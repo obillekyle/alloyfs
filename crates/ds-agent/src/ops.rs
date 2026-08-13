@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use dashmap::DashMap;
-use ds_common::{attr_from_metadata, io_to_code, read_fully, set_mode, write_fully, ExcludeSet, OrCode};
+use ds_common::{attr_from_metadata, read_fully, set_mode, write_fully, ExcludeSet, OrCode};
 use ds_proto::{DirEntry, ErrorCode, EventKind, FsEvent, OpenFlags, RelPath, Request, Response, DATA_CHUNK};
 use ds_transport::{EventPusher, RequestHandler};
 
@@ -89,14 +89,21 @@ impl Export {
         let mut entries = Vec::new();
         for item in std::fs::read_dir(&full).or_code()? {
             let item = item.or_code()?;
-            let Ok(name) = item.file_name().into_string() else { continue };
+            let Ok(name) = item.file_name().into_string() else {
+                continue;
+            };
             let child = rel.join(&name);
             if self.exclude.is_excluded(&child) {
                 continue; // invisible
             }
-            let md = item.metadata().or_else(|_| std::fs::symlink_metadata(item.path()));
+            let md = item
+                .metadata()
+                .or_else(|_| std::fs::symlink_metadata(item.path()));
             let Ok(md) = md else { continue };
-            entries.push(DirEntry { name, attr: attr_from_metadata(&md, self.version_of(&child)) });
+            entries.push(DirEntry {
+                name,
+                attr: attr_from_metadata(&md, self.version_of(&child)),
+            });
         }
         entries.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(entries)
@@ -119,8 +126,8 @@ impl ExportRegistry {
                 .map_err(|e| anyhow::anyhow!("export {name}: cannot resolve {:?}: {e}", ec.path))?;
             anyhow::ensure!(root.is_dir(), "export {name}: {root:?} is not a directory");
             // Server matching is always case-sensitive (documented).
-            let exclude = ExcludeSet::compile(&ec.exclude, false)
-                .map_err(|e| anyhow::anyhow!("export {name}: {e}"))?;
+            let exclude =
+                ExcludeSet::compile(&ec.exclude, false).map_err(|e| anyhow::anyhow!("export {name}: {e}"))?;
             tracing::info!(
                 name,
                 root = %root.display(),
@@ -143,7 +150,10 @@ impl ExportRegistry {
             );
         }
         anyhow::ensure!(!exports.is_empty(), "no exports configured");
-        Ok(Self { exports, sessions: DashMap::new() })
+        Ok(Self {
+            exports,
+            sessions: DashMap::new(),
+        })
     }
 
     pub fn get(&self, name: &str) -> Option<Arc<Export>> {
@@ -165,11 +175,17 @@ impl ExportRegistry {
                 tick.tick().await;
                 let Some(registry) = registry.upgrade() else { break };
                 registry.sessions.retain(|id, weak| {
-                    let Some(session) = weak.upgrade() else { return false };
+                    let Some(session) = weak.upgrade() else {
+                        return false;
+                    };
                     if session.last_seen_elapsed() > lease {
                         let released = session.force_release();
                         if released > 0 {
-                            tracing::warn!(session = id, released, "lease expired: released stale locks/handles");
+                            tracing::warn!(
+                                session = id,
+                                released,
+                                "lease expired: released stale locks/handles"
+                            );
                         }
                     }
                     true
@@ -314,12 +330,16 @@ impl SessionInner {
     }
 
     fn handle_of(&self, fh: u64) -> Result<Arc<OpenFile>, ErrorCode> {
-        self.handles.get(&fh).map(|h| h.clone()).ok_or(ErrorCode::BadHandle)
+        self.handles
+            .get(&fh)
+            .map(|h| h.clone())
+            .ok_or(ErrorCode::BadHandle)
     }
 
     fn insert_handle(&self, file: File, path: RelPath, writable: bool) -> u64 {
         let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
-        self.handles.insert(fh, Arc::new(OpenFile { file, path, writable }));
+        self.handles
+            .insert(fh, Arc::new(OpenFile { file, path, writable }));
         fh
     }
 
@@ -331,7 +351,10 @@ impl SessionInner {
         let attr = attr_from_metadata(&md, 0);
         tracing::info!(export = export.name, "client attached");
         let _ = self.attached.set(export);
-        Ok(Response::AttachOk { export_id: 0, root_attr: attr })
+        Ok(Response::AttachOk {
+            export_id: 0,
+            root_attr: attr,
+        })
     }
 
     fn getattr(&self, path: RelPath) -> Result<Response, ErrorCode> {
@@ -357,18 +380,29 @@ impl SessionInner {
             }
             // metadata() follows symlinks; fall back to the link's own
             // metadata for broken links so the entry still lists.
-            let md = item.metadata().or_else(|_| std::fs::symlink_metadata(item.path()));
+            let md = item
+                .metadata()
+                .or_else(|_| std::fs::symlink_metadata(item.path()));
             let Ok(md) = md else { continue };
             // Real versions in listings: the client auto-cache walker relies
             // on them for freshness without extra Getattrs.
-            entries.push(DirEntry { name, attr: attr_from_metadata(&md, export.version_of(&child)) });
+            entries.push(DirEntry {
+                name,
+                attr: attr_from_metadata(&md, export.version_of(&child)),
+            });
         }
         entries.sort_by(|a, b| a.name.cmp(&b.name));
         let start = cursor as usize;
         let page: Vec<DirEntry> = entries.iter().skip(start).take(READDIR_PAGE).cloned().collect();
-        let next_cursor =
-            if start + page.len() < entries.len() { Some((start + page.len()) as u64) } else { None };
-        Ok(Response::Dir { entries: page, next_cursor })
+        let next_cursor = if start + page.len() < entries.len() {
+            Some((start + page.len()) as u64)
+        } else {
+            None
+        };
+        Ok(Response::Dir {
+            entries: page,
+            next_cursor,
+        })
     }
 
     fn open(&self, path: RelPath, flags: OpenFlags) -> Result<Response, ErrorCode> {
@@ -378,12 +412,21 @@ impl SessionInner {
             return Err(ErrorCode::ReadOnly);
         }
         let full = export.resolve(&path)?;
-        let file = File::options().read(true).write(wants_write).truncate(flags.truncate).open(&full).or_code()?;
+        let file = File::options()
+            .read(true)
+            .write(wants_write)
+            .truncate(flags.truncate)
+            .open(&full)
+            .or_code()?;
         let md = file.metadata().or_code()?;
         if md.is_dir() {
             return Err(ErrorCode::IsADirectory);
         }
-        let version = if flags.truncate { export.bump(&path) } else { export.version_of(&path) };
+        let version = if flags.truncate {
+            export.bump(&path)
+        } else {
+            export.version_of(&path)
+        };
         let attr = attr_from_metadata(&md, version);
         let fh = self.insert_handle(file, path, wants_write);
         Ok(Response::Opened { fh, attr })
@@ -421,7 +464,13 @@ impl SessionInner {
         Ok(Response::Data(buf.into()))
     }
 
-    fn write(&self, fh: u64, offset: u64, data: bytes::Bytes, expect_version: Option<u64>) -> Result<Response, ErrorCode> {
+    fn write(
+        &self,
+        fh: u64,
+        offset: u64,
+        data: bytes::Bytes,
+        expect_version: Option<u64>,
+    ) -> Result<Response, ErrorCode> {
         let export = self.writable_export()?;
         let of = self.handle_of(fh)?;
         if !of.writable {
@@ -436,7 +485,11 @@ impl SessionInner {
         write_fully(&of.file, &data, offset).or_code()?;
         export.events.note_local_write(&of.path, self.id);
         let new_version = export.bump(&of.path);
-        Ok(Response::Written { n: data.len() as u32, new_version, conflict })
+        Ok(Response::Written {
+            n: data.len() as u32,
+            new_version,
+            conflict,
+        })
     }
 
     fn setattr(
@@ -449,10 +502,20 @@ impl SessionInner {
         let export = self.writable_export()?;
         let full = export.resolve(&path)?;
         if let Some(size) = size {
-            File::options().write(true).open(&full).or_code()?.set_len(size).or_code()?;
+            File::options()
+                .write(true)
+                .open(&full)
+                .or_code()?
+                .set_len(size)
+                .or_code()?;
         }
         if let Some(mtime) = mtime {
-            File::options().write(true).open(&full).or_code()?.set_modified(mtime).or_code()?;
+            File::options()
+                .write(true)
+                .open(&full)
+                .or_code()?
+                .set_modified(mtime)
+                .or_code()?;
         }
         if let Some(mode) = mode {
             let f = File::options().write(true).open(&full).or_code()?;
@@ -534,7 +597,11 @@ impl SessionInner {
     fn statfs(&self) -> Result<Response, ErrorCode> {
         // Real numbers come with a platform statvfs call later; these
         // placeholders are already enough for `df` not to error.
-        Ok(Response::Statfs { block_size: 4096, blocks: 1 << 24, blocks_free: 1 << 23 })
+        Ok(Response::Statfs {
+            block_size: 4096,
+            blocks: 1 << 24,
+            blocks_free: 1 << 23,
+        })
     }
 
     /// Blocking-pool dispatch: pure routing, no logic.
@@ -546,10 +613,20 @@ impl SessionInner {
             Request::Open { path, flags } => self.open(path, flags),
             Request::Create { path, flags, mode } => self.create(path, flags, mode),
             Request::Read { fh, offset, len } => self.read(fh, offset, len),
-            Request::Write { fh, offset, data, expect_version } => self.write(fh, offset, data, expect_version),
+            Request::Write {
+                fh,
+                offset,
+                data,
+                expect_version,
+            } => self.write(fh, offset, data, expect_version),
             Request::Flush { .. } => Ok(Response::Ok),
             Request::Release { fh } => self.release(fh),
-            Request::Setattr { path, size, mtime, mode } => self.setattr(path, size, mtime, mode),
+            Request::Setattr {
+                path,
+                size,
+                mtime,
+                mode,
+            } => self.setattr(path, size, mtime, mode),
             Request::Mkdir { path, mode } => self.mkdir(path, mode),
             Request::Unlink { path } => self.unlink(path),
             Request::Rmdir { path } => self.rmdir(path),

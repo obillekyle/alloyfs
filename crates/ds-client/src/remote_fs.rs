@@ -113,7 +113,10 @@ impl RemoteFs {
         let mut fetch_rx = None;
         let cache = if cache_enabled {
             let root = opts.data_dir.join("cache").join(&opts.mount_key);
-            let manifest = opts.data_dir.join("cache").join(format!("{}.manifest.json", opts.mount_key));
+            let manifest = opts
+                .data_dir
+                .join("cache")
+                .join(format!("{}.manifest.json", opts.mount_key));
             let (cache, rx) = AutoCache::load(crate::autocache::AutoCacheConfig {
                 max_file_size: opts.auto_cache_max,
                 budget: opts.auto_cache_budget.max(1),
@@ -240,7 +243,8 @@ impl RemoteFs {
             let ino = self.ino.get_or_alloc(path);
             return Ok((ino, attr));
         }
-        let attr = expect_resp!(self.call(Request::Getattr { path: path.clone() })?, Response::Attr(attr) => attr);
+        let attr =
+            expect_resp!(self.call(Request::Getattr { path: path.clone() })?, Response::Attr(attr) => attr);
         let ino = self.ino.get_or_alloc(path);
         self.cache_attr(ino, attr);
         Ok((ino, attr))
@@ -296,13 +300,18 @@ impl RemoteFs {
         if self.is_overlay(&path) {
             return self.overlay_ref().open(&path, flags);
         }
-        let (fh, attr) =
-            expect_resp!(self.call(Request::Open { path: path.clone(), flags })?, Response::Opened { fh, attr } => (fh, attr));
+        let (fh, attr) = expect_resp!(self.call(Request::Open { path: path.clone(), flags })?, Response::Opened { fh, attr } => (fh, attr));
         debug_assert!(fh & OVERLAY_FH_BIT == 0, "server fh collides with overlay bit");
         self.cache_attr(ino, attr);
         let cache_ok = self.cache.as_ref().is_some_and(|c| c.fresh_for(&path, &attr));
-        self.open_files
-            .insert(fh, OpenState { path, cache_ok: AtomicBool::new(cache_ok), wrote: AtomicBool::new(false) });
+        self.open_files.insert(
+            fh,
+            OpenState {
+                path,
+                cache_ok: AtomicBool::new(cache_ok),
+                wrote: AtomicBool::new(false),
+            },
+        );
         Ok((fh, attr))
     }
 
@@ -334,11 +343,13 @@ impl RemoteFs {
             v
         };
         let responses = self.rt.block_on(async {
-            futures::future::join_all(
-                chunks
-                    .iter()
-                    .map(|&(pos, want)| self.conn.request(Request::Read { fh, offset: pos, len: want })),
-            )
+            futures::future::join_all(chunks.iter().map(|&(pos, want)| {
+                self.conn.request(Request::Read {
+                    fh,
+                    offset: pos,
+                    len: want,
+                })
+            }))
             .await
         });
         let mut out = Vec::with_capacity(size as usize);
@@ -420,8 +431,14 @@ impl RemoteFs {
         );
         let ino = self.ino.get_or_alloc(path.clone());
         self.cache_attr(ino, attr);
-        self.open_files
-            .insert(fh, OpenState { path, cache_ok: AtomicBool::new(false), wrote: AtomicBool::new(true) });
+        self.open_files.insert(
+            fh,
+            OpenState {
+                path,
+                cache_ok: AtomicBool::new(false),
+                wrote: AtomicBool::new(true),
+            },
+        );
         Ok((ino, fh, attr))
     }
 
@@ -451,9 +468,17 @@ impl RemoteFs {
         let parent_path = self.path_of(parent)?;
         let path = parent_path.join(name);
         if self.is_overlay(&path) {
-            return if dir { self.overlay_ref().rmdir(&path) } else { self.overlay_ref().unlink(&path) };
+            return if dir {
+                self.overlay_ref().rmdir(&path)
+            } else {
+                self.overlay_ref().unlink(&path)
+            };
         }
-        let req = if dir { Request::Rmdir { path: path.clone() } } else { Request::Unlink { path: path.clone() } };
+        let req = if dir {
+            Request::Rmdir { path: path.clone() }
+        } else {
+            Request::Unlink { path: path.clone() }
+        };
         expect_resp!(self.call(req)?, Response::Ok => ());
         if let Some(ino) = self.ino.ino_of(&path) {
             self.invalidate_attr(ino);
@@ -530,8 +555,7 @@ impl RemoteFs {
                 Ok((ino, attr))
             }
             (false, false) => {
-                let attr =
-                    expect_resp!(self.call(Request::Link { target, link: link.clone() })?, Response::Attr(attr) => attr);
+                let attr = expect_resp!(self.call(Request::Link { target, link: link.clone() })?, Response::Attr(attr) => attr);
                 let ino = self.ino.get_or_alloc(link);
                 self.cache_attr(ino, attr);
                 Ok((ino, attr))

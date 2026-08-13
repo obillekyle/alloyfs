@@ -11,9 +11,9 @@ use std::time::SystemTime;
 use dashmap::DashMap;
 use ds_proto::{Attr, ErrorCode, OpenFlags, RelPath};
 
+use crate::remote_fs::FsError;
 use ds_common::ExcludeSet;
 use ds_common::{attr_from_metadata, io_to_code, read_fully, write_fully};
-use crate::remote_fs::FsError;
 
 /// Overlay file handles carry this bit; server handles are a small counter
 /// (asserted clear on the remote path), so the namespaces can't collide.

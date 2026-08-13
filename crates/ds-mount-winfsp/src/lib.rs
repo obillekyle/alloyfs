@@ -65,8 +65,8 @@ const STATUS_INVALID_DEVICE_REQUEST: i32 = 0xC000_0010u32 as i32;
 const STATUS_NOT_SAME_DEVICE: i32 = 0xC000_00D4u32 as i32;
 
 /// Bytes per allocation unit as advertised in `VolumeParams` (sector_size 4096
-/// * sectors_per_allocation_unit 1). `FileInfo::allocation_size` is rounded up
-/// to this.
+///   sectors_per_allocation_unit 1). `FileInfo::allocation_size` is rounded up
+///   to this.
 const ALLOCATION_UNIT: u64 = 4096;
 
 fn nt(code: i32) -> FspError {

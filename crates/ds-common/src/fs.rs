@@ -19,7 +19,14 @@ pub fn attr_from_metadata(md: &Metadata, version: u64) -> Attr {
     };
     let mtime = md.modified().unwrap_or(SystemTime::UNIX_EPOCH);
     let ctime = md.created().unwrap_or(mtime);
-    Attr { kind, size: md.len(), mtime, ctime, mode: mode_of(md), version }
+    Attr {
+        kind,
+        size: md.len(),
+        mtime,
+        ctime,
+        mode: mode_of(md),
+        version,
+    }
 }
 
 #[cfg(unix)]
