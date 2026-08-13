@@ -10,6 +10,6 @@ mod locks;
 mod ops;
 pub mod watch;
 
-pub use config::{AgentConfig, ExportConfig};
-pub use ops::{AgentSession, Export, ExportRegistry};
+pub use config::{AgentConfig, ClientDefaults, ExportConfig};
+pub use ops::{AgentSession, Export, ExportRegistry, MountDefaults};
 pub use watch::EventHub;

@@ -8,8 +8,12 @@ use crate::error::ErrorCode;
 /// Protocol versions this build can speak. The handshake picks
 /// `min(client_max, server_max)`; a peer whose range doesn't overlap ours is
 /// rejected. Bump MAX when the protocol grows, MIN only on breaking changes.
+///
+/// v2: `Request::MountDefaults` / `Response::MountDefaults` — clients only
+/// send it when the negotiated version is >= 2, so v1 peers never see the
+/// (to them undecodable) new variants.
 pub const PROTO_VERSION_MIN: u16 = 1;
-pub const PROTO_VERSION_MAX: u16 = 1;
+pub const PROTO_VERSION_MAX: u16 = 2;
 
 /// Read/write payloads are capped to this many bytes per request so one huge
 /// file operation can never monopolize the connection (head-of-line blocking).
@@ -232,6 +236,10 @@ pub enum Request {
         target: RelPath,
         link: RelPath,
     },
+    /// v2+: ask for the attached export's suggested client settings
+    /// (overlay excludes, pins, cache sizes). Send ONLY when the negotiated
+    /// protocol version is >= 2 — v1 peers cannot decode this variant.
+    MountDefaults,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -264,6 +272,15 @@ pub enum Response {
         last_seq: u64,
     },
     Ok,
+    /// v2+: the export's suggested client config. Lists are suggestions the
+    /// client unions with its own; sizes apply only where the client didn't
+    /// set an explicit value. Appended last (see `Request::MountDefaults`).
+    MountDefaults {
+        exclude: Vec<String>,
+        pin: Vec<String>,
+        auto_cache_max: Option<u64>,
+        auto_cache_budget: Option<u64>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 ds-proto.workspace = true
+ds-common.workspace = true
 ds-transport.workspace = true
 ds-agent.workspace = true
 ds-client.workspace = true

@@ -29,6 +29,17 @@ pub struct Export {
     pub locks: crate::locks::LockManager,
     /// Server-side excludes: matching paths are invisible to every client.
     pub exclude: ExcludeSet,
+    /// Suggested client settings (already size-parsed), served to v2 mounts.
+    pub mount_defaults: MountDefaults,
+}
+
+/// Resolved form of the config's `client:` section.
+#[derive(Debug, Default, Clone)]
+pub struct MountDefaults {
+    pub exclude: Vec<String>,
+    pub pin: Vec<String>,
+    pub auto_cache_max: Option<u64>,
+    pub auto_cache_budget: Option<u64>,
 }
 
 impl Export {
@@ -128,6 +139,27 @@ impl ExportRegistry {
             // Server matching is always case-sensitive (documented).
             let exclude =
                 ExcludeSet::compile(&ec.exclude, false).map_err(|e| anyhow::anyhow!("export {name}: {e}"))?;
+            // Resolve the suggested-client-config sizes at startup so a bad
+            // value fails the boot, not a mount.
+            let mount_defaults = match &ec.client {
+                Some(c) => MountDefaults {
+                    exclude: c.exclude.clone(),
+                    pin: c.pin.clone(),
+                    auto_cache_max: c
+                        .auto_cache_max
+                        .as_ref()
+                        .map(|s| s.to_bytes())
+                        .transpose()
+                        .map_err(|e| anyhow::anyhow!("export {name}: client.auto_cache_max: {e}"))?,
+                    auto_cache_budget: c
+                        .auto_cache_budget
+                        .as_ref()
+                        .map(|s| s.to_bytes())
+                        .transpose()
+                        .map_err(|e| anyhow::anyhow!("export {name}: client.auto_cache_budget: {e}"))?,
+                },
+                None => MountDefaults::default(),
+            };
             tracing::info!(
                 name,
                 root = %root.display(),
@@ -146,6 +178,7 @@ impl ExportRegistry {
                     events: crate::watch::EventHub::new(),
                     locks: crate::locks::LockManager::default(),
                     exclude,
+                    mount_defaults,
                 }),
             );
         }
@@ -604,6 +637,17 @@ impl SessionInner {
         })
     }
 
+    fn mount_defaults(&self) -> Result<Response, ErrorCode> {
+        let export = self.export()?;
+        let d = &export.mount_defaults;
+        Ok(Response::MountDefaults {
+            exclude: d.exclude.clone(),
+            pin: d.pin.clone(),
+            auto_cache_max: d.auto_cache_max,
+            auto_cache_budget: d.auto_cache_budget,
+        })
+    }
+
     /// Blocking-pool dispatch: pure routing, no logic.
     fn dispatch_blocking(&self, req: Request) -> Result<Response, ErrorCode> {
         match req {
@@ -633,6 +677,7 @@ impl SessionInner {
             Request::Rename { from, to, replace } => self.rename(from, to, replace),
             Request::Link { target, link } => self.link(target, link),
             Request::Statfs => self.statfs(),
+            Request::MountDefaults => self.mount_defaults(),
             // Handled in async context (handle()); never reach the pool.
             Request::Lock { .. } | Request::Unlock { .. } | Request::Subscribe { .. } => Err(ErrorCode::Io),
         }

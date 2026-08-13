@@ -43,6 +43,24 @@ pub struct ExportConfig {
     /// never listed, resolvable, or event-broadcast to any client.
     #[serde(default)]
     pub exclude: Vec<String>,
+    /// Suggested CLIENT settings, sent to v2+ mounts at attach time. The
+    /// client unions the lists with its own and uses the sizes only where it
+    /// has no explicit value; `--no-server-defaults` opts out entirely.
+    #[serde(default)]
+    pub client: Option<ClientDefaults>,
+}
+
+/// The `client:` section of an export: what this server recommends mounts
+/// configure locally (overlay excludes, pins, cache sizing).
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClientDefaults {
+    #[serde(default)]
+    pub exclude: Vec<String>,
+    #[serde(default)]
+    pub pin: Vec<String>,
+    pub auto_cache_max: Option<ds_common::SizeField>,
+    pub auto_cache_budget: Option<ds_common::SizeField>,
 }
 
 impl AgentConfig {

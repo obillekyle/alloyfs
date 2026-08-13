@@ -63,6 +63,10 @@ enum Command {
         /// Local data directory (overlay + cache). Default: per-user app data.
         #[arg(long, value_name = "PATH")]
         data_dir: Option<PathBuf>,
+        /// Ignore the server's suggested client settings (exclude/pin/cache
+        /// sizes published by the export's `client:` config section).
+        #[arg(long)]
+        no_server_defaults: bool,
     },
     /// Manage the local auto-download cache.
     Cache {
@@ -134,6 +138,7 @@ async fn main() -> anyhow::Result<()> {
             auto_cache_max,
             auto_cache_budget,
             data_dir,
+            no_server_defaults,
         } => {
             commands::mount::run(
                 url,
@@ -145,6 +150,7 @@ async fn main() -> anyhow::Result<()> {
                 auto_cache_max,
                 auto_cache_budget,
                 data_dir,
+                no_server_defaults,
             )
             .await
         }

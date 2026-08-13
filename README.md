@@ -142,6 +142,15 @@ exports:
     exclude:
       - "**/.git"
       - "secret*"
+    # Suggested settings for every machine that mounts this export
+    # (applied at attach; see "Negotiated mount defaults" below).
+    client:
+      exclude:
+        - node_modules
+      pin:
+        - "docs/**"
+      auto_cache_max: 2M
+      auto_cache_budget: 512M
 ```
 
 Mount (`mount <url> <point> --config mount.yml`; CLI flags override):
@@ -154,7 +163,25 @@ pin:
   - "docs/**"
 auto_cache_max: 2M
 auto_cache_budget: 512M
+# no_server_defaults: true   # ignore the export's `client:` suggestions
 ```
+
+## Negotiated mount defaults
+
+An export can publish a `client:` section (above) — the settings the server
+*recommends* every mounting machine use. Clients fetch it at attach and merge
+it under their own configuration:
+
+- **Precedence**: CLI flag > mount config file > server suggestion > built-in
+  default (`2M`/`512M`). An explicit `--auto-cache-max 0` is a real "off"
+  that beats the server's suggestion.
+- **Lists union**: server-suggested `exclude`/`pin` globs are added to the
+  client's own (duplicates dropped, client entries first).
+- **Opting out**: `--no-server-defaults` (or `no_server_defaults: true` in
+  the mount config) skips the exchange entirely.
+
+The exchange is protocol v2; a v1 peer on either side simply never performs
+it, and mixed-version pairs keep working with local settings only.
 
 ## Known issues
 

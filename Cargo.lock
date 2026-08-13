@@ -351,6 +351,7 @@ dependencies = [
  "clap",
  "ds-agent",
  "ds-client",
+ "ds-common",
  "ds-http",
  "ds-mount-fuse",
  "ds-mount-winfsp",
@@ -394,6 +395,7 @@ dependencies = [
  "anyhow",
  "ds-proto",
  "globset",
+ "serde",
 ]
 
 [[package]]

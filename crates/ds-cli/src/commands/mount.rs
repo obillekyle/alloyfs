@@ -15,8 +15,10 @@ pub async fn run(
     auto_cache_max: Option<String>,
     auto_cache_budget: Option<String>,
     data_dir: Option<PathBuf>,
+    no_server_defaults: bool,
 ) -> anyhow::Result<()> {
-    // File values first, CLI flags override.
+    // File values first, CLI flags override. Sizes stay None when neither
+    // set one, so a server suggestion (proto v2+) can fill them in.
     let file_cfg = match &config {
         Some(path) => MountConfig::load(path)?,
         None => MountConfig::default(),
@@ -28,15 +30,16 @@ pub async fn run(
     };
     let pins = if pins.is_empty() { file_cfg.pin } else { pins };
     let auto_cache_max = match (auto_cache_max, &file_cfg.auto_cache_max) {
-        (Some(flag), _) => parse_size(&flag).map_err(|e| anyhow::anyhow!(e))?,
-        (None, Some(f)) => f.to_bytes().map_err(|e| anyhow::anyhow!(e))?,
-        (None, None) => 2 * 1024 * 1024,
+        (Some(flag), _) => Some(parse_size(&flag).map_err(|e| anyhow::anyhow!(e))?),
+        (None, Some(f)) => Some(f.to_bytes().map_err(|e| anyhow::anyhow!(e))?),
+        (None, None) => None,
     };
     let auto_cache_budget = match (auto_cache_budget, &file_cfg.auto_cache_budget) {
-        (Some(flag), _) => parse_size(&flag).map_err(|e| anyhow::anyhow!(e))?,
-        (None, Some(f)) => f.to_bytes().map_err(|e| anyhow::anyhow!(e))?,
-        (None, None) => 512 * 1024 * 1024,
+        (Some(flag), _) => Some(parse_size(&flag).map_err(|e| anyhow::anyhow!(e))?),
+        (None, Some(f)) => Some(f.to_bytes().map_err(|e| anyhow::anyhow!(e))?),
+        (None, None) => None,
     };
+    let no_server_defaults = no_server_defaults || file_cfg.no_server_defaults;
     let data_dir = data_dir.or(file_cfg.data_dir).unwrap_or_else(default_data_dir);
 
     let (conn, export) = connect_target(&url, &remote_cmd, &whoami()).await?;
@@ -48,10 +51,15 @@ pub async fn run(
         pins,
         auto_cache_max,
         auto_cache_budget,
-        data_dir,
+        // CLI mounts default to auto-caching (2M files, 512M budget) when
+        // neither the user nor the server picked values.
+        auto_cache_max_fallback: 2 * 1024 * 1024,
+        auto_cache_budget_fallback: 512 * 1024 * 1024,
+        no_server_defaults,
         // Survive connection loss: re-dial, re-attach, re-open handles,
         // resubscribe events. Locks do not survive (documented).
         dialer: Some(dialer_for(&url, &remote_cmd, &whoami())),
+        data_dir,
     };
     let fs = ds_client::RemoteFs::attach_with(conn, &export, opts).await?;
     // Each platform starts the event pump itself, wiring server events into

@@ -29,6 +29,8 @@ pub struct AgentOpts {
     pub excludes: Vec<String>,
     pub watch: bool,
     pub debounce_ms: u64,
+    /// The export's `client:` section — suggested mount defaults (proto v2).
+    pub client_defaults: Option<ds_agent::ClientDefaults>,
 }
 
 impl Default for AgentOpts {
@@ -38,6 +40,7 @@ impl Default for AgentOpts {
             excludes: Vec::new(),
             watch: false,
             debounce_ms: 100,
+            client_defaults: None,
         }
     }
 }
@@ -51,7 +54,7 @@ pub struct TestAgent {
 
 /// One export named "test" over a fresh tempdir. No lease reaper: tests that
 /// need lock release use `Session::sever` for a deterministic disconnect.
-pub fn start_agent(opts: AgentOpts) -> TestAgent {
+pub fn start_agent(mut opts: AgentOpts) -> TestAgent {
     let dir = tempfile::TempDir::new().expect("tempdir");
     let mut cfg = AgentConfig::default();
     cfg.exports.insert(
@@ -60,6 +63,7 @@ pub fn start_agent(opts: AgentOpts) -> TestAgent {
             path: dir.path().to_path_buf(),
             read_only: opts.read_only,
             exclude: opts.excludes.clone(),
+            client: opts.client_defaults.take(),
         },
     );
     let registry = Arc::new(ExportRegistry::from_config(&cfg).expect("export registry"));

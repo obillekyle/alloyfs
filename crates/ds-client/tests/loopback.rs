@@ -599,8 +599,8 @@ async fn autocache_fresh_serve_write_invalidate() {
     let opts = ClientOptions {
         data_dir: data_dir.path().to_path_buf(),
         mount_key: "t".into(),
-        auto_cache_max: 1 << 20,
-        auto_cache_budget: 10 << 20,
+        auto_cache_max: Some(1 << 20),
+        auto_cache_budget: Some(10 << 20),
         ..ClientOptions::default()
     };
     let s = connect(&agent, opts).await;
@@ -852,5 +852,109 @@ async fn request_timeout() {
     assert!(
         waited < Duration::from_millis(1500),
         "deadline not honored (~300ms expected): {waited:?}"
+    );
+}
+
+// --------------------------------------------------------------------- 22
+
+/// The export's `client:` section reaches a default-configured client at
+/// attach: overlay excludes, pins, and cache sizes all come from the server.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn server_defaults_negotiated() {
+    let agent = start_agent(AgentOpts {
+        client_defaults: Some(ds_agent::ClientDefaults {
+            exclude: vec!["*.local".into()],
+            pin: vec![],
+            auto_cache_max: Some(ds_common::SizeField::Bytes(1 << 20)),
+            auto_cache_budget: Some(ds_common::SizeField::Human("10M".into())),
+        }),
+        ..AgentOpts::default()
+    });
+    let content = patterned(64 * 1024);
+    std::fs::write(agent.dir.path().join("big.bin"), &content).unwrap();
+    let data_dir = tempfile::TempDir::new().unwrap();
+
+    // No excludes, no sizes: everything below must come from the server.
+    let opts = ClientOptions {
+        data_dir: data_dir.path().to_path_buf(),
+        mount_key: "t".into(),
+        ..ClientOptions::default()
+    };
+    let s = connect(&agent, opts).await;
+
+    // Server-suggested exclude activates the overlay.
+    mkfile(&s.fs, ROOT_INO, "notes.local", b"client only").await;
+    let overlay_file = data_dir.path().join("overlay").join("t").join("notes.local");
+    assert_eq!(std::fs::read(&overlay_file).unwrap(), b"client only");
+    assert!(
+        !agent.dir.path().join("notes.local").exists(),
+        "server-suggested exclude must keep the file off the server"
+    );
+
+    // Server-suggested cache sizes enable the auto-cache walker.
+    let blob = data_dir.path().join("cache").join("t").join("big.bin");
+    wait_until(
+        "walker caches big.bin via server-suggested sizes",
+        10,
+        move || (std::fs::read(&blob).ok()? == content).then_some(()),
+    )
+    .await;
+}
+
+// --------------------------------------------------------------------- 23
+
+/// `no_server_defaults` (and explicit client values) beat the suggestion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn server_defaults_opt_out_and_precedence() {
+    let agent = start_agent(AgentOpts {
+        client_defaults: Some(ds_agent::ClientDefaults {
+            exclude: vec!["*.local".into()],
+            pin: vec![],
+            auto_cache_max: Some(ds_common::SizeField::Bytes(1 << 20)),
+            auto_cache_budget: None,
+        }),
+        ..AgentOpts::default()
+    });
+    let data_dir = tempfile::TempDir::new().unwrap();
+
+    // Opted out: the suggestion is never even requested, so *.local is a
+    // perfectly ordinary remote file.
+    let opts = ClientOptions {
+        data_dir: data_dir.path().to_path_buf(),
+        mount_key: "t".into(),
+        no_server_defaults: true,
+        ..ClientOptions::default()
+    };
+    let s = connect(&agent, opts).await;
+    mkfile(&s.fs, ROOT_INO, "notes.local", b"remote after all").await;
+    assert_eq!(
+        std::fs::read(agent.dir.path().join("notes.local")).unwrap(),
+        b"remote after all",
+        "opt-out: file must land on the server"
+    );
+    drop(s);
+
+    // Explicit Some(0) beats the server's Some(1M): cache stays off, so the
+    // walker never materializes a blob dir for this mount.
+    let content = patterned(16 * 1024);
+    std::fs::write(agent.dir.path().join("small.bin"), &content).unwrap();
+    let opts = ClientOptions {
+        data_dir: data_dir.path().to_path_buf(),
+        mount_key: "t2".into(),
+        auto_cache_max: Some(0),
+        ..ClientOptions::default()
+    };
+    let s = connect(&agent, opts).await;
+    let (ino, _) = lookup_path(&s.fs, "small.bin").await.unwrap();
+    assert_eq!(read_all(&s.fs, ino).await, content);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !data_dir
+            .path()
+            .join("cache")
+            .join("t2")
+            .join("small.bin")
+            .exists(),
+        "explicit auto_cache_max=0 must beat the server suggestion"
     );
 }

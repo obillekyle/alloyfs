@@ -49,17 +49,42 @@ const ATTR_TTL: Duration = Duration::from_secs(5);
 pub type Dialer = Arc<dyn Fn() -> BoxFuture<'static, anyhow::Result<Arc<MuxConnection>>> + Send + Sync>;
 
 /// Per-mount client behavior: local overlay excludes + auto-download cache +
-/// optional reconnect. Default (all empty/zero/None) means every feature is
-/// off and RemoteFs behaves exactly as a plain single-connection client.
-#[derive(Default, Clone)]
+/// optional reconnect. Default means every feature is off and RemoteFs
+/// behaves exactly as a plain single-connection client.
+#[derive(Clone)]
 pub struct ClientOptions {
     pub excludes: Vec<String>,
     pub data_dir: PathBuf,
     pub mount_key: String,
-    pub auto_cache_max: u64,
-    pub auto_cache_budget: u64,
+    /// None = no explicit choice: a server suggestion (v2+) applies, else
+    /// the fallback below. `Some(0)` is an explicit OFF that beats both.
+    pub auto_cache_max: Option<u64>,
+    pub auto_cache_budget: Option<u64>,
+    /// Used when neither the client nor the server chose a value. The
+    /// library default is off/512M; the CLI mounts pass 2M/512M.
+    pub auto_cache_max_fallback: u64,
+    pub auto_cache_budget_fallback: u64,
     pub pins: Vec<String>,
     pub dialer: Option<Dialer>,
+    /// Ignore the server's suggested client settings entirely.
+    pub no_server_defaults: bool,
+}
+
+impl Default for ClientOptions {
+    fn default() -> Self {
+        Self {
+            excludes: Vec::new(),
+            data_dir: PathBuf::new(),
+            mount_key: String::new(),
+            auto_cache_max: None,
+            auto_cache_budget: None,
+            auto_cache_max_fallback: 0, // library default: cache off
+            auto_cache_budget_fallback: 512 * 1024 * 1024,
+            pins: Vec::new(),
+            dialer: None,
+            no_server_defaults: false,
+        }
+    }
 }
 
 /// Client-side bookkeeping for one open remote handle. Keyed by the fh the
@@ -112,6 +137,48 @@ impl RemoteFs {
             Response::AttachOk { root_attr, .. } => root_attr
         );
 
+        // Config negotiation (protocol v2+): merge the server's suggested
+        // client settings under the client's own. Precedence: explicit client
+        // value > server suggestion > fallback. Lists are unioned (client
+        // entries first); `no_server_defaults` skips the exchange entirely.
+        let mut opts = opts;
+        if !opts.no_server_defaults && conn.proto >= 2 {
+            if let Ok(Ok(Response::MountDefaults {
+                exclude,
+                pin,
+                auto_cache_max,
+                auto_cache_budget,
+            })) = conn.request(Request::MountDefaults).await
+            {
+                let suggested = exclude.len() + pin.len();
+                for e in exclude {
+                    if !opts.excludes.contains(&e) {
+                        opts.excludes.push(e);
+                    }
+                }
+                for p in pin {
+                    if !opts.pins.contains(&p) {
+                        opts.pins.push(p);
+                    }
+                }
+                if opts.auto_cache_max.is_none() {
+                    opts.auto_cache_max = auto_cache_max;
+                }
+                if opts.auto_cache_budget.is_none() {
+                    opts.auto_cache_budget = auto_cache_budget;
+                }
+                if suggested > 0 || auto_cache_max.is_some() || auto_cache_budget.is_some() {
+                    tracing::info!(
+                        excludes = opts.excludes.len(),
+                        pins = opts.pins.len(),
+                        "applied server-suggested mount defaults (--no-server-defaults to opt out)"
+                    );
+                }
+            }
+        }
+        let auto_cache_max = opts.auto_cache_max.unwrap_or(opts.auto_cache_max_fallback);
+        let auto_cache_budget = opts.auto_cache_budget.unwrap_or(opts.auto_cache_budget_fallback);
+
         let overlay = if opts.excludes.is_empty() {
             None
         } else {
@@ -131,7 +198,7 @@ impl RemoteFs {
             Some(ov)
         };
 
-        let cache_enabled = opts.auto_cache_max > 0 || !opts.pins.is_empty();
+        let cache_enabled = auto_cache_max > 0 || !opts.pins.is_empty();
         let mut fetch_rx = None;
         let cache = if cache_enabled {
             let root = opts.data_dir.join("cache").join(&opts.mount_key);
@@ -140,8 +207,8 @@ impl RemoteFs {
                 .join("cache")
                 .join(format!("{}.manifest.json", opts.mount_key));
             let (cache, rx) = AutoCache::load(crate::autocache::AutoCacheConfig {
-                max_file_size: opts.auto_cache_max,
-                budget: opts.auto_cache_budget.max(1),
+                max_file_size: auto_cache_max,
+                budget: auto_cache_budget.max(1),
                 pins: opts.pins.clone(),
                 root,
                 manifest,

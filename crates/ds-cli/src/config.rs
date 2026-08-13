@@ -16,6 +16,9 @@ pub struct MountConfig {
     pub auto_cache_max: Option<SizeField>,
     pub auto_cache_budget: Option<SizeField>,
     pub data_dir: Option<PathBuf>,
+    /// Ignore the server's suggested client settings for this mount.
+    #[serde(default)]
+    pub no_server_defaults: bool,
 }
 
 impl MountConfig {
@@ -25,42 +28,9 @@ impl MountConfig {
     }
 }
 
-/// Accepts `auto_cache_max: 2M` (string) or `auto_cache_max: 2097152` (int).
-#[derive(serde::Deserialize)]
-#[serde(untagged)]
-pub enum SizeField {
-    Bytes(u64),
-    Human(String),
-}
-
-impl SizeField {
-    pub fn to_bytes(&self) -> Result<u64, String> {
-        match self {
-            SizeField::Bytes(n) => Ok(*n),
-            SizeField::Human(s) => parse_size(s),
-        }
-    }
-}
-
-/// "2M" → 2 MiB, "512K", "1G", bare digits = bytes, "0" disables.
-pub fn parse_size(s: &str) -> Result<u64, String> {
-    let s = s.trim();
-    if s.is_empty() {
-        return Err("empty size".into());
-    }
-    let (digits, mult) = match s.chars().last().unwrap().to_ascii_uppercase() {
-        'K' => (&s[..s.len() - 1], 1024u64),
-        'M' => (&s[..s.len() - 1], 1024 * 1024),
-        'G' => (&s[..s.len() - 1], 1024 * 1024 * 1024),
-        c if c.is_ascii_digit() => (s, 1),
-        c => return Err(format!("unknown size suffix {c:?} in {s:?}")),
-    };
-    digits
-        .parse::<u64>()
-        .map_err(|e| format!("bad size {s:?}: {e}"))?
-        .checked_mul(mult)
-        .ok_or_else(|| format!("size {s:?} overflows"))
-}
+// Size parsing lives in ds-common (the agent's `client:` section uses the
+// same forms); re-exported so callers keep one import path.
+pub use ds_common::{parse_size, SizeField};
 
 pub fn default_data_dir() -> PathBuf {
     #[cfg(windows)]
@@ -123,25 +93,9 @@ pub fn load_agent_config(config: Option<PathBuf>, inline_exports: &[String]) -> 
                 path: PathBuf::from(path),
                 read_only: false,
                 exclude: vec![],
+                client: None,
             },
         );
     }
     Ok(cfg)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_size_forms() {
-        assert_eq!(parse_size("0"), Ok(0));
-        assert_eq!(parse_size("42"), Ok(42));
-        assert_eq!(parse_size("2M"), Ok(2 * 1024 * 1024));
-        assert_eq!(parse_size("512k"), Ok(512 * 1024));
-        assert_eq!(parse_size("1G"), Ok(1024 * 1024 * 1024));
-        assert!(parse_size("").is_err());
-        assert!(parse_size("2X").is_err());
-        assert!(parse_size("M").is_err());
-    }
 }

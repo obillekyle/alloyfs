@@ -189,6 +189,7 @@ fn canonical() -> Vec<(&'static str, Frame)> {
                 link: RelPath("dir/link.txt".into()),
             }),
         ),
+        ("req_mount_defaults", req(Request::MountDefaults)),
         // --- every Response variant (as Ok) ---
         (
             "resp_attach_ok",
@@ -228,6 +229,15 @@ fn canonical() -> Vec<(&'static str, Frame)> {
         ),
         ("resp_subscribed", ok(Response::Subscribed { last_seq: 55 })),
         ("resp_ok", ok(Response::Ok)),
+        (
+            "resp_mount_defaults",
+            ok(Response::MountDefaults {
+                exclude: vec!["node_modules/**".into()],
+                pin: vec!["*.lock".into()],
+                auto_cache_max: Some(42),
+                auto_cache_budget: None,
+            }),
+        ),
         // --- every ErrorCode (as Err) ---
         ("err_not_found", err(ErrorCode::NotFound)),
         ("err_permission_denied", err(ErrorCode::PermissionDenied)),
@@ -303,6 +313,7 @@ fn _variant_tripwire(
         Request::Subscribe { .. } => {}
         Request::Statfs => {}
         Request::Link { .. } => {}
+        Request::MountDefaults => {} // v2: golden added, PROTO_VERSION_MAX bumped
     }
     match response {
         Response::AttachOk { .. } => {}
@@ -314,6 +325,7 @@ fn _variant_tripwire(
         Response::Statfs { .. } => {}
         Response::Subscribed { .. } => {}
         Response::Ok => {}
+        Response::MountDefaults { .. } => {} // v2: golden added, PROTO_VERSION_MAX bumped
     }
     match code {
         ErrorCode::NotFound => {}
@@ -358,8 +370,10 @@ fn _variant_tripwire(
 /// `cargo test -p ds-proto print_goldens -- --ignored --nocapture`
 #[rustfmt::skip]
 const GOLDEN: &[(&str, &str)] = &[
-    ("hello", "00010106676f6c64656e"),
-    ("hello_ack", "010106676f6c64656e"),
+    // hello/hello_ack embed PROTO_VERSION_MAX — they legitimately move when
+    // the protocol version bumps (v2: MountDefaults negotiation).
+    ("hello", "00010206676f6c64656e"),
+    ("hello_ack", "010206676f6c64656e"),
     ("ping", "0507"),
     ("pong", "0607"),
     ("req_attach", "0207000870726f6a65637473"),
@@ -381,6 +395,7 @@ const GOLDEN: &[(&str, &str)] = &[
     ("req_subscribe", "0207100137"),
     ("req_statfs", "020711"),
     ("req_link", "0207120c6469722f66696c652e7478740c6469722f6c696e6b2e747874"),
+    ("req_mount_defaults", "020713"),
     ("resp_attach_ok", "030700002a002a80e2cfaa06bc99ef3a80e2cfaa06bc99ef3aa40308"),
     ("resp_attr", "03070001002a80e2cfaa06bc99ef3a80e2cfaa06bc99ef3aa40308"),
     ("resp_dir", "030700020106676f6c64656e002a80e2cfaa06bc99ef3a80e2cfaa06bc99ef3aa40308012a"),
@@ -390,6 +405,7 @@ const GOLDEN: &[(&str, &str)] = &[
     ("resp_statfs", "030700062a2a2a"),
     ("resp_subscribed", "0307000737"),
     ("resp_ok", "03070008"),
+    ("resp_mount_defaults", "03070009010f6e6f64655f6d6f64756c65732f2a2a01062a2e6c6f636b012a00"),
     ("err_not_found", "03070100"),
     ("err_permission_denied", "03070101"),
     ("err_already_exists", "03070102"),
