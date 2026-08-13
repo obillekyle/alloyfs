@@ -12,8 +12,11 @@ use ds_proto::{
 };
 
 /// Fixed timestamp used everywhere a `SystemTime` appears.
+/// 100ns-aligned: Windows SystemTime has 100ns resolution, so a finer
+/// canonical value would encode differently per platform (the golden test
+/// caught exactly that on its first cross-OS run).
 fn t() -> SystemTime {
-    SystemTime::UNIX_EPOCH + Duration::new(1_700_000_000, 123_456_789)
+    SystemTime::UNIX_EPOCH + Duration::new(1_700_000_000, 123_456_700)
 }
 
 fn path() -> RelPath {
