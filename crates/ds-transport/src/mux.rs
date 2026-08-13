@@ -57,8 +57,8 @@ impl MuxConnection {
         S: AsyncRead + AsyncWrite + Send + 'static,
     {
         let (r, w) = tokio::io::split(stream);
-        let mut reader = FramedRead::new(r, FrameCodec);
-        let mut writer = FramedWrite::new(w, FrameCodec);
+        let mut reader = FramedRead::new(r, FrameCodec::default());
+        let mut writer = FramedWrite::new(w, FrameCodec::default());
 
         writer
             .send(&Frame::Hello {
@@ -78,6 +78,8 @@ impl MuxConnection {
                 "server chose unsupported version {proto}"
             )));
         }
+        // v3+: both sides may compress large frames from here on.
+        writer.encoder_mut().compress = proto >= 3;
 
         let (tx, mut out_rx) = mpsc::channel::<Frame>(256);
         let inflight: Arc<DashMap<u64, oneshot::Sender<Result<Response, ErrorCode>>>> =

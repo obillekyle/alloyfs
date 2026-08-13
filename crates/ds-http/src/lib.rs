@@ -58,14 +58,7 @@ pub async fn serve(listen: &str, registry: Arc<ExportRegistry>, token: Option<St
     Ok(())
 }
 
-/// Constant-time equality: never leak how much of a token matched.
-fn token_eq(a: &str, b: &str) -> bool {
-    let (a, b) = (a.as_bytes(), b.as_bytes());
-    if a.len() != b.len() {
-        return false;
-    }
-    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
-}
+use ds_common::token_eq;
 
 async fn auth(State(state): State<Arc<AppState>>, req: Request, next: Next) -> Response {
     let Some(expected) = &state.token else {

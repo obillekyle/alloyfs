@@ -249,15 +249,33 @@ fn spawn_server_link(
     registry: &Arc<ExportRegistry>,
     slot: &SeverSlot,
 ) -> (Severable<DuplexStream>, JoinHandle<()>) {
+    spawn_server_link_with(registry, slot, None)
+}
+
+fn spawn_server_link_with(
+    registry: &Arc<ExportRegistry>,
+    slot: &SeverSlot,
+    token: Option<String>,
+) -> (Severable<DuplexStream>, JoinHandle<()>) {
     let (client_io, server_io): (DuplexStream, DuplexStream) = tokio::io::duplex(1024 * 1024);
     let (server_half, sever) = Severable::new(server_io);
     let client_half = Severable::sibling(client_io, &sever);
     *slot.lock().unwrap() = Some(sever);
-    let handler: Arc<dyn RequestHandler> = Arc::new(AgentSession::new(registry.clone()));
+    let handler: Arc<dyn RequestHandler> = Arc::new(AgentSession::with_token(registry.clone(), token));
     let server = tokio::spawn(async move {
         let _ = serve_connection(server_half, "test-agent", handler).await;
     });
     (client_half, server)
+}
+
+/// A bare authenticated-or-not `MuxConnection` against a token-protected
+/// session — no RemoteFs, so tests can poke Auth/Attach by hand.
+pub async fn connect_raw_with_server_token(agent: &TestAgent, token: &str) -> Arc<MuxConnection> {
+    let slot: SeverSlot = Arc::new(Mutex::new(None));
+    let (client_io, _server) = spawn_server_link_with(&agent.registry, &slot, Some(token.into()));
+    MuxConnection::establish(client_io, "test-client")
+        .await
+        .expect("handshake")
 }
 
 /// Full loopback stack: duplex pipe, `serve_connection` on the (severable)

@@ -41,6 +41,10 @@ pub enum ErrorCode {
     /// (no server sends it); appended last so postcard stays wire-compatible.
     #[error("cross-device link or rename")]
     CrossDevice,
+    /// v3+: the session must send `Request::Auth` with the agent's tcp_token
+    /// before anything else. Appended last (postcard append-only rule).
+    #[error("authentication required")]
+    AuthRequired,
 }
 
 /// Errors in the codec itself (framing/serialization) — these are fatal to a
@@ -51,6 +55,8 @@ pub enum ProtoError {
     FrameTooLarge(usize),
     #[error("malformed frame: {0}")]
     Malformed(#[from] postcard::Error),
+    #[error("bad compressed frame: {0}")]
+    Compression(String),
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }

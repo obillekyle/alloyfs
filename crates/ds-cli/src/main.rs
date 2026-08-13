@@ -67,6 +67,9 @@ enum Command {
         /// sizes published by the export's `client:` config section).
         #[arg(long)]
         no_server_defaults: bool,
+        /// Shared secret for token-protected TCP servers (agent.tcp_token).
+        #[arg(long)]
+        token: Option<String>,
     },
     /// Manage the local auto-download cache.
     Cache {
@@ -83,18 +86,27 @@ enum Command {
         /// Remote drive-sync command for ssh:// urls.
         #[arg(long, default_value = "drive-sync")]
         remote_cmd: String,
+        /// Shared secret for token-protected TCP servers.
+        #[arg(long)]
+        token: Option<String>,
     },
     /// Measure round-trip latency to an agent (url: tcp://host:port or ssh://host).
     Ping {
         url: String,
         #[arg(long, default_value_t = 5)]
         count: u32,
+        /// Shared secret for token-protected TCP servers.
+        #[arg(long)]
+        token: Option<String>,
     },
     /// Fire many concurrent pipelined requests at an agent and verify replies.
     Stress {
         url: String,
         #[arg(long, default_value_t = 1000)]
         count: u32,
+        /// Shared secret for token-protected TCP servers.
+        #[arg(long)]
+        token: Option<String>,
     },
 }
 
@@ -139,6 +151,7 @@ async fn main() -> anyhow::Result<()> {
             auto_cache_budget,
             data_dir,
             no_server_defaults,
+            token,
         } => {
             commands::mount::run(
                 url,
@@ -151,6 +164,7 @@ async fn main() -> anyhow::Result<()> {
                 auto_cache_budget,
                 data_dir,
                 no_server_defaults,
+                token,
             )
             .await
         }
@@ -165,8 +179,9 @@ async fn main() -> anyhow::Result<()> {
             url,
             since,
             remote_cmd,
-        } => commands::diag::events(url, since, remote_cmd).await,
-        Command::Ping { url, count } => commands::diag::ping(url, count).await,
-        Command::Stress { url, count } => commands::diag::stress(url, count).await,
+            token,
+        } => commands::diag::events(url, since, remote_cmd, token).await,
+        Command::Ping { url, count, token } => commands::diag::ping(url, count, token).await,
+        Command::Stress { url, count, token } => commands::diag::stress(url, count, token).await,
     }
 }

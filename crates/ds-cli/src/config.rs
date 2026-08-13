@@ -19,6 +19,8 @@ pub struct MountConfig {
     /// Ignore the server's suggested client settings for this mount.
     #[serde(default)]
     pub no_server_defaults: bool,
+    /// Shared secret for token-protected TCP servers (agent.tcp_token).
+    pub token: Option<String>,
 }
 
 impl MountConfig {

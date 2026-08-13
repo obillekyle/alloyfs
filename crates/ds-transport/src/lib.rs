@@ -11,4 +11,4 @@ pub mod stdio;
 pub mod tcp;
 
 pub use mux::{MuxConnection, TransportError};
-pub use server::{serve_connection, EventPusher, RequestHandler};
+pub use server::{serve_connection, serve_connection_with, EventPusher, RequestHandler};

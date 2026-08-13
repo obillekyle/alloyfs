@@ -16,6 +16,7 @@ pub async fn run(
     auto_cache_budget: Option<String>,
     data_dir: Option<PathBuf>,
     no_server_defaults: bool,
+    token: Option<String>,
 ) -> anyhow::Result<()> {
     // File values first, CLI flags override. Sizes stay None when neither
     // set one, so a server suggestion (proto v2+) can fill them in.
@@ -40,9 +41,10 @@ pub async fn run(
         (None, None) => None,
     };
     let no_server_defaults = no_server_defaults || file_cfg.no_server_defaults;
+    let token = token.or(file_cfg.token);
     let data_dir = data_dir.or(file_cfg.data_dir).unwrap_or_else(default_data_dir);
 
-    let (conn, export) = connect_target(&url, &remote_cmd, &whoami()).await?;
+    let (conn, export) = connect_target(&url, &remote_cmd, &whoami(), token.as_deref()).await?;
     let export = require_export(export, &url)?;
     tracing::info!(server = conn.server_name, proto = conn.proto, "connected");
     let opts = ds_client::ClientOptions {
@@ -58,7 +60,7 @@ pub async fn run(
         no_server_defaults,
         // Survive connection loss: re-dial, re-attach, re-open handles,
         // resubscribe events. Locks do not survive (documented).
-        dialer: Some(dialer_for(&url, &remote_cmd, &whoami())),
+        dialer: Some(dialer_for(&url, &remote_cmd, &whoami(), token)),
         data_dir,
     };
     let fs = ds_client::RemoteFs::attach_with(conn, &export, opts).await?;

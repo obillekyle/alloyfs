@@ -96,6 +96,10 @@ fn canonical() -> Vec<(&'static str, Frame)> {
         ),
         ("ping", Frame::Ping { nonce: 7 }),
         ("pong", Frame::Pong { nonce: 7 }),
+        // Fixed bytes rather than a real lz4 output: this freezes the
+        // VARIANT encoding; the lz4 block format itself is frozen by the
+        // compression roundtrip tests in ds-proto/src/frame.rs.
+        ("compressed", Frame::Compressed(Bytes::from_static(b"golden"))),
         // --- every Request variant ---
         (
             "req_attach",
@@ -190,6 +194,12 @@ fn canonical() -> Vec<(&'static str, Frame)> {
             }),
         ),
         ("req_mount_defaults", req(Request::MountDefaults)),
+        (
+            "req_auth",
+            req(Request::Auth {
+                token: "golden-secret".into(),
+            }),
+        ),
         // --- every Response variant (as Ok) ---
         (
             "resp_attach_ok",
@@ -256,6 +266,7 @@ fn canonical() -> Vec<(&'static str, Frame)> {
         ("err_too_old", err(ErrorCode::TooOld)),
         ("err_io", err(ErrorCode::Io)),
         ("err_cross_device", err(ErrorCode::CrossDevice)),
+        ("err_auth_required", err(ErrorCode::AuthRequired)),
         // --- every EventKind (inside an Events batch) ---
         ("event_created", ev(EventKind::Created)),
         ("event_modified", ev(EventKind::Modified)),
@@ -292,6 +303,7 @@ fn _variant_tripwire(
         Frame::Events { .. } => {}
         Frame::Ping { .. } => {}
         Frame::Pong { .. } => {}
+        Frame::Compressed(..) => {} // v3: golden added, PROTO_VERSION_MAX bumped
     }
     match request {
         Request::Attach { .. } => {}
@@ -314,6 +326,7 @@ fn _variant_tripwire(
         Request::Statfs => {}
         Request::Link { .. } => {}
         Request::MountDefaults => {} // v2: golden added, PROTO_VERSION_MAX bumped
+        Request::Auth { .. } => {}   // v3: golden added, PROTO_VERSION_MAX bumped
     }
     match response {
         Response::AttachOk { .. } => {}
@@ -345,6 +358,7 @@ fn _variant_tripwire(
         ErrorCode::TooOld => {}
         ErrorCode::Io => {}
         ErrorCode::CrossDevice => {}
+        ErrorCode::AuthRequired => {} // v3: golden added, PROTO_VERSION_MAX bumped
     }
     match event {
         EventKind::Created => {}
@@ -371,11 +385,12 @@ fn _variant_tripwire(
 #[rustfmt::skip]
 const GOLDEN: &[(&str, &str)] = &[
     // hello/hello_ack embed PROTO_VERSION_MAX — they legitimately move when
-    // the protocol version bumps (v2: MountDefaults negotiation).
-    ("hello", "00010206676f6c64656e"),
-    ("hello_ack", "010206676f6c64656e"),
+    // the protocol version bumps (v3: auth + compression).
+    ("hello", "00010306676f6c64656e"),
+    ("hello_ack", "010306676f6c64656e"),
     ("ping", "0507"),
     ("pong", "0607"),
+    ("compressed", "0706676f6c64656e"),
     ("req_attach", "0207000870726f6a65637473"),
     ("req_getattr", "0207010c6469722f66696c652e747874"),
     ("req_readdir", "0207020c6469722f66696c652e7478742a"),
@@ -396,6 +411,7 @@ const GOLDEN: &[(&str, &str)] = &[
     ("req_statfs", "020711"),
     ("req_link", "0207120c6469722f66696c652e7478740c6469722f6c696e6b2e747874"),
     ("req_mount_defaults", "020713"),
+    ("req_auth", "0207140d676f6c64656e2d736563726574"),
     ("resp_attach_ok", "030700002a002a80e2cfaa06bc99ef3a80e2cfaa06bc99ef3aa40308"),
     ("resp_attr", "03070001002a80e2cfaa06bc99ef3a80e2cfaa06bc99ef3aa40308"),
     ("resp_dir", "030700020106676f6c64656e002a80e2cfaa06bc99ef3a80e2cfaa06bc99ef3aa40308012a"),
@@ -423,6 +439,7 @@ const GOLDEN: &[(&str, &str)] = &[
     ("err_too_old", "0307010e"),
     ("err_io", "0307010f"),
     ("err_cross_device", "03070110"),
+    ("err_auth_required", "03070111"),
     ("event_created", "040137000c6469722f66696c652e74787401080101"),
     ("event_modified", "040137010c6469722f66696c652e74787401080101"),
     ("event_attr_changed", "040137020c6469722f66696c652e74787401080101"),

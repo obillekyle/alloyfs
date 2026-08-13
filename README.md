@@ -135,6 +135,9 @@ Windows; `.toml` variants still parse for existing deployments):
 ```yaml
 agent:
   tcp_listen: "0.0.0.0:7440"
+  # Required for any non-loopback tcp_listen: clients present it at connect
+  # (mount --token / token: in the mount config). ssh mounts never need it.
+  tcp_token: "change-me"
   http_listen: "127.0.0.1:7441"
 exports:
   projects:
@@ -182,6 +185,45 @@ it under their own configuration:
 
 The exchange is protocol v2; a v1 peer on either side simply never performs
 it, and mixed-version pairs keep working with local settings only.
+
+## TCP authentication (protocol v3)
+
+Raw `tcp://` mounts historically trusted the network. Now:
+
+- `agent.tcp_token` in the agent config makes every TCP session authenticate
+  (constant-time compare) before any other request is served. Clients pass
+  `--token` (or `token:` in the mount config); the reconnect dialer re-sends
+  it automatically after a connection drop.
+- **Serving TCP on a non-loopback address without a token is refused at
+  startup** — anyone who could reach the port could mount every export.
+  Loopback listeners may stay tokenless by choice.
+- `ssh://` mounts are untouched: reaching the stdio agent already required an
+  ssh login, which is stronger auth than any shared secret.
+- Token-protected listeners require protocol v3+ clients (older ones are
+  turned away at the handshake with a version error they can decode).
+
+## Wire compression (protocol v3)
+
+Frames of 512+ bytes are transparently lz4-compressed whenever both ends
+speak v3 — but only when compression actually shrinks them, so
+already-compressed file data (archives, images, video) passes through
+untouched. Source trees typically halve their wire volume or better; on slow
+links (the ~2 MB/s ssh path this project grew up on) that translates almost
+directly into throughput. No configuration, no flags: it's negotiated per
+connection and silently off with any v2 peer.
+
+## Running the agent as a service
+
+- **Linux (systemd)**: [scripts/drive-sync.service](scripts/drive-sync.service) —
+  copy to `/etc/systemd/system/`, adjust `User=`/`--config`, then
+  `systemctl enable --now drive-sync`. Logs land in journald
+  (`journalctl -u drive-sync -f`); the agent restarts on failure.
+- **Windows (Scheduled Task)**: [scripts/install-agent-task.ps1](scripts/install-agent-task.ps1)
+  (elevated PowerShell) registers a `drive-sync-agent` task that starts
+  `drive-sync serve` at logon and restarts it on failure.
+- Mounts don't need service treatment: a mount already **auto-reconnects**
+  through server restarts, so an agent coming back after a reboot picks up
+  its clients where they left off (open files reopen; locks are lost).
 
 ## Known issues
 

@@ -29,6 +29,7 @@ ds-http = { path = "crates/ds-http" }
 
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1.1", features = ["use-std"] }
+lz4_flex = "0.11"
 bytes = { version = "1", features = ["serde"] }
 thiserror = "2"
 anyhow = "1"

@@ -42,14 +42,37 @@ pub async fn run(
     let name = format!("drive-sync/{}", env!("CARGO_PKG_VERSION"));
     if stdio_mode {
         // One session over our own stdin/stdout (the ssh exec channel).
-        // stdout carries protocol frames; logging is stderr-only.
+        // stdout carries protocol frames; logging is stderr-only. No tcp_token
+        // check: reaching this process already required an ssh login.
         stdio::serve(&name, Arc::new(AgentSession::new(registry))).await?;
     } else {
         let listen = cfg.agent.tcp_listen.unwrap_or(addr);
-        tcp::serve(&listen, name, move || {
-            Arc::new(AgentSession::new(registry.clone())) as Arc<dyn RequestHandler>
+        let token = cfg.agent.tcp_token.clone();
+        if token.is_none() && !is_loopback(&listen) {
+            anyhow::bail!(
+                "refusing to serve TCP on non-loopback {listen} without agent.tcp_token — \
+                 anyone who can reach the port could mount every export"
+            );
+        }
+        // Token-protected listeners require proto v3: older clients can't
+        // decode AuthRequired, so they're turned away at the handshake.
+        let min_proto = if token.is_some() {
+            3
+        } else {
+            ds_proto::PROTO_VERSION_MIN
+        };
+        tcp::serve(&listen, name, min_proto, move || {
+            Arc::new(AgentSession::with_token(registry.clone(), token.clone())) as Arc<dyn RequestHandler>
         })
         .await?;
     }
     Ok(())
+}
+
+fn is_loopback(listen: &str) -> bool {
+    use std::net::ToSocketAddrs;
+    match listen.to_socket_addrs() {
+        Ok(mut addrs) => addrs.all(|a| a.ip().is_loopback()),
+        Err(_) => false, // unparseable: be strict, demand a token
+    }
 }

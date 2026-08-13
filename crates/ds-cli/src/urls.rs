@@ -40,11 +40,14 @@ pub fn parse_url(url: &str) -> anyhow::Result<(Target, Option<String>)> {
 }
 
 /// Connect to a target url; for ssh, spawn `ssh <host> <remote_cmd> serve
-/// --stdio` and speak the protocol over the exec channel.
+/// --stdio` and speak the protocol over the exec channel. A `token`
+/// authenticates immediately after the handshake (TCP servers with
+/// `agent.tcp_token`; protocol v3+).
 pub async fn connect_target(
     url: &str,
     remote_cmd: &str,
     client: &str,
+    token: Option<&str>,
 ) -> anyhow::Result<(Arc<MuxConnection>, Option<String>)> {
     let (target, export) = parse_url(url)?;
     let conn = match target {
@@ -62,6 +65,21 @@ pub async fn connect_target(
             stdio::connect_command("ssh", &args, client).await?
         }
     };
+    if let Some(token) = token {
+        anyhow::ensure!(
+            conn.proto >= 3,
+            "server {} speaks protocol v{} — tokens need v3+ (update the server)",
+            conn.server_name,
+            conn.proto
+        );
+        match conn
+            .request(ds_proto::Request::Auth { token: token.into() })
+            .await?
+        {
+            Ok(_) => {}
+            Err(e) => anyhow::bail!("authentication failed: {e}"),
+        }
+    }
     Ok((conn, export))
 }
 
@@ -70,15 +88,17 @@ pub fn require_export(export: Option<String>, url: &str) -> anyhow::Result<Strin
 }
 
 /// A reconnect dialer that re-runs the same connect logic (tcp dial or ssh
-/// re-spawn) whenever the client needs a replacement connection.
-pub fn dialer_for(url: &str, remote_cmd: &str, client: &str) -> ds_client::Dialer {
+/// re-spawn) whenever the client needs a replacement connection. The token
+/// travels with it: a reconnected session must re-authenticate too.
+pub fn dialer_for(url: &str, remote_cmd: &str, client: &str, token: Option<String>) -> ds_client::Dialer {
     let url = url.to_string();
     let remote_cmd = remote_cmd.to_string();
     let client = client.to_string();
     Arc::new(move || {
-        let (url, remote_cmd, client) = (url.clone(), remote_cmd.clone(), client.clone());
+        let (url, remote_cmd, client, token) =
+            (url.clone(), remote_cmd.clone(), client.clone(), token.clone());
         Box::pin(async move {
-            let (conn, _) = connect_target(&url, &remote_cmd, &client).await?;
+            let (conn, _) = connect_target(&url, &remote_cmd, &client, token.as_deref()).await?;
             Ok(conn)
         })
     })

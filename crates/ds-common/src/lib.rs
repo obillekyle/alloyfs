@@ -48,6 +48,17 @@ impl SizeField {
     }
 }
 
+/// Constant-time token equality: never leak how much of a secret matched
+/// through response timing. Used by both the HTTP bearer check and the TCP
+/// `Request::Auth` handler.
+pub fn token_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 /// Map std::io errors onto wire error codes.
 pub fn io_to_code(e: &std::io::Error) -> ErrorCode {
     use std::io::ErrorKind::*;

@@ -1,0 +1,25 @@
+# systemd unit for the drive-sync agent (Linux server).
+# Install:
+#   sudo cp scripts/drive-sync.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now drive-sync
+# Logs: journalctl -u drive-sync -f
+#
+# Adjust User= and the --config path to the account that owns the exports.
+
+[Unit]
+Description=drive-sync agent (virtual drive exports)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=okyle
+ExecStart=/usr/local/bin/drive-sync serve --config /home/okyle/.config/drive-sync/agent.toml
+Restart=on-failure
+RestartSec=2
+Environment=RUST_LOG=info
+# The agent only needs to read/write the exported folders.
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

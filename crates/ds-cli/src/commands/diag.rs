@@ -6,8 +6,8 @@ use ds_proto::{Request, Response};
 
 use crate::urls::{connect_target, require_export, whoami};
 
-pub async fn ping(url: String, count: u32) -> anyhow::Result<()> {
-    let (conn, _) = connect_target(&url, "drive-sync", "ping").await?;
+pub async fn ping(url: String, count: u32, token: Option<String>) -> anyhow::Result<()> {
+    let (conn, _) = connect_target(&url, "drive-sync", "ping", token.as_deref()).await?;
     println!("connected to {} (proto v{})", conn.server_name, conn.proto);
     for i in 1..=count {
         let rtt = conn.ping().await?;
@@ -16,8 +16,8 @@ pub async fn ping(url: String, count: u32) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub async fn stress(url: String, count: u32) -> anyhow::Result<()> {
-    let (conn, _) = connect_target(&url, "drive-sync", "stress").await?;
+pub async fn stress(url: String, count: u32, token: Option<String>) -> anyhow::Result<()> {
+    let (conn, _) = connect_target(&url, "drive-sync", "stress", token.as_deref()).await?;
     let start = Instant::now();
     // Launch every request before awaiting any: true pipelining.
     let mut futs = Vec::with_capacity(count as usize);
@@ -41,8 +41,13 @@ pub async fn stress(url: String, count: u32) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub async fn events(url: String, since: Option<u64>, remote_cmd: String) -> anyhow::Result<()> {
-    let (conn, export) = connect_target(&url, &remote_cmd, &whoami()).await?;
+pub async fn events(
+    url: String,
+    since: Option<u64>,
+    remote_cmd: String,
+    token: Option<String>,
+) -> anyhow::Result<()> {
+    let (conn, export) = connect_target(&url, &remote_cmd, &whoami(), token.as_deref()).await?;
     let export = require_export(export, &url)?;
     let fs = ds_client::RemoteFs::attach(conn.clone(), &export).await?;
     let mut rx = conn.events();

@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 ds-proto.workspace = true
+ds-common.workspace = true
 ds-agent.workspace = true
 axum.workspace = true
 serde.workspace = true

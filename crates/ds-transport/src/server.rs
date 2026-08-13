@@ -53,9 +53,25 @@ pub async fn serve_connection<S>(
 where
     S: AsyncRead + AsyncWrite + Send + 'static,
 {
+    serve_connection_with(stream, server_name, handler, PROTO_VERSION_MIN).await
+}
+
+/// `serve_connection` that additionally requires the negotiated version to
+/// reach `min_proto`. Token-protected TCP listeners pass 3: an older client
+/// couldn't decode `AuthRequired` errors, so it's turned away at the
+/// handshake with a version mismatch it CAN decode.
+pub async fn serve_connection_with<S>(
+    stream: S,
+    server_name: &str,
+    handler: Arc<dyn RequestHandler>,
+    min_proto: u16,
+) -> Result<(), TransportError>
+where
+    S: AsyncRead + AsyncWrite + Send + 'static,
+{
     let (r, w) = tokio::io::split(stream);
-    let mut reader = FramedRead::new(r, FrameCodec);
-    let mut writer = FramedWrite::new(w, FrameCodec);
+    let mut reader = FramedRead::new(r, FrameCodec::default());
+    let mut writer = FramedWrite::new(w, FrameCodec::default());
 
     match reader.next().await {
         Some(Ok(Frame::Hello {
@@ -63,7 +79,7 @@ where
             proto_max,
             client,
         })) => {
-            let lo = proto_min.max(PROTO_VERSION_MIN);
+            let lo = proto_min.max(PROTO_VERSION_MIN).max(min_proto);
             let hi = proto_max.min(PROTO_VERSION_MAX);
             if lo > hi {
                 let _ = writer
@@ -83,6 +99,8 @@ where
                     server: server_name.to_string(),
                 })
                 .await?;
+            // v3+: both sides may compress large frames from here on.
+            writer.encoder_mut().compress = hi >= 3;
         }
         Some(Ok(other)) => {
             return Err(TransportError::Handshake(format!(

@@ -1,4 +1,4 @@
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use tokio_util::codec::{Decoder, Encoder};
 
 use crate::error::ProtoError;
@@ -9,11 +9,24 @@ use crate::messages::Frame;
 /// close. Protects both sides from corrupt lengths and hostile peers.
 pub const MAX_FRAME_LEN: usize = 1024 * 1024;
 
+/// Frames smaller than this aren't worth compressing: the lz4 header plus
+/// the `Compressed` wrapper would eat most of the win.
+const COMPRESS_MIN: usize = 512;
+
 const LEN_PREFIX: usize = 4;
 
 /// Wire format: `u32 little-endian payload length` + `postcard(Frame)`.
+///
+/// With `compress` on (both peers negotiated protocol v3+), outgoing frames
+/// of COMPRESS_MIN+ bytes are lz4-compressed and wrapped in
+/// `Frame::Compressed` — but only when that actually made them smaller, so
+/// already-compressed file data passes through untouched. The decoder always
+/// unwraps `Compressed` regardless of the flag; the version gate lives on
+/// the sending side.
 #[derive(Debug, Default)]
-pub struct FrameCodec;
+pub struct FrameCodec {
+    pub compress: bool,
+}
 
 impl Decoder for FrameCodec {
     type Item = Frame;
@@ -34,7 +47,25 @@ impl Decoder for FrameCodec {
         }
         src.advance(LEN_PREFIX);
         let payload = src.split_to(len);
-        Ok(Some(postcard::from_bytes(&payload)?))
+        match postcard::from_bytes(&payload)? {
+            Frame::Compressed(data) => {
+                // The prepended size is attacker-controlled: bound it before
+                // allocating anything (decompression-bomb guard).
+                if data.len() >= 4 {
+                    let claimed = u32::from_le_bytes(data[..4].try_into().unwrap()) as usize;
+                    if claimed > MAX_FRAME_LEN {
+                        return Err(ProtoError::FrameTooLarge(claimed));
+                    }
+                }
+                let inner = lz4_flex::decompress_size_prepended(&data)
+                    .map_err(|e| ProtoError::Compression(e.to_string()))?;
+                match postcard::from_bytes(&inner)? {
+                    Frame::Compressed(_) => Err(ProtoError::Compression("nested Compressed frame".into())),
+                    frame => Ok(Some(frame)),
+                }
+            }
+            frame => Ok(Some(frame)),
+        }
     }
 }
 
@@ -42,7 +73,13 @@ impl Encoder<&Frame> for FrameCodec {
     type Error = ProtoError;
 
     fn encode(&mut self, frame: &Frame, dst: &mut BytesMut) -> Result<(), ProtoError> {
-        let payload = postcard::to_stdvec(frame)?;
+        let mut payload = postcard::to_stdvec(frame)?;
+        if self.compress && payload.len() >= COMPRESS_MIN && !matches!(frame, Frame::Compressed(_)) {
+            let squeezed = lz4_flex::compress_prepend_size(&payload);
+            if squeezed.len() < payload.len() {
+                payload = postcard::to_stdvec(&Frame::Compressed(Bytes::from(squeezed)))?;
+            }
+        }
         if payload.len() > MAX_FRAME_LEN {
             return Err(ProtoError::FrameTooLarge(payload.len()));
         }
@@ -61,7 +98,7 @@ mod tests {
     use std::time::SystemTime;
 
     fn roundtrip(frame: &Frame) -> Frame {
-        let mut codec = FrameCodec;
+        let mut codec = FrameCodec::default();
         let mut buf = BytesMut::new();
         codec.encode(frame, &mut buf).expect("encode");
         codec.decode(&mut buf).expect("decode").expect("complete frame")
@@ -145,8 +182,81 @@ mod tests {
     }
 
     #[test]
+    fn compression_roundtrips_and_shrinks() {
+        let mut tx = FrameCodec { compress: true };
+        let mut rx = FrameCodec::default(); // decode side needs no flag
+        let data = Bytes::from(vec![0x42u8; 128 * 1024]); // maximally compressible
+        let frame = Frame::Response {
+            id: 7,
+            body: Ok(Response::Data(data.clone())),
+        };
+        let mut buf = BytesMut::new();
+        tx.encode(&frame, &mut buf).unwrap();
+        assert!(
+            buf.len() < data.len() / 10,
+            "128K of constant bytes should shrink dramatically, got {}",
+            buf.len()
+        );
+        match rx.decode(&mut buf).unwrap().unwrap() {
+            Frame::Response {
+                id: 7,
+                body: Ok(Response::Data(got)),
+            } => assert_eq!(got, data),
+            other => panic!("wrong frame after decompression: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn incompressible_data_passes_through_uncompressed() {
+        // Pseudo-random bytes don't shrink; the encoder must fall back to the
+        // plain encoding rather than growing the frame.
+        let mut noise = vec![0u8; 64 * 1024];
+        let mut state = 0x12345678u32;
+        for b in noise.iter_mut() {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            *b = (state >> 24) as u8;
+        }
+        let frame = Frame::Response {
+            id: 1,
+            body: Ok(Response::Data(Bytes::from(noise.clone()))),
+        };
+        let plain_len = postcard::to_stdvec(&frame).unwrap().len();
+        let mut tx = FrameCodec { compress: true };
+        let mut buf = BytesMut::new();
+        tx.encode(&frame, &mut buf).unwrap();
+        assert_eq!(
+            buf.len(),
+            LEN_PREFIX + plain_len,
+            "must not wrap when lz4 doesn't win"
+        );
+        match FrameCodec::default().decode(&mut buf).unwrap().unwrap() {
+            Frame::Response {
+                body: Ok(Response::Data(got)),
+                ..
+            } => assert_eq!(&got[..], &noise[..]),
+            other => panic!("wrong frame: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compression_bomb_rejected() {
+        // A Compressed frame claiming to inflate past MAX_FRAME_LEN must be
+        // rejected before any allocation happens.
+        let mut bomb = Vec::new();
+        bomb.extend_from_slice(&(u32::MAX).to_le_bytes());
+        bomb.extend_from_slice(&[0u8; 32]);
+        let frame = Frame::Compressed(Bytes::from(bomb));
+        let mut buf = BytesMut::new();
+        FrameCodec::default().encode(&frame, &mut buf).unwrap();
+        assert!(matches!(
+            FrameCodec::default().decode(&mut buf),
+            Err(ProtoError::FrameTooLarge(_))
+        ));
+    }
+
+    #[test]
     fn truncated_frame_waits_for_more() {
-        let mut codec = FrameCodec;
+        let mut codec = FrameCodec::default();
         let mut buf = BytesMut::new();
         codec.encode(&Frame::Ping { nonce: 1 }, &mut buf).unwrap();
         let full = buf.clone();
@@ -158,7 +268,7 @@ mod tests {
 
     #[test]
     fn oversize_frame_rejected() {
-        let mut codec = FrameCodec;
+        let mut codec = FrameCodec::default();
         let mut buf = BytesMut::new();
         buf.put_u32_le((MAX_FRAME_LEN + 1) as u32);
         buf.put_slice(&[0u8; 16]);
@@ -170,7 +280,7 @@ mod tests {
 
     #[test]
     fn garbage_payload_is_malformed() {
-        let mut codec = FrameCodec;
+        let mut codec = FrameCodec::default();
         let mut buf = BytesMut::new();
         buf.put_u32_le(4);
         buf.put_slice(&[0xff, 0xff, 0xff, 0xff]);
@@ -179,7 +289,7 @@ mod tests {
 
     #[test]
     fn two_frames_in_one_buffer() {
-        let mut codec = FrameCodec;
+        let mut codec = FrameCodec::default();
         let mut buf = BytesMut::new();
         codec.encode(&Frame::Ping { nonce: 1 }, &mut buf).unwrap();
         codec.encode(&Frame::Pong { nonce: 2 }, &mut buf).unwrap();

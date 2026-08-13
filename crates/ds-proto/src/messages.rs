@@ -12,8 +12,12 @@ use crate::error::ErrorCode;
 /// v2: `Request::MountDefaults` / `Response::MountDefaults` — clients only
 /// send it when the negotiated version is >= 2, so v1 peers never see the
 /// (to them undecodable) new variants.
+///
+/// v3: `Request::Auth` + `ErrorCode::AuthRequired` (TCP shared-secret auth)
+/// and `Frame::Compressed` (transparent large-frame compression). Both sides
+/// send the new variants only when the negotiated version is >= 3.
 pub const PROTO_VERSION_MIN: u16 = 1;
-pub const PROTO_VERSION_MAX: u16 = 2;
+pub const PROTO_VERSION_MAX: u16 = 3;
 
 /// Read/write payloads are capped to this many bytes per request so one huge
 /// file operation can never monopolize the connection (head-of-line blocking).
@@ -240,6 +244,12 @@ pub enum Request {
     /// (overlay excludes, pins, cache sizes). Send ONLY when the negotiated
     /// protocol version is >= 2 — v1 peers cannot decode this variant.
     MountDefaults,
+    /// v3+: authenticate a TCP session with the agent's shared secret
+    /// (`agent.tcp_token`). Must precede every other request when the server
+    /// requires it; ssh/stdio sessions are pre-authenticated by ssh itself.
+    Auth {
+        token: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -314,4 +324,8 @@ pub enum Frame {
     Pong {
         nonce: u64,
     },
+    /// v3+: an entire postcard-encoded `Frame`, lz4-block-compressed (with
+    /// prepended uncompressed size). Senders use it for large compressible
+    /// frames when the negotiated version is >= 3; nesting is forbidden.
+    Compressed(Bytes),
 }

@@ -15,8 +15,8 @@ use ds_client::{ClientOptions, ROOT_INO};
 use ds_proto::{ErrorCode, EventKind, FileKind, FsEvent, LockKind, OpenFlags, RelPath, Request, Response};
 use ds_transport::TransportError;
 use harness::{
-    connect, connect_reconnectable, deadline_after, expect_event, lookup_path, mkfile, on_fs, patterned,
-    read_all, remote_code, start_agent, wait_until, AgentOpts, Session,
+    connect, connect_raw_with_server_token, connect_reconnectable, deadline_after, expect_event, lookup_path,
+    mkfile, on_fs, patterned, read_all, remote_code, start_agent, wait_until, AgentOpts, Session,
 };
 
 fn rw() -> OpenFlags {
@@ -957,4 +957,48 @@ async fn server_defaults_opt_out_and_precedence() {
             .exists(),
         "explicit auto_cache_max=0 must beat the server suggestion"
     );
+}
+
+// --------------------------------------------------------------------- 24
+
+/// Token-protected sessions serve NOTHING until Request::Auth presents the
+/// right secret; wrong secrets are rejected without opening the gate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auth_token_gates_requests() {
+    let agent = start_agent(AgentOpts::default());
+    let conn = connect_raw_with_server_token(&agent, "sekrit").await;
+
+    let attach = || Request::Attach {
+        export: "test".into(),
+    };
+    assert_eq!(
+        conn.request(attach()).await.expect("transport").unwrap_err(),
+        ErrorCode::AuthRequired,
+        "unauthenticated attach must be refused"
+    );
+    assert_eq!(
+        conn.request(Request::Auth {
+            token: "wrong".into()
+        })
+        .await
+        .expect("transport")
+        .unwrap_err(),
+        ErrorCode::PermissionDenied,
+        "bad token must be rejected"
+    );
+    assert_eq!(
+        conn.request(attach()).await.expect("transport").unwrap_err(),
+        ErrorCode::AuthRequired,
+        "a failed auth must not open the gate"
+    );
+    conn.request(Request::Auth {
+        token: "sekrit".into(),
+    })
+    .await
+    .expect("transport")
+    .expect("correct token accepted");
+    conn.request(attach())
+        .await
+        .expect("transport")
+        .expect("authenticated attach works");
 }

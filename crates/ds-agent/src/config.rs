@@ -26,6 +26,11 @@ pub struct AgentConfig {
 #[serde(deny_unknown_fields)]
 pub struct AgentSection {
     pub tcp_listen: Option<String>,
+    /// Shared secret required from every TCP mount (protocol v3+ Auth
+    /// request). Mandatory when tcp_listen is not loopback; optional on
+    /// localhost. ssh/stdio sessions never need it — ssh already
+    /// authenticated the user.
+    pub tcp_token: Option<String>,
     /// Optional HTTP API (status/browse/files/SSE events), e.g. "127.0.0.1:7441".
     pub http_listen: Option<String>,
     /// Bearer token required on every /api request (`Authorization: Bearer …`).

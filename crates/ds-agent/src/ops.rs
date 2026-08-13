@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use dashmap::DashMap;
@@ -256,12 +256,24 @@ struct SessionInner {
     push: std::sync::OnceLock<EventPusher>,
     /// Updated on every request; the lease reaper compares against it.
     last_seen: std::sync::Mutex<std::time::Instant>,
+    /// v3 TCP auth: `Some` on token-protected listeners, `None` on stdio
+    /// (ssh already authenticated the user) and open TCP.
+    required_token: Option<String>,
+    /// Starts true when no token is required; flipped by `Request::Auth`.
+    authed: AtomicBool,
 }
 
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
 
 impl AgentSession {
     pub fn new(registry: Arc<ExportRegistry>) -> Self {
+        Self::with_token(registry, None)
+    }
+
+    /// A session that must present `token` (via `Request::Auth`, protocol
+    /// v3+) before any other request. Used by token-protected TCP listeners;
+    /// stdio sessions use `new` — ssh already authenticated the user.
+    pub fn with_token(registry: Arc<ExportRegistry>, token: Option<String>) -> Self {
         let inner = Arc::new(SessionInner {
             id: NEXT_SESSION.fetch_add(1, Ordering::Relaxed),
             registry: registry.clone(),
@@ -270,6 +282,8 @@ impl AgentSession {
             next_fh: AtomicU64::new(1),
             push: std::sync::OnceLock::new(),
             last_seen: std::sync::Mutex::new(std::time::Instant::now()),
+            authed: AtomicBool::new(token.is_none()),
+            required_token: token,
         });
         registry.sessions.insert(inner.id, Arc::downgrade(&inner));
         Self { inner }
@@ -679,7 +693,10 @@ impl SessionInner {
             Request::Statfs => self.statfs(),
             Request::MountDefaults => self.mount_defaults(),
             // Handled in async context (handle()); never reach the pool.
-            Request::Lock { .. } | Request::Unlock { .. } | Request::Subscribe { .. } => Err(ErrorCode::Io),
+            Request::Lock { .. }
+            | Request::Unlock { .. }
+            | Request::Subscribe { .. }
+            | Request::Auth { .. } => Err(ErrorCode::Io),
         }
     }
 }
@@ -688,6 +705,23 @@ impl SessionInner {
 impl RequestHandler for AgentSession {
     async fn handle(&self, req: Request) -> Result<Response, ErrorCode> {
         self.inner.touch();
+        // Auth gate first: on a token-protected session nothing else is
+        // served until Request::Auth presents the right secret.
+        if let Request::Auth { token } = &req {
+            let expected = self.inner.required_token.as_deref().unwrap_or("");
+            return if self.inner.required_token.is_none() {
+                Ok(Response::Ok) // no token required: auth is a no-op
+            } else if ds_common::token_eq(token, expected) {
+                self.inner.authed.store(true, Ordering::Release);
+                Ok(Response::Ok)
+            } else {
+                tracing::warn!(session = self.inner.id, "rejected bad auth token");
+                Err(ErrorCode::PermissionDenied)
+            };
+        }
+        if !self.inner.authed.load(Ordering::Acquire) {
+            return Err(ErrorCode::AuthRequired);
+        }
         // Subscribe spawns an async forwarder and Lock may await another
         // session's release — both must run here in async context; everything
         // else does blocking file I/O and moves to the blocking pool.

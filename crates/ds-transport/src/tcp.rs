@@ -15,7 +15,14 @@ pub async fn connect(addr: &str, client_name: &str) -> Result<Arc<MuxConnection>
 
 /// Accept loop: one spawned `serve_connection` per client. `make_handler` is
 /// called per connection so each session gets its own handler/state.
-pub async fn serve<F>(addr: &str, server_name: String, make_handler: F) -> Result<(), TransportError>
+/// `min_proto` lets token-protected listeners require v3+ (older clients
+/// can't decode AuthRequired, so they're refused at the handshake instead).
+pub async fn serve<F>(
+    addr: &str,
+    server_name: String,
+    min_proto: u16,
+    make_handler: F,
+) -> Result<(), TransportError>
 where
     F: Fn() -> Arc<dyn RequestHandler> + Send + Sync + 'static,
 {
@@ -28,7 +35,9 @@ where
         let server_name = server_name.clone();
         tokio::spawn(async move {
             tracing::info!(%peer, "connection accepted");
-            if let Err(e) = crate::server::serve_connection(stream, &server_name, handler).await {
+            if let Err(e) =
+                crate::server::serve_connection_with(stream, &server_name, handler, min_proto).await
+            {
                 tracing::warn!(%peer, error = %e, "connection ended with error");
             } else {
                 tracing::info!(%peer, "connection closed");
