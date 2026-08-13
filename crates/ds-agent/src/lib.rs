@@ -5,7 +5,6 @@
 //! that client's open file handles.
 
 mod config;
-pub mod exclude;
 mod fsutil;
 mod locks;
 mod ops;

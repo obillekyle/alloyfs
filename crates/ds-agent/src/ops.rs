@@ -5,11 +5,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use dashmap::DashMap;
-use ds_proto::{DirEntry, ErrorCode, EventKind, FsEvent, RelPath, Request, Response, DATA_CHUNK};
+use ds_common::{attr_from_metadata, io_to_code, read_fully, set_mode, write_fully, ExcludeSet, OrCode};
+use ds_proto::{DirEntry, ErrorCode, EventKind, FsEvent, OpenFlags, RelPath, Request, Response, DATA_CHUNK};
 use ds_transport::{EventPusher, RequestHandler};
-
-use crate::config::AgentConfig;
-use crate::fsutil::{attr_from_metadata, io_to_code, read_fully, resolve, set_mode};
 
 /// Max directory entries per Readdir response; clients page with the cursor.
 const READDIR_PAGE: usize = 1024;
@@ -21,8 +19,8 @@ pub struct Export {
     pub read_only: bool,
     /// Per-file version counters, bumped on every mutation through drive-sync.
     /// Advisory: files changed directly on the server get their bump from the
-    /// watcher (M5). Values come from one per-export clock so they also give
-    /// a rough ordering.
+    /// watcher. Values come from one per-export clock so they also give a
+    /// rough ordering.
     versions: DashMap<RelPath, u64>,
     vclock: AtomicU64,
     /// Event fan-out for this export (watcher feeds it, sessions subscribe).
@@ -30,7 +28,7 @@ pub struct Export {
     /// Whole-file advisory locks shared by all sessions of this export.
     pub locks: crate::locks::LockManager,
     /// Server-side excludes: matching paths are invisible to every client.
-    pub exclude: crate::exclude::ExcludeSet,
+    pub exclude: ExcludeSet,
 }
 
 impl Export {
@@ -42,12 +40,11 @@ impl Export {
         if self.exclude.is_excluded(rel) {
             return Err(ErrorCode::NotFound);
         }
-        let full = resolve(&self.root, rel)?;
+        let full = crate::fsutil::resolve_unchecked(&self.root, rel)?;
         if !self.exclude.is_empty() {
             if let Ok(stripped) = full.strip_prefix(&self.root) {
                 if let Some(s) = stripped.to_str() {
-                    let canon_rel = RelPath(s.replace('\\', "/"));
-                    if self.exclude.is_excluded(&canon_rel) {
+                    if self.exclude.is_excluded(&RelPath(s.replace('\\', "/"))) {
                         return Err(ErrorCode::NotFound);
                     }
                 }
@@ -66,9 +63,7 @@ impl Export {
         let parent_full = self.resolve(&parent)?;
         Ok(parent_full.join(leaf))
     }
-}
 
-impl Export {
     pub fn version_of(&self, path: &RelPath) -> u64 {
         self.versions.get(path).map(|v| *v).unwrap_or(0)
     }
@@ -92,24 +87,16 @@ impl Export {
     pub fn browse(&self, rel: &RelPath) -> Result<Vec<DirEntry>, ErrorCode> {
         let full = self.resolve(rel)?;
         let mut entries = Vec::new();
-        for item in std::fs::read_dir(&full).map_err(|e| io_to_code(&e))? {
-            let item = item.map_err(|e| io_to_code(&e))?;
-            let Ok(name) = item.file_name().into_string() else {
-                continue;
-            };
+        for item in std::fs::read_dir(&full).or_code()? {
+            let item = item.or_code()?;
+            let Ok(name) = item.file_name().into_string() else { continue };
             let child = rel.join(&name);
             if self.exclude.is_excluded(&child) {
                 continue; // invisible
             }
-            let md = item
-                .metadata()
-                .or_else(|_| std::fs::symlink_metadata(item.path()));
+            let md = item.metadata().or_else(|_| std::fs::symlink_metadata(item.path()));
             let Ok(md) = md else { continue };
-            let version = self.version_of(&child);
-            entries.push(DirEntry {
-                name,
-                attr: attr_from_metadata(&md, version),
-            });
+            entries.push(DirEntry { name, attr: attr_from_metadata(&md, self.version_of(&child)) });
         }
         entries.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(entries)
@@ -125,14 +112,14 @@ pub struct ExportRegistry {
 }
 
 impl ExportRegistry {
-    pub fn from_config(cfg: &AgentConfig) -> anyhow::Result<Self> {
+    pub fn from_config(cfg: &crate::config::AgentConfig) -> anyhow::Result<Self> {
         let mut exports = BTreeMap::new();
         for (name, ec) in &cfg.exports {
             let root = std::fs::canonicalize(&ec.path)
                 .map_err(|e| anyhow::anyhow!("export {name}: cannot resolve {:?}: {e}", ec.path))?;
             anyhow::ensure!(root.is_dir(), "export {name}: {root:?} is not a directory");
             // Server matching is always case-sensitive (documented).
-            let exclude = crate::exclude::ExcludeSet::compile(&ec.exclude, false)
+            let exclude = ExcludeSet::compile(&ec.exclude, false)
                 .map_err(|e| anyhow::anyhow!("export {name}: {e}"))?;
             tracing::info!(
                 name,
@@ -156,10 +143,15 @@ impl ExportRegistry {
             );
         }
         anyhow::ensure!(!exports.is_empty(), "no exports configured");
-        Ok(Self {
-            exports,
-            sessions: DashMap::new(),
-        })
+        Ok(Self { exports, sessions: DashMap::new() })
+    }
+
+    pub fn get(&self, name: &str) -> Option<Arc<Export>> {
+        self.exports.get(name).cloned()
+    }
+
+    pub fn all(&self) -> Vec<Arc<Export>> {
+        self.exports.values().cloned().collect()
     }
 
     /// Background task: every 5 s, free locks and handles of sessions whose
@@ -173,31 +165,17 @@ impl ExportRegistry {
                 tick.tick().await;
                 let Some(registry) = registry.upgrade() else { break };
                 registry.sessions.retain(|id, weak| {
-                    let Some(session) = weak.upgrade() else {
-                        return false;
-                    };
+                    let Some(session) = weak.upgrade() else { return false };
                     if session.last_seen_elapsed() > lease {
                         let released = session.force_release();
                         if released > 0 {
-                            tracing::warn!(
-                                session = id,
-                                released,
-                                "lease expired: released stale locks/handles"
-                            );
+                            tracing::warn!(session = id, released, "lease expired: released stale locks/handles");
                         }
                     }
                     true
                 });
             }
         });
-    }
-
-    pub fn get(&self, name: &str) -> Option<Arc<Export>> {
-        self.exports.get(name).cloned()
-    }
-
-    pub fn all(&self) -> Vec<Arc<Export>> {
-        self.exports.values().cloned().collect()
     }
 }
 
@@ -229,28 +207,6 @@ struct SessionInner {
     push: std::sync::OnceLock<EventPusher>,
     /// Updated on every request; the lease reaper compares against it.
     last_seen: std::sync::Mutex<std::time::Instant>,
-}
-
-impl SessionInner {
-    fn touch(&self) {
-        *self.last_seen.lock().unwrap() = std::time::Instant::now();
-    }
-
-    fn last_seen_elapsed(&self) -> std::time::Duration {
-        self.last_seen.lock().unwrap().elapsed()
-    }
-
-    /// Free all locks and handles (lease expiry / disconnect). The session
-    /// object stays usable — new opens simply start fresh.
-    fn force_release(&self) -> usize {
-        let mut released = 0;
-        if let Some(export) = self.attached.get() {
-            released = export.locks.release_session(self.id);
-        }
-        released += self.handles.len();
-        self.handles.clear();
-        released
-    }
 }
 
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
@@ -324,315 +280,284 @@ impl AgentSession {
 }
 
 impl SessionInner {
+    fn touch(&self) {
+        *self.last_seen.lock().unwrap() = std::time::Instant::now();
+    }
+
+    fn last_seen_elapsed(&self) -> std::time::Duration {
+        self.last_seen.lock().unwrap().elapsed()
+    }
+
+    /// Free all locks and handles (lease expiry / disconnect). The session
+    /// object stays usable — new opens simply start fresh.
+    fn force_release(&self) -> usize {
+        let mut released = 0;
+        if let Some(export) = self.attached.get() {
+            released = export.locks.release_session(self.id);
+        }
+        released += self.handles.len();
+        self.handles.clear();
+        released
+    }
+
     fn export(&self) -> Result<Arc<Export>, ErrorCode> {
         self.attached.get().cloned().ok_or(ErrorCode::NotAttached)
     }
 
-    fn handle_of(&self, fh: u64) -> Result<Arc<OpenFile>, ErrorCode> {
-        self.handles
-            .get(&fh)
-            .map(|h| h.clone())
-            .ok_or(ErrorCode::BadHandle)
+    /// The single read_only gate: every mutating handler starts here.
+    fn writable_export(&self) -> Result<Arc<Export>, ErrorCode> {
+        let export = self.export()?;
+        if export.read_only {
+            return Err(ErrorCode::ReadOnly);
+        }
+        Ok(export)
     }
 
+    fn handle_of(&self, fh: u64) -> Result<Arc<OpenFile>, ErrorCode> {
+        self.handles.get(&fh).map(|h| h.clone()).ok_or(ErrorCode::BadHandle)
+    }
+
+    fn insert_handle(&self, file: File, path: RelPath, writable: bool) -> u64 {
+        let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
+        self.handles.insert(fh, Arc::new(OpenFile { file, path, writable }));
+        fh
+    }
+
+    // ---- one method per request; dispatch_blocking is just the phone book --
+
+    fn attach(&self, export: String) -> Result<Response, ErrorCode> {
+        let export = self.registry.get(&export).ok_or(ErrorCode::NoSuchExport)?;
+        let md = std::fs::metadata(&export.root).or_code()?;
+        let attr = attr_from_metadata(&md, 0);
+        tracing::info!(export = export.name, "client attached");
+        let _ = self.attached.set(export);
+        Ok(Response::AttachOk { export_id: 0, root_attr: attr })
+    }
+
+    fn getattr(&self, path: RelPath) -> Result<Response, ErrorCode> {
+        let export = self.export()?;
+        let full = export.resolve(&path)?;
+        let md = std::fs::metadata(&full).or_code()?;
+        Ok(Response::Attr(attr_from_metadata(&md, export.version_of(&path))))
+    }
+
+    fn readdir(&self, path: RelPath, cursor: u64) -> Result<Response, ErrorCode> {
+        let export = self.export()?;
+        let full = export.resolve(&path)?;
+        let mut entries: Vec<DirEntry> = Vec::new();
+        for item in std::fs::read_dir(&full).or_code()? {
+            let item = item.or_code()?;
+            let name = match item.file_name().into_string() {
+                Ok(n) => n,
+                Err(_) => continue, // non-UTF-8 names are not served
+            };
+            let child = path.join(&name);
+            if export.exclude.is_excluded(&child) {
+                continue; // invisible to every client
+            }
+            // metadata() follows symlinks; fall back to the link's own
+            // metadata for broken links so the entry still lists.
+            let md = item.metadata().or_else(|_| std::fs::symlink_metadata(item.path()));
+            let Ok(md) = md else { continue };
+            // Real versions in listings: the client auto-cache walker relies
+            // on them for freshness without extra Getattrs.
+            entries.push(DirEntry { name, attr: attr_from_metadata(&md, export.version_of(&child)) });
+        }
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        let start = cursor as usize;
+        let page: Vec<DirEntry> = entries.iter().skip(start).take(READDIR_PAGE).cloned().collect();
+        let next_cursor =
+            if start + page.len() < entries.len() { Some((start + page.len()) as u64) } else { None };
+        Ok(Response::Dir { entries: page, next_cursor })
+    }
+
+    fn open(&self, path: RelPath, flags: OpenFlags) -> Result<Response, ErrorCode> {
+        let export = self.export()?;
+        let wants_write = flags.write || flags.truncate || flags.append;
+        if wants_write && export.read_only {
+            return Err(ErrorCode::ReadOnly);
+        }
+        let full = export.resolve(&path)?;
+        let file = File::options().read(true).write(wants_write).truncate(flags.truncate).open(&full).or_code()?;
+        let md = file.metadata().or_code()?;
+        if md.is_dir() {
+            return Err(ErrorCode::IsADirectory);
+        }
+        let version = if flags.truncate { export.bump(&path) } else { export.version_of(&path) };
+        let attr = attr_from_metadata(&md, version);
+        let fh = self.insert_handle(file, path, wants_write);
+        Ok(Response::Opened { fh, attr })
+    }
+
+    fn create(&self, path: RelPath, flags: OpenFlags, mode: u32) -> Result<Response, ErrorCode> {
+        let export = self.writable_export()?;
+        let full = export.resolve_new(&path)?;
+        // O_EXCL means "must not exist"; a plain O_CREAT loser of a create
+        // race just opens the existing file (POSIX).
+        let mut opts = File::options();
+        opts.read(true).write(true);
+        if flags.excl {
+            opts.create_new(true);
+        } else {
+            opts.create(true).truncate(flags.truncate);
+        }
+        let file = opts.open(&full).or_code()?;
+        set_mode(&file, mode);
+        let md = file.metadata().or_code()?;
+        export.events.note_local_write(&path, self.id);
+        let attr = attr_from_metadata(&md, export.bump(&path));
+        let fh = self.insert_handle(file, path, true);
+        Ok(Response::Opened { fh, attr })
+    }
+
+    fn read(&self, fh: u64, offset: u64, len: u32) -> Result<Response, ErrorCode> {
+        if len > DATA_CHUNK {
+            return Err(ErrorCode::Io);
+        }
+        let of = self.handle_of(fh)?;
+        let mut buf = vec![0u8; len as usize];
+        let n = read_fully(&of.file, &mut buf, offset).or_code()?;
+        buf.truncate(n);
+        Ok(Response::Data(buf.into()))
+    }
+
+    fn write(&self, fh: u64, offset: u64, data: bytes::Bytes, expect_version: Option<u64>) -> Result<Response, ErrorCode> {
+        let export = self.writable_export()?;
+        let of = self.handle_of(fh)?;
+        if !of.writable {
+            return Err(ErrorCode::BadHandle);
+        }
+        // Conflict *detection*, not prevention: last writer wins, but the
+        // loser's client gets told and can surface it.
+        let conflict = matches!(expect_version, Some(v) if v != export.version_of(&of.path));
+        if conflict {
+            tracing::warn!(path = %of.path, "write conflict (concurrent modification)");
+        }
+        write_fully(&of.file, &data, offset).or_code()?;
+        export.events.note_local_write(&of.path, self.id);
+        let new_version = export.bump(&of.path);
+        Ok(Response::Written { n: data.len() as u32, new_version, conflict })
+    }
+
+    fn setattr(
+        &self,
+        path: RelPath,
+        size: Option<u64>,
+        mtime: Option<std::time::SystemTime>,
+        mode: Option<u32>,
+    ) -> Result<Response, ErrorCode> {
+        let export = self.writable_export()?;
+        let full = export.resolve(&path)?;
+        if let Some(size) = size {
+            File::options().write(true).open(&full).or_code()?.set_len(size).or_code()?;
+        }
+        if let Some(mtime) = mtime {
+            File::options().write(true).open(&full).or_code()?.set_modified(mtime).or_code()?;
+        }
+        if let Some(mode) = mode {
+            let f = File::options().write(true).open(&full).or_code()?;
+            set_mode(&f, mode);
+        }
+        let md = std::fs::metadata(&full).or_code()?;
+        export.events.note_local_write(&path, self.id);
+        Ok(Response::Attr(attr_from_metadata(&md, export.bump(&path))))
+    }
+
+    fn mkdir(&self, path: RelPath, _mode: u32) -> Result<Response, ErrorCode> {
+        let export = self.writable_export()?;
+        let full = export.resolve_new(&path)?;
+        std::fs::create_dir(&full).or_code()?; // directory modes: server umask decides
+        let md = std::fs::metadata(&full).or_code()?;
+        export.events.note_local_write(&path, self.id);
+        Ok(Response::Attr(attr_from_metadata(&md, export.bump(&path))))
+    }
+
+    fn unlink(&self, path: RelPath) -> Result<Response, ErrorCode> {
+        let export = self.writable_export()?;
+        let full = export.resolve(&path)?;
+        std::fs::remove_file(&full).or_code()?;
+        export.events.note_local_write(&path, self.id);
+        export.bump(&path);
+        Ok(Response::Ok)
+    }
+
+    fn rmdir(&self, path: RelPath) -> Result<Response, ErrorCode> {
+        let export = self.writable_export()?;
+        let full = export.resolve(&path)?;
+        std::fs::remove_dir(&full).or_code()?;
+        export.events.note_local_write(&path, self.id);
+        export.bump(&path);
+        Ok(Response::Ok)
+    }
+
+    fn rename(&self, from: RelPath, to: RelPath, replace: bool) -> Result<Response, ErrorCode> {
+        let export = self.writable_export()?;
+        let from_full = export.resolve(&from)?;
+        let to_full = export.resolve_new(&to)?;
+        if !replace && to_full.exists() {
+            return Err(ErrorCode::AlreadyExists);
+        }
+        // Windows note: std::fs::rename fails if `to` exists; POSIX replaces
+        // atomically. Cross-platform "replace" is therefore remove-then-rename
+        // on Windows (a non-atomic window we accept and document).
+        #[cfg(windows)]
+        if replace && to_full.exists() {
+            let _ = std::fs::remove_file(&to_full);
+        }
+        std::fs::rename(&from_full, &to_full).or_code()?;
+        export.events.note_local_write(&from, self.id);
+        export.events.note_local_write(&to, self.id);
+        export.rename_version(&from, &to);
+        Ok(Response::Ok)
+    }
+
+    fn link(&self, target: RelPath, link: RelPath) -> Result<Response, ErrorCode> {
+        let export = self.writable_export()?;
+        let target_full = export.resolve(&target)?;
+        let link_full = export.resolve_new(&link)?;
+        std::fs::hard_link(&target_full, &link_full).or_code()?;
+        let md = std::fs::metadata(&link_full).or_code()?;
+        export.events.note_local_write(&link, self.id);
+        Ok(Response::Attr(attr_from_metadata(&md, export.bump(&link))))
+    }
+
+    fn release(&self, fh: u64) -> Result<Response, ErrorCode> {
+        if let Some((_, of)) = self.handles.remove(&fh) {
+            // Closing a handle drops any lock it held (flock semantics).
+            if let Some(export) = self.attached.get() {
+                export.locks.unlock(&of.path, self.id, fh);
+            }
+        }
+        Ok(Response::Ok)
+    }
+
+    fn statfs(&self) -> Result<Response, ErrorCode> {
+        // Real numbers come with a platform statvfs call later; these
+        // placeholders are already enough for `df` not to error.
+        Ok(Response::Statfs { block_size: 4096, blocks: 1 << 24, blocks_free: 1 << 23 })
+    }
+
+    /// Blocking-pool dispatch: pure routing, no logic.
     fn dispatch_blocking(&self, req: Request) -> Result<Response, ErrorCode> {
         match req {
-            Request::Attach { export } => {
-                let export = self.registry.get(&export).ok_or(ErrorCode::NoSuchExport)?;
-                let md = std::fs::metadata(&export.root).map_err(|e| io_to_code(&e))?;
-                let attr = attr_from_metadata(&md, 0);
-                tracing::info!(export = export.name, "client attached");
-                let _ = self.attached.set(export);
-                Ok(Response::AttachOk {
-                    export_id: 0,
-                    root_attr: attr,
-                })
-            }
-            Request::Getattr { path } => {
-                let export = self.export()?;
-                let full = export.resolve(&path)?;
-                let md = std::fs::metadata(&full).map_err(|e| io_to_code(&e))?;
-                Ok(Response::Attr(attr_from_metadata(&md, export.version_of(&path))))
-            }
-            Request::Readdir { path, cursor } => {
-                let export = self.export()?;
-                let full = export.resolve(&path)?;
-                let mut entries: Vec<DirEntry> = Vec::new();
-                let rd = std::fs::read_dir(&full).map_err(|e| io_to_code(&e))?;
-                for item in rd {
-                    let item = item.map_err(|e| io_to_code(&e))?;
-                    let name = match item.file_name().into_string() {
-                        Ok(n) => n,
-                        Err(_) => continue, // non-UTF-8 names are not served
-                    };
-                    let child = path.join(&name);
-                    if export.exclude.is_excluded(&child) {
-                        continue; // invisible to every client
-                    }
-                    // metadata() follows symlinks; fall back to the link's own
-                    // metadata for broken links so the entry still lists.
-                    let md = item
-                        .metadata()
-                        .or_else(|_| std::fs::symlink_metadata(item.path()));
-                    let Ok(md) = md else { continue };
-                    // Real versions in listings: the client auto-cache walker
-                    // relies on them for freshness without extra Getattrs.
-                    let version = export.version_of(&child);
-                    entries.push(DirEntry {
-                        name,
-                        attr: attr_from_metadata(&md, version),
-                    });
-                }
-                entries.sort_by(|a, b| a.name.cmp(&b.name));
-                let start = cursor as usize;
-                let page: Vec<DirEntry> = entries.iter().skip(start).take(READDIR_PAGE).cloned().collect();
-                let next_cursor = if start + page.len() < entries.len() {
-                    Some((start + page.len()) as u64)
-                } else {
-                    None
-                };
-                Ok(Response::Dir {
-                    entries: page,
-                    next_cursor,
-                })
-            }
-            Request::Open { path, flags } => {
-                let export = self.export()?;
-                let wants_write = flags.write || flags.truncate || flags.append;
-                if wants_write && export.read_only {
-                    return Err(ErrorCode::ReadOnly);
-                }
-                let full = export.resolve(&path)?;
-                let file = File::options()
-                    .read(true)
-                    .write(wants_write)
-                    .truncate(flags.truncate)
-                    .open(&full)
-                    .map_err(|e| io_to_code(&e))?;
-                let md = file.metadata().map_err(|e| io_to_code(&e))?;
-                if md.is_dir() {
-                    return Err(ErrorCode::IsADirectory);
-                }
-                let version = if flags.truncate {
-                    export.bump(&path)
-                } else {
-                    export.version_of(&path)
-                };
-                let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
-                let attr = attr_from_metadata(&md, version);
-                self.handles.insert(
-                    fh,
-                    Arc::new(OpenFile {
-                        file,
-                        path,
-                        writable: wants_write,
-                    }),
-                );
-                Ok(Response::Opened { fh, attr })
-            }
-            Request::Create { path, flags, mode } => {
-                let export = self.export()?;
-                if export.read_only {
-                    return Err(ErrorCode::ReadOnly);
-                }
-                let full = export.resolve_new(&path)?;
-                // O_EXCL means "must not exist"; a plain O_CREAT loser of a
-                // create race just opens the existing file (POSIX).
-                let mut opts = File::options();
-                opts.read(true).write(true);
-                if flags.excl {
-                    opts.create_new(true);
-                } else {
-                    opts.create(true).truncate(flags.truncate);
-                }
-                let file = opts.open(&full).map_err(|e| io_to_code(&e))?;
-                set_mode(&file, mode);
-                let md = file.metadata().map_err(|e| io_to_code(&e))?;
-                export.events.note_local_write(&path, self.id);
-                let version = export.bump(&path);
-                let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
-                let attr = attr_from_metadata(&md, version);
-                let _ = flags; // creation implies writability regardless of flags
-                self.handles.insert(
-                    fh,
-                    Arc::new(OpenFile {
-                        file,
-                        path,
-                        writable: true,
-                    }),
-                );
-                Ok(Response::Opened { fh, attr })
-            }
-            Request::Read { fh, offset, len } => {
-                if len > DATA_CHUNK {
-                    return Err(ErrorCode::Io);
-                }
-                let of = self.handle_of(fh)?;
-                let mut buf = vec![0u8; len as usize];
-                let n = read_fully(&of.file, &mut buf, offset).map_err(|e| io_to_code(&e))?;
-                buf.truncate(n);
-                Ok(Response::Data(buf.into()))
-            }
-            Request::Release { fh } => {
-                if let Some((_, of)) = self.handles.remove(&fh) {
-                    // Closing a handle drops any lock it held (flock semantics).
-                    if let Some(export) = self.attached.get() {
-                        export.locks.unlock(&of.path, self.id, fh);
-                    }
-                }
-                Ok(Response::Ok)
-            }
+            Request::Attach { export } => self.attach(export),
+            Request::Getattr { path } => self.getattr(path),
+            Request::Readdir { path, cursor } => self.readdir(path, cursor),
+            Request::Open { path, flags } => self.open(path, flags),
+            Request::Create { path, flags, mode } => self.create(path, flags, mode),
+            Request::Read { fh, offset, len } => self.read(fh, offset, len),
+            Request::Write { fh, offset, data, expect_version } => self.write(fh, offset, data, expect_version),
             Request::Flush { .. } => Ok(Response::Ok),
-            Request::Statfs => {
-                // Real numbers come with a platform statvfs call later; these
-                // placeholders are already enough for `df` not to error.
-                Ok(Response::Statfs {
-                    block_size: 4096,
-                    blocks: 1 << 24,
-                    blocks_free: 1 << 23,
-                })
-            }
-            Request::Write {
-                fh,
-                offset,
-                data,
-                expect_version,
-            } => {
-                let export = self.export()?;
-                if export.read_only {
-                    return Err(ErrorCode::ReadOnly);
-                }
-                let of = self.handle_of(fh)?;
-                if !of.writable {
-                    return Err(ErrorCode::BadHandle);
-                }
-                // Conflict *detection*, not prevention: last writer wins, but
-                // the loser's client gets told and can surface it.
-                let conflict = matches!(expect_version, Some(v) if v != export.version_of(&of.path));
-                if conflict {
-                    tracing::warn!(path = %of.path, "write conflict (concurrent modification)");
-                }
-                crate::fsutil::write_fully(&of.file, &data, offset).map_err(|e| io_to_code(&e))?;
-                export.events.note_local_write(&of.path, self.id);
-                let new_version = export.bump(&of.path);
-                Ok(Response::Written {
-                    n: data.len() as u32,
-                    new_version,
-                    conflict,
-                })
-            }
-            Request::Setattr {
-                path,
-                size,
-                mtime,
-                mode,
-            } => {
-                let export = self.export()?;
-                if export.read_only {
-                    return Err(ErrorCode::ReadOnly);
-                }
-                let full = export.resolve(&path)?;
-                if let Some(size) = size {
-                    let f = File::options()
-                        .write(true)
-                        .open(&full)
-                        .map_err(|e| io_to_code(&e))?;
-                    f.set_len(size).map_err(|e| io_to_code(&e))?;
-                }
-                if let Some(mtime) = mtime {
-                    let f = File::options()
-                        .write(true)
-                        .open(&full)
-                        .map_err(|e| io_to_code(&e))?;
-                    f.set_modified(mtime).map_err(|e| io_to_code(&e))?;
-                }
-                if let Some(mode) = mode {
-                    let f = File::options()
-                        .write(true)
-                        .open(&full)
-                        .map_err(|e| io_to_code(&e))?;
-                    set_mode(&f, mode);
-                }
-                let md = std::fs::metadata(&full).map_err(|e| io_to_code(&e))?;
-                export.events.note_local_write(&path, self.id);
-                let version = export.bump(&path);
-                Ok(Response::Attr(attr_from_metadata(&md, version)))
-            }
-            Request::Mkdir { path, mode } => {
-                let export = self.export()?;
-                if export.read_only {
-                    return Err(ErrorCode::ReadOnly);
-                }
-                let full = export.resolve_new(&path)?;
-                std::fs::create_dir(&full).map_err(|e| io_to_code(&e))?;
-                let _ = mode; // directory modes: server-side umask decides
-                let md = std::fs::metadata(&full).map_err(|e| io_to_code(&e))?;
-                export.events.note_local_write(&path, self.id);
-                let version = export.bump(&path);
-                Ok(Response::Attr(attr_from_metadata(&md, version)))
-            }
-            Request::Unlink { path } => {
-                let export = self.export()?;
-                if export.read_only {
-                    return Err(ErrorCode::ReadOnly);
-                }
-                let full = export.resolve(&path)?;
-                std::fs::remove_file(&full).map_err(|e| io_to_code(&e))?;
-                export.events.note_local_write(&path, self.id);
-                export.bump(&path);
-                Ok(Response::Ok)
-            }
-            Request::Rmdir { path } => {
-                let export = self.export()?;
-                if export.read_only {
-                    return Err(ErrorCode::ReadOnly);
-                }
-                let full = export.resolve(&path)?;
-                std::fs::remove_dir(&full).map_err(|e| io_to_code(&e))?;
-                export.events.note_local_write(&path, self.id);
-                export.bump(&path);
-                Ok(Response::Ok)
-            }
-            Request::Rename { from, to, replace } => {
-                let export = self.export()?;
-                if export.read_only {
-                    return Err(ErrorCode::ReadOnly);
-                }
-                let from_full = export.resolve(&from)?;
-                let to_full = export.resolve_new(&to)?;
-                if !replace && to_full.exists() {
-                    return Err(ErrorCode::AlreadyExists);
-                }
-                // Windows note: std::fs::rename fails if `to` exists; POSIX
-                // replaces atomically. Cross-platform "replace" is therefore
-                // remove-then-rename on Windows (a non-atomic window we accept
-                // and document).
-                #[cfg(windows)]
-                if replace && to_full.exists() {
-                    let _ = std::fs::remove_file(&to_full);
-                }
-                std::fs::rename(&from_full, &to_full).map_err(|e| io_to_code(&e))?;
-                export.events.note_local_write(&from, self.id);
-                export.events.note_local_write(&to, self.id);
-                export.rename_version(&from, &to);
-                Ok(Response::Ok)
-            }
-            Request::Link { target, link } => {
-                let export = self.export()?;
-                if export.read_only {
-                    return Err(ErrorCode::ReadOnly);
-                }
-                let target_full = export.resolve(&target)?;
-                let link_full = export.resolve_new(&link)?;
-                std::fs::hard_link(&target_full, &link_full).map_err(|e| io_to_code(&e))?;
-                let md = std::fs::metadata(&link_full).map_err(|e| io_to_code(&e))?;
-                self.export()?.events.note_local_write(&link, self.id);
-                let version = export.bump(&link);
-                Ok(Response::Attr(attr_from_metadata(&md, version)))
-            }
-            Request::Lock { .. } | Request::Unlock { .. } => Err(ErrorCode::Io), // handled async
-            // Subscribe never reaches here — handled in async context.
-            Request::Subscribe { .. } => Err(ErrorCode::Io),
+            Request::Release { fh } => self.release(fh),
+            Request::Setattr { path, size, mtime, mode } => self.setattr(path, size, mtime, mode),
+            Request::Mkdir { path, mode } => self.mkdir(path, mode),
+            Request::Unlink { path } => self.unlink(path),
+            Request::Rmdir { path } => self.rmdir(path),
+            Request::Rename { from, to, replace } => self.rename(from, to, replace),
+            Request::Link { target, link } => self.link(target, link),
+            Request::Statfs => self.statfs(),
+            // Handled in async context (handle()); never reach the pool.
+            Request::Lock { .. } | Request::Unlock { .. } | Request::Subscribe { .. } => Err(ErrorCode::Io),
         }
     }
 }
