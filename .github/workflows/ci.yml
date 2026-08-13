@@ -25,13 +25,16 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      # winfsp-sys reads the WinFsp registry key + SDK at build time; the
-      # choco package installs with INSTALLLEVEL=1000 (includes Developer).
-      # Fallback if choco ever lags: download the MSI from GitHub releases and
-      # msiexec /i winfsp.msi /qn INSTALLLEVEL=1000 (runners are admin).
+      # winfsp-sys reads the WinFsp registry key + SDK at build time.
+      # Installed straight from the upstream MSI (INSTALLLEVEL=1000 includes
+      # the Developer/SDK feature) — the choco package proved unreliable (the
+      # first CI run found it delisted from the community feed).
       - name: Install WinFsp (with SDK)
         if: runner.os == 'Windows'
-        run: choco install winfsp -y --no-progress
+        run: |
+          Invoke-WebRequest -Uri "https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi" -OutFile winfsp.msi
+          Start-Process msiexec -ArgumentList '/i','winfsp.msi','/qn','INSTALLLEVEL=1000' -Wait
+          Remove-Item winfsp.msi
       # bindgen needs libclang; the runner image ships LLVM here.
       - name: Point bindgen at preinstalled LLVM
         if: runner.os == 'Windows'
