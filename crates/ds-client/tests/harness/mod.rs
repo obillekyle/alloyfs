@@ -14,9 +14,10 @@ use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use ds_agent::{watch, AgentConfig, AgentSession, Export, ExportConfig, ExportRegistry};
-use ds_client::{ClientOptions, FsError, RemoteFs, ROOT_INO};
+use ds_client::{ClientOptions, Dialer, FsError, RemoteFs, ROOT_INO};
 use ds_proto::{Attr, ErrorCode, FsEvent, OpenFlags};
 use ds_transport::{serve_connection, MuxConnection, RequestHandler};
+use futures::future::BoxFuture;
 use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
@@ -85,12 +86,17 @@ pub fn start_agent(opts: AgentOpts) -> TestAgent {
 
 // ------------------------------------------------------------ severable pipe
 
-type SeverState = Arc<Mutex<(bool, Option<Waker>)>>;
+type SeverState = Arc<Mutex<(bool, Vec<Waker>)>>;
 
-/// Wraps the server half of the duplex so tests can force a deterministic
-/// disconnect: once severed, reads yield EOF (empty `ReadBuf`), which walks
-/// `serve_connection` into its clean-EOF path → `disconnected()` → the
-/// session's locks and handles are released.
+/// Wraps ONE half of the duplex; both halves of a link share one state so a
+/// single `sever()` kills the link in BOTH directions, like a broken socket:
+/// reads yield EOF, writes fail with BrokenPipe.
+///
+/// Why both directions matter: severing only the server's read side leaves a
+/// half-alive zombie — the server can still push frames to the client, the
+/// client never observes EOF, so `closed()` never resolves and the reconnect
+/// supervisor never dials. Server-side, the EOF walks `serve_connection`
+/// into its clean-EOF path → `disconnected()` → locks/handles released.
 pub struct Severable<S> {
     inner: S,
     state: SeverState,
@@ -101,9 +107,12 @@ pub struct SeverHandle(SeverState);
 
 impl SeverHandle {
     pub fn sever(&self) {
-        let mut guard = self.0.lock().unwrap();
-        guard.0 = true;
-        if let Some(waker) = guard.1.take() {
+        let wakers = {
+            let mut guard = self.0.lock().unwrap();
+            guard.0 = true;
+            std::mem::take(&mut guard.1)
+        };
+        for waker in wakers {
             waker.wake();
         }
     }
@@ -111,14 +120,33 @@ impl SeverHandle {
 
 impl<S> Severable<S> {
     pub fn new(inner: S) -> (Self, SeverHandle) {
-        let state: SeverState = Arc::new(Mutex::new((false, None)));
-        (
-            Self {
-                inner,
-                state: state.clone(),
-            },
-            SeverHandle(state),
-        )
+        let state: SeverState = Arc::new(Mutex::new((false, Vec::new())));
+        let handle = SeverHandle(state.clone());
+        (Self { inner, state }, handle)
+    }
+
+    /// A second wrapper sharing this one's sever state (the peer half).
+    pub fn sibling(inner: S, handle: &SeverHandle) -> Self {
+        Self {
+            inner,
+            state: handle.0.clone(),
+        }
+    }
+
+    fn severed(&self) -> bool {
+        self.state.lock().unwrap().0
+    }
+
+    /// Park on the sever flag: re-check under the lock (a sever between the
+    /// caller's check and here must not be missed) and register the waker.
+    /// Returns true when severed.
+    fn park(&self, cx: &mut Context<'_>) -> bool {
+        let mut guard = self.state.lock().unwrap();
+        if guard.0 {
+            return true;
+        }
+        guard.1.push(cx.waker().clone());
+        false
     }
 }
 
@@ -128,15 +156,19 @@ impl<S: AsyncRead + Unpin> AsyncRead for Severable<S> {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        {
-            let mut guard = self.state.lock().unwrap();
-            if guard.0 {
-                // Severed: report EOF by leaving the buffer untouched.
-                return Poll::Ready(Ok(()));
-            }
-            guard.1 = Some(cx.waker().clone());
+        if self.severed() {
+            // Report EOF by leaving the buffer untouched.
+            return Poll::Ready(Ok(()));
         }
-        Pin::new(&mut self.inner).poll_read(cx, buf)
+        match Pin::new(&mut self.inner).poll_read(cx, buf) {
+            Poll::Pending => {
+                if self.park(cx) {
+                    return Poll::Ready(Ok(()));
+                }
+                Poll::Pending
+            }
+            ready => ready,
+        }
     }
 }
 
@@ -146,10 +178,24 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Severable<S> {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        Pin::new(&mut self.inner).poll_write(cx, buf)
+        if self.severed() {
+            return Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()));
+        }
+        match Pin::new(&mut self.inner).poll_write(cx, buf) {
+            Poll::Pending => {
+                if self.park(cx) {
+                    return Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()));
+                }
+                Poll::Pending
+            }
+            ready => ready,
+        }
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        if self.severed() {
+            return Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()));
+        }
         Pin::new(&mut self.inner).poll_flush(cx)
     }
 
@@ -160,40 +206,100 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Severable<S> {
 
 // -------------------------------------------------------------- client session
 
+/// Tracks the SeverHandle of the CURRENTLY live server link. Reconnectable
+/// sessions replace the handle on every dial.
+type SeverSlot = Arc<Mutex<Option<SeverHandle>>>;
+
+/// A connected client. Deliberately does NOT hold an `Arc<MuxConnection>`:
+/// holding the first connection forever would keep its event broadcast
+/// channel open after a reconnect, so the event pump would never observe
+/// `Closed` and never resubscribe. Take snapshots via `conn()` instead.
 pub struct Session {
     pub fs: Arc<RemoteFs>,
-    pub conn: Arc<MuxConnection>,
-    sever: SeverHandle,
-    _server: JoinHandle<()>,
+    sever: SeverSlot,
+    _server: Option<JoinHandle<()>>,
 }
 
 impl Session {
-    /// Force this session's server side to see EOF (simulated dead client).
-    pub fn sever(&self) {
-        self.sever.sever();
+    /// Snapshot of the live connection (changes across reconnects).
+    pub fn conn(&self) -> Arc<MuxConnection> {
+        self.fs.conn()
     }
+
+    /// Force the CURRENT server link to see EOF (simulated dead client).
+    pub fn sever(&self) {
+        self.sever
+            .lock()
+            .unwrap()
+            .as_ref()
+            .expect("session has a live link")
+            .sever();
+    }
+}
+
+/// Spawn one server link: fresh `AgentSession` served over the severable
+/// server half of a new duplex pair. The returned client half shares the
+/// same sever state, so one `sever()` kills both directions; the slot
+/// remembers the new link's handle.
+fn spawn_server_link(
+    registry: &Arc<ExportRegistry>,
+    slot: &SeverSlot,
+) -> (Severable<DuplexStream>, JoinHandle<()>) {
+    let (client_io, server_io): (DuplexStream, DuplexStream) = tokio::io::duplex(1024 * 1024);
+    let (server_half, sever) = Severable::new(server_io);
+    let client_half = Severable::sibling(client_io, &sever);
+    *slot.lock().unwrap() = Some(sever);
+    let handler: Arc<dyn RequestHandler> = Arc::new(AgentSession::new(registry.clone()));
+    let server = tokio::spawn(async move {
+        let _ = serve_connection(server_half, "test-agent", handler).await;
+    });
+    (client_half, server)
 }
 
 /// Full loopback stack: duplex pipe, `serve_connection` on the (severable)
 /// server half, `MuxConnection` + `RemoteFs::attach_with` on the client half.
+/// No dialer: a severed link stays dead.
 pub async fn connect(agent: &TestAgent, opts: ClientOptions) -> Session {
-    let (client_io, server_io): (DuplexStream, DuplexStream) = tokio::io::duplex(1024 * 1024);
-    let (severable, sever) = Severable::new(server_io);
-    let handler: Arc<dyn RequestHandler> = Arc::new(AgentSession::new(agent.registry.clone()));
-    let server = tokio::spawn(async move {
-        let _ = serve_connection(severable, "test-agent", handler).await;
-    });
+    let slot: SeverSlot = Arc::new(Mutex::new(None));
+    let (client_io, server) = spawn_server_link(&agent.registry, &slot);
     let conn = MuxConnection::establish(client_io, "test-client")
         .await
         .expect("handshake");
-    let fs = RemoteFs::attach_with(conn.clone(), "test", opts)
+    let fs = RemoteFs::attach_with(conn, "test", opts).await.expect("attach");
+    Session {
+        fs,
+        sever: slot,
+        _server: Some(server),
+    }
+}
+
+/// Like `connect`, but wires a `Dialer` into the options so the reconnect
+/// supervisor can re-dial after `Session::sever()`: every dial builds a fresh
+/// duplex pair + fresh `AgentSession` against the SAME registry, and the
+/// session's sever slot tracks the newest link.
+pub async fn connect_reconnectable(agent: &TestAgent, mut opts: ClientOptions) -> Session {
+    let slot: SeverSlot = Arc::new(Mutex::new(None));
+    let registry = agent.registry.clone();
+    let dial_slot = slot.clone();
+    let dialer: Dialer = Arc::new(move || {
+        let registry = registry.clone();
+        let slot = dial_slot.clone();
+        Box::pin(async move {
+            let (client_io, _server) = spawn_server_link(&registry, &slot);
+            let conn = MuxConnection::establish(client_io, "test-client").await?;
+            Ok(conn)
+        }) as BoxFuture<'static, anyhow::Result<Arc<MuxConnection>>>
+    });
+
+    let initial = dialer().await.expect("initial dial");
+    opts.dialer = Some(dialer);
+    let fs = RemoteFs::attach_with(initial, "test", opts)
         .await
         .expect("attach");
     Session {
         fs,
-        conn,
-        sever,
-        _server: server,
+        sever: slot,
+        _server: None,
     }
 }
 
@@ -221,10 +327,15 @@ fn deadline_mult() -> u64 {
         .max(1)
 }
 
+/// Deadline `secs` (× DS_TEST_DEADLINE_MULT) from now, for hand-rolled polls.
+pub fn deadline_after(secs: u64) -> std::time::Instant {
+    std::time::Instant::now() + Duration::from_secs(secs * deadline_mult())
+}
+
 /// Poll `probe` every 25 ms until it yields, or panic after `secs`
 /// (× DS_TEST_DEADLINE_MULT) naming `what`.
 pub async fn wait_until<T>(what: &str, secs: u64, mut probe: impl FnMut() -> Option<T>) -> T {
-    let deadline = std::time::Instant::now() + Duration::from_secs(secs * deadline_mult());
+    let deadline = deadline_after(secs);
     loop {
         if let Some(v) = probe() {
             return v;

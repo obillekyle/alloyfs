@@ -13,9 +13,10 @@ use std::time::Duration;
 use bytes::Bytes;
 use ds_client::{ClientOptions, ROOT_INO};
 use ds_proto::{ErrorCode, EventKind, FileKind, FsEvent, LockKind, OpenFlags, RelPath, Request, Response};
+use ds_transport::TransportError;
 use harness::{
-    connect, expect_event, lookup_path, mkfile, on_fs, patterned, read_all, remote_code, start_agent,
-    wait_until, AgentOpts, Session,
+    connect, connect_reconnectable, deadline_after, expect_event, lookup_path, mkfile, on_fs, patterned,
+    read_all, remote_code, start_agent, wait_until, AgentOpts, Session,
 };
 
 fn rw() -> OpenFlags {
@@ -36,9 +37,9 @@ fn ro() -> OpenFlags {
 /// Grab the raw event receiver BEFORE subscribing (pushes to a broadcast with
 /// no receiver are dropped), then issue the Subscribe request.
 async fn subscribe(s: &Session) -> tokio::sync::broadcast::Receiver<Vec<FsEvent>> {
-    let rx = s.conn.events();
-    let resp = s
-        .conn
+    let conn = s.conn();
+    let rx = conn.events();
+    let resp = conn
         .request(Request::Subscribe { since_seq: None })
         .await
         .expect("transport")
@@ -419,7 +420,7 @@ async fn write_conflict_last_writer_wins() {
 
     // s1's raw write pins the now-stale version: flagged, but still applied.
     let resp = s1
-        .conn
+        .conn()
         .request(Request::Write {
             fh: fh1,
             offset: 0,
@@ -536,7 +537,7 @@ async fn overlay_routing() {
 
     // The server's namespace never even hears the name.
     let resp = s
-        .conn
+        .conn()
         .request(Request::Getattr {
             path: RelPath("notes.local".into()),
         })
@@ -642,4 +643,214 @@ async fn autocache_fresh_serve_write_invalidate() {
         (std::fs::read(&blob).ok()? == new_content).then_some(())
     })
     .await;
+}
+
+// --------------------------------------------------------------------- 18
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn readahead_sequential_correctness() {
+    let agent = start_agent(AgentOpts::default());
+    let data = patterned(2 * 1024 * 1024);
+    std::fs::write(agent.dir.path().join("stream.bin"), &data).unwrap();
+    let s = connect(&agent, ClientOptions::default()).await;
+
+    let (ino, _) = lookup_path(&s.fs, "stream.bin").await.unwrap();
+    let fh = on_fs(&s.fs, move |fs| fs.open(ino, ro()).unwrap().0).await;
+
+    // Sequential stream in 256 KiB steps: after MIN_STREAK back-to-back reads
+    // the window fills and later slices are served from prefetched blocks —
+    // every byte must still be exact.
+    let step = 256 * 1024usize;
+    for i in 0..data.len() / step {
+        let off = i * step;
+        let got = on_fs(&s.fs, move |fs| fs.read(fh, off as u64, step as u32))
+            .await
+            .unwrap();
+        assert!(
+            got == data[off..off + step],
+            "sequential step {i} at offset {off}"
+        );
+    }
+
+    // Pattern break: scattered, DATA_CHUNK-unaligned reads on the SAME fh.
+    // The window must clear on the break — no stale prefetched bytes.
+    for &(off, len) in &[(100_001usize, 200_000usize), (1_700_003, 50_000), (37, 4_096)] {
+        let got = on_fs(&s.fs, move |fs| fs.read(fh, off as u64, len as u32))
+            .await
+            .unwrap();
+        assert!(got == data[off..off + len], "random read at {off}+{len}");
+    }
+    on_fs(&s.fs, move |fs| fs.release(fh)).await;
+}
+
+// --------------------------------------------------------------------- 19
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reconnect_read_survives() {
+    let agent = start_agent(AgentOpts::default());
+    let content = patterned(48 * 1024);
+    std::fs::write(agent.dir.path().join("r.bin"), &content).unwrap();
+    let s = connect_reconnectable(&agent, ClientOptions::default()).await;
+
+    let (ino, _) = lookup_path(&s.fs, "r.bin").await.unwrap();
+    let fh = on_fs(&s.fs, move |fs| fs.open(ino, ro()).unwrap().0).await;
+    let len = content.len() as u32;
+    let got = on_fs(&s.fs, move |fs| fs.read(fh, 0, len)).await.unwrap();
+    assert!(got == content, "read before disconnect");
+
+    let old_conn = s.fs.conn();
+    s.sever();
+
+    // A read issued in the dead window can stall for the full REQUEST_TIMEOUT
+    // (30 s): its waiter registers after the dying reader already failed all
+    // inflight requests, so nothing fails it early. Wait for the supervisor's
+    // swap first (new connection object, not closed), then prove the SAME
+    // kernel fh works again (re-dialed, re-attached, handle re-opened with a
+    // fresh server_fh translation).
+    wait_until("supervisor swapped in a live connection", 10, || {
+        let now = s.fs.conn();
+        (!std::sync::Arc::ptr_eq(&old_conn, &now) && !now.is_closed()).then_some(())
+    })
+    .await;
+
+    let deadline = deadline_after(10);
+    loop {
+        match on_fs(&s.fs, move |fs| fs.read(fh, 0, len)).await {
+            Ok(data) => {
+                assert!(data == content, "reconnected read returned wrong bytes");
+                break;
+            }
+            Err(err) => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "read did not recover within 10s of reconnect (last: {err:?})"
+                );
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
+    }
+    on_fs(&s.fs, move |fs| fs.release(fh)).await;
+}
+
+// --------------------------------------------------------------------- 20
+
+/// Accumulate pump batches into `captured` until `done(captured)`; false on
+/// deadline or pump end.
+async fn recv_until(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<FsEvent>>,
+    captured: &mut Vec<FsEvent>,
+    secs: u64,
+    done: impl Fn(&[FsEvent]) -> bool,
+) -> bool {
+    let deadline = deadline_after(secs);
+    while !done(captured) {
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        match tokio::time::timeout(deadline - now, rx.recv()).await {
+            Ok(Some(batch)) => captured.extend(batch),
+            Ok(None) | Err(_) => return false,
+        }
+    }
+    true
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reconnect_events_resume() {
+    let agent = start_agent(AgentOpts {
+        watch: true,
+        ..AgentOpts::default()
+    });
+    let s = connect_reconnectable(&agent, ClientOptions::default()).await;
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<FsEvent>>();
+    s.fs.start_event_pump(move |batch| {
+        let _ = tx.send(batch.to_vec());
+    })
+    .await
+    .unwrap();
+
+    // A arrives over the live stream.
+    std::fs::write(agent.dir.path().join("a.txt"), b"first").unwrap();
+    let mut captured: Vec<FsEvent> = Vec::new();
+    assert!(
+        recv_until(&mut rx, &mut captured, 10, |evs| evs
+            .iter()
+            .any(|e| e.path.0 == "a.txt"))
+        .await,
+        "a.txt event before disconnect: {captured:?}"
+    );
+
+    // Kill the link; the change to B lands only in the server-side ring log.
+    s.sever();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    std::fs::write(agent.dir.path().join("b.txt"), b"second").unwrap();
+
+    // After reconnect the pump resubscribes with since_seq and the ring-log
+    // catchup (or the live stream, if B flushes late) must deliver b.txt.
+    // The supervisor's epoch bump can race the pump's Closed observation; if
+    // the pump missed this cycle, another sever forces the next one — the
+    // ring log still holds b.txt, so catchup delivers it regardless.
+    let overall = deadline_after(15);
+    loop {
+        if recv_until(&mut rx, &mut captured, 3, |evs| {
+            evs.iter().any(|e| e.path.0 == "b.txt")
+        })
+        .await
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < overall,
+            "b.txt never delivered after reconnect; captured: {captured:?}"
+        );
+        s.sever();
+    }
+
+    let a = captured.iter().position(|e| e.path.0 == "a.txt").unwrap();
+    let b = captured.iter().position(|e| e.path.0 == "b.txt").unwrap();
+    assert!(a < b, "a.txt must precede b.txt: {captured:?}");
+}
+
+// --------------------------------------------------------------------- 21
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn request_timeout() {
+    let agent = start_agent(AgentOpts::default());
+    std::fs::write(agent.dir.path().join("l.txt"), b"lockme").unwrap();
+    let s1 = connect(&agent, ClientOptions::default()).await;
+    let s2 = connect(&agent, ClientOptions::default()).await;
+
+    let fh1 = open_for_lock(&s1, "l.txt").await;
+    let fh2 = open_for_lock(&s2, "l.txt").await;
+    on_fs(&s1.fs, move |fs| fs.lock(fh1, LockKind::Exclusive, false))
+        .await
+        .unwrap();
+
+    // A wait:true lock on a held file is a request the server legitimately
+    // never answers — exactly what the client-side deadline is for.
+    let started = std::time::Instant::now();
+    let err = s2
+        .conn()
+        .request_with_deadline(
+            Request::Lock {
+                fh: fh2,
+                kind: LockKind::Exclusive,
+                wait: true,
+            },
+            Duration::from_millis(300),
+        )
+        .await
+        .unwrap_err();
+    let waited = started.elapsed();
+    assert!(matches!(err, TransportError::Timeout), "got {err:?}");
+    assert!(
+        waited >= Duration::from_millis(250),
+        "timeout fired too early: {waited:?}"
+    );
+    assert!(
+        waited < Duration::from_millis(1500),
+        "deadline not honored (~300ms expected): {waited:?}"
+    );
 }
