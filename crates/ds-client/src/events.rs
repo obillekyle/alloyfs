@@ -91,42 +91,78 @@ impl RemoteFs {
             }
         }
     }
-
     /// Subscribe on the server and spawn the pump task. `on_batch` runs after
     /// cache invalidation — mount backends re-emit events natively from it.
-    /// The pump ends when the connection closes.
+    ///
+    /// With a reconnect dialer configured, the pump survives connection loss:
+    /// it waits for the supervisor's swap, then resubscribes from the last
+    /// event seq it applied (server ring-log catchup); a `TooOld` answer
+    /// flushes caches and resubscribes live. Without a dialer it ends when
+    /// the connection closes, as before.
     pub async fn start_event_pump(
         self: &Arc<Self>,
         on_batch: impl Fn(&[FsEvent]) + Send + 'static,
     ) -> Result<u64, FsError> {
-        let last_seq = match self
-            .conn()
-            .request(Request::Subscribe { since_seq: None })
-            .await??
-        {
+        let conn = self.conn();
+        // Receiver BEFORE Subscribe: catchup batches pushed with no receiver
+        // would be silently dropped by the broadcast channel.
+        let rx = conn.events();
+        let last_seq = match conn.request(Request::Subscribe { since_seq: None }).await?? {
             Response::Subscribed { last_seq } => last_seq,
             _ => return Err(ds_proto::ErrorCode::Io.into()),
         };
         let fs = self.clone();
-        let mut rx = self.conn().events();
         tokio::spawn(async move {
+            let mut rx = rx;
             loop {
-                match rx.recv().await {
-                    Ok(batch) => {
-                        let batch = fs.filter_for_overlay(batch);
-                        if batch.is_empty() {
-                            continue;
+                loop {
+                    match rx.recv().await {
+                        Ok(batch) => {
+                            if let Some(max) = batch.iter().map(|e| e.seq).max() {
+                                fs.last_event_seq
+                                    .fetch_max(max, std::sync::atomic::Ordering::AcqRel);
+                            }
+                            let batch = fs.filter_for_overlay(batch);
+                            if batch.is_empty() {
+                                continue;
+                            }
+                            fs.apply_events(&batch);
+                            fs.apply_events_to_cache(&batch);
+                            on_batch(&batch);
                         }
-                        fs.apply_events(&batch);
-                        fs.apply_events_to_cache(&batch);
-                        on_batch(&batch);
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            // We fell behind the connection reader: safest reset.
+                            tracing::warn!(missed = n, "event pump lagged; flushing caches");
+                            fs.invalidate_all();
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        // We fell behind the connection reader: safest reset.
-                        tracing::warn!(missed = n, "event pump lagged; flushing caches");
+                }
+                if fs.dialer.is_none() {
+                    break;
+                }
+                // Wait for the reconnect supervisor to swap in a fresh conn,
+                // then resubscribe from where we left off.
+                fs.conn_changed().await;
+                let conn = fs.conn();
+                rx = conn.events();
+                let seen = fs.last_event_seq.load(std::sync::atomic::Ordering::Acquire);
+                let since = if seen == 0 { None } else { Some(seen) };
+                match conn.request(Request::Subscribe { since_seq: since }).await {
+                    Ok(Ok(Response::Subscribed { .. })) => {
+                        tracing::info!(since = seen, "event stream resubscribed");
+                    }
+                    Ok(Err(ds_proto::ErrorCode::TooOld)) => {
+                        tracing::warn!("event history expired during outage; flushing caches");
                         fs.invalidate_all();
+                        if let Some(cache) = &fs.cache {
+                            cache.mark_all_unverified();
+                        }
+                        let _ = conn.request(Request::Subscribe { since_seq: None }).await;
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    other => {
+                        tracing::warn!(?other, "resubscribe failed; will retry on next reconnect");
+                    }
                 }
             }
             tracing::info!("event pump ended (connection closed)");

@@ -5,17 +5,24 @@ use std::time::{Duration, Instant};
 use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio_util::codec::{FramedRead, FramedWrite};
 
 use ds_proto::{
     ErrorCode, Frame, FrameCodec, FsEvent, Request, Response, PROTO_VERSION_MAX, PROTO_VERSION_MIN,
 };
 
+/// Backstop for a wedged-but-open peer: a request unanswered this long is
+/// failed. The 10 s heartbeat catches most dead peers earlier; this bound
+/// guarantees mount callbacks can never hang forever.
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
 #[derive(Debug, thiserror::Error)]
 pub enum TransportError {
     #[error("connection closed")]
     Closed,
+    #[error("request timed out after {}s", REQUEST_TIMEOUT.as_secs())]
+    Timeout,
     #[error("handshake failed: {0}")]
     Handshake(String),
     #[error(transparent)]
@@ -37,6 +44,7 @@ pub struct MuxConnection {
     inflight: Arc<DashMap<u64, oneshot::Sender<Result<Response, ErrorCode>>>>,
     pings: Arc<DashMap<u64, oneshot::Sender<()>>>,
     events_tx: broadcast::Sender<Vec<FsEvent>>,
+    closed_rx: watch::Receiver<bool>,
     pub server_name: String,
     pub proto: u16,
 }
@@ -76,6 +84,7 @@ impl MuxConnection {
             Arc::new(DashMap::new());
         let pings: Arc<DashMap<u64, oneshot::Sender<()>>> = Arc::new(DashMap::new());
         let (events_tx, _) = broadcast::channel(256);
+        let (closed_tx, closed_rx) = watch::channel(false);
 
         // Writer task: sole owner of the outgoing half.
         tokio::spawn(async move {
@@ -93,6 +102,7 @@ impl MuxConnection {
             inflight: inflight.clone(),
             pings: pings.clone(),
             events_tx: events_tx.clone(),
+            closed_rx,
             server_name,
             proto,
         });
@@ -122,9 +132,11 @@ impl MuxConnection {
                     }
                 }
             }
-            // Stream ended: fail every waiter so callers see Closed, not a hang.
+            // Stream ended: fail every waiter so callers see Closed, not a
+            // hang, and let supervisors (reconnect) know.
             inflight.clear();
             pings.clear();
+            let _ = closed_tx.send(true);
         });
 
         // Heartbeat: one ping every 10 s keeps the server's lease for this
@@ -146,9 +158,19 @@ impl MuxConnection {
         Ok(conn)
     }
 
-    /// Send one request and await its response. Cancel-safe: dropping the
-    /// future abandons the slot; a late response is discarded by the reader.
+    /// Send one request and await its response, bounded by REQUEST_TIMEOUT.
+    /// Cancel-safe: dropping the future abandons the slot; a late response is
+    /// discarded by the reader.
     pub async fn request(&self, body: Request) -> Result<Result<Response, ErrorCode>, TransportError> {
+        self.request_with_deadline(body, REQUEST_TIMEOUT).await
+    }
+
+    /// `request` with an explicit deadline (tests use short ones).
+    pub async fn request_with_deadline(
+        &self,
+        body: Request,
+        deadline: Duration,
+    ) -> Result<Result<Response, ErrorCode>, TransportError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (done_tx, done_rx) = oneshot::channel();
         self.inflight.insert(id, done_tx);
@@ -156,7 +178,28 @@ impl MuxConnection {
             self.inflight.remove(&id);
             return Err(TransportError::Closed);
         }
-        done_rx.await.map_err(|_| TransportError::Closed)
+        match tokio::time::timeout(deadline, done_rx).await {
+            Ok(done) => done.map_err(|_| TransportError::Closed),
+            Err(_) => {
+                self.inflight.remove(&id);
+                Err(TransportError::Timeout)
+            }
+        }
+    }
+
+    /// Resolves once the connection has died (reader loop ended). For
+    /// reconnect supervisors.
+    pub async fn closed(&self) {
+        let mut rx = self.closed_rx.clone();
+        while !*rx.borrow() {
+            if rx.changed().await.is_err() {
+                return; // sender dropped ⇒ reader gone ⇒ closed
+            }
+        }
+    }
+
+    pub fn is_closed(&self) -> bool {
+        *self.closed_rx.borrow()
     }
 
     /// Round-trip a Ping and return the measured latency.

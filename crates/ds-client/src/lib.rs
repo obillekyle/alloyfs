@@ -10,8 +10,9 @@ mod autocache;
 mod events;
 mod inode;
 mod overlay;
+mod readahead;
 mod remote_fs;
 mod walker;
 
 pub use inode::{InodeTable, ROOT_INO};
-pub use remote_fs::{ClientOptions, FsError, RemoteFs};
+pub use remote_fs::{ClientOptions, Dialer, FsError, RemoteFs};

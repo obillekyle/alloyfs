@@ -69,6 +69,21 @@ pub fn require_export(export: Option<String>, url: &str) -> anyhow::Result<Strin
     export.ok_or_else(|| anyhow::anyhow!("url must include an export name, e.g. {url}/projects"))
 }
 
+/// A reconnect dialer that re-runs the same connect logic (tcp dial or ssh
+/// re-spawn) whenever the client needs a replacement connection.
+pub fn dialer_for(url: &str, remote_cmd: &str, client: &str) -> ds_client::Dialer {
+    let url = url.to_string();
+    let remote_cmd = remote_cmd.to_string();
+    let client = client.to_string();
+    Arc::new(move || {
+        let (url, remote_cmd, client) = (url.clone(), remote_cmd.clone(), client.clone());
+        Box::pin(async move {
+            let (conn, _) = connect_target(&url, &remote_cmd, &client).await?;
+            Ok(conn)
+        })
+    })
+}
+
 /// Stable per-(server, export) key for local data dirs:
 /// sanitize(host)-sanitize(export)-fnv1a8(normalized identity).
 pub fn mount_key(url: &str, export: &str) -> String {

@@ -150,11 +150,11 @@ async fn fetch_one(fs: &Arc<RemoteFs>, cache: &Arc<AutoCache>, path: &RelPath) -
                 batch.push((pos, want));
                 pos += want as u64;
             }
-            let responses = futures::future::join_all(
-                batch
-                    .iter()
-                    .map(|&(off, len)| fs.conn().request(Request::Read { fh, offset: off, len })),
-            )
+            let conn = fs.conn();
+            let responses = futures::future::join_all(batch.iter().map(|&(off, len)| {
+                let conn = conn.clone();
+                async move { conn.request(Request::Read { fh, offset: off, len }).await }
+            }))
             .await;
             for resp in responses {
                 match resp {

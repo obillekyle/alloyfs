@@ -1,14 +1,18 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
 use dashmap::DashMap;
 use ds_proto::{Attr, ErrorCode, OpenFlags, RelPath, Request, Response, DATA_CHUNK};
 use ds_transport::{MuxConnection, TransportError};
+use futures::future::BoxFuture;
 
 use crate::autocache::AutoCache;
 use crate::overlay::{Overlay, OVERLAY_FH_BIT};
+use crate::readahead::ReadAhead;
 
 #[derive(Debug, thiserror::Error)]
 pub enum FsError {
@@ -40,9 +44,13 @@ macro_rules! expect_resp {
 /// staleness if the event stream hiccups.
 const ATTR_TTL: Duration = Duration::from_secs(5);
 
-/// Per-mount client behavior: local overlay excludes + auto-download cache.
-/// Default (all empty/zero) means both features are off and RemoteFs behaves
-/// exactly as before.
+/// Re-dial an equivalent connection after the current one dies. Built by the
+/// CLI from the original mount url (tcp dial or ssh re-spawn).
+pub type Dialer = Arc<dyn Fn() -> BoxFuture<'static, anyhow::Result<Arc<MuxConnection>>> + Send + Sync>;
+
+/// Per-mount client behavior: local overlay excludes + auto-download cache +
+/// optional reconnect. Default (all empty/zero/None) means every feature is
+/// off and RemoteFs behaves exactly as a plain single-connection client.
 #[derive(Default, Clone)]
 pub struct ClientOptions {
     pub excludes: Vec<String>,
@@ -51,19 +59,26 @@ pub struct ClientOptions {
     pub auto_cache_max: u64,
     pub auto_cache_budget: u64,
     pub pins: Vec<String>,
+    pub dialer: Option<Dialer>,
 }
 
-/// Client-side bookkeeping for one open remote handle.
+/// Client-side bookkeeping for one open remote handle. Keyed by the fh the
+/// KERNEL holds (stable across reconnects); `server_fh` is what the current
+/// server session knows and is rewritten by the reconnect supervisor.
 pub(crate) struct OpenState {
     pub path: RelPath,
+    pub flags: OpenFlags,
+    pub server_fh: AtomicU64,
     /// May reads on this fh be served from the auto-cache blob?
     pub cache_ok: AtomicBool,
     /// Did any write happen through this fh (⇒ re-fetch on release)?
     pub wrote: AtomicBool,
+    /// Sequential prefetch window for this handle.
+    pub ra: ReadAhead,
 }
 
 pub struct RemoteFs {
-    conn: Arc<MuxConnection>,
+    conn: RwLock<Arc<MuxConnection>>,
     rt: tokio::runtime::Handle,
     pub ino: crate::InodeTable,
     pub root_attr: Attr,
@@ -71,6 +86,12 @@ pub struct RemoteFs {
     pub(crate) overlay: Option<Overlay>,
     pub(crate) cache: Option<Arc<AutoCache>>,
     pub(crate) open_files: DashMap<u64, OpenState>,
+    export: String,
+    pub(crate) dialer: Option<Dialer>,
+    /// Bumped after every successful reconnect; the event pump watches it.
+    conn_epoch: tokio::sync::watch::Sender<u64>,
+    /// Highest event seq the pump has applied — reconnect resubscribes here.
+    pub(crate) last_event_seq: AtomicU64,
 }
 
 impl RemoteFs {
@@ -78,8 +99,9 @@ impl RemoteFs {
         Self::attach_with(conn, export, ClientOptions::default()).await
     }
 
-    /// Attach with overlay/auto-cache options. Spawns the cache walker,
-    /// fetcher, and manifest flusher when the cache is enabled.
+    /// Attach with overlay/auto-cache/reconnect options. Spawns the cache
+    /// walker, fetcher, manifest flusher, and reconnect supervisor as
+    /// configured.
     pub async fn attach_with(
         conn: Arc<MuxConnection>,
         export: &str,
@@ -134,8 +156,9 @@ impl RemoteFs {
             None
         };
 
+        let (epoch_tx, _) = tokio::sync::watch::channel(0u64);
         let fs = Arc::new(Self {
-            conn,
+            conn: RwLock::new(conn),
             rt: tokio::runtime::Handle::current(),
             ino: crate::InodeTable::new(),
             root_attr,
@@ -143,6 +166,10 @@ impl RemoteFs {
             overlay,
             cache,
             open_files: DashMap::new(),
+            export: export.to_string(),
+            dialer: opts.dialer.clone(),
+            conn_epoch: epoch_tx,
+            last_event_seq: AtomicU64::new(0),
         });
 
         if let (Some(cache), Some(rx)) = (fs.cache.clone(), fetch_rx) {
@@ -158,6 +185,9 @@ impl RemoteFs {
                 }
             });
         }
+        if fs.dialer.is_some() {
+            tokio::spawn(reconnect_supervisor(fs.clone()));
+        }
         Ok(fs)
     }
 
@@ -170,9 +200,43 @@ impl RemoteFs {
         }
     }
 
+    /// The live connection (may change across reconnects — take a snapshot,
+    /// never hold it across long waits).
+    pub fn conn(&self) -> Arc<MuxConnection> {
+        self.conn.read().unwrap().clone()
+    }
+
+    /// Resolves when the supervisor swaps in a new connection.
+    pub(crate) async fn conn_changed(&self) {
+        let mut rx = self.conn_epoch.subscribe();
+        let seen = *rx.borrow();
+        while *rx.borrow() == seen {
+            if rx.changed().await.is_err() {
+                std::future::pending::<()>().await; // no supervisor: never
+            }
+        }
+    }
+
+    /// One request on the current connection; if the connection died and the
+    /// supervisor already swapped in a new one, IDEMPOTENT READS retry once.
+    /// Mutations never retry (the original may have applied before the drop).
     fn call(&self, req: Request) -> Result<Response, FsError> {
-        let out = self.rt.block_on(self.conn.request(req))?;
-        Ok(out?)
+        let conn = self.conn();
+        let retryable = matches!(
+            req,
+            Request::Getattr { .. } | Request::Readdir { .. } | Request::Read { .. } | Request::Statfs
+        );
+        let first = self.rt.block_on(conn.request(req.clone()));
+        match first {
+            Err(TransportError::Closed) if retryable => {
+                let now = self.conn();
+                if !Arc::ptr_eq(&conn, &now) && !now.is_closed() {
+                    return Ok(self.rt.block_on(now.request(req))??);
+                }
+                Err(TransportError::Closed.into())
+            }
+            other => Ok(other??),
+        }
     }
 
     fn cache_attr(&self, ino: u64, attr: Attr) {
@@ -185,10 +249,6 @@ impl RemoteFs {
 
     pub fn invalidate_all(&self) {
         self.attr_cache.clear();
-    }
-
-    pub fn conn(&self) -> &Arc<MuxConnection> {
-        &self.conn
     }
 
     /// Is this path routed to the local overlay?
@@ -214,6 +274,14 @@ impl RemoteFs {
 
     fn path_of(&self, ino: u64) -> Result<RelPath, FsError> {
         self.ino.path_of(ino).ok_or_else(|| ErrorCode::NotFound.into())
+    }
+
+    /// Translate a kernel-visible fh to the current server session's fh.
+    fn server_fh(&self, fh: u64) -> u64 {
+        self.open_files
+            .get(&fh)
+            .map(|s| s.server_fh.load(Ordering::Acquire))
+            .unwrap_or(fh)
     }
 
     // ---------------------------------------------------------------- reads
@@ -308,11 +376,30 @@ impl RemoteFs {
             fh,
             OpenState {
                 path,
+                flags,
+                server_fh: AtomicU64::new(fh),
                 cache_ok: AtomicBool::new(cache_ok),
                 wrote: AtomicBool::new(false),
+                ra: ReadAhead::new(),
             },
         );
         Ok((fh, attr))
+    }
+
+    /// Fetch one whole DATA_CHUNK-aligned block on `conn` (async).
+    async fn fetch_block(conn: Arc<MuxConnection>, server_fh: u64, block: u64) -> Option<Bytes> {
+        let offset = block * DATA_CHUNK as u64;
+        match conn
+            .request(Request::Read {
+                fh: server_fh,
+                offset,
+                len: DATA_CHUNK,
+            })
+            .await
+        {
+            Ok(Ok(Response::Data(data))) => Some(data),
+            _ => None,
+        }
     }
 
     pub fn read(&self, fh: u64, offset: u64, size: u32) -> Result<Vec<u8>, FsError> {
@@ -329,8 +416,80 @@ impl RemoteFs {
                 state.cache_ok.store(false, Ordering::Relaxed);
             }
         }
-        // Wire chunks of one kernel read go out CONCURRENTLY — on a 60 ms
-        // link this is one round-trip per megabyte instead of eight.
+        let Some(state) = self.open_files.get(&fh) else {
+            return self.read_blocks_direct(fh, offset, size); // untracked fh (walker)
+        };
+        let server_fh = state.server_fh.load(Ordering::Acquire);
+        let prefetch = state.ra.observe(offset, size);
+
+        // Serve [offset, offset+size) from DATA_CHUNK-aligned blocks: consume
+        // prefetched ones, fetch the rest concurrently.
+        let chunk = DATA_CHUNK as u64;
+        let first_block = ReadAhead::block_of(offset);
+        let last_block = ReadAhead::block_of(offset + size.max(1) as u64 - 1);
+        let mut ready: HashMap<u64, Bytes> = HashMap::new();
+        let mut need: Vec<u64> = Vec::new();
+        for b in first_block..=last_block {
+            match state.ra.take(b) {
+                Some(task) => match self.rt.block_on(task) {
+                    Ok(Some(data)) => {
+                        ready.insert(b, data);
+                    }
+                    _ => need.push(b), // prefetch failed (old conn?) — refetch
+                },
+                None => need.push(b),
+            }
+        }
+        if !need.is_empty() {
+            let conn = self.conn();
+            let fetched = self.rt.block_on(async {
+                futures::future::join_all(
+                    need.iter()
+                        .map(|&b| Self::fetch_block(conn.clone(), server_fh, b)),
+                )
+                .await
+            });
+            for (b, data) in need.iter().zip(fetched) {
+                match data {
+                    Some(d) => {
+                        ready.insert(*b, d);
+                    }
+                    None => return Err(ErrorCode::Io.into()),
+                }
+            }
+        }
+        // Assemble contiguous bytes from first_block onward; a short block is
+        // EOF and ends the file.
+        let mut assembled: Vec<u8> = Vec::with_capacity(((last_block - first_block + 1) * chunk) as usize);
+        for b in first_block..=last_block {
+            let data = ready.get(&b).expect("all needed blocks fetched");
+            assembled.extend_from_slice(data);
+            if data.len() < DATA_CHUNK as usize {
+                break; // EOF inside this block
+            }
+        }
+        let skip = (offset - first_block * chunk) as usize;
+        let out = if skip >= assembled.len() {
+            Vec::new() // read past EOF
+        } else {
+            assembled[skip..(skip + size as usize).min(assembled.len())].to_vec()
+        };
+
+        // Top up the prefetch window behind the reader's back.
+        if prefetch {
+            for b in state.ra.missing(last_block + 1, u64::MAX) {
+                let conn = self.conn();
+                state
+                    .ra
+                    .put(b, self.rt.spawn(Self::fetch_block(conn, server_fh, b)));
+            }
+        }
+        Ok(out)
+    }
+
+    /// The pre-readahead read path, kept for fhs we don't track (the cache
+    /// walker opens raw server fhs that never enter `open_files`).
+    fn read_blocks_direct(&self, fh: u64, offset: u64, size: u32) -> Result<Vec<u8>, FsError> {
         let end = offset + size as u64;
         let chunks: Vec<(u64, u32)> = {
             let mut v = Vec::new();
@@ -342,9 +501,10 @@ impl RemoteFs {
             }
             v
         };
+        let conn = self.conn();
         let responses = self.rt.block_on(async {
             futures::future::join_all(chunks.iter().map(|&(pos, want)| {
-                self.conn.request(Request::Read {
+                conn.request(Request::Read {
                     fh,
                     offset: pos,
                     len: want,
@@ -370,14 +530,15 @@ impl RemoteFs {
         if fh & OVERLAY_FH_BIT != 0 {
             return self.overlay_ref().write(fh, offset, data);
         }
+        let server_fh = self.server_fh(fh);
         let mut pos = 0usize;
         while pos < data.len() {
             let chunk = &data[pos..(pos + DATA_CHUNK as usize).min(data.len())];
             let (n, conflict) = expect_resp!(
                 self.call(Request::Write {
-                    fh,
+                    fh: server_fh,
                     offset: offset + pos as u64,
-                    data: bytes::Bytes::copy_from_slice(chunk),
+                    data: Bytes::copy_from_slice(chunk),
                     expect_version: None,
                 })?,
                 Response::Written { n, conflict, .. } => (n, conflict)
@@ -399,15 +560,17 @@ impl RemoteFs {
         Ok(data.len() as u32)
     }
 
-    /// Invalidate the cache entry and every open fh's fast path for `path`.
+    /// Invalidate the cache entry, readahead windows, and every open fh's
+    /// fast path for `path`.
     fn mark_path_written(&self, path: &RelPath) {
+        for entry in self.open_files.iter() {
+            if entry.value().path == *path {
+                entry.value().cache_ok.store(false, Ordering::Relaxed);
+                entry.value().ra.clear(); // prefetched blocks predate the write
+            }
+        }
         if let Some(cache) = &self.cache {
             cache.invalidate(path);
-            for entry in self.open_files.iter() {
-                if entry.value().path == *path {
-                    entry.value().cache_ok.store(false, Ordering::Relaxed);
-                }
-            }
         }
     }
 
@@ -435,8 +598,11 @@ impl RemoteFs {
             fh,
             OpenState {
                 path,
+                flags,
+                server_fh: AtomicU64::new(fh),
                 cache_ok: AtomicBool::new(false),
                 wrote: AtomicBool::new(true),
+                ra: ReadAhead::new(),
             },
         );
         Ok((ino, fh, attr))
@@ -570,7 +736,8 @@ impl RemoteFs {
         if fh & OVERLAY_FH_BIT != 0 {
             return Ok(()); // single-machine data: advisory lock is a no-op
         }
-        expect_resp!(self.call(Request::Lock { fh, kind, wait })?, Response::Ok => ());
+        let server_fh = self.server_fh(fh);
+        expect_resp!(self.call(Request::Lock { fh: server_fh, kind, wait })?, Response::Ok => ());
         Ok(())
     }
 
@@ -578,7 +745,8 @@ impl RemoteFs {
         if fh & OVERLAY_FH_BIT != 0 {
             return Ok(());
         }
-        expect_resp!(self.call(Request::Unlock { fh })?, Response::Ok => ());
+        let server_fh = self.server_fh(fh);
+        expect_resp!(self.call(Request::Unlock { fh: server_fh })?, Response::Ok => ());
         Ok(())
     }
 
@@ -586,7 +754,8 @@ impl RemoteFs {
         if fh & OVERLAY_FH_BIT != 0 {
             return self.overlay_ref().flush(fh);
         }
-        expect_resp!(self.call(Request::Flush { fh })?, Response::Ok => ());
+        let server_fh = self.server_fh(fh);
+        expect_resp!(self.call(Request::Flush { fh: server_fh })?, Response::Ok => ());
         Ok(())
     }
 
@@ -595,7 +764,9 @@ impl RemoteFs {
             self.overlay_ref().release(fh);
             return;
         }
+        let server_fh = self.server_fh(fh);
         if let Some((_, state)) = self.open_files.remove(&fh) {
+            state.ra.clear();
             if state.wrote.load(Ordering::Relaxed) {
                 if let Some(cache) = &self.cache {
                     // The finished file may qualify for (re-)caching now.
@@ -603,7 +774,7 @@ impl RemoteFs {
                 }
             }
         }
-        let _ = self.call(Request::Release { fh });
+        let _ = self.call(Request::Release { fh: server_fh });
     }
 
     pub fn statfs(&self) -> Result<(u32, u64, u64), FsError> {
@@ -612,5 +783,74 @@ impl RemoteFs {
             Response::Statfs { block_size, blocks, blocks_free } => (block_size, blocks, blocks_free)
         );
         Ok(out)
+    }
+}
+
+/// Reconnect supervisor: when the connection dies, dial a replacement with
+/// exponential backoff, re-attach, re-open every live handle on the new
+/// session, then swap it in and bump the epoch (which re-triggers the event
+/// pump's subscription). Advisory locks do NOT survive a reconnect —
+/// documented behavior, logged when it happens.
+async fn reconnect_supervisor(fs: Arc<RemoteFs>) {
+    let dialer = fs.dialer.clone().expect("supervisor spawned only with a dialer");
+    loop {
+        fs.conn().closed().await;
+        tracing::warn!("connection lost; reconnecting");
+        let mut delay = Duration::from_millis(500);
+        let new_conn = loop {
+            match dialer().await {
+                Ok(c) => break c,
+                Err(e) => {
+                    tracing::warn!(error = %e, retry_in = ?delay, "reconnect failed");
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(Duration::from_secs(15));
+                }
+            }
+        };
+        // Re-attach before swapping so concurrent ops keep failing fast on
+        // the dead conn instead of racing a half-initialized one.
+        match new_conn
+            .request(Request::Attach {
+                export: fs.export.clone(),
+            })
+            .await
+        {
+            Ok(Ok(Response::AttachOk { .. })) => {}
+            other => {
+                tracing::error!(?other, "re-attach failed; retrying");
+                continue;
+            }
+        }
+        // Re-open live handles on the new session; kernel fhs stay stable,
+        // only the server_fh translation changes.
+        let mut reopened = 0usize;
+        let mut failed = 0usize;
+        for entry in fs.open_files.iter() {
+            let state = entry.value();
+            state.ra.clear(); // in-flight blocks belong to the dead conn
+            let req = Request::Open {
+                path: state.path.clone(),
+                flags: state.flags,
+            };
+            match new_conn.request(req).await {
+                Ok(Ok(Response::Opened { fh, .. })) => {
+                    state.server_fh.store(fh, Ordering::Release);
+                    reopened += 1;
+                }
+                _ => {
+                    // File may be gone; subsequent ops get BadHandle → EBADF.
+                    failed += 1;
+                }
+            }
+        }
+        *fs.conn.write().unwrap() = new_conn;
+        // The server may have restarted (versions reset) or missed changes:
+        // trust nothing cached until revalidated.
+        fs.invalidate_all();
+        if let Some(cache) = &fs.cache {
+            cache.mark_all_unverified();
+        }
+        fs.conn_epoch.send_modify(|e| *e += 1);
+        tracing::info!(reopened, failed, "reconnected (locks do not survive reconnects)");
     }
 }

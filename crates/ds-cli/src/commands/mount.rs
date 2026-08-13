@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::config::{default_data_dir, parse_size, MountConfig};
-use crate::urls::{connect_target, mount_key, require_export, whoami};
+use crate::urls::{connect_target, dialer_for, mount_key, require_export, whoami};
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
@@ -49,6 +49,9 @@ pub async fn run(
         auto_cache_max,
         auto_cache_budget,
         data_dir,
+        // Survive connection loss: re-dial, re-attach, re-open handles,
+        // resubscribe events. Locks do not survive (documented).
+        dialer: Some(dialer_for(&url, &remote_cmd, &whoami())),
     };
     let fs = ds_client::RemoteFs::attach_with(conn, &export, opts).await?;
     // Each platform starts the event pump itself, wiring server events into
