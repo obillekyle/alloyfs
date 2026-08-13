@@ -332,6 +332,16 @@ fn flush(
     }
     let mut batch: Vec<(RelPath, EventKind)> = Vec::with_capacity(pending.len() + renames.len());
     for (from, to) in renames.drain(..) {
+        // Some backends report one rename as From + To + Both: the paired
+        // event wins, so drop the degraded halves it would duplicate — but
+        // ONLY exact halves (a real Modified on the target must survive for
+        // cache freshness).
+        if pending.get(&from).is_some_and(|p| matches!(p.kind, EventKind::Removed)) {
+            pending.remove(&from);
+        }
+        if pending.get(&to).is_some_and(|p| matches!(p.kind, EventKind::Created)) {
+            pending.remove(&to);
+        }
         export.rename_version(&from, &to);
         batch.push((from, EventKind::RenamedFrom { to }));
     }
@@ -348,4 +358,97 @@ fn flush(
     }
     tracing::debug!(export = export.name, n = batch.len(), "event batch");
     hub.publish(batch);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_export() -> (tempfile::TempDir, Arc<Export>) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = crate::config::AgentConfig::default();
+        cfg.exports.insert(
+            "t".into(),
+            crate::config::ExportConfig {
+                path: dir.path().to_path_buf(),
+                read_only: false,
+                exclude: vec![],
+                client: None,
+            },
+        );
+        let registry = crate::ExportRegistry::from_config(&cfg).unwrap();
+        let export = registry.get("t").unwrap();
+        (dir, export)
+    }
+
+    fn rename_event(mode: RenameMode, paths: Vec<std::path::PathBuf>) -> notify::Event {
+        notify::Event {
+            kind: NotifyKind::Modify(ModifyKind::Name(mode)),
+            paths,
+            attrs: Default::default(),
+        }
+    }
+
+    /// Backends that report one rename as From + To + Both must yield exactly
+    /// one RenamedFrom — the degraded Removed/Created halves are dropped.
+    #[tokio::test]
+    async fn paired_rename_dedupes_degraded_halves() {
+        let (_dir, export) = test_export();
+        // Build paths from export.root (canonicalized) so rel_of strips them.
+        let from = export.root.join("old.txt");
+        let to = export.root.join("new.txt");
+
+        let mut pending = HashMap::new();
+        let mut renames = Vec::new();
+        ingest(&export, &mut pending, &mut renames, rename_event(RenameMode::From, vec![from.clone()]));
+        ingest(&export, &mut pending, &mut renames, rename_event(RenameMode::To, vec![to.clone()]));
+        ingest(&export, &mut pending, &mut renames, rename_event(RenameMode::Both, vec![from, to]));
+
+        let hub = export.events.clone();
+        let mut rx = hub.subscribe(None).unwrap().1;
+        flush(&export, &hub, &mut pending, &mut renames);
+        let batch = rx.try_recv().expect("one batch published");
+        assert_eq!(batch.len(), 1, "exactly one event, got {batch:?}");
+        assert!(
+            matches!(&batch[0].kind, EventKind::RenamedFrom { to } if to.0 == "new.txt"),
+            "the paired rename must win: {batch:?}"
+        );
+        assert_eq!(batch[0].path.0, "old.txt");
+    }
+
+    /// A real Modified on the rename target (e.g. write-after-move) must NOT
+    /// be swallowed by the dedupe.
+    #[tokio::test]
+    async fn rename_dedupe_keeps_real_modify() {
+        let (_dir, export) = test_export();
+        let from = export.root.join("old.txt");
+        let to = export.root.join("new.txt");
+
+        let mut pending = HashMap::new();
+        let mut renames = Vec::new();
+        ingest(&export, &mut pending, &mut renames, rename_event(RenameMode::Both, vec![from, to.clone()]));
+        ingest(
+            &export,
+            &mut pending,
+            &mut renames,
+            notify::Event {
+                kind: NotifyKind::Modify(ModifyKind::Data(notify::event::DataChange::Any)),
+                paths: vec![to],
+                attrs: Default::default(),
+            },
+        );
+
+        let hub = export.events.clone();
+        let mut rx = hub.subscribe(None).unwrap().1;
+        flush(&export, &hub, &mut pending, &mut renames);
+        let batch = rx.try_recv().expect("one batch published");
+        assert_eq!(batch.len(), 2, "rename + modify both survive: {batch:?}");
+        assert!(batch.iter().any(|e| matches!(e.kind, EventKind::RenamedFrom { .. })));
+        assert!(
+            batch
+                .iter()
+                .any(|e| matches!(e.kind, EventKind::Modified) && e.path.0 == "new.txt"),
+            "real Modified on the target must survive: {batch:?}"
+        );
+    }
 }
