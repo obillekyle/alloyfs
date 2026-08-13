@@ -8,9 +8,7 @@
 
 mod autocache;
 mod events;
-pub mod exclude;
 mod inode;
-mod localfs;
 mod overlay;
 mod remote_fs;
 mod walker;

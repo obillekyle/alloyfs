@@ -20,6 +20,21 @@ pub enum FsError {
     Transport(#[from] TransportError),
 }
 
+/// Unwrap one expected Response variant; anything else is a protocol-level
+/// surprise that logs and becomes Io. Collapses the five-line match this
+/// crate used to repeat at every RPC call site.
+macro_rules! expect_resp {
+    ($call:expr, $pat:pat => $out:expr) => {
+        match $call {
+            $pat => $out,
+            other => {
+                tracing::error!(?other, "unexpected response variant");
+                return Err(ErrorCode::Io.into());
+            }
+        }
+    };
+}
+
 /// How long a cached attribute may serve reads before we re-ask the server.
 /// Event-driven invalidation is the primary freshness mechanism; this bounds
 /// staleness if the event stream hiccups.
@@ -70,18 +85,10 @@ impl RemoteFs {
         export: &str,
         opts: ClientOptions,
     ) -> Result<Arc<Self>, FsError> {
-        let root_attr = match conn
-            .request(Request::Attach {
-                export: export.into(),
-            })
-            .await??
-        {
-            Response::AttachOk { root_attr, .. } => root_attr,
-            other => {
-                tracing::error!(?other, "bad Attach response");
-                return Err(ErrorCode::Io.into());
-            }
-        };
+        let root_attr = expect_resp!(
+            conn.request(Request::Attach { export: export.into() }).await??,
+            Response::AttachOk { root_attr, .. } => root_attr
+        );
 
         let overlay = if opts.excludes.is_empty() {
             None
@@ -106,10 +113,7 @@ impl RemoteFs {
         let mut fetch_rx = None;
         let cache = if cache_enabled {
             let root = opts.data_dir.join("cache").join(&opts.mount_key);
-            let manifest = opts
-                .data_dir
-                .join("cache")
-                .join(format!("{}.manifest.json", opts.mount_key));
+            let manifest = opts.data_dir.join("cache").join(format!("{}.manifest.json", opts.mount_key));
             let (cache, rx) = AutoCache::load(crate::autocache::AutoCacheConfig {
                 max_file_size: opts.auto_cache_max,
                 budget: opts.auto_cache_budget.max(1),
@@ -189,6 +193,18 @@ impl RemoteFs {
         self.overlay.as_ref().is_some_and(|o| o.excluded(path))
     }
 
+    /// Readdir intent name #1: a server entry with this name must NOT be
+    /// listed — the overlay's copy is the only visible one on this client.
+    fn shadowed_by_overlay(&self, child: &RelPath) -> bool {
+        self.is_overlay(child)
+    }
+
+    /// Readdir intent name #2: an on-disk overlay child belongs in the
+    /// listing (it matches the exclude patterns, so it routes local).
+    fn lives_in_overlay(&self, child: &RelPath) -> bool {
+        self.is_overlay(child)
+    }
+
     fn overlay_ref(&self) -> &Overlay {
         self.overlay.as_ref().expect("overlay routing checked by caller")
     }
@@ -211,13 +227,9 @@ impl RemoteFs {
                 return Ok(attr);
             }
         }
-        match self.call(Request::Getattr { path })? {
-            Response::Attr(attr) => {
-                self.cache_attr(ino, attr);
-                Ok(attr)
-            }
-            _ => Err(ErrorCode::Io.into()),
-        }
+        let attr = expect_resp!(self.call(Request::Getattr { path })?, Response::Attr(attr) => attr);
+        self.cache_attr(ino, attr);
+        Ok(attr)
     }
 
     pub fn lookup(&self, parent: u64, name: &str) -> Result<(u64, Attr), FsError> {
@@ -228,19 +240,14 @@ impl RemoteFs {
             let ino = self.ino.get_or_alloc(path);
             return Ok((ino, attr));
         }
-        match self.call(Request::Getattr { path: path.clone() })? {
-            Response::Attr(attr) => {
-                let ino = self.ino.get_or_alloc(path);
-                self.cache_attr(ino, attr);
-                Ok((ino, attr))
-            }
-            _ => Err(ErrorCode::Io.into()),
-        }
+        let attr = expect_resp!(self.call(Request::Getattr { path: path.clone() })?, Response::Attr(attr) => attr);
+        let ino = self.ino.get_or_alloc(path);
+        self.cache_attr(ino, attr);
+        Ok((ino, attr))
     }
 
-    /// Full listing. With an overlay: remote entries minus excluded names
-    /// (overlay shadows any same-named server entry) plus local overlay
-    /// children of this directory.
+    /// Full listing. With an overlay: remote entries minus shadowed names,
+    /// plus local overlay children of this directory.
     pub fn readdir(&self, ino: u64) -> Result<Vec<(String, u64, Attr)>, FsError> {
         let dir = self.path_of(ino)?;
         if self.is_overlay(&dir) {
@@ -254,32 +261,28 @@ impl RemoteFs {
         let mut out = Vec::new();
         let mut cursor = 0u64;
         loop {
-            match self.call(Request::Readdir {
-                path: dir.clone(),
-                cursor,
-            })? {
-                Response::Dir { entries, next_cursor } => {
-                    for e in entries {
-                        let child = dir.join(&e.name);
-                        if self.is_overlay(&child) {
-                            continue; // shadowed by the overlay
-                        }
-                        let child_ino = self.ino.get_or_alloc(child);
-                        self.cache_attr(child_ino, e.attr);
-                        out.push((e.name, child_ino, e.attr));
-                    }
-                    match next_cursor {
-                        Some(c) => cursor = c,
-                        None => break,
-                    }
+            let (entries, next_cursor) = expect_resp!(
+                self.call(Request::Readdir { path: dir.clone(), cursor })?,
+                Response::Dir { entries, next_cursor } => (entries, next_cursor)
+            );
+            for e in entries {
+                let child = dir.join(&e.name);
+                if self.shadowed_by_overlay(&child) {
+                    continue;
                 }
-                _ => return Err(ErrorCode::Io.into()),
+                let child_ino = self.ino.get_or_alloc(child);
+                self.cache_attr(child_ino, e.attr);
+                out.push((e.name, child_ino, e.attr));
+            }
+            match next_cursor {
+                Some(c) => cursor = c,
+                None => break,
             }
         }
         if let Some(ov) = &self.overlay {
             for (name, attr) in ov.readdir_children(&dir) {
                 let child = dir.join(&name);
-                if ov.excluded(&child) {
+                if self.lives_in_overlay(&child) {
                     let child_ino = self.ino.get_or_alloc(child);
                     out.push((name, child_ino, attr));
                 }
@@ -293,26 +296,14 @@ impl RemoteFs {
         if self.is_overlay(&path) {
             return self.overlay_ref().open(&path, flags);
         }
-        match self.call(Request::Open {
-            path: path.clone(),
-            flags,
-        })? {
-            Response::Opened { fh, attr } => {
-                debug_assert!(fh & OVERLAY_FH_BIT == 0, "server fh collides with overlay bit");
-                self.cache_attr(ino, attr);
-                let cache_ok = self.cache.as_ref().is_some_and(|c| c.fresh_for(&path, &attr));
-                self.open_files.insert(
-                    fh,
-                    OpenState {
-                        path,
-                        cache_ok: AtomicBool::new(cache_ok),
-                        wrote: AtomicBool::new(false),
-                    },
-                );
-                Ok((fh, attr))
-            }
-            _ => Err(ErrorCode::Io.into()),
-        }
+        let (fh, attr) =
+            expect_resp!(self.call(Request::Open { path: path.clone(), flags })?, Response::Opened { fh, attr } => (fh, attr));
+        debug_assert!(fh & OVERLAY_FH_BIT == 0, "server fh collides with overlay bit");
+        self.cache_attr(ino, attr);
+        let cache_ok = self.cache.as_ref().is_some_and(|c| c.fresh_for(&path, &attr));
+        self.open_files
+            .insert(fh, OpenState { path, cache_ok: AtomicBool::new(cache_ok), wrote: AtomicBool::new(false) });
+        Ok((fh, attr))
     }
 
     pub fn read(&self, fh: u64, offset: u64, size: u32) -> Result<Vec<u8>, FsError> {
@@ -343,26 +334,20 @@ impl RemoteFs {
             v
         };
         let responses = self.rt.block_on(async {
-            futures::future::join_all(chunks.iter().map(|&(pos, want)| {
-                self.conn.request(Request::Read {
-                    fh,
-                    offset: pos,
-                    len: want,
-                })
-            }))
+            futures::future::join_all(
+                chunks
+                    .iter()
+                    .map(|&(pos, want)| self.conn.request(Request::Read { fh, offset: pos, len: want })),
+            )
             .await
         });
         let mut out = Vec::with_capacity(size as usize);
         for (resp, &(_, want)) in responses.into_iter().zip(&chunks) {
-            match resp?? {
-                Response::Data(chunk) => {
-                    let got = chunk.len() as u32;
-                    out.extend_from_slice(&chunk);
-                    if got < want {
-                        break; // EOF inside this chunk
-                    }
-                }
-                _ => return Err(ErrorCode::Io.into()),
+            let chunk = expect_resp!(resp??, Response::Data(chunk) => chunk);
+            let got = chunk.len() as u32;
+            out.extend_from_slice(&chunk);
+            if got < want {
+                break; // EOF inside this chunk
             }
         }
         Ok(out)
@@ -377,22 +362,21 @@ impl RemoteFs {
         let mut pos = 0usize;
         while pos < data.len() {
             let chunk = &data[pos..(pos + DATA_CHUNK as usize).min(data.len())];
-            match self.call(Request::Write {
-                fh,
-                offset: offset + pos as u64,
-                data: bytes::Bytes::copy_from_slice(chunk),
-                expect_version: None,
-            })? {
-                Response::Written { n, conflict, .. } => {
-                    if conflict {
-                        tracing::warn!(fh, "server reported concurrent modification");
-                    }
-                    pos += n as usize;
-                    if n == 0 {
-                        return Err(ErrorCode::Io.into());
-                    }
-                }
-                _ => return Err(ErrorCode::Io.into()),
+            let (n, conflict) = expect_resp!(
+                self.call(Request::Write {
+                    fh,
+                    offset: offset + pos as u64,
+                    data: bytes::Bytes::copy_from_slice(chunk),
+                    expect_version: None,
+                })?,
+                Response::Written { n, conflict, .. } => (n, conflict)
+            );
+            if conflict {
+                tracing::warn!(fh, "server reported concurrent modification");
+            }
+            pos += n as usize;
+            if n == 0 {
+                return Err(ErrorCode::Io.into());
             }
         }
         // Our own writes never come back as events (server strips
@@ -430,26 +414,15 @@ impl RemoteFs {
             let ino = self.ino.get_or_alloc(path);
             return Ok((ino, fh, attr));
         }
-        match self.call(Request::Create {
-            path: path.clone(),
-            flags,
-            mode,
-        })? {
-            Response::Opened { fh, attr } => {
-                let ino = self.ino.get_or_alloc(path.clone());
-                self.cache_attr(ino, attr);
-                self.open_files.insert(
-                    fh,
-                    OpenState {
-                        path,
-                        cache_ok: AtomicBool::new(false),
-                        wrote: AtomicBool::new(true),
-                    },
-                );
-                Ok((ino, fh, attr))
-            }
-            _ => Err(ErrorCode::Io.into()),
-        }
+        let (fh, attr) = expect_resp!(
+            self.call(Request::Create { path: path.clone(), flags, mode })?,
+            Response::Opened { fh, attr } => (fh, attr)
+        );
+        let ino = self.ino.get_or_alloc(path.clone());
+        self.cache_attr(ino, attr);
+        self.open_files
+            .insert(fh, OpenState { path, cache_ok: AtomicBool::new(false), wrote: AtomicBool::new(true) });
+        Ok((ino, fh, attr))
     }
 
     pub fn mkdir(&self, parent: u64, name: &str, mode: u32) -> Result<(u64, Attr), FsError> {
@@ -460,17 +433,10 @@ impl RemoteFs {
             let ino = self.ino.get_or_alloc(path);
             return Ok((ino, attr));
         }
-        match self.call(Request::Mkdir {
-            path: path.clone(),
-            mode,
-        })? {
-            Response::Attr(attr) => {
-                let ino = self.ino.get_or_alloc(path);
-                self.cache_attr(ino, attr);
-                Ok((ino, attr))
-            }
-            _ => Err(ErrorCode::Io.into()),
-        }
+        let attr = expect_resp!(self.call(Request::Mkdir { path: path.clone(), mode })?, Response::Attr(attr) => attr);
+        let ino = self.ino.get_or_alloc(path);
+        self.cache_attr(ino, attr);
+        Ok((ino, attr))
     }
 
     pub fn unlink(&self, parent: u64, name: &str) -> Result<(), FsError> {
@@ -485,29 +451,17 @@ impl RemoteFs {
         let parent_path = self.path_of(parent)?;
         let path = parent_path.join(name);
         if self.is_overlay(&path) {
-            return if dir {
-                self.overlay_ref().rmdir(&path)
-            } else {
-                self.overlay_ref().unlink(&path)
-            };
+            return if dir { self.overlay_ref().rmdir(&path) } else { self.overlay_ref().unlink(&path) };
         }
-        let req = if dir {
-            Request::Rmdir { path: path.clone() }
-        } else {
-            Request::Unlink { path: path.clone() }
-        };
-        match self.call(req)? {
-            Response::Ok => {
-                if let Some(ino) = self.ino.ino_of(&path) {
-                    self.invalidate_attr(ino);
-                }
-                if let Some(cache) = &self.cache {
-                    cache.remove(&path);
-                }
-                Ok(())
-            }
-            _ => Err(ErrorCode::Io.into()),
+        let req = if dir { Request::Rmdir { path: path.clone() } } else { Request::Unlink { path: path.clone() } };
+        expect_resp!(self.call(req)?, Response::Ok => ());
+        if let Some(ino) = self.ino.ino_of(&path) {
+            self.invalidate_attr(ino);
         }
+        if let Some(cache) = &self.cache {
+            cache.remove(&path);
+        }
+        Ok(())
     }
 
     pub fn rename(
@@ -527,20 +481,15 @@ impl RemoteFs {
                 Ok(())
             }
             (false, false) => {
-                match self.call(Request::Rename {
-                    from: from.clone(),
-                    to: to.clone(),
-                    replace,
-                })? {
-                    Response::Ok => {
-                        self.ino.rename(&from, &to);
-                        if let Some(cache) = &self.cache {
-                            cache.rename(&from, &to);
-                        }
-                        Ok(())
-                    }
-                    _ => Err(ErrorCode::Io.into()),
+                expect_resp!(
+                    self.call(Request::Rename { from: from.clone(), to: to.clone(), replace })?,
+                    Response::Ok => ()
+                );
+                self.ino.rename(&from, &to);
+                if let Some(cache) = &self.cache {
+                    cache.rename(&from, &to);
                 }
+                Ok(())
             }
             // Across the boundary: EXDEV — tools fall back to copy+delete,
             // and each individual op then routes to the right side.
@@ -559,21 +508,15 @@ impl RemoteFs {
         if self.is_overlay(&path) {
             return self.overlay_ref().setattr(&path, size, mtime, mode);
         }
-        match self.call(Request::Setattr {
-            path: path.clone(),
-            size,
-            mtime,
-            mode,
-        })? {
-            Response::Attr(attr) => {
-                self.cache_attr(ino, attr);
-                if size.is_some() {
-                    self.mark_path_written(&path);
-                }
-                Ok(attr)
-            }
-            _ => Err(ErrorCode::Io.into()),
+        let attr = expect_resp!(
+            self.call(Request::Setattr { path: path.clone(), size, mtime, mode })?,
+            Response::Attr(attr) => attr
+        );
+        self.cache_attr(ino, attr);
+        if size.is_some() {
+            self.mark_path_written(&path);
         }
+        Ok(attr)
     }
 
     pub fn link(&self, target_ino: u64, newparent: u64, newname: &str) -> Result<(u64, Attr), FsError> {
@@ -586,17 +529,13 @@ impl RemoteFs {
                 let ino = self.ino.get_or_alloc(link);
                 Ok((ino, attr))
             }
-            (false, false) => match self.call(Request::Link {
-                target,
-                link: link.clone(),
-            })? {
-                Response::Attr(attr) => {
-                    let ino = self.ino.get_or_alloc(link);
-                    self.cache_attr(ino, attr);
-                    Ok((ino, attr))
-                }
-                _ => Err(ErrorCode::Io.into()),
-            },
+            (false, false) => {
+                let attr =
+                    expect_resp!(self.call(Request::Link { target, link: link.clone() })?, Response::Attr(attr) => attr);
+                let ino = self.ino.get_or_alloc(link);
+                self.cache_attr(ino, attr);
+                Ok((ino, attr))
+            }
             _ => Err(ErrorCode::CrossDevice.into()),
         }
     }
@@ -607,30 +546,24 @@ impl RemoteFs {
         if fh & OVERLAY_FH_BIT != 0 {
             return Ok(()); // single-machine data: advisory lock is a no-op
         }
-        match self.call(Request::Lock { fh, kind, wait })? {
-            Response::Ok => Ok(()),
-            _ => Err(ErrorCode::Io.into()),
-        }
+        expect_resp!(self.call(Request::Lock { fh, kind, wait })?, Response::Ok => ());
+        Ok(())
     }
 
     pub fn unlock(&self, fh: u64) -> Result<(), FsError> {
         if fh & OVERLAY_FH_BIT != 0 {
             return Ok(());
         }
-        match self.call(Request::Unlock { fh })? {
-            Response::Ok => Ok(()),
-            _ => Err(ErrorCode::Io.into()),
-        }
+        expect_resp!(self.call(Request::Unlock { fh })?, Response::Ok => ());
+        Ok(())
     }
 
     pub fn flush(&self, fh: u64) -> Result<(), FsError> {
         if fh & OVERLAY_FH_BIT != 0 {
             return self.overlay_ref().flush(fh);
         }
-        match self.call(Request::Flush { fh })? {
-            Response::Ok => Ok(()),
-            _ => Err(ErrorCode::Io.into()),
-        }
+        expect_resp!(self.call(Request::Flush { fh })?, Response::Ok => ());
+        Ok(())
     }
 
     pub fn release(&self, fh: u64) {
@@ -650,13 +583,10 @@ impl RemoteFs {
     }
 
     pub fn statfs(&self) -> Result<(u32, u64, u64), FsError> {
-        match self.call(Request::Statfs)? {
-            Response::Statfs {
-                block_size,
-                blocks,
-                blocks_free,
-            } => Ok((block_size, blocks, blocks_free)),
-            _ => Err(ErrorCode::Io.into()),
-        }
+        let out = expect_resp!(
+            self.call(Request::Statfs)?,
+            Response::Statfs { block_size, blocks, blocks_free } => (block_size, blocks, blocks_free)
+        );
+        Ok(out)
     }
 }

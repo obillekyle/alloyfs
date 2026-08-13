@@ -11,8 +11,8 @@ use std::time::SystemTime;
 use dashmap::DashMap;
 use ds_proto::{Attr, ErrorCode, OpenFlags, RelPath};
 
-use crate::exclude::ExcludeSet;
-use crate::localfs::{attr_from_metadata, io_to_code, read_fully, write_fully};
+use ds_common::ExcludeSet;
+use ds_common::{attr_from_metadata, io_to_code, read_fully, write_fully};
 use crate::remote_fs::FsError;
 
 /// Overlay file handles carry this bit; server handles are a small counter
@@ -64,7 +64,7 @@ impl Overlay {
 
     pub fn getattr(&self, p: &RelPath) -> Result<Attr, FsError> {
         let md = std::fs::symlink_metadata(self.abs(p)).map_err(|e| io_to_code(&e))?;
-        Ok(attr_from_metadata(&md))
+        Ok(attr_from_metadata(&md, 0))
     }
 
     pub fn open(&self, p: &RelPath, flags: OpenFlags) -> Result<(u64, Attr), FsError> {
@@ -80,7 +80,7 @@ impl Overlay {
             return Err(ErrorCode::IsADirectory.into());
         }
         let fh = OVERLAY_FH_BIT | self.next_fh.fetch_add(1, Ordering::Relaxed);
-        let attr = attr_from_metadata(&md);
+        let attr = attr_from_metadata(&md, 0);
         self.handles.insert(
             fh,
             OverlayHandle {
@@ -108,7 +108,7 @@ impl Overlay {
         let _ = mode; // local umask/ACL decides
         let md = file.metadata().map_err(|e| io_to_code(&e))?;
         let fh = OVERLAY_FH_BIT | self.next_fh.fetch_add(1, Ordering::Relaxed);
-        let attr = attr_from_metadata(&md);
+        let attr = attr_from_metadata(&md, 0);
         self.handles.insert(
             fh,
             OverlayHandle {
@@ -150,7 +150,7 @@ impl Overlay {
             else {
                 continue;
             };
-            out.push((name, attr_from_metadata(&md)));
+            out.push((name, attr_from_metadata(&md, 0)));
         }
         out
     }
@@ -162,7 +162,7 @@ impl Overlay {
         }
         std::fs::create_dir(&full).map_err(|e| io_to_code(&e))?;
         let md = std::fs::metadata(&full).map_err(|e| io_to_code(&e))?;
-        Ok(attr_from_metadata(&md))
+        Ok(attr_from_metadata(&md, 0))
     }
 
     pub fn unlink(&self, p: &RelPath) -> Result<(), FsError> {
@@ -212,7 +212,7 @@ impl Overlay {
             f.set_modified(mtime).map_err(|e| io_to_code(&e))?;
         }
         let md = std::fs::metadata(&full).map_err(|e| io_to_code(&e))?;
-        Ok(attr_from_metadata(&md))
+        Ok(attr_from_metadata(&md, 0))
     }
 
     pub fn link(&self, target: &RelPath, link: &RelPath) -> Result<Attr, FsError> {
@@ -222,7 +222,7 @@ impl Overlay {
         }
         std::fs::hard_link(self.abs(target), &link_full).map_err(|e| io_to_code(&e))?;
         let md = std::fs::metadata(&link_full).map_err(|e| io_to_code(&e))?;
-        Ok(attr_from_metadata(&md))
+        Ok(attr_from_metadata(&md, 0))
     }
 
     pub fn flush(&self, fh: u64) -> Result<(), FsError> {

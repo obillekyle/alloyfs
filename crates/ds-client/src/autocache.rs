@@ -16,8 +16,8 @@ use ds_proto::{Attr, RelPath};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-use crate::exclude::ExcludeSet;
-use crate::localfs::{io_to_code, read_fully};
+use ds_common::ExcludeSet;
+use ds_common::{io_to_code, read_fully};
 
 pub(crate) struct AutoCacheConfig {
     pub max_file_size: u64,
@@ -147,6 +147,11 @@ impl AutoCache {
         ))
     }
 
+    /// The state lock, one honest panic point instead of eighteen.
+    fn st(&self) -> std::sync::MutexGuard<'_, CacheState> {
+        self.state.lock().unwrap()
+    }
+
     pub fn pin_match(&self, p: &RelPath) -> bool {
         self.pins.is_excluded(p)
     }
@@ -159,7 +164,7 @@ impl AutoCache {
     /// May the cached blob serve reads for `path`, given a current server
     /// Attr? Also bumps LRU + re-verifies after a resync.
     pub fn fresh_for(&self, path: &RelPath, attr: &Attr) -> bool {
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.st();
         st.tick += 1;
         let tick = st.tick;
         let Some(entry) = st.entries.get_mut(path) else {
@@ -189,7 +194,7 @@ impl AutoCache {
     /// Record a fully fetched blob (already staged at its final path by the
     /// fetcher). Evicts LRU non-pinned entries to fit the budget.
     pub fn commit(&self, path: &RelPath, attr: &Attr, pinned: bool) {
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.st();
         st.tick += 1;
         let tick = st.tick;
         if let Some(old) = st.entries.remove(path) {
@@ -239,7 +244,7 @@ impl AutoCache {
 
     /// Is a (re-)fetch worthwhile: not already fresh for this attr?
     pub fn needs_fetch(&self, path: &RelPath, attr: &Attr) -> bool {
-        let st = self.state.lock().unwrap();
+        let st = self.st();
         match st.entries.get(path) {
             Some(e) => {
                 !(attr.size == e.size
@@ -251,11 +256,11 @@ impl AutoCache {
     }
 
     pub fn known(&self, path: &RelPath) -> bool {
-        self.state.lock().unwrap().entries.contains_key(path)
+        self.st().entries.contains_key(path)
     }
 
     pub fn invalidate(&self, path: &RelPath) {
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.st();
         if let Some(e) = st.entries.remove(path) {
             st.total_bytes -= e.size;
             st.dirty = true;
@@ -269,7 +274,7 @@ impl AutoCache {
 
     /// Rename bookkeeping incl. directory prefix moves (mirrors InodeTable).
     pub fn rename(&self, from: &RelPath, to: &RelPath) {
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.st();
         let prefix = format!("{}/", from.0);
         let affected: Vec<RelPath> = st
             .entries
@@ -302,7 +307,7 @@ impl AutoCache {
 
     /// After ResyncRequired: keep blobs but force re-validation at next open.
     pub fn mark_all_unverified(&self) {
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.st();
         for e in st.entries.values_mut() {
             e.verified = false;
         }
@@ -313,14 +318,14 @@ impl AutoCache {
     }
 
     pub fn stats(&self) -> (usize, u64) {
-        let st = self.state.lock().unwrap();
+        let st = self.st();
         (st.entries.len(), st.total_bytes)
     }
 
     /// Persist the manifest if dirty. Called by the flusher task and shutdown.
     pub fn flush_manifest(&self) {
         let snapshot = {
-            let mut st = self.state.lock().unwrap();
+            let mut st = self.st();
             if !st.dirty {
                 return;
             }
