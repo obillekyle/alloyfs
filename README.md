@@ -201,6 +201,15 @@ vendored upstream crate carrying a small build patch for the portable
 llvm-mingw toolchain; it keeps its upstream licenses (winfsp-rs MIT, WinFsp
 GPLv3-with-FLOSS-exception).
 
+## Development
+
+`bash scripts/verify.sh` is the local gate: fmt check, clippy (deny
+warnings), the full test suite (unit + the in-process loopback integration
+battery + the frozen wire-format goldens), and a release build. CI
+(`.github/workflows/ci.yml`) runs the same on ubuntu + windows the moment
+this repo ever lands on GitHub. If you change any protocol type, the golden
+test tells you exactly what to do.
+
 ## Building
 
 Rust workspace; `cargo build` at the root. Platform bridges are isolated:

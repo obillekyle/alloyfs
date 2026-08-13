@@ -1,0 +1,46 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # NOTE: never add RUSTFLAGS=-Dwarnings here — the vendored path-patched
+  # winfsp-sys crate is lint-uncapped (local path dep) and would fail the
+  # Windows build. Deny warnings via the clippy invocation instead.
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      # MSVC host default on Windows — deliberately covers the toolchain path
+      # the gnullvm dev machine can't test.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      # winfsp-sys reads the WinFsp registry key + SDK at build time; the
+      # choco package installs with INSTALLLEVEL=1000 (includes Developer).
+      # Fallback if choco ever lags: download the MSI from GitHub releases and
+      # msiexec /i winfsp.msi /qn INSTALLLEVEL=1000 (runners are admin).
+      - name: Install WinFsp (with SDK)
+        if: runner.os == 'Windows'
+        run: choco install winfsp -y --no-progress
+      # bindgen needs libclang; the runner image ships LLVM here.
+      - name: Point bindgen at preinstalled LLVM
+        if: runner.os == 'Windows'
+        run: echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -Append $env:GITHUB_ENV
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+        env:
+          DS_TEST_DEADLINE_MULT: "3" # generous event-timing ceilings on shared runners
+      # Exercises the pinned profile as-is (lto=false is load-bearing; see
+      # the comment in the workspace Cargo.toml — do not override profiles).
+      - run: cargo build --workspace --release
