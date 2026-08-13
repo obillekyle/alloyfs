@@ -38,7 +38,12 @@ impl Overlay {
         // matcher must too — "Node_Modules" still routes local there.
         let matcher = ExcludeSet::compile(patterns, cfg!(windows))?;
         std::fs::create_dir_all(&root)?;
-        Ok(Self { matcher, root, handles: DashMap::new(), next_fh: AtomicU64::new(1) })
+        Ok(Self {
+            matcher,
+            root,
+            handles: DashMap::new(),
+            next_fh: AtomicU64::new(1),
+        })
     }
 
     pub fn excluded(&self, p: &RelPath) -> bool {
@@ -76,7 +81,13 @@ impl Overlay {
         }
         let fh = OVERLAY_FH_BIT | self.next_fh.fetch_add(1, Ordering::Relaxed);
         let attr = attr_from_metadata(&md);
-        self.handles.insert(fh, OverlayHandle { file, path: p.clone() });
+        self.handles.insert(
+            fh,
+            OverlayHandle {
+                file,
+                path: p.clone(),
+            },
+        );
         Ok((fh, attr))
     }
 
@@ -98,7 +109,13 @@ impl Overlay {
         let md = file.metadata().map_err(|e| io_to_code(&e))?;
         let fh = OVERLAY_FH_BIT | self.next_fh.fetch_add(1, Ordering::Relaxed);
         let attr = attr_from_metadata(&md);
-        self.handles.insert(fh, OverlayHandle { file, path: p.clone() });
+        self.handles.insert(
+            fh,
+            OverlayHandle {
+                file,
+                path: p.clone(),
+            },
+        );
         Ok((fh, attr))
     }
 
@@ -119,11 +136,18 @@ impl Overlay {
     /// Direct children present on local disk under `dir` (empty if the
     /// directory doesn't exist locally yet).
     pub fn readdir_children(&self, dir: &RelPath) -> Vec<(String, Attr)> {
-        let Ok(rd) = std::fs::read_dir(self.abs(dir)) else { return Vec::new() };
+        let Ok(rd) = std::fs::read_dir(self.abs(dir)) else {
+            return Vec::new();
+        };
         let mut out = Vec::new();
         for item in rd.flatten() {
-            let Ok(name) = item.file_name().into_string() else { continue };
-            let Ok(md) = item.metadata().or_else(|_| std::fs::symlink_metadata(item.path())) else {
+            let Ok(name) = item.file_name().into_string() else {
+                continue;
+            };
+            let Ok(md) = item
+                .metadata()
+                .or_else(|_| std::fs::symlink_metadata(item.path()))
+            else {
                 continue;
             };
             out.push((name, attr_from_metadata(&md)));
@@ -174,11 +198,17 @@ impl Overlay {
     ) -> Result<Attr, FsError> {
         let full = self.abs(p);
         if let Some(size) = size {
-            let f = File::options().write(true).open(&full).map_err(|e| io_to_code(&e))?;
+            let f = File::options()
+                .write(true)
+                .open(&full)
+                .map_err(|e| io_to_code(&e))?;
             f.set_len(size).map_err(|e| io_to_code(&e))?;
         }
         if let Some(mtime) = mtime {
-            let f = File::options().write(true).open(&full).map_err(|e| io_to_code(&e))?;
+            let f = File::options()
+                .write(true)
+                .open(&full)
+                .map_err(|e| io_to_code(&e))?;
             f.set_modified(mtime).map_err(|e| io_to_code(&e))?;
         }
         let md = std::fs::metadata(&full).map_err(|e| io_to_code(&e))?;
@@ -208,7 +238,9 @@ impl Overlay {
     /// On-disk top-level entries that no longer match any exclude pattern —
     /// invisible orphans worth warning about at mount time.
     pub fn orphans(&self) -> Vec<String> {
-        let Ok(rd) = std::fs::read_dir(&self.root) else { return Vec::new() };
+        let Ok(rd) = std::fs::read_dir(&self.root) else {
+            return Vec::new();
+        };
         rd.flatten()
             .filter_map(|item| item.file_name().into_string().ok())
             .filter(|name| !self.matcher.is_excluded(&RelPath(name.clone())))

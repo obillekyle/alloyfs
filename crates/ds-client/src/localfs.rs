@@ -33,7 +33,14 @@ pub(crate) fn attr_from_metadata(md: &Metadata) -> Attr {
     };
     let mtime = md.modified().unwrap_or(SystemTime::UNIX_EPOCH);
     let ctime = md.created().unwrap_or(mtime);
-    Attr { kind, size: md.len(), mtime, ctime, mode: mode_of(md), version: 0 }
+    Attr {
+        kind,
+        size: md.len(),
+        mtime,
+        ctime,
+        mode: mode_of(md),
+        version: 0,
+    }
 }
 
 #[cfg(unix)]

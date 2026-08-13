@@ -29,7 +29,9 @@ impl RelPath {
         if s.starts_with('/') || s.contains('\\') {
             return Err(ErrorCode::InvalidPath);
         }
-        if s.split('/').any(|c| c.is_empty() && !s.is_empty() || c == "." || c == "..") {
+        if s.split('/')
+            .any(|c| c.is_empty() && !s.is_empty() || c == "." || c == "..")
+        {
             return Err(ErrorCode::InvalidPath);
         }
         Ok(())
@@ -143,7 +145,9 @@ pub enum EventKind {
     Modified,
     AttrChanged,
     Removed,
-    RenamedFrom { to: RelPath },
+    RenamedFrom {
+        to: RelPath,
+    },
     /// Event log rotated past this subscriber (or watcher overflow): caches
     /// can no longer be patched incrementally and must be flushed.
     ResyncRequired,
@@ -151,54 +155,146 @@ pub enum EventKind {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Request {
-    Attach { export: String },
-    Getattr { path: RelPath },
-    Readdir { path: RelPath, cursor: u64 },
-    Open { path: RelPath, flags: OpenFlags },
-    Create { path: RelPath, flags: OpenFlags, mode: u32 },
-    Read { fh: u64, offset: u64, len: u32 },
-    Write { fh: u64, offset: u64, data: Bytes, expect_version: Option<u64> },
-    Flush { fh: u64 },
-    Release { fh: u64 },
-    Setattr { path: RelPath, size: Option<u64>, mtime: Option<SystemTime>, mode: Option<u32> },
-    Mkdir { path: RelPath, mode: u32 },
-    Unlink { path: RelPath },
-    Rmdir { path: RelPath },
-    Rename { from: RelPath, to: RelPath, replace: bool },
-    Lock { fh: u64, kind: LockKind, wait: bool },
-    Unlock { fh: u64 },
-    Subscribe { since_seq: Option<u64> },
+    Attach {
+        export: String,
+    },
+    Getattr {
+        path: RelPath,
+    },
+    Readdir {
+        path: RelPath,
+        cursor: u64,
+    },
+    Open {
+        path: RelPath,
+        flags: OpenFlags,
+    },
+    Create {
+        path: RelPath,
+        flags: OpenFlags,
+        mode: u32,
+    },
+    Read {
+        fh: u64,
+        offset: u64,
+        len: u32,
+    },
+    Write {
+        fh: u64,
+        offset: u64,
+        data: Bytes,
+        expect_version: Option<u64>,
+    },
+    Flush {
+        fh: u64,
+    },
+    Release {
+        fh: u64,
+    },
+    Setattr {
+        path: RelPath,
+        size: Option<u64>,
+        mtime: Option<SystemTime>,
+        mode: Option<u32>,
+    },
+    Mkdir {
+        path: RelPath,
+        mode: u32,
+    },
+    Unlink {
+        path: RelPath,
+    },
+    Rmdir {
+        path: RelPath,
+    },
+    Rename {
+        from: RelPath,
+        to: RelPath,
+        replace: bool,
+    },
+    Lock {
+        fh: u64,
+        kind: LockKind,
+        wait: bool,
+    },
+    Unlock {
+        fh: u64,
+    },
+    Subscribe {
+        since_seq: Option<u64>,
+    },
     Statfs,
     /// Hard link: `link` becomes a second name for existing `target`. Only
     /// within one export — cross-device links are impossible by definition
     /// (two directory entries must share one inode). Appended last: postcard
     /// encodes variant indices, so old peers stay compatible.
-    Link { target: RelPath, link: RelPath },
+    Link {
+        target: RelPath,
+        link: RelPath,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Response {
-    AttachOk { export_id: u32, root_attr: Attr },
+    AttachOk {
+        export_id: u32,
+        root_attr: Attr,
+    },
     Attr(Attr),
-    Dir { entries: Vec<DirEntry>, next_cursor: Option<u64> },
-    Opened { fh: u64, attr: Attr },
+    Dir {
+        entries: Vec<DirEntry>,
+        next_cursor: Option<u64>,
+    },
+    Opened {
+        fh: u64,
+        attr: Attr,
+    },
     Data(Bytes),
-    Written { n: u32, new_version: u64, conflict: bool },
-    Statfs { block_size: u32, blocks: u64, blocks_free: u64 },
-    Subscribed { last_seq: u64 },
+    Written {
+        n: u32,
+        new_version: u64,
+        conflict: bool,
+    },
+    Statfs {
+        block_size: u32,
+        blocks: u64,
+        blocks_free: u64,
+    },
+    Subscribed {
+        last_seq: u64,
+    },
     Ok,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Frame {
     /// First frame from the client.
-    Hello { proto_min: u16, proto_max: u16, client: String },
+    Hello {
+        proto_min: u16,
+        proto_max: u16,
+        client: String,
+    },
     /// Server's reply choosing the version; connection is then "up".
-    HelloAck { proto: u16, server: String },
-    Request { id: u64, body: Request },
-    Response { id: u64, body: Result<Response, ErrorCode> },
+    HelloAck {
+        proto: u16,
+        server: String,
+    },
+    Request {
+        id: u64,
+        body: Request,
+    },
+    Response {
+        id: u64,
+        body: Result<Response, ErrorCode>,
+    },
     /// Server push; not correlated with any request.
-    Events { batch: Vec<FsEvent> },
-    Ping { nonce: u64 },
-    Pong { nonce: u64 },
+    Events {
+        batch: Vec<FsEvent>,
+    },
+    Ping {
+        nonce: u64,
+    },
+    Pong {
+        nonce: u64,
+    },
 }

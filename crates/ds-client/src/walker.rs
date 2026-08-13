@@ -20,7 +20,11 @@ use crate::remote_fs::RemoteFs;
 const FILE_CONCURRENCY: usize = 4;
 const CHUNK_CONCURRENCY: usize = 8;
 
-pub(crate) fn spawn(fs: Arc<RemoteFs>, cache: Arc<AutoCache>, mut fetch_rx: mpsc::UnboundedReceiver<RelPath>) {
+pub(crate) fn spawn(
+    fs: Arc<RemoteFs>,
+    cache: Arc<AutoCache>,
+    mut fetch_rx: mpsc::UnboundedReceiver<RelPath>,
+) {
     tokio::spawn(async move {
         let started = std::time::Instant::now();
         let sem = Arc::new(Semaphore::new(FILE_CONCURRENCY));
@@ -33,7 +37,13 @@ pub(crate) fn spawn(fs: Arc<RemoteFs>, cache: Arc<AutoCache>, mut fetch_rx: mpsc
             walked_dirs += 1;
             let mut cursor = 0u64;
             loop {
-                let resp = fs.conn().request(Request::Readdir { path: dir.clone(), cursor }).await;
+                let resp = fs
+                    .conn()
+                    .request(Request::Readdir {
+                        path: dir.clone(),
+                        cursor,
+                    })
+                    .await;
                 let (entries, next) = match resp {
                     Ok(Ok(Response::Dir { entries, next_cursor })) => (entries, next_cursor),
                     _ => break, // transient failure: skip this dir, keep walking
@@ -105,8 +115,17 @@ pub(crate) fn spawn(fs: Arc<RemoteFs>, cache: Arc<AutoCache>, mut fetch_rx: mpsc
 /// Fetch one file into the cache: open → verify it (still) qualifies →
 /// chunked concurrent read → stage `.part` → rename into place → commit.
 async fn fetch_one(fs: &Arc<RemoteFs>, cache: &Arc<AutoCache>, path: &RelPath) -> bool {
-    let flags = OpenFlags { read: true, ..OpenFlags::default() };
-    let opened = fs.conn().request(Request::Open { path: path.clone(), flags }).await;
+    let flags = OpenFlags {
+        read: true,
+        ..OpenFlags::default()
+    };
+    let opened = fs
+        .conn()
+        .request(Request::Open {
+            path: path.clone(),
+            flags,
+        })
+        .await;
     let (fh, attr) = match opened {
         Ok(Ok(Response::Opened { fh, attr })) => (fh, attr),
         _ => return false, // vanished (or excluded server-side): fine

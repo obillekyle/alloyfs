@@ -94,15 +94,22 @@ impl Export {
         let mut entries = Vec::new();
         for item in std::fs::read_dir(&full).map_err(|e| io_to_code(&e))? {
             let item = item.map_err(|e| io_to_code(&e))?;
-            let Ok(name) = item.file_name().into_string() else { continue };
+            let Ok(name) = item.file_name().into_string() else {
+                continue;
+            };
             let child = rel.join(&name);
             if self.exclude.is_excluded(&child) {
                 continue; // invisible
             }
-            let md = item.metadata().or_else(|_| std::fs::symlink_metadata(item.path()));
+            let md = item
+                .metadata()
+                .or_else(|_| std::fs::symlink_metadata(item.path()));
             let Ok(md) = md else { continue };
             let version = self.version_of(&child);
-            entries.push(DirEntry { name, attr: attr_from_metadata(&md, version) });
+            entries.push(DirEntry {
+                name,
+                attr: attr_from_metadata(&md, version),
+            });
         }
         entries.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(entries)
@@ -149,7 +156,10 @@ impl ExportRegistry {
             );
         }
         anyhow::ensure!(!exports.is_empty(), "no exports configured");
-        Ok(Self { exports, sessions: DashMap::new() })
+        Ok(Self {
+            exports,
+            sessions: DashMap::new(),
+        })
     }
 
     /// Background task: every 5 s, free locks and handles of sessions whose
@@ -163,7 +173,9 @@ impl ExportRegistry {
                 tick.tick().await;
                 let Some(registry) = registry.upgrade() else { break };
                 registry.sessions.retain(|id, weak| {
-                    let Some(session) = weak.upgrade() else { return false };
+                    let Some(session) = weak.upgrade() else {
+                        return false;
+                    };
                     if session.last_seen_elapsed() > lease {
                         let released = session.force_release();
                         if released > 0 {
@@ -317,7 +329,10 @@ impl SessionInner {
     }
 
     fn handle_of(&self, fh: u64) -> Result<Arc<OpenFile>, ErrorCode> {
-        self.handles.get(&fh).map(|h| h.clone()).ok_or(ErrorCode::BadHandle)
+        self.handles
+            .get(&fh)
+            .map(|h| h.clone())
+            .ok_or(ErrorCode::BadHandle)
     }
 
     fn dispatch_blocking(&self, req: Request) -> Result<Response, ErrorCode> {
@@ -328,7 +343,10 @@ impl SessionInner {
                 let attr = attr_from_metadata(&md, 0);
                 tracing::info!(export = export.name, "client attached");
                 let _ = self.attached.set(export);
-                Ok(Response::AttachOk { export_id: 0, root_attr: attr })
+                Ok(Response::AttachOk {
+                    export_id: 0,
+                    root_attr: attr,
+                })
             }
             Request::Getattr { path } => {
                 let export = self.export()?;
@@ -353,19 +371,30 @@ impl SessionInner {
                     }
                     // metadata() follows symlinks; fall back to the link's own
                     // metadata for broken links so the entry still lists.
-                    let md = item.metadata().or_else(|_| std::fs::symlink_metadata(item.path()));
+                    let md = item
+                        .metadata()
+                        .or_else(|_| std::fs::symlink_metadata(item.path()));
                     let Ok(md) = md else { continue };
                     // Real versions in listings: the client auto-cache walker
                     // relies on them for freshness without extra Getattrs.
                     let version = export.version_of(&child);
-                    entries.push(DirEntry { name, attr: attr_from_metadata(&md, version) });
+                    entries.push(DirEntry {
+                        name,
+                        attr: attr_from_metadata(&md, version),
+                    });
                 }
                 entries.sort_by(|a, b| a.name.cmp(&b.name));
                 let start = cursor as usize;
                 let page: Vec<DirEntry> = entries.iter().skip(start).take(READDIR_PAGE).cloned().collect();
-                let next_cursor =
-                    if start + page.len() < entries.len() { Some((start + page.len()) as u64) } else { None };
-                Ok(Response::Dir { entries: page, next_cursor })
+                let next_cursor = if start + page.len() < entries.len() {
+                    Some((start + page.len()) as u64)
+                } else {
+                    None
+                };
+                Ok(Response::Dir {
+                    entries: page,
+                    next_cursor,
+                })
             }
             Request::Open { path, flags } => {
                 let export = self.export()?;
@@ -384,10 +413,21 @@ impl SessionInner {
                 if md.is_dir() {
                     return Err(ErrorCode::IsADirectory);
                 }
-                let version = if flags.truncate { export.bump(&path) } else { export.version_of(&path) };
+                let version = if flags.truncate {
+                    export.bump(&path)
+                } else {
+                    export.version_of(&path)
+                };
                 let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
                 let attr = attr_from_metadata(&md, version);
-                self.handles.insert(fh, Arc::new(OpenFile { file, path, writable: wants_write }));
+                self.handles.insert(
+                    fh,
+                    Arc::new(OpenFile {
+                        file,
+                        path,
+                        writable: wants_write,
+                    }),
+                );
                 Ok(Response::Opened { fh, attr })
             }
             Request::Create { path, flags, mode } => {
@@ -413,7 +453,14 @@ impl SessionInner {
                 let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
                 let attr = attr_from_metadata(&md, version);
                 let _ = flags; // creation implies writability regardless of flags
-                self.handles.insert(fh, Arc::new(OpenFile { file, path, writable: true }));
+                self.handles.insert(
+                    fh,
+                    Arc::new(OpenFile {
+                        file,
+                        path,
+                        writable: true,
+                    }),
+                );
                 Ok(Response::Opened { fh, attr })
             }
             Request::Read { fh, offset, len } => {
@@ -439,9 +486,18 @@ impl SessionInner {
             Request::Statfs => {
                 // Real numbers come with a platform statvfs call later; these
                 // placeholders are already enough for `df` not to error.
-                Ok(Response::Statfs { block_size: 4096, blocks: 1 << 24, blocks_free: 1 << 23 })
+                Ok(Response::Statfs {
+                    block_size: 4096,
+                    blocks: 1 << 24,
+                    blocks_free: 1 << 23,
+                })
             }
-            Request::Write { fh, offset, data, expect_version } => {
+            Request::Write {
+                fh,
+                offset,
+                data,
+                expect_version,
+            } => {
                 let export = self.export()?;
                 if export.read_only {
                     return Err(ErrorCode::ReadOnly);
@@ -459,24 +515,42 @@ impl SessionInner {
                 crate::fsutil::write_fully(&of.file, &data, offset).map_err(|e| io_to_code(&e))?;
                 export.events.note_local_write(&of.path, self.id);
                 let new_version = export.bump(&of.path);
-                Ok(Response::Written { n: data.len() as u32, new_version, conflict })
+                Ok(Response::Written {
+                    n: data.len() as u32,
+                    new_version,
+                    conflict,
+                })
             }
-            Request::Setattr { path, size, mtime, mode } => {
+            Request::Setattr {
+                path,
+                size,
+                mtime,
+                mode,
+            } => {
                 let export = self.export()?;
                 if export.read_only {
                     return Err(ErrorCode::ReadOnly);
                 }
                 let full = export.resolve(&path)?;
                 if let Some(size) = size {
-                    let f = File::options().write(true).open(&full).map_err(|e| io_to_code(&e))?;
+                    let f = File::options()
+                        .write(true)
+                        .open(&full)
+                        .map_err(|e| io_to_code(&e))?;
                     f.set_len(size).map_err(|e| io_to_code(&e))?;
                 }
                 if let Some(mtime) = mtime {
-                    let f = File::options().write(true).open(&full).map_err(|e| io_to_code(&e))?;
+                    let f = File::options()
+                        .write(true)
+                        .open(&full)
+                        .map_err(|e| io_to_code(&e))?;
                     f.set_modified(mtime).map_err(|e| io_to_code(&e))?;
                 }
                 if let Some(mode) = mode {
-                    let f = File::options().write(true).open(&full).map_err(|e| io_to_code(&e))?;
+                    let f = File::options()
+                        .write(true)
+                        .open(&full)
+                        .map_err(|e| io_to_code(&e))?;
                     set_mode(&f, mode);
                 }
                 let md = std::fs::metadata(&full).map_err(|e| io_to_code(&e))?;

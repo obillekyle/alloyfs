@@ -8,7 +8,9 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::codec::{FramedRead, FramedWrite};
 
-use ds_proto::{ErrorCode, Frame, FrameCodec, FsEvent, Request, Response, PROTO_VERSION_MAX, PROTO_VERSION_MIN};
+use ds_proto::{
+    ErrorCode, Frame, FrameCodec, FsEvent, Request, Response, PROTO_VERSION_MAX, PROTO_VERSION_MIN,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum TransportError {
@@ -64,11 +66,14 @@ impl MuxConnection {
             None => return Err(TransportError::Closed),
         };
         if !(PROTO_VERSION_MIN..=PROTO_VERSION_MAX).contains(&proto) {
-            return Err(TransportError::Handshake(format!("server chose unsupported version {proto}")));
+            return Err(TransportError::Handshake(format!(
+                "server chose unsupported version {proto}"
+            )));
         }
 
         let (tx, mut out_rx) = mpsc::channel::<Frame>(256);
-        let inflight: Arc<DashMap<u64, oneshot::Sender<Result<Response, ErrorCode>>>> = Arc::new(DashMap::new());
+        let inflight: Arc<DashMap<u64, oneshot::Sender<Result<Response, ErrorCode>>>> =
+            Arc::new(DashMap::new());
         let pings: Arc<DashMap<u64, oneshot::Sender<()>>> = Arc::new(DashMap::new());
         let (events_tx, _) = broadcast::channel(256);
 

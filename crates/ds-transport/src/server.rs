@@ -58,12 +58,19 @@ where
     let mut writer = FramedWrite::new(w, FrameCodec);
 
     match reader.next().await {
-        Some(Ok(Frame::Hello { proto_min, proto_max, client })) => {
+        Some(Ok(Frame::Hello {
+            proto_min,
+            proto_max,
+            client,
+        })) => {
             let lo = proto_min.max(PROTO_VERSION_MIN);
             let hi = proto_max.min(PROTO_VERSION_MAX);
             if lo > hi {
                 let _ = writer
-                    .send(&Frame::Response { id: 0, body: Err(ErrorCode::VersionMismatch) })
+                    .send(&Frame::Response {
+                        id: 0,
+                        body: Err(ErrorCode::VersionMismatch),
+                    })
                     .await;
                 return Err(TransportError::Handshake(format!(
                     "no common version with {client} ({proto_min}..={proto_max})"
@@ -71,10 +78,17 @@ where
             }
             tracing::info!(client, proto = hi, "session connected");
             writer
-                .send(&Frame::HelloAck { proto: hi, server: server_name.to_string() })
+                .send(&Frame::HelloAck {
+                    proto: hi,
+                    server: server_name.to_string(),
+                })
                 .await?;
         }
-        Some(Ok(other)) => return Err(TransportError::Handshake(format!("expected Hello, got {other:?}"))),
+        Some(Ok(other)) => {
+            return Err(TransportError::Handshake(format!(
+                "expected Hello, got {other:?}"
+            )))
+        }
         Some(Err(e)) => return Err(e.into()),
         None => return Err(TransportError::Closed),
     }

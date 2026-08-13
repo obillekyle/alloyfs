@@ -168,7 +168,13 @@ fn mount_key(url: &str, export: &str) -> String {
     }
     let sanitize = |s: &str| -> String {
         s.chars()
-            .map(|c| if c.is_ascii_alphanumeric() || "._-".contains(c) { c } else { '-' })
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || "._-".contains(c) {
+                    c
+                } else {
+                    '-'
+                }
+            })
             .collect()
     };
     let host = url
@@ -269,7 +275,9 @@ fn require_export(export: Option<String>, url: &str) -> anyhow::Result<String> {
 /// YAML preferred; TOML kept for existing deployments.
 fn default_config_path() -> Option<PathBuf> {
     #[cfg(unix)]
-    let dir = std::env::var("HOME").ok().map(|h| PathBuf::from(h).join(".config/drive-sync"));
+    let dir = std::env::var("HOME")
+        .ok()
+        .map(|h| PathBuf::from(h).join(".config/drive-sync"));
     #[cfg(windows)]
     let dir = Some(PathBuf::from("C:\\MyApps"));
     let dir = dir?;
@@ -280,10 +288,7 @@ fn default_config_path() -> Option<PathBuf> {
     names.iter().map(|n| dir.join(n)).find(|p| p.is_file())
 }
 
-fn load_agent_config(
-    config: Option<PathBuf>,
-    inline_exports: &[String],
-) -> anyhow::Result<AgentConfig> {
+fn load_agent_config(config: Option<PathBuf>, inline_exports: &[String]) -> anyhow::Result<AgentConfig> {
     let mut cfg = match config {
         Some(path) => AgentConfig::from_path(&path)?,
         // No explicit config: a default file (if present) supplies exports —
@@ -303,7 +308,11 @@ fn load_agent_config(
             .ok_or_else(|| anyhow::anyhow!("--export wants NAME=PATH, got {spec}"))?;
         cfg.exports.insert(
             name.to_string(),
-            ds_agent::ExportConfig { path: PathBuf::from(path), read_only: false, exclude: vec![] },
+            ds_agent::ExportConfig {
+                path: PathBuf::from(path),
+                read_only: false,
+                exclude: vec![],
+            },
         );
     }
     Ok(cfg)
@@ -313,14 +322,18 @@ fn load_agent_config(
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .with_writer(std::io::stderr) // stdout stays clean: future --stdio transport uses it
         .init();
 
     match Cli::parse().command {
-        Command::Serve { tcp: addr, stdio, config, exports } => {
+        Command::Serve {
+            tcp: addr,
+            stdio,
+            config,
+            exports,
+        } => {
             let cfg = load_agent_config(config, &exports)?;
             let registry = Arc::new(ExportRegistry::from_config(&cfg)?);
             // One watcher per export; guards keep the OS watchers alive for
@@ -352,8 +365,7 @@ async fn main() -> anyhow::Result<()> {
             if stdio {
                 // One session over our own stdin/stdout (the ssh exec channel).
                 // stdout carries protocol frames; logging is stderr-only.
-                ds_transport::stdio::serve(&name, Arc::new(AgentSession::new(registry)))
-                    .await?;
+                ds_transport::stdio::serve(&name, Arc::new(AgentSession::new(registry))).await?;
             } else {
                 let listen = cfg.agent.tcp_listen.unwrap_or(addr);
                 tcp::serve(&listen, name, move || {
@@ -379,7 +391,11 @@ async fn main() -> anyhow::Result<()> {
                     .map_err(|e| anyhow::anyhow!("mount config {}: {e}", path.display()))?,
                 None => MountConfig::default(),
             };
-            let excludes = if excludes.is_empty() { file_cfg.exclude } else { excludes };
+            let excludes = if excludes.is_empty() {
+                file_cfg.exclude
+            } else {
+                excludes
+            };
             let pins = if pins.is_empty() { file_cfg.pin } else { pins };
             let auto_cache_max = match (auto_cache_max, &file_cfg.auto_cache_max) {
                 (Some(flag), _) => parse_size(&flag).map_err(|e| anyhow::anyhow!(e))?,
@@ -410,7 +426,11 @@ async fn main() -> anyhow::Result<()> {
             mount_platform(fs, mountpoint, &export).await?;
         }
         Command::Cache { cmd } => match cmd {
-            CacheCmd::Clear { target, all, data_dir } => {
+            CacheCmd::Clear {
+                target,
+                all,
+                data_dir,
+            } => {
                 let base = data_dir.unwrap_or_else(default_data_dir).join("cache");
                 if all {
                     if base.exists() {
@@ -418,8 +438,8 @@ async fn main() -> anyhow::Result<()> {
                     }
                     println!("cleared all caches under {}", base.display());
                 } else {
-                    let url = target
-                        .ok_or_else(|| anyhow::anyhow!("pass a mount url (with export) or --all"))?;
+                    let url =
+                        target.ok_or_else(|| anyhow::anyhow!("pass a mount url (with export) or --all"))?;
                     let (_, export) = parse_url(&url)?;
                     let export = require_export(export, &url)?;
                     let key = mount_key(&url, &export);
@@ -433,7 +453,11 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         },
-        Command::Events { url, since, remote_cmd } => {
+        Command::Events {
+            url,
+            since,
+            remote_cmd,
+        } => {
             let (conn, export) = connect_target(&url, &remote_cmd, &whoami()).await?;
             let export = require_export(export, &url)?;
             let fs = ds_client::RemoteFs::attach(conn.clone(), &export).await?;
@@ -491,8 +515,15 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn whoami() -> String {
-    format!("{}@{}", std::env::var("USER").or_else(|_| std::env::var("USERNAME")).unwrap_or_else(|_| "?".into()),
-        std::env::var("HOSTNAME").or_else(|_| std::env::var("COMPUTERNAME")).unwrap_or_else(|_| "?".into()))
+    format!(
+        "{}@{}",
+        std::env::var("USER")
+            .or_else(|_| std::env::var("USERNAME"))
+            .unwrap_or_else(|_| "?".into()),
+        std::env::var("HOSTNAME")
+            .or_else(|_| std::env::var("COMPUTERNAME"))
+            .unwrap_or_else(|_| "?".into())
+    )
 }
 
 #[cfg(unix)]

@@ -1,0 +1,2 @@
+# Matches the existing hand style closely (minimizes the one-time churn).
+max_width = 110

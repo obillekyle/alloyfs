@@ -64,7 +64,9 @@ pub(crate) struct AutoCache {
 }
 
 pub(crate) fn mtime_ns(t: SystemTime) -> u128 {
-    t.duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)
+    t.duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
 }
 
 impl AutoCache {
@@ -118,7 +120,11 @@ impl AutoCache {
                 tracing::info!(evicted, bytes = total, "auto-cache shrank to fit budget at load");
             }
             if total > cfg.budget {
-                tracing::warn!(bytes = total, budget = cfg.budget, "pinned files alone exceed the cache budget");
+                tracing::warn!(
+                    bytes = total,
+                    budget = cfg.budget,
+                    "pinned files alone exceed the cache budget"
+                );
             }
         }
         let loaded = entries.len();
@@ -129,7 +135,12 @@ impl AutoCache {
             Self {
                 cfg,
                 pins,
-                state: Mutex::new(CacheState { entries, total_bytes: total, tick, dirty: false }),
+                state: Mutex::new(CacheState {
+                    entries,
+                    total_bytes: total,
+                    tick,
+                    dirty: false,
+                }),
                 fetch_tx,
             },
             fetch_rx,
@@ -151,7 +162,9 @@ impl AutoCache {
         let mut st = self.state.lock().unwrap();
         st.tick += 1;
         let tick = st.tick;
-        let Some(entry) = st.entries.get_mut(path) else { return false };
+        let Some(entry) = st.entries.get_mut(path) else {
+            return false;
+        };
         let fresh = attr.size == entry.size
             && mtime_ns(attr.mtime) == entry.mtime_ns
             && (attr.version == entry.version || attr.version == 0 || entry.version == 0);
@@ -330,7 +343,10 @@ impl AutoCache {
 
     pub fn blob_stage_path(&self, path: &RelPath) -> PathBuf {
         let mut p = blob_path(&self.cfg.root, path);
-        let name = format!("{}.part", p.file_name().and_then(|n| n.to_str()).unwrap_or("blob"));
+        let name = format!(
+            "{}.part",
+            p.file_name().and_then(|n| n.to_str()).unwrap_or("blob")
+        );
         p.set_file_name(name);
         p
     }
@@ -441,7 +457,10 @@ mod tests {
         c.rename(&RelPath("d".into()), &RelPath("e".into()));
         assert!(!c.known(&a));
         assert!(c.known(&RelPath("e/x.txt".into())));
-        assert_eq!(c.read(&RelPath("e/x.txt".into()), 0, 1).as_deref(), Some(&b"1"[..]));
+        assert_eq!(
+            c.read(&RelPath("e/x.txt".into()), 0, 1).as_deref(),
+            Some(&b"1"[..])
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

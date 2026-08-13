@@ -81,8 +81,15 @@ mod tests {
     #[test]
     fn roundtrip_all_variants() {
         let frames = vec![
-            Frame::Hello { proto_min: 1, proto_max: 1, client: "test".into() },
-            Frame::HelloAck { proto: 1, server: "srv".into() },
+            Frame::Hello {
+                proto_min: 1,
+                proto_max: 1,
+                client: "test".into(),
+            },
+            Frame::HelloAck {
+                proto: 1,
+                server: "srv".into(),
+            },
             Frame::Request {
                 id: 9,
                 body: Request::Write {
@@ -92,12 +99,24 @@ mod tests {
                     expect_version: Some(6),
                 },
             },
-            Frame::Response { id: 9, body: Ok(Response::Written { n: 11, new_version: 7, conflict: false }) },
-            Frame::Response { id: 10, body: Err(crate::ErrorCode::NotFound) },
+            Frame::Response {
+                id: 9,
+                body: Ok(Response::Written {
+                    n: 11,
+                    new_version: 7,
+                    conflict: false,
+                }),
+            },
+            Frame::Response {
+                id: 10,
+                body: Err(crate::ErrorCode::NotFound),
+            },
             Frame::Events {
                 batch: vec![FsEvent {
                     seq: 55,
-                    kind: EventKind::RenamedFrom { to: RelPath("b/new.txt".into()) },
+                    kind: EventKind::RenamedFrom {
+                        to: RelPath("b/new.txt".into()),
+                    },
                     path: RelPath("a/old.txt".into()),
                     new_version: Some(8),
                     origin: Some(1),
@@ -108,7 +127,10 @@ mod tests {
             Frame::Response {
                 id: 2,
                 body: Ok(Response::Dir {
-                    entries: vec![DirEntry { name: "x".into(), attr: sample_attr() }],
+                    entries: vec![DirEntry {
+                        name: "x".into(),
+                        attr: sample_attr(),
+                    }],
                     next_cursor: None,
                 }),
             },
@@ -140,7 +162,10 @@ mod tests {
         let mut buf = BytesMut::new();
         buf.put_u32_le((MAX_FRAME_LEN + 1) as u32);
         buf.put_slice(&[0u8; 16]);
-        assert!(matches!(codec.decode(&mut buf), Err(ProtoError::FrameTooLarge(_))));
+        assert!(matches!(
+            codec.decode(&mut buf),
+            Err(ProtoError::FrameTooLarge(_))
+        ));
     }
 
     #[test]
@@ -158,8 +183,14 @@ mod tests {
         let mut buf = BytesMut::new();
         codec.encode(&Frame::Ping { nonce: 1 }, &mut buf).unwrap();
         codec.encode(&Frame::Pong { nonce: 2 }, &mut buf).unwrap();
-        assert!(matches!(codec.decode(&mut buf), Ok(Some(Frame::Ping { nonce: 1 }))));
-        assert!(matches!(codec.decode(&mut buf), Ok(Some(Frame::Pong { nonce: 2 }))));
+        assert!(matches!(
+            codec.decode(&mut buf),
+            Ok(Some(Frame::Ping { nonce: 1 }))
+        ));
+        assert!(matches!(
+            codec.decode(&mut buf),
+            Ok(Some(Frame::Pong { nonce: 2 }))
+        ));
         assert!(matches!(codec.decode(&mut buf), Ok(None)));
     }
 

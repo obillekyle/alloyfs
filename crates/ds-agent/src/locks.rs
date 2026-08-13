@@ -71,7 +71,11 @@ impl LockManager {
                     return Err(ErrorCode::WouldBlock);
                 }
                 let (tx, rx) = oneshot::channel();
-                entry.waiters.push_back(Waiter { session, kind, wake: tx });
+                entry.waiters.push_back(Waiter {
+                    session,
+                    kind,
+                    wake: tx,
+                });
                 rx
             };
             // Parked until a release wakes us; then retry the take. A dropped
@@ -155,9 +159,7 @@ mod tests {
         let lm = std::sync::Arc::new(LockManager::default());
         lm.lock(&path(), 1, 1, LockKind::Exclusive, false).await.unwrap();
         let lm2 = lm.clone();
-        let waiter = tokio::spawn(async move {
-            lm2.lock(&path(), 2, 1, LockKind::Exclusive, true).await
-        });
+        let waiter = tokio::spawn(async move { lm2.lock(&path(), 2, 1, LockKind::Exclusive, true).await });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(!waiter.is_finished());
         lm.unlock(&path(), 1, 1);
@@ -167,9 +169,15 @@ mod tests {
     #[tokio::test]
     async fn session_release_frees_all() {
         let lm = LockManager::default();
-        lm.lock(&RelPath("x".into()), 7, 1, LockKind::Exclusive, false).await.unwrap();
-        lm.lock(&RelPath("y".into()), 7, 2, LockKind::Shared, false).await.unwrap();
+        lm.lock(&RelPath("x".into()), 7, 1, LockKind::Exclusive, false)
+            .await
+            .unwrap();
+        lm.lock(&RelPath("y".into()), 7, 2, LockKind::Shared, false)
+            .await
+            .unwrap();
         assert_eq!(lm.release_session(7), 2);
-        lm.lock(&RelPath("x".into()), 8, 1, LockKind::Exclusive, false).await.unwrap();
+        lm.lock(&RelPath("x".into()), 8, 1, LockKind::Exclusive, false)
+            .await
+            .unwrap();
     }
 }

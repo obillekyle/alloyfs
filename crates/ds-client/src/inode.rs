@@ -19,7 +19,11 @@ pub struct InodeTable {
 
 impl InodeTable {
     pub fn new() -> Self {
-        let t = Self { by_ino: DashMap::new(), by_path: DashMap::new(), next: AtomicU64::new(ROOT_INO + 1) };
+        let t = Self {
+            by_ino: DashMap::new(),
+            by_path: DashMap::new(),
+            next: AtomicU64::new(ROOT_INO + 1),
+        };
         t.by_ino.insert(ROOT_INO, RelPath(String::new()));
         t.by_path.insert(RelPath(String::new()), ROOT_INO);
         t

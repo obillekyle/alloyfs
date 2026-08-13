@@ -99,7 +99,11 @@ impl RemoteFs {
         self: &Arc<Self>,
         on_batch: impl Fn(&[FsEvent]) + Send + 'static,
     ) -> Result<u64, FsError> {
-        let last_seq = match self.conn().request(Request::Subscribe { since_seq: None }).await?? {
+        let last_seq = match self
+            .conn()
+            .request(Request::Subscribe { since_seq: None })
+            .await??
+        {
             Response::Subscribed { last_seq } => last_seq,
             _ => return Err(ds_proto::ErrorCode::Io.into()),
         };

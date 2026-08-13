@@ -40,7 +40,10 @@ impl ExcludeSet {
                 builder.add(glob);
             }
         }
-        Ok(Self { set: builder.build()?, empty: patterns.is_empty() })
+        Ok(Self {
+            set: builder.build()?,
+            empty: patterns.is_empty(),
+        })
     }
 
     pub fn is_excluded(&self, path: &RelPath) -> bool {

@@ -8,16 +8,16 @@
 //! root). Errors travel back as NTSTATUS via `FspError::NTSTATUS`.
 #![cfg(windows)]
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ds_client::{FsError, RemoteFs};
 use ds_proto::{Attr, ErrorCode, FileKind, OpenFlags, RelPath};
 use winfsp::constants::FspCleanupFlags;
 use winfsp::filesystem::{
-    DirBuffer, DirBufferLock, DirInfo, DirMarker, FileInfo, FileSecurity, FileSystemContext,
-    OpenFileInfo, VolumeInfo, WideNameInfo,
+    DirBuffer, DirBufferLock, DirInfo, DirMarker, FileInfo, FileSecurity, FileSystemContext, OpenFileInfo,
+    VolumeInfo, WideNameInfo,
 };
 use winfsp::host::{FileSystemHost, VolumeParams};
 use winfsp::{FspError, U16CStr};
@@ -259,9 +259,8 @@ impl FileSystemContext for WinFspFs {
 
         let mut fh = None;
         if !is_dir {
-            let wants_write = granted_access
-                & (FILE_WRITE_DATA | FILE_APPEND_DATA | GENERIC_WRITE | GENERIC_ALL)
-                != 0;
+            let wants_write =
+                granted_access & (FILE_WRITE_DATA | FILE_APPEND_DATA | GENERIC_WRITE | GENERIC_ALL) != 0;
             let wants_read = granted_access
                 & (FILE_READ_DATA | FILE_EXECUTE | GENERIC_READ | GENERIC_EXECUTE | GENERIC_ALL)
                 != 0;
@@ -332,7 +331,12 @@ impl FileSystemContext for WinFspFs {
             // WinFsp only routes true creations here (open-or-create
             // dispositions resolve via get_security_by_name first), so
             // exclusive semantics are correct.
-            let excl = OpenFlags { read: true, write: true, excl: true, ..OpenFlags::default() };
+            let excl = OpenFlags {
+                read: true,
+                write: true,
+                excl: true,
+                ..OpenFlags::default()
+            };
             let (ino, fh, attr) = self.fs.create(parent_ino, name, 0o644, excl).map_err(fsp_err)?;
             fill_file_info(file_info.as_mut(), ino, &attr);
             Ok(FileContext {
@@ -415,12 +419,13 @@ impl FileSystemContext for WinFspFs {
             // STATUS_INVALID_DEVICE_REQUEST (bun probes paths by reading them
             // and detects directories from this exact status); a data read on
             // a metadata-only file handle is an access problem.
-            return Err(nt(if context.is_dir { STATUS_INVALID_DEVICE_REQUEST } else { STATUS_ACCESS_DENIED }));
+            return Err(nt(if context.is_dir {
+                STATUS_INVALID_DEVICE_REQUEST
+            } else {
+                STATUS_ACCESS_DENIED
+            }));
         };
-        let data = self
-            .fs
-            .read(fh, offset, buffer.len() as u32)
-            .map_err(fsp_err)?;
+        let data = self.fs.read(fh, offset, buffer.len() as u32).map_err(fsp_err)?;
         if data.is_empty() && !buffer.is_empty() {
             return Err(nt(STATUS_END_OF_FILE));
         }
@@ -440,7 +445,11 @@ impl FileSystemContext for WinFspFs {
         let Some(fh) = context.fh else {
             // Mirror NTFS: writes to a directory handle are invalid device
             // requests, not bad handles (see read()).
-            return Err(nt(if context.is_dir { STATUS_INVALID_DEVICE_REQUEST } else { STATUS_ACCESS_DENIED }));
+            return Err(nt(if context.is_dir {
+                STATUS_INVALID_DEVICE_REQUEST
+            } else {
+                STATUS_ACCESS_DENIED
+            }));
         };
         let attr = self.fs.getattr(context.ino).map_err(fsp_err)?;
 
@@ -517,9 +526,7 @@ impl FileSystemContext for WinFspFs {
         let from = rel_path(file_name)?;
         let to = rel_path(new_file_name)?;
         tracing::trace!(from = %from, to = %to, replace_if_exists, "rename");
-        let (Some((from_parent, from_name)), Some((to_parent, to_name))) =
-            (from.split(), to.split())
-        else {
+        let (Some((from_parent, from_name)), Some((to_parent, to_name))) = (from.split(), to.split()) else {
             return Err(nt(STATUS_ACCESS_DENIED)); // renaming the root
         };
         let (from_ino, _) = self.resolve(&from_parent).map_err(fsp_err)?;
@@ -557,13 +564,11 @@ impl FileSystemContext for WinFspFs {
         }
         // 0 means "don't change" for times (and -1 means "disable implicit
         // updates", which we also treat as no change).
-        let mtime = (last_write_time != 0 && last_write_time != u64::MAX)
-            .then(|| from_filetime(last_write_time));
+        let mtime =
+            (last_write_time != 0 && last_write_time != u64::MAX).then(|| from_filetime(last_write_time));
 
         let attr = if mode.is_some() || mtime.is_some() {
-            self.fs
-                .setattr(context.ino, None, mtime, mode)
-                .map_err(fsp_err)?
+            self.fs.setattr(context.ino, None, mtime, mode).map_err(fsp_err)?
         } else {
             cur
         };
@@ -698,9 +703,12 @@ impl winfsp::notify::NotifyingFileSystemContext<Vec<ds_proto::FsEvent>> for WinF
                     FILE_ACTION_MODIFIED,
                     FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_LAST_WRITE,
                 ),
-                EventKind::AttrChanged => {
-                    emit_one(notifier, &ev.path, FILE_ACTION_MODIFIED, FILE_NOTIFY_CHANGE_ATTRIBUTES)
-                }
+                EventKind::AttrChanged => emit_one(
+                    notifier,
+                    &ev.path,
+                    FILE_ACTION_MODIFIED,
+                    FILE_NOTIFY_CHANGE_ATTRIBUTES,
+                ),
                 EventKind::RenamedFrom { to } => {
                     emit_one(notifier, &ev.path, FILE_ACTION_RENAMED_OLD_NAME, NAME_BOTH);
                     emit_one(notifier, to, FILE_ACTION_RENAMED_NEW_NAME, NAME_BOTH);
@@ -739,14 +747,9 @@ impl MountedDrive {
 ///
 /// The tokio runtime that `fs` was attached on must stay alive while mounted:
 /// every callback parks a WinFsp dispatcher thread on it via `block_on`.
-pub fn mount(
-    fs: Arc<RemoteFs>,
-    mountpoint: &str,
-    volume_label: &str,
-) -> anyhow::Result<MountedDrive> {
-    winfsp::winfsp_init().map_err(|e| {
-        anyhow::anyhow!("WinFsp is not available (is it installed?): {}", e)
-    })?;
+pub fn mount(fs: Arc<RemoteFs>, mountpoint: &str, volume_label: &str) -> anyhow::Result<MountedDrive> {
+    winfsp::winfsp_init()
+        .map_err(|e| anyhow::anyhow!("WinFsp is not available (is it installed?): {}", e))?;
 
     let mut params = VolumeParams::new();
     params
@@ -819,6 +822,13 @@ pub fn mount(
         host.mount(mountpoint)
             .map_err(|e| anyhow::anyhow!("mounting at {mountpoint} failed: {e}"))?;
     }
-    tracing::info!(mountpoint, mountmgr = mounted_via_mountmgr, "WinFsp volume mounted");
-    Ok(MountedDrive { host, sink: EventSink(pending) })
+    tracing::info!(
+        mountpoint,
+        mountmgr = mounted_via_mountmgr,
+        "WinFsp volume mounted"
+    );
+    Ok(MountedDrive {
+        host,
+        sink: EventSink(pending),
+    })
 }

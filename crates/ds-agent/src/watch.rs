@@ -182,7 +182,9 @@ pub fn spawn(export: Arc<Export>, hub: Arc<EventHub>, debounce: Duration) -> any
     tracing::info!(export = export.name, "watching for changes");
 
     tokio::spawn(coalesce_loop(export, hub, debounce, raw_rx));
-    Ok(WatchGuard { _watcher: Box::new(watcher) })
+    Ok(WatchGuard {
+        _watcher: Box::new(watcher),
+    })
 }
 
 pub struct WatchGuard {
@@ -238,7 +240,10 @@ fn ingest(
         }
         match merge(pending.get(&path).map(|p| &p.kind), kind) {
             Some(kind) => {
-                let first_seen = pending.get(&path).map(|p| p.first_seen).unwrap_or_else(Instant::now);
+                let first_seen = pending
+                    .get(&path)
+                    .map(|p| p.first_seen)
+                    .unwrap_or_else(Instant::now);
                 pending.insert(path, Pending { kind, first_seen });
             }
             None => {

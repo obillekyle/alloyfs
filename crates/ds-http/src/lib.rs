@@ -30,11 +30,7 @@ struct AppState {
     token: Option<String>,
 }
 
-pub async fn serve(
-    listen: &str,
-    registry: Arc<ExportRegistry>,
-    token: Option<String>,
-) -> anyhow::Result<()> {
+pub async fn serve(listen: &str, registry: Arc<ExportRegistry>, token: Option<String>) -> anyhow::Result<()> {
     let loopback = {
         let host = listen.rsplit_once(':').map(|(h, _)| h).unwrap_or(listen);
         matches!(host, "127.0.0.1" | "localhost" | "[::1]" | "::1")
@@ -114,8 +110,13 @@ async fn file_get(
     let export = state.registry.get(&name).ok_or(StatusCode::NOT_FOUND)?;
     let rel = RelPath(q.path);
     let full = export.resolve(&rel).map_err(code_to_status)?;
-    let file = tokio::fs::File::open(&full).await.map_err(|_| StatusCode::NOT_FOUND)?;
-    let md = file.metadata().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let file = tokio::fs::File::open(&full)
+        .await
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+    let md = file
+        .metadata()
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     if md.is_dir() {
         return Err(StatusCode::BAD_REQUEST);
     }
@@ -149,7 +150,9 @@ async fn file_post(
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     .map_err(code_to_status)?;
-    Ok(Json(serde_json::json!({ "written": written, "version": version })))
+    Ok(Json(
+        serde_json::json!({ "written": written, "version": version }),
+    ))
 }
 
 /// POST /api/exports/{name}/mkdir?path=…
@@ -234,7 +237,14 @@ async fn status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 }
 
 async fn exports(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    Json(state.registry.all().iter().map(|e| export_info(e)).collect::<Vec<_>>())
+    Json(
+        state
+            .registry
+            .all()
+            .iter()
+            .map(|e| export_info(e))
+            .collect::<Vec<_>>(),
+    )
 }
 
 #[derive(Deserialize)]
@@ -308,10 +318,15 @@ async fn events_sse(
     let (catchup, rx) = match export.events.subscribe(since) {
         Ok(pair) => pair,
         Err(ErrorCode::TooOld) => {
-            let (catchup, rx) = export.events.subscribe(None).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            let (catchup, rx) = export
+                .events
+                .subscribe(None)
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
             drop(catchup);
             let resync = futures::stream::once(async {
-                Ok(Event::default().event("resync").data("event history expired; refetch state"))
+                Ok(Event::default()
+                    .event("resync")
+                    .data("event history expired; refetch state"))
             });
             let live = live_stream(rx);
             return Ok(Sse::new(Box::pin(futures::StreamExt::chain(resync, live))
@@ -323,9 +338,13 @@ async fn events_sse(
 
     let catchup_stream = futures::stream::iter(catchup.into_iter().map(|ev| Ok(fs_event(&ev))));
     let stream = futures::StreamExt::chain(catchup_stream, live_stream(rx));
-    Ok(Sse::new(Box::pin(stream)
-        as std::pin::Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>)
-    .keep_alive(KeepAlive::default()))
+    Ok(
+        Sse::new(Box::pin(stream)
+            as std::pin::Pin<
+                Box<dyn Stream<Item = Result<Event, Infallible>> + Send>,
+            >)
+        .keep_alive(KeepAlive::default()),
+    )
 }
 
 fn fs_event(ev: &ds_proto::FsEvent) -> Event {
@@ -339,18 +358,19 @@ fn live_stream(
     rx: tokio::sync::broadcast::Receiver<Vec<ds_proto::FsEvent>>,
 ) -> impl Stream<Item = Result<Event, Infallible>> + Send {
     use futures::StreamExt;
-    tokio_stream::wrappers::BroadcastStream::new(rx).filter_map(|item| async move {
-        match item {
-            Ok(batch) => {
-                let events: Vec<Result<Event, Infallible>> =
-                    batch.iter().map(|ev| Ok(fs_event(ev))).collect();
-                Some(futures::stream::iter(events))
+    tokio_stream::wrappers::BroadcastStream::new(rx)
+        .filter_map(|item| async move {
+            match item {
+                Ok(batch) => {
+                    let events: Vec<Result<Event, Infallible>> =
+                        batch.iter().map(|ev| Ok(fs_event(ev))).collect();
+                    Some(futures::stream::iter(events))
+                }
+                // Lagged: tell the client to resync rather than lose data silently.
+                Err(_) => Some(futures::stream::iter(vec![Ok(Event::default()
+                    .event("resync")
+                    .data("stream lagged; refetch state"))])),
             }
-            // Lagged: tell the client to resync rather than lose data silently.
-            Err(_) => Some(futures::stream::iter(vec![Ok(Event::default()
-                .event("resync")
-                .data("stream lagged; refetch state"))])),
-        }
-    })
-    .flatten()
+        })
+        .flatten()
 }

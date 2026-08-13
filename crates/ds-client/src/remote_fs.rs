@@ -70,7 +70,12 @@ impl RemoteFs {
         export: &str,
         opts: ClientOptions,
     ) -> Result<Arc<Self>, FsError> {
-        let root_attr = match conn.request(Request::Attach { export: export.into() }).await?? {
+        let root_attr = match conn
+            .request(Request::Attach {
+                export: export.into(),
+            })
+            .await??
+        {
             Response::AttachOk { root_attr, .. } => root_attr,
             other => {
                 tracing::error!(?other, "bad Attach response");
@@ -101,7 +106,10 @@ impl RemoteFs {
         let mut fetch_rx = None;
         let cache = if cache_enabled {
             let root = opts.data_dir.join("cache").join(&opts.mount_key);
-            let manifest = opts.data_dir.join("cache").join(format!("{}.manifest.json", opts.mount_key));
+            let manifest = opts
+                .data_dir
+                .join("cache")
+                .join(format!("{}.manifest.json", opts.mount_key));
             let (cache, rx) = AutoCache::load(crate::autocache::AutoCacheConfig {
                 max_file_size: opts.auto_cache_max,
                 budget: opts.auto_cache_budget.max(1),
@@ -246,7 +254,10 @@ impl RemoteFs {
         let mut out = Vec::new();
         let mut cursor = 0u64;
         loop {
-            match self.call(Request::Readdir { path: dir.clone(), cursor })? {
+            match self.call(Request::Readdir {
+                path: dir.clone(),
+                cursor,
+            })? {
                 Response::Dir { entries, next_cursor } => {
                     for e in entries {
                         let child = dir.join(&e.name);
@@ -282,17 +293,21 @@ impl RemoteFs {
         if self.is_overlay(&path) {
             return self.overlay_ref().open(&path, flags);
         }
-        match self.call(Request::Open { path: path.clone(), flags })? {
+        match self.call(Request::Open {
+            path: path.clone(),
+            flags,
+        })? {
             Response::Opened { fh, attr } => {
                 debug_assert!(fh & OVERLAY_FH_BIT == 0, "server fh collides with overlay bit");
                 self.cache_attr(ino, attr);
-                let cache_ok = self
-                    .cache
-                    .as_ref()
-                    .is_some_and(|c| c.fresh_for(&path, &attr));
+                let cache_ok = self.cache.as_ref().is_some_and(|c| c.fresh_for(&path, &attr));
                 self.open_files.insert(
                     fh,
-                    OpenState { path, cache_ok: AtomicBool::new(cache_ok), wrote: AtomicBool::new(false) },
+                    OpenState {
+                        path,
+                        cache_ok: AtomicBool::new(cache_ok),
+                        wrote: AtomicBool::new(false),
+                    },
                 );
                 Ok((fh, attr))
             }
@@ -328,11 +343,13 @@ impl RemoteFs {
             v
         };
         let responses = self.rt.block_on(async {
-            futures::future::join_all(
-                chunks
-                    .iter()
-                    .map(|&(pos, want)| self.conn.request(Request::Read { fh, offset: pos, len: want })),
-            )
+            futures::future::join_all(chunks.iter().map(|&(pos, want)| {
+                self.conn.request(Request::Read {
+                    fh,
+                    offset: pos,
+                    len: want,
+                })
+            }))
             .await
         });
         let mut out = Vec::with_capacity(size as usize);
@@ -413,7 +430,11 @@ impl RemoteFs {
             let ino = self.ino.get_or_alloc(path);
             return Ok((ino, fh, attr));
         }
-        match self.call(Request::Create { path: path.clone(), flags, mode })? {
+        match self.call(Request::Create {
+            path: path.clone(),
+            flags,
+            mode,
+        })? {
             Response::Opened { fh, attr } => {
                 let ino = self.ino.get_or_alloc(path.clone());
                 self.cache_attr(ino, attr);
@@ -439,7 +460,10 @@ impl RemoteFs {
             let ino = self.ino.get_or_alloc(path);
             return Ok((ino, attr));
         }
-        match self.call(Request::Mkdir { path: path.clone(), mode })? {
+        match self.call(Request::Mkdir {
+            path: path.clone(),
+            mode,
+        })? {
             Response::Attr(attr) => {
                 let ino = self.ino.get_or_alloc(path);
                 self.cache_attr(ino, attr);
@@ -461,9 +485,17 @@ impl RemoteFs {
         let parent_path = self.path_of(parent)?;
         let path = parent_path.join(name);
         if self.is_overlay(&path) {
-            return if dir { self.overlay_ref().rmdir(&path) } else { self.overlay_ref().unlink(&path) };
+            return if dir {
+                self.overlay_ref().rmdir(&path)
+            } else {
+                self.overlay_ref().unlink(&path)
+            };
         }
-        let req = if dir { Request::Rmdir { path: path.clone() } } else { Request::Unlink { path: path.clone() } };
+        let req = if dir {
+            Request::Rmdir { path: path.clone() }
+        } else {
+            Request::Unlink { path: path.clone() }
+        };
         match self.call(req)? {
             Response::Ok => {
                 if let Some(ino) = self.ino.ino_of(&path) {
@@ -495,7 +527,11 @@ impl RemoteFs {
                 Ok(())
             }
             (false, false) => {
-                match self.call(Request::Rename { from: from.clone(), to: to.clone(), replace })? {
+                match self.call(Request::Rename {
+                    from: from.clone(),
+                    to: to.clone(),
+                    replace,
+                })? {
                     Response::Ok => {
                         self.ino.rename(&from, &to);
                         if let Some(cache) = &self.cache {
@@ -523,7 +559,12 @@ impl RemoteFs {
         if self.is_overlay(&path) {
             return self.overlay_ref().setattr(&path, size, mtime, mode);
         }
-        match self.call(Request::Setattr { path: path.clone(), size, mtime, mode })? {
+        match self.call(Request::Setattr {
+            path: path.clone(),
+            size,
+            mtime,
+            mode,
+        })? {
             Response::Attr(attr) => {
                 self.cache_attr(ino, attr);
                 if size.is_some() {
@@ -545,7 +586,10 @@ impl RemoteFs {
                 let ino = self.ino.get_or_alloc(link);
                 Ok((ino, attr))
             }
-            (false, false) => match self.call(Request::Link { target, link: link.clone() })? {
+            (false, false) => match self.call(Request::Link {
+                target,
+                link: link.clone(),
+            })? {
                 Response::Attr(attr) => {
                     let ino = self.ino.get_or_alloc(link);
                     self.cache_attr(ino, attr);
@@ -607,7 +651,11 @@ impl RemoteFs {
 
     pub fn statfs(&self) -> Result<(u32, u64, u64), FsError> {
         match self.call(Request::Statfs)? {
-            Response::Statfs { block_size, blocks, blocks_free } => Ok((block_size, blocks, blocks_free)),
+            Response::Statfs {
+                block_size,
+                blocks,
+                blocks_free,
+            } => Ok((block_size, blocks, blocks_free)),
             _ => Err(ErrorCode::Io.into()),
         }
     }

@@ -11,10 +11,10 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use fuser::{
-    Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo,
-    LockOwner, MountOption, OpenAccMode, OpenFlags as FuseOpenFlags, ReplyAttr, ReplyCreate,
-    ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite,
-    Request as FuseRequest, SessionACL, TimeOrNow, WriteFlags,
+    Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo, LockOwner,
+    MountOption, OpenAccMode, OpenFlags as FuseOpenFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
+    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request as FuseRequest, SessionACL,
+    TimeOrNow, WriteFlags,
 };
 
 use ds_client::{FsError, RemoteFs, ROOT_INO};
@@ -167,7 +167,14 @@ impl Filesystem for DsFuse {
         }
     }
 
-    fn readdir(&self, _req: &FuseRequest, ino: INodeNo, _fh: FileHandle, offset: u64, mut reply: ReplyDirectory) {
+    fn readdir(
+        &self,
+        _req: &FuseRequest,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
+        mut reply: ReplyDirectory,
+    ) {
         let entries = match self.fs.readdir(ino.0) {
             Ok(e) => e,
             Err(e) => {
@@ -266,7 +273,14 @@ impl Filesystem for DsFuse {
         }
     }
 
-    fn flush(&self, _req: &FuseRequest, _ino: INodeNo, fh: FileHandle, _lock_owner: LockOwner, reply: ReplyEmpty) {
+    fn flush(
+        &self,
+        _req: &FuseRequest,
+        _ino: INodeNo,
+        fh: FileHandle,
+        _lock_owner: LockOwner,
+        reply: ReplyEmpty,
+    ) {
         match self.fs.flush(fh.0) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(errno(&e)),
@@ -287,7 +301,15 @@ impl Filesystem for DsFuse {
         reply.ok();
     }
 
-    fn mkdir(&self, _req: &FuseRequest, parent: INodeNo, name: &OsStr, mode: u32, _umask: u32, reply: ReplyEntry) {
+    fn mkdir(
+        &self,
+        _req: &FuseRequest,
+        parent: INodeNo,
+        name: &OsStr,
+        mode: u32,
+        _umask: u32,
+        reply: ReplyEntry,
+    ) {
         let name = ok_name!(name, reply);
         match self.fs.mkdir(parent.0, name, mode) {
             Ok((ino, attr)) => reply.entry(&KERNEL_TTL, &self.file_attr(ino, &attr), Generation(0)),
@@ -331,22 +353,13 @@ impl Filesystem for DsFuse {
         }
     }
 
-    fn link(
-        &self,
-        _req: &FuseRequest,
-        ino: INodeNo,
-        newparent: INodeNo,
-        newname: &OsStr,
-        reply: ReplyEntry,
-    ) {
+    fn link(&self, _req: &FuseRequest, ino: INodeNo, newparent: INodeNo, newname: &OsStr, reply: ReplyEntry) {
         // Same-export hard links (what git object storage and bun-style
         // installers use). The link gets its own inode number in our table —
         // a documented simplification (same content, distinct ino).
         let newname = ok_name!(newname, reply);
         match self.fs.link(ino.0, newparent.0, newname) {
-            Ok((link_ino, attr)) => {
-                reply.entry(&KERNEL_TTL, &self.file_attr(link_ino, &attr), Generation(0))
-            }
+            Ok((link_ino, attr)) => reply.entry(&KERNEL_TTL, &self.file_attr(link_ino, &attr), Generation(0)),
             Err(e) => reply.error(errno(&e)),
         }
     }
@@ -398,7 +411,11 @@ impl Filesystem for DsFuse {
 pub fn apply_events_native(fs: &RemoteFs, notifier: &fuser::Notifier, batch: &[ds_proto::FsEvent]) {
     use ds_proto::EventKind;
     let inval_name = |parent: &ds_proto::RelPath, name: &str| {
-        if let Some(pino) = if parent.is_root() { Some(ROOT_INO) } else { fs.ino.ino_of(parent) } {
+        if let Some(pino) = if parent.is_root() {
+            Some(ROOT_INO)
+        } else {
+            fs.ino.ino_of(parent)
+        } {
             // ENOENT here just means the kernel had nothing cached — fine.
             let _ = notifier.inval_entry(INodeNo(pino), std::ffi::OsStr::new(name));
         }
