@@ -100,6 +100,14 @@ pub(crate) struct OpenState {
     pub wrote: AtomicBool,
     /// Sequential prefetch window for this handle.
     pub ra: ReadAhead,
+    /// The advisory lock this fh currently holds (client mirror of server
+    /// state) — what the reconnect supervisor replays.
+    pub lock: std::sync::Mutex<Option<ds_proto::LockKind>>,
+    /// Set when a reconnect could not restore this handle's lock (or the
+    /// handle itself, if it held one). A poisoned handle fails read/write/
+    /// lock/flush with EIO — mutual exclusion may have been broken and the
+    /// application must find out; release still works.
+    pub poisoned: AtomicBool,
 }
 
 pub struct RemoteFs {
@@ -456,6 +464,8 @@ impl RemoteFs {
                 cache_ok: AtomicBool::new(cache_ok),
                 wrote: AtomicBool::new(false),
                 ra: ReadAhead::new(),
+                lock: std::sync::Mutex::new(None),
+                poisoned: AtomicBool::new(false),
             },
         );
         Ok((fh, attr))
@@ -481,6 +491,7 @@ impl RemoteFs {
         if fh & OVERLAY_FH_BIT != 0 {
             return self.overlay_ref().read(fh, offset, size);
         }
+        self.check_poisoned(fh)?;
         // Auto-cache fast path: serve from the local blob when fresh.
         if let (Some(cache), Some(state)) = (&self.cache, self.open_files.get(&fh)) {
             if state.cache_ok.load(Ordering::Relaxed) {
@@ -606,6 +617,7 @@ impl RemoteFs {
         if fh & OVERLAY_FH_BIT != 0 {
             return self.overlay_ref().write(fh, offset, data);
         }
+        self.check_poisoned(fh)?;
         let server_fh = self.server_fh(fh);
         let mut pos = 0usize;
         while pos < data.len() {
@@ -679,6 +691,8 @@ impl RemoteFs {
                 cache_ok: AtomicBool::new(false),
                 wrote: AtomicBool::new(true),
                 ra: ReadAhead::new(),
+                lock: std::sync::Mutex::new(None),
+                poisoned: AtomicBool::new(false),
             },
         );
         Ok((ino, fh, attr))
@@ -812,8 +826,25 @@ impl RemoteFs {
         if fh & OVERLAY_FH_BIT != 0 {
             return Ok(()); // single-machine data: advisory lock is a no-op
         }
+        self.check_poisoned(fh)?;
         let server_fh = self.server_fh(fh);
-        expect_resp!(self.call(Request::Lock { fh: server_fh, kind, wait })?, Response::Ok => ());
+        let req = Request::Lock {
+            fh: server_fh,
+            kind,
+            wait,
+        };
+        // A blocking wait may legitimately outlast any fixed timeout: bound
+        // it by peer liveness instead (fails fast on disconnect, ~20 s on a
+        // wedged-but-open server, forever-patient on a healthy busy one).
+        let resp = if wait {
+            self.rt.block_on(self.conn().request_keepalive(req))??
+        } else {
+            self.call(req)?
+        };
+        expect_resp!(resp, Response::Ok => ());
+        if let Some(state) = self.open_files.get(&fh) {
+            *state.lock.lock().unwrap() = Some(kind); // server did release-then-take
+        }
         Ok(())
     }
 
@@ -823,13 +854,26 @@ impl RemoteFs {
         }
         let server_fh = self.server_fh(fh);
         expect_resp!(self.call(Request::Unlock { fh: server_fh })?, Response::Ok => ());
+        if let Some(state) = self.open_files.get(&fh) {
+            *state.lock.lock().unwrap() = None;
+        }
         Ok(())
+    }
+
+    /// EIO for handles whose lock (or reopen) was lost across a reconnect —
+    /// mutual exclusion may have been broken and silence would hide it.
+    fn check_poisoned(&self, fh: u64) -> Result<(), FsError> {
+        match self.open_files.get(&fh) {
+            Some(state) if state.poisoned.load(Ordering::Acquire) => Err(ErrorCode::Io.into()),
+            _ => Ok(()),
+        }
     }
 
     pub fn flush(&self, fh: u64) -> Result<(), FsError> {
         if fh & OVERLAY_FH_BIT != 0 {
             return self.overlay_ref().flush(fh);
         }
+        self.check_poisoned(fh)?;
         let server_fh = self.server_fh(fh);
         expect_resp!(self.call(Request::Flush { fh: server_fh })?, Response::Ok => ());
         Ok(())
@@ -864,9 +908,18 @@ impl RemoteFs {
 
 /// Reconnect supervisor: when the connection dies, dial a replacement with
 /// exponential backoff, re-attach, re-open every live handle on the new
-/// session, then swap it in and bump the epoch (which re-triggers the event
-/// pump's subscription). Advisory locks do NOT survive a reconnect —
-/// documented behavior, logged when it happens.
+/// session, replay each handle's advisory lock, then swap it in and bump
+/// the epoch (which re-triggers the event pump's subscription).
+///
+/// Lock replay is best-effort by nature: the server freed the old session's
+/// locks the moment it saw the disconnect, so a waiting contender may
+/// legally win the lock before our replay arrives. When that happens the
+/// handle is POISONED (subsequent I/O fails EIO) rather than silently
+/// continuing without mutual exclusion — apps handle EIO; none can handle a
+/// lock that quietly stopped existing. Even a successful replay means "held
+/// again", not "held continuously" — during an asymmetric partition the old
+/// session's locks persist up to the ~30 s lease, and between its release
+/// and our replay another client may have held and released the lock.
 async fn reconnect_supervisor(fs: Arc<RemoteFs>) {
     let dialer = fs.dialer.clone().expect("supervisor spawned only with a dialer");
     loop {
@@ -898,12 +951,18 @@ async fn reconnect_supervisor(fs: Arc<RemoteFs>) {
             }
         }
         // Re-open live handles on the new session; kernel fhs stay stable,
-        // only the server_fh translation changes.
+        // only the server_fh translation changes. A handle's lock replays
+        // right after its re-open (it needs the fresh server_fh); all of it
+        // happens BEFORE the conn swap so lock state is settled by the time
+        // the new connection is observable.
         let mut reopened = 0usize;
         let mut failed = 0usize;
+        let mut locks_restored = 0usize;
+        let mut locks_lost = 0usize;
         for entry in fs.open_files.iter() {
             let state = entry.value();
             state.ra.clear(); // in-flight blocks belong to the dead conn
+            let held = *state.lock.lock().unwrap();
             let req = Request::Open {
                 path: state.path.clone(),
                 flags: state.flags,
@@ -912,10 +971,28 @@ async fn reconnect_supervisor(fs: Arc<RemoteFs>) {
                 Ok(Ok(Response::Opened { fh, .. })) => {
                     state.server_fh.store(fh, Ordering::Release);
                     reopened += 1;
+                    if let Some(kind) = held {
+                        if replay_lock(&new_conn, fh, kind).await {
+                            locks_restored += 1;
+                        } else {
+                            locks_lost += 1;
+                            state.poisoned.store(true, Ordering::Release);
+                            tracing::warn!(
+                                path = %state.path,
+                                "lock lost across reconnect; handle poisoned (EIO until reopened)"
+                            );
+                        }
+                    }
                 }
                 _ => {
-                    // File may be gone; subsequent ops get BadHandle → EBADF.
+                    // File may be gone; subsequent ops get BadHandle → EBADF —
+                    // unless it held a lock, which makes the loss a mutual-
+                    // exclusion break: poison so it surfaces as EIO.
                     failed += 1;
+                    if held.is_some() {
+                        locks_lost += 1;
+                        state.poisoned.store(true, Ordering::Release);
+                    }
                 }
             }
         }
@@ -927,6 +1004,30 @@ async fn reconnect_supervisor(fs: Arc<RemoteFs>) {
             cache.mark_all_unverified();
         }
         fs.conn_epoch.send_modify(|e| *e += 1);
-        tracing::info!(reopened, failed, "reconnected (locks do not survive reconnects)");
+        tracing::info!(reopened, failed, locks_restored, locks_lost, "reconnected");
     }
+}
+
+/// Re-acquire one advisory lock on the new session. Retries WouldBlock a few
+/// times: the server may not have processed the OLD session's disconnect yet,
+/// so the first attempts can lose to our own zombie's still-held lock.
+async fn replay_lock(conn: &Arc<MuxConnection>, fh: u64, kind: ds_proto::LockKind) -> bool {
+    for attempt in 0..4 {
+        if attempt > 0 {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        match conn
+            .request(Request::Lock {
+                fh,
+                kind,
+                wait: false,
+            })
+            .await
+        {
+            Ok(Ok(Response::Ok)) => return true,
+            Ok(Err(ErrorCode::WouldBlock)) => continue, // maybe our zombie; retry
+            _ => return false,
+        }
+    }
+    false
 }

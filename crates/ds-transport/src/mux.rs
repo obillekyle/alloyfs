@@ -17,6 +17,11 @@ use ds_proto::{
 /// guarantees mount callbacks can never hang forever.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Liveness probing for `request_keepalive`: ping this often, and give the
+/// peer this long to answer before declaring it wedged.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+const KEEPALIVE_GRACE: Duration = Duration::from_secs(10);
+
 #[derive(Debug, thiserror::Error)]
 pub enum TransportError {
     #[error("connection closed")]
@@ -176,6 +181,55 @@ impl MuxConnection {
         body: Request,
         deadline: Duration,
     ) -> Result<Result<Response, ErrorCode>, TransportError> {
+        let (id, done_rx) = self.begin_request(body).await?;
+        match tokio::time::timeout(deadline, done_rx).await {
+            Ok(done) => done.map_err(|_| TransportError::Closed),
+            Err(_) => {
+                self.inflight.remove(&id);
+                Err(TransportError::Timeout)
+            }
+        }
+    }
+
+    /// A request with no fixed deadline, bounded by peer LIVENESS instead:
+    /// while the wait runs, the peer is pinged every KEEPALIVE_INTERVAL and
+    /// gets KEEPALIVE_GRACE to answer. Built for `Lock { wait: true }` — a
+    /// legitimate lock wait can outlast any fixed timeout, but a wedged
+    /// server still can't hang the caller forever, and connection death
+    /// fails the wait immediately (teardown drops the inflight entry).
+    pub async fn request_keepalive(
+        &self,
+        body: Request,
+    ) -> Result<Result<Response, ErrorCode>, TransportError> {
+        let (id, done_rx) = self.begin_request(body).await?;
+        tokio::select! {
+            done = done_rx => done.map_err(|_| TransportError::Closed),
+            _ = self.liveness_lost() => {
+                self.inflight.remove(&id);
+                Err(TransportError::Timeout)
+            }
+        }
+    }
+
+    /// Resolves when the peer stops answering pings (never resolves while
+    /// the peer stays responsive).
+    async fn liveness_lost(&self) {
+        loop {
+            tokio::time::sleep(KEEPALIVE_INTERVAL).await;
+            match tokio::time::timeout(KEEPALIVE_GRACE, self.ping()).await {
+                Ok(Ok(_)) => {}                // alive (possibly busy) — keep waiting
+                Ok(Err(_)) | Err(_) => return, // closed or unanswered ping
+            }
+        }
+    }
+
+    /// Shared request prologue: allocate an id, park the waiter in
+    /// `inflight`, and send the frame — with the closed re-check that keeps
+    /// teardown from orphaning the entry.
+    async fn begin_request(
+        &self,
+        body: Request,
+    ) -> Result<(u64, oneshot::Receiver<Result<Response, ErrorCode>>), TransportError> {
         if self.is_closed() {
             return Err(TransportError::Closed);
         }
@@ -193,13 +247,7 @@ impl MuxConnection {
             self.inflight.remove(&id);
             return Err(TransportError::Closed);
         }
-        match tokio::time::timeout(deadline, done_rx).await {
-            Ok(done) => done.map_err(|_| TransportError::Closed),
-            Err(_) => {
-                self.inflight.remove(&id);
-                Err(TransportError::Timeout)
-            }
-        }
+        Ok((id, done_rx))
     }
 
     /// Resolves once the connection has died (reader loop ended). For

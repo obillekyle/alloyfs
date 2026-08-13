@@ -1002,3 +1002,137 @@ async fn auth_token_gates_requests() {
         .expect("transport")
         .expect("authenticated attach works");
 }
+
+// --------------------------------------------------------------------- 25
+
+/// A blocking lock wait dies immediately when the connection does — the
+/// no-fixed-deadline keepalive path must not orphan the wait.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn blocking_lock_fails_fast_on_sever() {
+    let agent = start_agent(AgentOpts::default());
+    std::fs::write(agent.dir.path().join("l.txt"), b"lockme").unwrap();
+    let s1 = connect(&agent, ClientOptions::default()).await;
+    let s2 = connect(&agent, ClientOptions::default()).await;
+
+    let fh1 = open_for_lock(&s1, "l.txt").await;
+    let fh2 = open_for_lock(&s2, "l.txt").await;
+    on_fs(&s1.fs, move |fs| fs.lock(fh1, LockKind::Exclusive, false))
+        .await
+        .unwrap();
+
+    // s2 parks on a blocking wait, then its own link dies under it.
+    let waiter = {
+        let fs = s2.fs.clone();
+        tokio::task::spawn_blocking(move || fs.lock(fh2, LockKind::Exclusive, true))
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await; // let the wait park
+    let started = std::time::Instant::now();
+    s2.sever();
+    let err = waiter.await.unwrap().unwrap_err();
+    assert!(
+        matches!(err, ds_client::FsError::Transport(TransportError::Closed)),
+        "got {err:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "wait outlived its connection: {:?}",
+        started.elapsed()
+    );
+}
+
+// --------------------------------------------------------------------- 26
+
+/// Uncontended: a held lock survives sever + reconnect — the supervisor
+/// replays it on the new session and the handle stays clean.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lock_survives_reconnect_uncontended() {
+    let agent = start_agent(AgentOpts::default());
+    std::fs::write(agent.dir.path().join("l.txt"), b"lockme").unwrap();
+    let s1 = connect_reconnectable(&agent, ClientOptions::default()).await;
+    let s2 = connect(&agent, ClientOptions::default()).await;
+
+    let fh1 = open_for_lock(&s1, "l.txt").await;
+    let fh2 = open_for_lock(&s2, "l.txt").await;
+    on_fs(&s1.fs, move |fs| fs.lock(fh1, LockKind::Exclusive, false))
+        .await
+        .unwrap();
+
+    let old_conn = s1.fs.conn();
+    s1.sever();
+    wait_until("supervisor swapped in a live connection", 10, || {
+        let now = s1.fs.conn();
+        (!std::sync::Arc::ptr_eq(&old_conn, &now) && !now.is_closed()).then_some(())
+    })
+    .await;
+
+    // Replay settled before the swap: the contender must still be excluded.
+    let err = on_fs(&s2.fs, move |fs| fs.lock(fh2, LockKind::Exclusive, false))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        remote_code(err),
+        ErrorCode::WouldBlock,
+        "lock must still be held by s1"
+    );
+
+    // And s1's handle is not poisoned: I/O keeps working.
+    on_fs(&s1.fs, move |fs| fs.write(fh1, 0, b"still mine"))
+        .await
+        .expect("uncontended replay must not poison the handle");
+
+    // Release; the contender can now take it.
+    on_fs(&s1.fs, move |fs| fs.unlock(fh1)).await.unwrap();
+    on_fs(&s2.fs, move |fs| fs.lock(fh2, LockKind::Exclusive, false))
+        .await
+        .expect("lock must be free after s1 unlocks");
+}
+
+// --------------------------------------------------------------------- 27
+
+/// Contended: a waiter grabs the lock during the reconnect gap; the replay
+/// loses and the handle is poisoned — I/O fails loudly instead of running
+/// without the mutual exclusion the app thinks it has.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lock_lost_to_contender_poisons_handle() {
+    let agent = start_agent(AgentOpts::default());
+    std::fs::write(agent.dir.path().join("l.txt"), b"lockme").unwrap();
+    let s1 = connect_reconnectable(&agent, ClientOptions::default()).await;
+    let s2 = connect(&agent, ClientOptions::default()).await;
+
+    let fh1 = open_for_lock(&s1, "l.txt").await;
+    let fh2 = open_for_lock(&s2, "l.txt").await;
+    on_fs(&s1.fs, move |fs| fs.lock(fh1, LockKind::Exclusive, false))
+        .await
+        .unwrap();
+
+    // s2 queues a blocking wait, guaranteeing it wins the instant the
+    // server releases s1's dead session (FIFO waiters wake first).
+    let contender = {
+        let fs = s2.fs.clone();
+        tokio::task::spawn_blocking(move || fs.lock(fh2, LockKind::Exclusive, true))
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await; // park the waiter
+
+    let old_conn = s1.fs.conn();
+    s1.sever();
+    contender.await.unwrap().expect("waiter must win the freed lock");
+    wait_until("supervisor swapped in a live connection", 10, || {
+        let now = s1.fs.conn();
+        (!std::sync::Arc::ptr_eq(&old_conn, &now) && !now.is_closed()).then_some(())
+    })
+    .await;
+
+    // s1's replay lost: the handle must be poisoned.
+    let err = on_fs(&s1.fs, move |fs| fs.write(fh1, 0, b"not mine anymore"))
+        .await
+        .unwrap_err();
+    assert_eq!(remote_code(err), ErrorCode::Io, "poisoned handle must fail EIO");
+    let err = on_fs(&s1.fs, move |fs| fs.lock(fh1, LockKind::Exclusive, false))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        remote_code(err),
+        ErrorCode::Io,
+        "poisoned handle must fail lock too"
+    );
+}
