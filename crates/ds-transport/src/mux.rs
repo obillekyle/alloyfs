@@ -132,11 +132,14 @@ impl MuxConnection {
                     }
                 }
             }
-            // Stream ended: fail every waiter so callers see Closed, not a
-            // hang, and let supervisors (reconnect) know.
+            // Stream ended: flip closed FIRST, then fail every waiter. The
+            // order matters: request() re-checks is_closed() after inserting
+            // its inflight entry, so any insert that lands after this clear
+            // necessarily observes closed=true and bails instead of orphaning
+            // an entry that would eat the full request timeout.
+            let _ = closed_tx.send(true);
             inflight.clear();
             pings.clear();
-            let _ = closed_tx.send(true);
         });
 
         // Heartbeat: one ping every 10 s keeps the server's lease for this
@@ -171,9 +174,19 @@ impl MuxConnection {
         body: Request,
         deadline: Duration,
     ) -> Result<Result<Response, ErrorCode>, TransportError> {
+        if self.is_closed() {
+            return Err(TransportError::Closed);
+        }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (done_tx, done_rx) = oneshot::channel();
         self.inflight.insert(id, done_tx);
+        // Re-check AFTER inserting: the reader flips closed before clearing
+        // the map, so an insert that raced the teardown sees closed here and
+        // fails fast instead of waiting out the whole deadline.
+        if self.is_closed() {
+            self.inflight.remove(&id);
+            return Err(TransportError::Closed);
+        }
         if self.tx.send(Frame::Request { id, body }).await.is_err() {
             self.inflight.remove(&id);
             return Err(TransportError::Closed);

@@ -115,6 +115,10 @@ impl RemoteFs {
         tokio::spawn(async move {
             let mut rx = rx;
             loop {
+                // Capture the epoch BEFORE consuming the stream: if the
+                // supervisor reconnects while we're in the recv loop, the
+                // wait below returns instantly instead of missing the bump.
+                let epoch = fs.conn_epoch_now();
                 loop {
                     match rx.recv().await {
                         Ok(batch) => {
@@ -143,7 +147,7 @@ impl RemoteFs {
                 }
                 // Wait for the reconnect supervisor to swap in a fresh conn,
                 // then resubscribe from where we left off.
-                fs.conn_changed().await;
+                fs.conn_changed_since(epoch).await;
                 let conn = fs.conn();
                 rx = conn.events();
                 let seen = fs.last_event_seq.load(std::sync::atomic::Ordering::Acquire);

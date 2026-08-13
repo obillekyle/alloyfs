@@ -206,11 +206,19 @@ impl RemoteFs {
         self.conn.read().unwrap().clone()
     }
 
-    /// Resolves when the supervisor swaps in a new connection.
-    pub(crate) async fn conn_changed(&self) {
+    /// The reconnect epoch right now. Capture it BEFORE doing work whose
+    /// failure you'll respond to with `conn_changed_since` — otherwise a
+    /// supervisor bump that lands in between is silently missed.
+    pub(crate) fn conn_epoch_now(&self) -> u64 {
+        *self.conn_epoch.subscribe().borrow()
+    }
+
+    /// Resolves once the epoch has advanced PAST `since` (returns instantly
+    /// when a reconnect already happened between the caller's capture and
+    /// this call — that's the race this API shape exists to close).
+    pub(crate) async fn conn_changed_since(&self, since: u64) {
         let mut rx = self.conn_epoch.subscribe();
-        let seen = *rx.borrow();
-        while *rx.borrow() == seen {
+        while *rx.borrow() <= since {
             if rx.changed().await.is_err() {
                 std::future::pending::<()>().await; // no supervisor: never
             }
@@ -421,6 +429,7 @@ impl RemoteFs {
         };
         let server_fh = state.server_fh.load(Ordering::Acquire);
         let prefetch = state.ra.observe(offset, size);
+        tracing::trace!(fh, offset, size, prefetch, "mount read");
 
         // Serve [offset, offset+size) from DATA_CHUNK-aligned blocks: consume
         // prefetched ones, fetch the rest concurrently.

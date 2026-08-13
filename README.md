@@ -171,8 +171,17 @@ auto_cache_budget: 512M
   included.)
 - **Do not build with LTO.** `lto = "thin"` miscompiles the WinFsp path
   (reads through the drive hang); the release profile pins `lto = false`.
-- Sequential throughput over high-latency links is ~3 MB/s pending the
-  readahead cache (chunks within one kernel read are already parallel).
+- Sequential reads use a per-handle readahead window (16 × 128 KiB in
+  flight once a sequential pattern is detected), which saturates the link:
+  measured *faster than raw `ssh cat`* on the same connection. Absolute
+  throughput is bounded by your link speed.
+- Mounts **auto-reconnect**: on connection loss the client re-dials (tcp or
+  a fresh ssh spawn) with backoff, re-attaches, re-opens every live file
+  handle on the new session (open fds keep working — verified across a full
+  server kill), and resubscribes the event stream from the last applied
+  sequence number. Advisory locks do NOT survive a reconnect. Requests are
+  also bounded by a 30 s timeout so a wedged server can never hang the
+  mount forever.
 
 ## Honest limitations (by design or by platform)
 
