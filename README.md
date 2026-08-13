@@ -1,0 +1,225 @@
+# drive-sync
+
+Cross-platform virtual drive service: any host runs an **agent** that exports
+folders; any other host **mounts** an export as a *real local drive* — a drive
+letter on Windows (via [WinFsp](https://winfsp.dev)), a mountpoint on Linux
+(via FUSE). Not SMB, not WebDAV, not a sync folder.
+
+What makes it different from sshfs/rclone mount:
+
+- **Multi-client concurrency** — several machines can mount the same export at
+  once, with advisory locking, sessions/leases, and write-conflict detection
+  (last-writer-wins, but detected and logged).
+- **Server-pushed file events** — the agent watches exported folders with the
+  OS-native watcher (inotify / `ReadDirectoryChangesW`), coalesces changes,
+  and streams them to every client. On Windows mounts they re-emerge as real
+  `ReadDirectoryChangesW` events (editors refresh by themselves).
+- **Event-invalidated caching** — clients cache metadata and data; the event
+  stream keeps caches honest instead of polling.
+- **SSH transport** — reuse your existing `ssh` config; the agent can be
+  spawned on demand over an SSH exec channel, no daemon or open port needed.
+
+## Status
+
+Working today, verified on Windows 11 + Ubuntu 24.04:
+
+- TCP and SSH-stdio transports (multiplexed binary protocol, pipelined)
+- Read/write mounts: FUSE mountpoint (Linux), WinFsp drive letter (Windows),
+  write-through semantics, full mutation set, `git` works inside the mount
+- Live change events end-to-end: server-side watching (debounced/coalesced,
+  sequenced), pushed to every client; **native `ReadDirectoryChangesW`
+  re-emission on Windows** (editors auto-refresh), sub-second kernel cache
+  invalidation on Linux; `drive-sync events` NDJSON tail anywhere
+- Multi-client concurrency: whole-file advisory locks (fcntl forwarding on
+  Linux), sessions with heartbeats, 30 s lease reaper for dead clients,
+  write-conflict detection scaffolding
+- HTTP API on the agent: status, browse, and an SSE event stream
+- Server-side path hardening (canonicalize + escape check, watcher does not
+  follow symlinks)
+
+## Usage
+
+```bash
+# serve (on the machine with the files)
+drive-sync serve --tcp 0.0.0.0:7440 --export projects=/home/you/projects
+
+# mount over TCP (LAN)
+drive-sync mount tcp://server:7440/projects /mnt/projects   # Linux
+drive-sync mount tcp://server:7440/projects X:              # Windows
+
+# mount over SSH — no daemon, no open port; reuses your ssh config.
+# The remote side needs drive-sync on PATH and a config file (below).
+drive-sync mount ssh://myhost/projects X:
+
+# live change feed (NDJSON)
+drive-sync events ssh://myhost/projects
+
+# diagnostics
+drive-sync ping ssh://myhost
+drive-sync stress tcp://server:7440 --count 1000
+```
+
+Agent config (`~/.config/drive-sync/agent.toml` on Linux,
+`C:\MyApps\drive-sync.toml` on Windows — picked up automatically, which is
+what makes zero-argument `serve --stdio` over SSH work):
+
+```toml
+[agent]
+tcp_listen = "0.0.0.0:7440"     # omit to disable TCP
+http_listen = "127.0.0.1:7441"  # optional HTTP/SSE API
+
+[exports.projects]
+path = "/home/you/projects"
+read_only = false
+```
+
+### HTTP API
+
+Enabled by `http_listen` in the agent config. With `http_token` set, every
+route requires `Authorization: Bearer <token>` (constant-time check); serving
+on a non-loopback address **without** a token is refused at startup.
+
+- `GET  /api/status`, `GET /api/exports`
+- `GET  /api/exports/{name}/browse?path=sub/dir`
+- `GET  /api/exports/{name}/file?path=a/b.txt` — download (streamed)
+- `POST /api/exports/{name}/file?path=a/b.txt` — create/overwrite with the
+  request body (≤256 MiB; use a mount for bigger)
+- `POST /api/exports/{name}/mkdir?path=newdir`
+- `POST /api/exports/{name}/delete?path=a/b.txt` — file or empty dir
+- `GET  /api/exports/{name}/events` — SSE; `Last-Event-ID` resumes from the
+  server's ring log
+
+Mutations respect `read_only` and server excludes (excluded paths are 404
+over HTTP too) and bump file versions, so mounted clients pick changes up
+through the normal event flow.
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" \
+  --data-binary @notes.txt \
+  "http://server:7441/api/exports/projects/file?path=notes.txt"
+```
+
+## Excludes
+
+**Server-side** (per export, in the agent config): matching paths exist on
+the server but are never listed, never resolvable (plain "not found" — their
+existence doesn't leak), and never produce events. Gitignore-flavored globs:
+a bare name (`node_modules`, `.git`) matches at any depth and covers
+everything beneath it; `secret*`, `build/out`, `**/*.log` work as expected.
+
+**Client-side** (`--exclude GLOB` per mount, repeatable): matching paths live
+**only on the mounting machine**, stored under the local data dir
+(`%LOCALAPPDATA%\drive-sync\overlay\…` / `~/.local/share/drive-sync/…`).
+The server never sees them; local watchers on the mount still fire natively;
+they persist across remounts. Renames across the boundary return EXDEV, which
+every tool answers with copy+delete — so `mv` in/out of an excluded directory
+just works. The classic use: `--exclude node_modules` keeps installs fast and
+local while the project itself stays on the server.
+
+## Auto-download cache
+
+Files at or below `--auto-cache-max` (default `2M`, `0` disables) are fully
+downloaded in a background walk at mount time and then served from local
+disk; `--pin GLOB` forces caching regardless of size. The event stream keeps
+copies fresh (stale blobs are rejected by a size+mtime+version check and
+re-fetched in the background). `--auto-cache-budget` (default `512M`) bounds
+the cache with LRU eviction — pinned files are never evicted.
+`drive-sync cache clear <url>` wipes a mount's blobs (never the overlay).
+
+## Config files (YAML)
+
+Agent (`serve --config agent.yml`; also the auto-discovered default —
+`~/.config/drive-sync/agent.yml` on Linux, `C:\MyApps\drive-sync.yml` on
+Windows; `.toml` variants still parse for existing deployments):
+
+```yaml
+agent:
+  tcp_listen: "0.0.0.0:7440"
+  http_listen: "127.0.0.1:7441"
+exports:
+  projects:
+    path: /home/you/projects
+    exclude:
+      - "**/.git"
+      - "secret*"
+```
+
+Mount (`mount <url> <point> --config mount.yml`; CLI flags override):
+
+```yaml
+exclude:
+  - node_modules
+  - "*.tmp"
+pin:
+  - "docs/**"
+auto_cache_max: 2M
+auto_cache_budget: 512M
+```
+
+## Known issues
+
+- **bun on Windows needs an elevated mount.** Solved mystery: bun (and the
+  identical failure on rclone drives) requires the volume to be registered
+  with the Windows Mount Manager — bun canonicalizes paths with
+  `GetFinalPathNameByHandle`, which doesn't round-trip on session-local DOS
+  drives, producing its famous unhelpful ENOENT. drive-sync now registers
+  with the Mount Manager automatically **when run as Administrator** (and
+  falls back to a session drive with a logged warning otherwise). bun also
+  needs POSIX-semantics renames for its lockfile, which the volume now
+  declares. With an elevated mount, `bun install` works with its default
+  backend. (This diagnosis applies to every WinFsp filesystem, rclone
+  included.)
+- **Do not build with LTO.** `lto = "thin"` miscompiles the WinFsp path
+  (reads through the drive hang); the release profile pins `lto = false`.
+- Sequential throughput over high-latency links is ~3 MB/s pending the
+  readahead cache (chunks within one kernel read are already parallel).
+
+## Honest limitations (by design or by platform)
+
+- **Linux inotify on the mount does not fire for remote changes.** The kernel
+  only generates inotify from local VFS activity, and FUSE has no passthrough
+  (the 2021 RFC was never merged). drive-sync keeps *reads* fresh via kernel
+  cache invalidation, and offers a userspace event stream (local socket + SSE)
+  for tools that need change notifications on Linux. Windows mounts do get
+  native events. Polling watchers (VS Code's fallback, `git status`) work fine
+  everywhere.
+- **Whole-file advisory locks only.** Byte-range locks are coarsened. Don't
+  host live database files (SQLite/Postgres) on a shared mount.
+- **Symlinks are resolved server-side** within the export (escaping links are
+  refused); symlinks cannot be created through the mount.
+- **Windows volumes are case-sensitive** to faithfully mirror Linux exports.
+- **Throughput ≈ scp class** over SSH; metadata-heavy workloads are RTT-bound
+  (mitigated by attr-priming readdir, pipelined 128 KiB chunks, caching).
+- **Network partition**: write-through means acknowledged writes are never
+  lost; in-flight operations fail with EIO; server-side leases free a dead
+  client's locks after ~30 s.
+
+## License
+
+MIT for this project's code (see `LICENSE`). `vendor/winfsp-sys/` is a
+vendored upstream crate carrying a small build patch for the portable
+llvm-mingw toolchain; it keeps its upstream licenses (winfsp-rs MIT, WinFsp
+GPLv3-with-FLOSS-exception).
+
+## Building
+
+Rust workspace; `cargo build` at the root. Platform bridges are isolated:
+`ds-mount-fuse` only compiles on Unix, `ds-mount-winfsp` only on Windows.
+
+- **Linux**: `apt install build-essential pkg-config fuse3 libfuse3-dev`, then rustup.
+- **Windows**: WinFsp 2.1+ (with SDK feature) is the one required install.
+  The reference build uses the fully-portable llvm-mingw toolchain targeting
+  `x86_64-pc-windows-gnullvm` (no Visual Studio needed); see
+  `vendor/winfsp-sys/` for the delay-load patch that makes this possible.
+
+## Architecture (one paragraph)
+
+One binary. `ds-proto` defines a length-prefixed postcard frame protocol
+(requests/responses multiplexed by correlation id, plus server-push event
+frames) spoken over any byte stream — TCP today, SSH stdio next. The agent
+(`ds-agent`) canonicalizes every path against the export root (escape-proof),
+tracks per-file versions, and will fan out watcher events to subscribed
+sessions. The client (`ds-client`) presents a synchronous `RemoteFs` facade
+(inode↔path table, TTL attr cache) that platform backends adapt to their
+callback dialect: `ds-mount-fuse` (fuser 0.17) and `ds-mount-winfsp`
+(winfsp-rs 0.13). A future ProjFS backend slots in behind the same seam.

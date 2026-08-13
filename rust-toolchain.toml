@@ -1,0 +1,3 @@
+# Pin the toolchain so Windows (gnullvm host) and the azure box build identically.
+[toolchain]
+channel = "stable"

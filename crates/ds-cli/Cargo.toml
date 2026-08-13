@@ -1,0 +1,37 @@
+[package]
+name = "ds-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "drive-sync"
+path = "src/main.rs"
+
+[dependencies]
+ds-proto.workspace = true
+ds-transport.workspace = true
+ds-agent.workspace = true
+ds-client.workspace = true
+ds-http.workspace = true
+tokio.workspace = true
+futures.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde_json.workspace = true
+serde.workspace = true
+serde_yaml.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+ds-mount-fuse.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+ds-mount-winfsp.workspace = true
+
+# build.rs emits the DELAYLOAD link flags for winfsp-x64.dll (the helper is
+# gnullvm-aware). Target-gated so non-Windows builds never compile winfsp.
+[target.'cfg(windows)'.build-dependencies]
+winfsp.workspace = true

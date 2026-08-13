@@ -1,0 +1,4 @@
+# Normalize line endings for text; never touch the vendored WinFsp SDK blobs
+# (headers/libs/dlls under vendor/) — EOL mangling there breaks builds.
+* text=auto
+vendor/winfsp-sys/winfsp/** -text

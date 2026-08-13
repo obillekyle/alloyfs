@@ -1,0 +1,68 @@
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+
+use serde::Deserialize;
+
+/// Agent configuration, usually from a TOML file:
+///
+/// ```toml
+/// [agent]
+/// tcp_listen = "0.0.0.0:7440"
+///
+/// [exports.projects]
+/// path = "/home/kyle/projects"
+/// read_only = false
+/// ```
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentConfig {
+    #[serde(default)]
+    pub agent: AgentSection,
+    #[serde(default)]
+    pub exports: BTreeMap<String, ExportConfig>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentSection {
+    pub tcp_listen: Option<String>,
+    /// Optional HTTP API (status/browse/files/SSE events), e.g. "127.0.0.1:7441".
+    pub http_listen: Option<String>,
+    /// Bearer token required on every /api request (`Authorization: Bearer …`).
+    /// Mandatory when http_listen is not loopback; optional on localhost.
+    pub http_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExportConfig {
+    pub path: PathBuf,
+    #[serde(default)]
+    pub read_only: bool,
+    /// Gitignore-flavored globs. Matching paths exist on the server but are
+    /// never listed, resolvable, or event-broadcast to any client.
+    #[serde(default)]
+    pub exclude: Vec<String>,
+}
+
+impl AgentConfig {
+    pub fn from_toml(text: &str) -> anyhow::Result<Self> {
+        Ok(toml::from_str(text)?)
+    }
+
+    /// Parse by extension: .yml/.yaml → YAML (preferred), .toml → TOML
+    /// (back-compat), anything else tries YAML then TOML.
+    pub fn from_path(path: &std::path::Path) -> anyhow::Result<Self> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("reading config {}: {e}", path.display()))?;
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        match ext.to_ascii_lowercase().as_str() {
+            "yml" | "yaml" => Ok(serde_yaml::from_str(&text)?),
+            "toml" => Self::from_toml(&text),
+            _ => serde_yaml::from_str(&text).or_else(|ye| {
+                Self::from_toml(&text)
+                    .map_err(|te| anyhow::anyhow!("config parses as neither YAML ({ye}) nor TOML ({te})"))
+            }),
+        }
+    }
+}
