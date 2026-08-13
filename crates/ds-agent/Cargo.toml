@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 ds-proto.workspace = true
+ds-common.workspace = true
 ds-transport.workspace = true
 tokio.workspace = true
 bytes.workspace = true

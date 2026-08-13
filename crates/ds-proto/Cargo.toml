@@ -10,3 +10,9 @@ postcard.workspace = true
 bytes.workspace = true
 thiserror.workspace = true
 tokio-util.workspace = true
+
+# Integration tests are separate crates: the lib's own deps aren't visible to
+# them, so the golden wire test re-declares what it imports directly.
+[dev-dependencies]
+postcard.workspace = true
+bytes.workspace = true

@@ -1,0 +1,10 @@
+[package]
+name = "ds-common"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ds-proto.workspace = true
+globset.workspace = true
+anyhow.workspace = true
