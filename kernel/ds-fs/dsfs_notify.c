@@ -252,6 +252,22 @@ int dsfs_notify_from_daemon(int code, const void *payload, u32 len)
 	if (code == DSFS_NOTIFY_RENAME && !dsfs_name_ok(name2, e->name2len))
 		return -EINVAL;
 
+	/* Validate the opcode HERE, with the other structural checks, rather
+	 * than in the switch below: a malformed message is malformed whether
+	 * or not anything happens to be mounted, and reporting ENODEV for an
+	 * unknown code would make the error depend on unrelated state.
+	 */
+	switch (code) {
+	case DSFS_NOTIFY_CREATE:
+	case DSFS_NOTIFY_DELETE:
+	case DSFS_NOTIFY_MODIFY:
+	case DSFS_NOTIFY_ATTRIB:
+	case DSFS_NOTIFY_RENAME:
+		break;
+	default:
+		return -EINVAL;
+	}
+
 	isdir = e->flags & DSFS_NOTIFY_F_ISDIR;
 	q = (struct qstr)QSTR_INIT(name, e->namelen);
 	q2 = (struct qstr)QSTR_INIT(name2, e->name2len);
@@ -293,9 +309,6 @@ int dsfs_notify_from_daemon(int code, const void *payload, u32 len)
 		}
 		dsfs_ev_moved(dir, &q, dir2, &q2, isdir);
 		dput(dir2);
-		break;
-	default:
-		ret = -EINVAL;
 		break;
 	}
 

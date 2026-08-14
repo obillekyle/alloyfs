@@ -145,11 +145,40 @@ check "unmount after in-flight abort" sh -c "umount $MNT"
 ok "in-flight request survived daemon death + unmount"
 
 echo "  .. section 6"
-# --- 6. module unload with everything gone ----------------------------------
+# --- 6. negative tests: every malformed shape gets its SPECIFIC errno -------
+# "It didn't crash" is far too weak a claim. Each case below names the exact
+# error the kernel owes for that input; a wrong-but-nonzero errno is still a
+# bug, and would hide real confusion about which check fired.
+ds-devtest --neg > /tmp/neg.log 2>&1
+while read -r kw name want got; do
+	[ "$kw" = "RESULT" ] || continue
+	eq "errno: $name" "$want" "$got"
+done < /tmp/neg.log
+nneg=$(grep -c '^RESULT ' /tmp/neg.log)
+check "negative suite actually ran" test "$nneg" -ge 15
+
+# --- 6b. fuzz the device ----------------------------------------------------
+# Enumeration only covers what I thought of. This is 20k writes of structured
+# garbage plus interleaved reads, seeded so a failure is reproducible.
+ds-devtest --fuzz 20000 > /tmp/fuzz.log 2>&1
+check "fuzz completed" grep -q '^FUZZ-DONE' /tmp/fuzz.log
+grep '^FUZZ-SEED' /tmp/fuzz.log
+
+# --- 6c. close racing in-flight syscalls ------------------------------------
+ds-devtest --race 40 > /tmp/race.log 2>&1
+check "close/read/write race survived" grep -q '^RACE-DONE' /tmp/race.log
+
+# The device must still work after all that.
+ds-devtest --neg > /tmp/neg2.log 2>&1
+check "device still sane after fuzzing" \
+	grep -q '^RESULT unknown_unique 2 2' /tmp/neg2.log
+
+echo "  .. section 7"
+# --- 7. module unload with everything gone ----------------------------------
 rmmod ds_fs
 check "rmmod clean" sh -c '! lsmod | grep -q ds_fs'
 
-# --- 7. what the kernel's own checkers thought ------------------------------
+# --- 8. what the kernel's own checkers thought ------------------------------
 # On the debug kernel this is where lockdep, DEBUG_OBJECTS and slab poisoning
 # report. Anything here is a real defect, not a test artifact.
 dmesg > /tmp/dmesg.txt
