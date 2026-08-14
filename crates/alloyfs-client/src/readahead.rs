@@ -20,6 +20,28 @@
 //!
 //! Blocks are absolute DATA_CHUNK-aligned file ranges. Failed or abandoned
 //! blocks die with the handle table entry.
+//!
+//! ## A separate prefetch pump was measured and is not needed
+//!
+//! There was a standing plan to move the top-up off the read path entirely —
+//! a per-handle task keeping the window full continuously, on the theory that
+//! refilling only when a kernel read arrives lets the window drain between
+//! reads. Measured on 2026-08-14 with `ALLOYFS_READ_STATS=1`, reading 64 MiB
+//! in 1 MiB reads (512 blocks):
+//!
+//! - FUSE over loopback: 510 window hits, 2 sync fetches, 0 clears; 415 MB/s
+//!   against a 479 MB/s `alloyfs bench --depth 16` ceiling on the same box.
+//! - WinFsp over a real link: 504 window hits, 16 sync fetches, 0 clears;
+//!   3.3-3.5 MB/s against a 3.39-3.56 MB/s ceiling measured back to back.
+//!
+//! The sync fetches are the cold start, and the window never collapsed once.
+//! Topping up BEFORE blocking on the current read's own blocks (see
+//! `RemoteFs::read`) already buys the decoupling the pump was meant to add,
+//! because the spawned prefetches ride the connection while the caller waits.
+//! A pump would add a lifecycle to get wrong — cancel on write, far seek,
+//! release, reconnect — for headroom the measurements say is not there.
+//! Re-measure before reviving it; do not assume the old 6.4-vs-14.6 MB/s gap
+//! still exists, as it did not reproduce.
 
 use std::collections::HashMap;
 use std::sync::Mutex;

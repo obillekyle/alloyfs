@@ -43,13 +43,9 @@ sshfs-win, and everything else.
 |---|---|
 | OS | Windows 11 Pro (10.0.26200) |
 | WinFsp | 2.1 |
-| bun | **TODO: fill in `bun --version` from the machine where this was reproduced** — do not guess before filing |
-| rclone | **TODO: fill in `rclone version`** |
+| bun | 1.3.14 |
+| rclone | 1.73.4 |
 | filesystems reproduced on | WinFsp `memfs` sample, rclone `mount`, our own WinFsp filesystem |
-
-> Two version placeholders are deliberately left blank. This report should not
-> be filed with invented version numbers; fill them in from the machine that
-> reproduced it.
 
 ## Reproducer
 
@@ -103,11 +99,13 @@ does not survive it.
 > Honesty note on what we did and did not do here: the failures, the Process
 > Monitor trace below, and the elevated-mount fix were all observed on Windows
 > during development of our own filesystem, and the rclone/memfs cases were run
-> to prove it was not our bug. We cannot re-run any of it in the environment this
-> document was written in (no Windows GUI tooling, no bun), so the exact
-> `memfs-x64.exe` flag spelling above should be sanity-checked against the usage
-> output before this is filed. The `-m X:` vs `-m \\.\X:` distinction is the part
-> that matters and is WinFsp-documented behaviour.
+> to prove it was not our bug. The `memfs-x64.exe` invocation above has since
+> been checked against that binary's own usage output on the reporting machine
+> — every flag used (`-i`, `-F`, `-n`, `-s`, `-m`) is spelled as memfs documents
+> it — and the versions in the table were read off that machine. What has NOT
+> been re-run end to end for this write-up is the bun failure itself; it is
+> reported from the original observation. The `-m X:` vs `-m \\.\X:` distinction
+> is the part that matters and is WinFsp-documented behaviour.
 
 ## Expected vs actual
 
