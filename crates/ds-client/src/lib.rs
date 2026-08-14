@@ -12,7 +12,9 @@ mod inode;
 mod overlay;
 mod readahead;
 mod remote_fs;
+pub mod sync;
 mod walker;
 
 pub use inode::{InodeTable, ROOT_INO};
 pub use remote_fs::{ClientOptions, Dialer, FsError, RemoteFs};
+pub use sync::{ConflictPolicy, SyncEngine, SyncOptions, SyncStats};

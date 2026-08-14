@@ -383,6 +383,7 @@ dependencies = [
  "ds-transport",
  "futures",
  "globset",
+ "notify",
  "serde",
  "serde_json",
  "tempfile",
