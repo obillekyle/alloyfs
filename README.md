@@ -499,8 +499,19 @@ every future DKMS rebuild is covered once the key is enrolled.
   locks works and excludes other machines on both backends. Don't host live
   database files (SQLite/Postgres) on a shared mount regardless: they want
   byte ranges and `F_GETLK`.
-- **Symlinks are resolved server-side** within the export (escaping links are
-  refused); symlinks cannot be created through the mount.
+- **Symlinks can be created and read** on FUSE and `--backend kernel`; a
+  target that would land outside the export is refused at creation, including
+  a dangling one, and so is a target inside an excluded path. Targets are
+  stored verbatim — relative links stay relative. On Windows, see the WinFsp
+  note below.
+- **Hard links share content but not cache coherence.** Two names for one
+  inode are a real hard link on the server, so a write through one changes the
+  file both see. But the client keys its caches by path and cannot know the
+  two names are the same file, so a read through the *other* name may serve
+  bytes cached before the write until that handle's window turns over. Fixing
+  it needs a stable inode identity on the wire, which the protocol does not
+  carry; NFS has the same hole. Don't rely on cross-name coherence within a
+  single mount session.
 - **Windows volumes are case-sensitive** to faithfully mirror Linux exports.
 - **Throughput ≈ scp class** over SSH; metadata-heavy workloads are RTT-bound
   (mitigated by attr-priming readdir, pipelined 128 KiB chunks, caching).

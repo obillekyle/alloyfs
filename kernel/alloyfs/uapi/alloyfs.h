@@ -17,7 +17,7 @@
 
 #include <linux/types.h>
 
-#define ALLOYFS_ABI_VERSION 2
+#define ALLOYFS_ABI_VERSION 3
 #define ALLOYFS_ROOT_NODEID 1ULL
 
 /* Largest payload either direction; bounds every kernel-side allocation. */
@@ -47,6 +47,37 @@ enum alloyfs_opcode {
 	 */
 	ALLOYFS_OP_LOCK = 12,	/* nodeid = file, payload = lock_in */
 	ALLOYFS_OP_UNLOCK = 13,	/* nodeid = file */
+	/* --- stage 9: links, and the last of the metadata ops. */
+	ALLOYFS_OP_SYMLINK = 14,	/* nodeid = parent, payload = symlink_in */
+	ALLOYFS_OP_READLINK = 15,	/* nodeid = link; reply is raw target bytes */
+	ALLOYFS_OP_LINK = 16,	/* nodeid = parent, payload = link_in + name */
+	ALLOYFS_OP_STATFS = 17,	/* no payload; reply = statfs_out */
+};
+
+/*
+ * SYMLINK request payload, followed by the link's name then the target.
+ *
+ * The target is NOT a path the kernel validates: it is whatever text the
+ * caller passed to symlink(2), commonly relative and possibly dangling. The
+ * daemon decides whether where it lands is inside the export.
+ */
+struct alloyfs_symlink_in {
+	__u16 namelen;
+	__u16 targetlen;
+	__u32 _pad;
+};
+
+/* LINK request payload, followed by the new name. */
+struct alloyfs_link_in {
+	__u64 target;		/* nodeid of the file gaining a name */
+};
+
+/* STATFS reply payload. */
+struct alloyfs_statfs_out {
+	__u64 blocks;
+	__u64 blocks_free;
+	__u32 block_size;
+	__u32 _pad;
 };
 
 #define ALLOYFS_LOCK_SHARED 1

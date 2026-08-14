@@ -28,6 +28,7 @@ static atomic_long_t alloyfs_next_ino = ATOMIC_LONG_INIT(2);	/* 1 is the root */
 
 static const struct inode_operations alloyfs_dir_inode_operations;
 static const struct inode_operations alloyfs_file_inode_operations;
+static const struct inode_operations alloyfs_symlink_inode_operations;
 static const struct file_operations alloyfs_dir_operations;
 static const struct file_operations alloyfs_file_operations;
 
@@ -85,6 +86,13 @@ static void alloyfs_init_inode(struct inode *inode, umode_t mode, loff_t size)
 		inode->i_fop = &alloyfs_dir_operations;
 		set_nlink(inode, 2);
 		inode->i_size = 0;
+	} else if (S_ISLNK(mode)) {
+		/* No i_fop: a symlink is never opened, it is only traversed,
+		 * and the VFS reaches ->get_link through i_op alone.
+		 */
+		inode->i_op = &alloyfs_symlink_inode_operations;
+		set_nlink(inode, 1);
+		inode->i_size = size;
 	} else {
 		inode->i_op = &alloyfs_file_inode_operations;
 		inode->i_fop = &alloyfs_file_operations;
@@ -368,6 +376,137 @@ static int alloyfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 	return alloyfs_do_mknod(dir, dentry, mode | S_IFDIR, ALLOYFS_OP_MKDIR);
 }
 
+/* ---------------------------------------------------------------- links */
+
+static int alloyfs_symlink(struct mnt_idmap *idmap, struct inode *dir,
+			struct dentry *dentry, const char *target)
+{
+	struct alloyfs_conn *conn = alloyfs_conn_of(dir);
+	struct alloyfs_symlink_in *in;
+	struct alloyfs_attr attr;
+	struct inode *inode;
+	size_t tlen = strlen(target);
+	size_t len = sizeof(*in) + dentry->d_name.len + tlen;
+	int ret;
+
+	if (!conn)
+		return -EROFS;
+	if (dentry->d_name.len > ALLOYFS_MAX_NAME)
+		return -ENAMETOOLONG;
+	/* PATH_MAX is the kernel's own ceiling for a symlink body; anything
+	 * longer could not have come from symlink(2) anyway.
+	 */
+	if (tlen == 0 || tlen > PATH_MAX)
+		return -ENAMETOOLONG;
+	if (len > ALLOYFS_MAX_PAYLOAD)
+		return -ENAMETOOLONG;
+
+	in = kzalloc(len, GFP_KERNEL);
+	if (!in)
+		return -ENOMEM;
+	in->namelen = dentry->d_name.len;
+	in->targetlen = tlen;
+	memcpy((char *)(in + 1), dentry->d_name.name, dentry->d_name.len);
+	memcpy((char *)(in + 1) + dentry->d_name.len, target, tlen);
+
+	ret = alloyfs_request(conn, ALLOYFS_OP_SYMLINK, dir->i_ino, 0, 0,
+			   in, len, &attr, sizeof(attr));
+	kfree(in);
+	if (ret < 0)
+		return ret;
+	if (ret < (int)sizeof(attr))
+		return -EIO;
+
+	inode = alloyfs_iget_attr(dir->i_sb, &attr);
+	if (IS_ERR(inode))
+		return PTR_ERR(inode);
+	d_instantiate(dentry, inode);
+	return 0;
+}
+
+/*
+ * Resolve a symlink for the VFS.
+ *
+ * The target is fetched from the daemon on every traversal rather than cached
+ * in the inode: a link's target can change on another machine, and a cached
+ * body would keep resolving to the old place with nothing to invalidate it.
+ * The buffer is handed to the VFS through a delayed call, which frees it once
+ * the walk is finished with it.
+ *
+ * `dentry == NULL` means RCU-mode lookup, which must not sleep — and this
+ * sleeps on the daemon. Returning ECHILD tells the VFS to retry in ref-walk
+ * mode, which is the standard answer for a filesystem that cannot resolve
+ * without blocking.
+ */
+static const char *alloyfs_get_link(struct dentry *dentry, struct inode *inode,
+				 struct delayed_call *done)
+{
+	struct alloyfs_conn *conn;
+	char *buf;
+	int ret;
+
+	if (!dentry)
+		return ERR_PTR(-ECHILD);
+
+	conn = alloyfs_conn_of(inode);
+	if (!conn)
+		return ERR_PTR(-EIO);
+
+	buf = kzalloc(PATH_MAX, GFP_KERNEL);
+	if (!buf)
+		return ERR_PTR(-ENOMEM);
+
+	ret = alloyfs_request(conn, ALLOYFS_OP_READLINK, inode->i_ino, 0, 0,
+			   NULL, 0, buf, PATH_MAX - 1);
+	if (ret < 0) {
+		kfree(buf);
+		return ERR_PTR(ret);
+	}
+	/* The daemon sends raw bytes with no terminator; the VFS wants a C
+	 * string. PATH_MAX - 1 above leaves room for this unconditionally.
+	 */
+	buf[ret] = '\0';
+	set_delayed_call(done, kfree_link, buf);
+	return buf;
+}
+
+static int alloyfs_link(struct dentry *old_dentry, struct inode *dir,
+		     struct dentry *dentry)
+{
+	struct alloyfs_conn *conn = alloyfs_conn_of(dir);
+	struct inode *target = d_inode(old_dentry);
+	struct alloyfs_link_in *in;
+	struct alloyfs_attr attr;
+	struct inode *inode;
+	size_t len = sizeof(*in) + dentry->d_name.len;
+	int ret;
+
+	if (!conn)
+		return -EROFS;
+	if (dentry->d_name.len > ALLOYFS_MAX_NAME)
+		return -ENAMETOOLONG;
+
+	in = kzalloc(len, GFP_KERNEL);
+	if (!in)
+		return -ENOMEM;
+	in->target = target->i_ino;
+	memcpy(in + 1, dentry->d_name.name, dentry->d_name.len);
+
+	ret = alloyfs_request(conn, ALLOYFS_OP_LINK, dir->i_ino, 0, 0, in, len,
+			   &attr, sizeof(attr));
+	kfree(in);
+	if (ret < 0)
+		return ret;
+	if (ret < (int)sizeof(attr))
+		return -EIO;
+
+	inode = alloyfs_iget_attr(dir->i_sb, &attr);
+	if (IS_ERR(inode))
+		return PTR_ERR(inode);
+	d_instantiate(dentry, inode);
+	return 0;
+}
+
 static int alloyfs_do_remove(struct inode *dir, struct dentry *dentry, u32 opcode)
 {
 	struct alloyfs_conn *conn = alloyfs_conn_of(dir);
@@ -609,6 +748,14 @@ static const struct inode_operations alloyfs_dir_inode_operations = {
 	.unlink = alloyfs_unlink,
 	.rmdir = alloyfs_rmdir,
 	.rename = alloyfs_rename,
+	.symlink = alloyfs_symlink,
+	.link = alloyfs_link,
+};
+
+static const struct inode_operations alloyfs_symlink_inode_operations = {
+	.get_link = alloyfs_get_link,
+	.getattr = alloyfs_getattr,
+	.setattr = alloyfs_setattr,
 };
 
 static const struct inode_operations alloyfs_file_inode_operations = {
@@ -755,8 +902,40 @@ static void alloyfs_put_super(struct super_block *sb)
 	mutex_unlock(&alloyfs_lock);
 }
 
+/*
+ * `df` on the mount reports the EXPORT's filesystem, not this one.
+ *
+ * simple_statfs answers with zeroes, which makes `df` show a 0-byte volume
+ * and makes anything checking free space before a write refuse to try. The
+ * numbers come from the daemon, which stats the real backing directory.
+ * A failed round trip falls back to the old zeroes rather than failing the
+ * syscall: `df` printing something odd beats `df` erroring.
+ */
+static int alloyfs_statfs(struct dentry *dentry, struct kstatfs *buf)
+{
+	struct alloyfs_conn *conn = alloyfs_conn_of(d_inode(dentry));
+	struct alloyfs_statfs_out out;
+	int ret;
+
+	if (!conn)
+		return simple_statfs(dentry, buf);
+
+	ret = alloyfs_request(conn, ALLOYFS_OP_STATFS, ALLOYFS_ROOT_NODEID, 0, 0,
+			   NULL, 0, &out, sizeof(out));
+	if (ret < (int)sizeof(out))
+		return simple_statfs(dentry, buf);
+
+	buf->f_type = ALLOYFS_MAGIC;
+	buf->f_bsize = out.block_size ? out.block_size : PAGE_SIZE;
+	buf->f_blocks = out.blocks;
+	buf->f_bfree = out.blocks_free;
+	buf->f_bavail = out.blocks_free;
+	buf->f_namelen = ALLOYFS_MAX_NAME;
+	return 0;
+}
+
 static const struct super_operations alloyfs_super_operations = {
-	.statfs = simple_statfs,
+	.statfs = alloyfs_statfs,
 	.drop_inode = generic_delete_inode,
 	.put_super = alloyfs_put_super,
 };

@@ -365,6 +365,37 @@ impl Filesystem for DsFuse {
         }
     }
 
+    fn symlink(
+        &self,
+        _req: &FuseRequest,
+        parent: INodeNo,
+        link_name: &OsStr,
+        target: &Path,
+        reply: ReplyEntry,
+    ) {
+        let link_name = ok_name!(link_name, reply);
+        // The target is passed through as the user typed it. It is not a path
+        // we resolve — it may be relative, and it may not exist yet. The
+        // server decides whether where it lands is allowed.
+        let Some(target) = target.to_str() else {
+            reply.error(Errno::EINVAL);
+            return;
+        };
+        match self.fs.symlink(parent.0, link_name, target) {
+            Ok((ino, attr)) => reply.entry(&KERNEL_TTL, &self.file_attr(ino, &attr), Generation(0)),
+            Err(e) => reply.error(errno(&e)),
+        }
+    }
+
+    fn readlink(&self, _req: &FuseRequest, ino: INodeNo, reply: ReplyData) {
+        match self.fs.readlink(ino.0) {
+            // No trailing NUL: the kernel takes the reply length as the length
+            // of the target, and a NUL inside it becomes part of the name.
+            Ok(target) => reply.data(target.as_bytes()),
+            Err(e) => reply.error(errno(&e)),
+        }
+    }
+
     fn setlk(
         &self,
         _req: &FuseRequest,

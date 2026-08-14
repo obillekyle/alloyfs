@@ -152,6 +152,10 @@ impl Server {
             abi::OP_SETATTR => self.op_setattr(h.nodeid, payload),
             abi::OP_LOCK => self.op_lock(h.nodeid, payload),
             abi::OP_UNLOCK => self.op_unlock(h.nodeid),
+            abi::OP_SYMLINK => self.op_symlink(h.nodeid, payload),
+            abi::OP_READLINK => self.op_readlink(h.nodeid),
+            abi::OP_LINK => self.op_link(h.nodeid, payload),
+            abi::OP_STATFS => self.op_statfs(),
             _ => Err(abi::ENOSYS),
         }
     }
@@ -160,9 +164,9 @@ impl Server {
 
     /// Server attr → kernel attr, remembering the kind for later.
     ///
-    /// Symlinks are presented as regular files: the module has no `get_link`,
-    /// so an inode with S_IFLNK would be a mode the VFS cannot service. The
-    /// client resolves symlinks server-side anyway.
+    /// Symlinks report S_IFLNK now that the module implements `get_link`.
+    /// They used to be flattened to regular files, because an inode the VFS
+    /// could not resolve was worse than a slightly dishonest mode.
     fn kernel_attr(&self, nodeid: u64, a: &Attr) -> KernelAttr {
         let isdir = matches!(a.kind, FileKind::Dir);
         self.record_kind(nodeid, isdir);
@@ -178,11 +182,16 @@ impl Server {
             }
             bits => bits,
         };
+        let kind_bits = match a.kind {
+            FileKind::Dir => abi::S_IFDIR,
+            FileKind::Symlink => abi::S_IFLNK,
+            FileKind::File => abi::S_IFREG,
+        };
         KernelAttr {
             nodeid,
             size: a.size,
             mtime_ns: nanos_since_epoch(a.mtime),
-            mode: if isdir { abi::S_IFDIR } else { abi::S_IFREG } | perm,
+            mode: kind_bits | perm,
             nlink: if isdir { 2 } else { 1 },
         }
     }
@@ -383,6 +392,43 @@ impl Server {
         // not keep serving the pre-write size to the next GETATTR.
         self.fs.invalidate_attr(nodeid);
         Ok(abi::write_out(n))
+    }
+
+    // ------------------------------------------------------------- links
+
+    fn op_symlink(&self, parent: u64, payload: &[u8]) -> Result<Vec<u8>, i32> {
+        let (name_bytes, target_bytes) = abi::parse_symlink_in(payload).ok_or(abi::EINVAL)?;
+        let name = name_of(name_bytes)?;
+        // The target is NOT run through `name_of`: it is a path, so slashes
+        // are expected, and it is not ours to validate — the agent decides
+        // whether where it lands is inside the export.
+        let target = std::str::from_utf8(target_bytes).map_err(|_| abi::EINVAL)?;
+        if target.is_empty() || target.contains('\0') {
+            return Err(abi::EINVAL);
+        }
+        self.forget_dir(parent);
+        let (ino, attr) = self.fs.symlink(parent, name, target).map_err(|e| errno_of(&e))?;
+        Ok(self.kernel_attr(ino, &attr).to_bytes())
+    }
+
+    fn op_readlink(&self, nodeid: u64) -> Result<Vec<u8>, i32> {
+        let target = self.fs.readlink(nodeid).map_err(|e| errno_of(&e))?;
+        // Raw bytes, no terminator: the kernel NUL-terminates its own buffer
+        // from the reply length.
+        Ok(target.into_bytes())
+    }
+
+    fn op_link(&self, parent: u64, payload: &[u8]) -> Result<Vec<u8>, i32> {
+        let (target, name_bytes) = abi::parse_link_in(payload).ok_or(abi::EINVAL)?;
+        let name = name_of(name_bytes)?;
+        self.forget_dir(parent);
+        let (ino, attr) = self.fs.link(target, parent, name).map_err(|e| errno_of(&e))?;
+        Ok(self.kernel_attr(ino, &attr).to_bytes())
+    }
+
+    fn op_statfs(&self) -> Result<Vec<u8>, i32> {
+        let (block_size, blocks, blocks_free) = self.fs.statfs().map_err(|e| errno_of(&e))?;
+        Ok(abi::statfs_out(blocks, blocks_free, block_size))
     }
 
     // ------------------------------------------------------------- locks

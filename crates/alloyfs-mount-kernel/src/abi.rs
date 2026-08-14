@@ -49,6 +49,17 @@ pub const OP_WRITE: u32 = 10;
 pub const OP_SETATTR: u32 = 11;
 pub const OP_LOCK: u32 = 12;
 pub const OP_UNLOCK: u32 = 13;
+pub const OP_SYMLINK: u32 = 14;
+pub const OP_READLINK: u32 = 15;
+pub const OP_LINK: u32 = 16;
+pub const OP_STATFS: u32 = 17;
+
+/// `struct alloyfs_symlink_in`: two u16 then padding.
+pub const SYMLINK_IN_LEN: usize = 8;
+/// `struct alloyfs_link_in`: one u64.
+pub const LINK_IN_LEN: usize = 8;
+/// `struct alloyfs_statfs_out`: two u64 then a u32 and padding.
+pub const STATFS_OUT_LEN: usize = 24;
 
 pub const LOCK_SHARED: u32 = 1;
 pub const LOCK_EXCLUSIVE: u32 = 2;
@@ -74,6 +85,7 @@ pub const NOTIFY_F_ISDIR: u32 = 1 << 0;
 pub const S_IFMT: u32 = 0o170000;
 pub const S_IFDIR: u32 = 0o040000;
 pub const S_IFREG: u32 = 0o100000;
+pub const S_IFLNK: u32 = 0o120000;
 
 pub const DT_DIR: u32 = 4;
 pub const DT_REG: u32 = 8;
@@ -232,7 +244,44 @@ pub fn parse_lock_in(payload: &[u8]) -> Option<LockIn> {
     })
 }
 
+/// Decode `struct alloyfs_symlink_in` into (name, target).
+///
+/// Both lengths are checked against the payload before either is sliced: the
+/// kernel is trusted to be well-behaved, but a length field that indexes past
+/// the buffer is exactly the shape of bug the `--neg` device tests exist to
+/// find, and panicking the daemon would take the mount with it.
+pub fn parse_symlink_in(payload: &[u8]) -> Option<(&[u8], &[u8])> {
+    if payload.len() < SYMLINK_IN_LEN {
+        return None;
+    }
+    let namelen = u16_at(payload, 0) as usize;
+    let targetlen = u16_at(payload, 2) as usize;
+    let rest = &payload[SYMLINK_IN_LEN..];
+    if namelen.checked_add(targetlen)? > rest.len() {
+        return None;
+    }
+    Some((&rest[..namelen], &rest[namelen..namelen + targetlen]))
+}
+
+/// Decode `struct alloyfs_link_in` into (target nodeid, new name).
+pub fn parse_link_in(payload: &[u8]) -> Option<(u64, &[u8])> {
+    if payload.len() < LINK_IN_LEN {
+        return None;
+    }
+    Some((u64_at(payload, 0), &payload[LINK_IN_LEN..]))
+}
+
 // ------------------------------------------------------------------ encoding
+
+/// Encode `struct alloyfs_statfs_out`.
+pub fn statfs_out(blocks: u64, blocks_free: u64, block_size: u32) -> Vec<u8> {
+    let mut v = Vec::with_capacity(STATFS_OUT_LEN);
+    v.extend_from_slice(&blocks.to_ne_bytes());
+    v.extend_from_slice(&blocks_free.to_ne_bytes());
+    v.extend_from_slice(&block_size.to_ne_bytes());
+    v.extend_from_slice(&0u32.to_ne_bytes()); // _pad
+    v
+}
 
 /// What the kernel wants to hear about one file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
