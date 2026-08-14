@@ -325,6 +325,138 @@ static void serve_request(int fd, char *req, ssize_t n, int *served)
 		reply(fd, h->unique, 0, n2->data + h->offset, (unsigned int)len);
 		break;
 	}
+	/* ------------------------------------------------ stage 4: mutations */
+	case DSFS_OP_CREATE:
+	case DSFS_OP_MKDIR: {
+		const struct dsfs_create_in *ci = (const void *)name;
+		const char *nm = (const char *)(ci + 1);
+		int namelen = (int)(h->len - sizeof(*h) - sizeof(*ci));
+		char tmp[DSFS_MAX_NAME + 1];
+		struct dsfs_attr a;
+		struct node *n2;
+
+		if (namelen <= 0 || namelen > DSFS_MAX_NAME) {
+			reply(fd, h->unique, -EINVAL, NULL, 0);
+			break;
+		}
+		memcpy(tmp, nm, namelen);
+		tmp[namelen] = '\0';
+		if (find_child(h->nodeid, tmp, namelen)) {
+			reply(fd, h->unique, -EEXIST, NULL, 0);
+			break;
+		}
+		add(next_nodeid, h->nodeid, tmp, ci->mode, "");
+		n2 = find_node(next_nodeid++);
+		if (!n2) {
+			reply(fd, h->unique, -ENOSPC, NULL, 0);
+			break;
+		}
+		fill_attr(&a, n2);
+		reply(fd, h->unique, 0, &a, sizeof(a));
+		break;
+	}
+	case DSFS_OP_UNLINK:
+	case DSFS_OP_RMDIR: {
+		int namelen = (int)(h->len - sizeof(*h));
+		struct node *n2 = find_child(h->nodeid, name, namelen);
+
+		if (!n2) {
+			reply(fd, h->unique, -ENOENT, NULL, 0);
+			break;
+		}
+		if (h->opcode == DSFS_OP_RMDIR) {
+			for (int i = 0; i < MAX_NODES; i++) {
+				if (tree[i].alive && tree[i].parent == n2->nodeid) {
+					reply(fd, h->unique, -ENOTEMPTY, NULL, 0);
+					goto done;
+				}
+			}
+		}
+		n2->alive = 0;
+		reply(fd, h->unique, 0, NULL, 0);
+done:
+		break;
+	}
+	case DSFS_OP_RENAME: {
+		const struct dsfs_rename_in *ri = (const void *)name;
+		const char *from = (const char *)(ri + 1);
+		const char *to = from + ri->namelen;
+		struct node *n2, *victim;
+		char tmp[DSFS_MAX_NAME + 1];
+
+		if (ri->namelen > DSFS_MAX_NAME || ri->newnamelen > DSFS_MAX_NAME) {
+			reply(fd, h->unique, -EINVAL, NULL, 0);
+			break;
+		}
+		n2 = find_child(h->nodeid, from, ri->namelen);
+		if (!n2) {
+			reply(fd, h->unique, -ENOENT, NULL, 0);
+			break;
+		}
+		victim = find_child(ri->newparent, to, ri->newnamelen);
+		if (victim)
+			victim->alive = 0;	/* replace, POSIX-style */
+		memcpy(tmp, to, ri->newnamelen);
+		tmp[ri->newnamelen] = '\0';
+		n2->parent = ri->newparent;
+		snprintf(n2->name, sizeof(n2->name), "%s", tmp);
+		reply(fd, h->unique, 0, NULL, 0);
+		break;
+	}
+	case DSFS_OP_WRITE: {
+		struct node *n2 = find_node(h->nodeid);
+		const char *data = name;
+		unsigned int len = h->len - sizeof(*h);
+		struct dsfs_write_out wo;
+		unsigned long long end;
+
+		if (!n2) {
+			reply(fd, h->unique, -ENOENT, NULL, 0);
+			break;
+		}
+		end = h->offset + len;
+		if (end >= MAX_DATA) {
+			reply(fd, h->unique, -EFBIG, NULL, 0);
+			break;
+		}
+		/* Sparse writes past the end zero-fill, like a real file. */
+		if (h->offset > strlen(n2->data))
+			memset(n2->data + strlen(n2->data), '\0',
+			       h->offset - strlen(n2->data));
+		memcpy(n2->data + h->offset, data, len);
+		n2->data[end] = '\0';
+		memset(&wo, 0, sizeof(wo));
+		wo.written = len;
+		reply(fd, h->unique, 0, &wo, sizeof(wo));
+		break;
+	}
+	case DSFS_OP_SETATTR: {
+		const struct dsfs_setattr_in *si = (const void *)name;
+		struct node *n2 = find_node(h->nodeid);
+		struct dsfs_attr a;
+
+		if (!n2) {
+			reply(fd, h->unique, -ENOENT, NULL, 0);
+			break;
+		}
+		if (si->valid & DSFS_SETATTR_MODE)
+			n2->mode = (n2->mode & S_IFMT) | (si->mode & 07777);
+		if (si->valid & DSFS_SETATTR_SIZE) {
+			unsigned long long want = si->size;
+
+			if (want >= MAX_DATA)
+				want = MAX_DATA - 1;
+			if (want < strlen(n2->data))
+				n2->data[want] = '\0';
+			else
+				memset(n2->data + strlen(n2->data), '\0',
+				       want - strlen(n2->data));
+			n2->data[want] = '\0';
+		}
+		fill_attr(&a, n2);
+		reply(fd, h->unique, 0, &a, sizeof(a));
+		break;
+	}
 	default:
 		reply(fd, h->unique, -ENOSYS, NULL, 0);
 		break;
@@ -335,7 +467,8 @@ int main(int argc, char **argv)
 {
 	int fd = -1, ctl = -1, served = 0;
 	const char *ctl_path = NULL;
-	char req[sizeof(struct dsfs_in_header) + DSFS_MAX_NAME + 16];
+	/* Must hold ANY request: a write carries a full payload, not a name. */
+	static char req[sizeof(struct dsfs_in_header) + DSFS_MAX_PAYLOAD];
 
 	for (int i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "--fd") && i + 1 < argc)

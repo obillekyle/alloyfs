@@ -29,7 +29,8 @@
 
 static void dsfs_req_free(struct dsfs_req *req)
 {
-	kfree(req->out_buf);
+	kvfree(req->in_buf);
+	kvfree(req->out_buf);
 	kfree(req);
 }
 
@@ -82,9 +83,7 @@ int dsfs_request(struct dsfs_conn *conn, u32 opcode, u64 nodeid, u64 offset,
 	struct dsfs_req *req;
 	int ret;
 
-	if (in_len > DSFS_MAX_NAME)
-		return -ENAMETOOLONG;
-	if (out_max > DSFS_MAX_PAYLOAD)
+	if (in_len > DSFS_MAX_PAYLOAD || out_max > DSFS_MAX_PAYLOAD)
 		return -EINVAL;
 
 	req = kzalloc(sizeof(*req), GFP_KERNEL);
@@ -98,13 +97,22 @@ int dsfs_request(struct dsfs_conn *conn, u32 opcode, u64 nodeid, u64 offset,
 	req->hdr.offset = offset;
 	req->hdr.size = size;
 	req->in_len = in_len;
-	if (in_len)
-		memcpy(req->in_payload, in_payload, in_len);
+	if (in_len) {
+		/* kvmalloc: a 128 KiB write payload is an order-5 allocation,
+		 * which kmalloc can fail under fragmentation.
+		 */
+		req->in_buf = kvmalloc(in_len, GFP_KERNEL);
+		if (!req->in_buf) {
+			kfree(req);
+			return -ENOMEM;
+		}
+		memcpy(req->in_buf, in_payload, in_len);
+	}
 	req->out_max = out_max;
 	if (out_max) {
-		req->out_buf = kzalloc(out_max, GFP_KERNEL);
+		req->out_buf = kvzalloc(out_max, GFP_KERNEL);
 		if (!req->out_buf) {
-			kfree(req);
+			dsfs_req_free(req);
 			return -ENOMEM;
 		}
 	}
@@ -182,7 +190,10 @@ static ssize_t dsfs_dev_read(struct file *file, char __user *ubuf, size_t count,
 	size_t total;
 	int err;
 
-	if (count < sizeof(struct dsfs_in_header) + DSFS_MAX_NAME)
+	/* The daemon must present a buffer able to hold ANY request, so a big
+	 * write never has to be split across reads.
+	 */
+	if (count < sizeof(struct dsfs_in_header) + DSFS_MAX_PAYLOAD)
 		return -EINVAL;
 
 	for (;;) {
@@ -211,7 +222,7 @@ static ssize_t dsfs_dev_read(struct file *file, char __user *ubuf, size_t count,
 	total = sizeof(req->hdr) + req->in_len;
 	if (copy_to_user(ubuf, &req->hdr, sizeof(req->hdr)) ||
 	    (req->in_len &&
-	     copy_to_user(ubuf + sizeof(req->hdr), req->in_payload, req->in_len))) {
+	     copy_to_user(ubuf + sizeof(req->hdr), req->in_buf, req->in_len))) {
 		/* The daemon never saw it: requeue so it is not lost. */
 		spin_lock(&conn->lock);
 		if (!req->finished)

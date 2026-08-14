@@ -29,6 +29,48 @@ enum dsfs_opcode {
 	DSFS_OP_GETATTR = 2,	/* nodeid = target */
 	DSFS_OP_READDIR = 3,	/* nodeid = dir, offset = cursor */
 	DSFS_OP_READ = 4,	/* nodeid = file, offset/size = range */
+	/* --- stage 4: mutations. All are write-through: the syscall does not
+	 * return until the daemon has acknowledged, so an acknowledged write
+	 * is durable as far as the application is concerned.
+	 */
+	DSFS_OP_CREATE = 5,	/* nodeid = parent, payload = create_in + name */
+	DSFS_OP_MKDIR = 6,	/* same shape as CREATE */
+	DSFS_OP_UNLINK = 7,	/* nodeid = parent, payload = name */
+	DSFS_OP_RMDIR = 8,	/* nodeid = parent, payload = name */
+	DSFS_OP_RENAME = 9,	/* nodeid = parent, payload = rename_in + names */
+	DSFS_OP_WRITE = 10,	/* nodeid = file, offset, payload = data */
+	DSFS_OP_SETATTR = 11,	/* nodeid = target, payload = setattr_in */
+};
+
+/* CREATE / MKDIR request payload, followed by the name. */
+struct dsfs_create_in {
+	__u32 mode;
+	__u32 _pad;
+};
+
+/* RENAME request payload, followed by name then newname. */
+struct dsfs_rename_in {
+	__u64 newparent;
+	__u16 namelen;
+	__u16 newnamelen;
+	__u32 _pad;
+};
+
+#define DSFS_SETATTR_MODE (1u << 0)
+#define DSFS_SETATTR_SIZE (1u << 1)
+#define DSFS_SETATTR_MTIME (1u << 2)
+
+struct dsfs_setattr_in {
+	__u32 valid;		/* DSFS_SETATTR_* */
+	__u32 mode;
+	__u64 size;
+	__u64 mtime_ns;
+};
+
+/* WRITE reply payload. */
+struct dsfs_write_out {
+	__u32 written;
+	__u32 _pad;
 };
 
 struct dsfs_attr {

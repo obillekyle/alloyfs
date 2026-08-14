@@ -302,6 +302,279 @@ static ssize_t dsfs_read_iter(struct kiocb *iocb, struct iov_iter *to)
 	return ret;
 }
 
+/* ------------------------------------------------------------- mutations
+ *
+ * Every mutation is WRITE-THROUGH: the syscall does not return until the
+ * daemon has acknowledged, so an acknowledged write is durable as far as the
+ * application is concerned and there is no writeback cache to lose. Slower
+ * than buffering, but a filesystem that loses acknowledged writes is a bug
+ * generator, and the client above already batches at a higher level.
+ *
+ * Local mutations do NOT emit fsnotify events here: the VFS already does
+ * that for us (vfs_create -> fsnotify_create, vfs_unlink -> fsnotify_unlink,
+ * and so on). Only remote changes need the injection path — that asymmetry
+ * is the whole design.
+ */
+
+/* Shared by create() and mkdir(): both send mode + name and get an attr. */
+static int dsfs_do_mknod(struct inode *dir, struct dentry *dentry, umode_t mode,
+			 u32 opcode)
+{
+	struct dsfs_conn *conn = dsfs_conn_of(dir);
+	struct dsfs_create_in *in;
+	struct dsfs_attr attr;
+	struct inode *inode;
+	size_t len = sizeof(*in) + dentry->d_name.len;
+	int ret;
+
+	if (!conn)
+		return -EROFS;	/* the in-memory demo tree is read-only */
+	if (dentry->d_name.len > DSFS_MAX_NAME)
+		return -ENAMETOOLONG;
+
+	in = kzalloc(len, GFP_KERNEL);
+	if (!in)
+		return -ENOMEM;
+	in->mode = mode;
+	memcpy(in + 1, dentry->d_name.name, dentry->d_name.len);
+
+	ret = dsfs_request(conn, opcode, dir->i_ino, 0, 0, in, len,
+			   &attr, sizeof(attr));
+	kfree(in);
+	if (ret < 0)
+		return ret;
+	if (ret < (int)sizeof(attr))
+		return -EIO;
+
+	inode = dsfs_iget_attr(dir->i_sb, &attr);
+	if (IS_ERR(inode))
+		return PTR_ERR(inode);
+	d_instantiate(dentry, inode);
+	if (S_ISDIR(mode))
+		inc_nlink(dir);
+	return 0;
+}
+
+static int dsfs_create(struct mnt_idmap *idmap, struct inode *dir,
+		       struct dentry *dentry, umode_t mode, bool excl)
+{
+	return dsfs_do_mknod(dir, dentry, mode | S_IFREG, DSFS_OP_CREATE);
+}
+
+static int dsfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
+		      struct dentry *dentry, umode_t mode)
+{
+	return dsfs_do_mknod(dir, dentry, mode | S_IFDIR, DSFS_OP_MKDIR);
+}
+
+static int dsfs_do_remove(struct inode *dir, struct dentry *dentry, u32 opcode)
+{
+	struct dsfs_conn *conn = dsfs_conn_of(dir);
+	int ret;
+
+	if (!conn)
+		return -EROFS;
+	ret = dsfs_request(conn, opcode, dir->i_ino, 0, 0,
+			   dentry->d_name.name, dentry->d_name.len, NULL, 0);
+	if (ret < 0)
+		return ret;
+
+	/* The name is gone; make the inode agree so a watch on the file sees
+	 * DELETE_SELF and a stale open fd reports the truth.
+	 */
+	if (d_really_is_positive(dentry)) {
+		struct inode *inode = d_inode(dentry);
+
+		if (opcode == DSFS_OP_RMDIR) {
+			clear_nlink(inode);
+			drop_nlink(dir);
+		} else if (inode->i_nlink) {
+			drop_nlink(inode);
+		}
+	}
+	return 0;
+}
+
+static int dsfs_unlink(struct inode *dir, struct dentry *dentry)
+{
+	return dsfs_do_remove(dir, dentry, DSFS_OP_UNLINK);
+}
+
+static int dsfs_rmdir(struct inode *dir, struct dentry *dentry)
+{
+	return dsfs_do_remove(dir, dentry, DSFS_OP_RMDIR);
+}
+
+static int dsfs_rename(struct mnt_idmap *idmap, struct inode *old_dir,
+		       struct dentry *old_dentry, struct inode *new_dir,
+		       struct dentry *new_dentry, unsigned int flags)
+{
+	struct dsfs_conn *conn = dsfs_conn_of(old_dir);
+	struct dsfs_rename_in *in;
+	size_t len;
+	int ret;
+
+	if (!conn)
+		return -EROFS;
+	/* EXCHANGE and WHITEOUT have no wire representation; refusing them is
+	 * correct and the VFS falls back for callers that can.
+	 */
+	if (flags & ~RENAME_NOREPLACE)
+		return -EINVAL;
+	if (old_dentry->d_name.len > DSFS_MAX_NAME ||
+	    new_dentry->d_name.len > DSFS_MAX_NAME)
+		return -ENAMETOOLONG;
+	if ((flags & RENAME_NOREPLACE) && d_really_is_positive(new_dentry))
+		return -EEXIST;
+
+	len = sizeof(*in) + old_dentry->d_name.len + new_dentry->d_name.len;
+	in = kzalloc(len, GFP_KERNEL);
+	if (!in)
+		return -ENOMEM;
+	in->newparent = new_dir->i_ino;
+	in->namelen = old_dentry->d_name.len;
+	in->newnamelen = new_dentry->d_name.len;
+	memcpy((char *)(in + 1), old_dentry->d_name.name, old_dentry->d_name.len);
+	memcpy((char *)(in + 1) + old_dentry->d_name.len,
+	       new_dentry->d_name.name, new_dentry->d_name.len);
+
+	ret = dsfs_request(conn, DSFS_OP_RENAME, old_dir->i_ino, 0, 0, in, len,
+			   NULL, 0);
+	kfree(in);
+	if (ret < 0)
+		return ret;
+
+	/* A replaced target is gone from the namespace. */
+	if (d_really_is_positive(new_dentry)) {
+		struct inode *victim = d_inode(new_dentry);
+
+		if (S_ISDIR(victim->i_mode)) {
+			clear_nlink(victim);
+			drop_nlink(new_dir);
+		} else if (victim->i_nlink) {
+			drop_nlink(victim);
+		}
+	}
+	if (S_ISDIR(d_inode(old_dentry)->i_mode) && old_dir != new_dir) {
+		drop_nlink(old_dir);
+		inc_nlink(new_dir);
+	}
+	return 0;
+}
+
+static ssize_t dsfs_write_iter(struct kiocb *iocb, struct iov_iter *from)
+{
+	struct inode *inode = file_inode(iocb->ki_filp);
+	struct dsfs_conn *conn = dsfs_conn_of(inode);
+	ssize_t total = 0;
+	loff_t pos;
+	int err;
+
+	if (!conn)
+		return -EROFS;
+
+	inode_lock(inode);
+	err = generic_write_checks(iocb, from) <= 0 ? -EINVAL : 0;
+	if (err && iov_iter_count(from)) {
+		inode_unlock(inode);
+		return err;
+	}
+	pos = iocb->ki_pos;
+
+	/* One request per DATA_CHUNK: bounded memory, and a partial failure
+	 * still reports exactly how much reached the server.
+	 */
+	while (iov_iter_count(from)) {
+		size_t want = min_t(size_t, iov_iter_count(from), DSFS_MAX_PAYLOAD);
+		struct dsfs_write_out out;
+		void *buf = kvmalloc(want, GFP_KERNEL);
+		size_t got;
+		int ret;
+
+		if (!buf) {
+			if (!total)
+				total = -ENOMEM;
+			break;
+		}
+		got = copy_from_iter(buf, want, from);
+		if (!got) {
+			kvfree(buf);
+			break;
+		}
+		ret = dsfs_request(conn, DSFS_OP_WRITE, inode->i_ino, pos, got,
+				   buf, got, &out, sizeof(out));
+		kvfree(buf);
+		if (ret < 0) {
+			if (!total)
+				total = ret;
+			break;
+		}
+		if (ret < (int)sizeof(out) || out.written == 0) {
+			if (!total)
+				total = -EIO;
+			break;
+		}
+		pos += out.written;
+		total += out.written;
+		if (out.written < got)
+			break;	/* short write: the server took what it could */
+	}
+
+	if (total > 0) {
+		iocb->ki_pos = pos;
+		if (pos > i_size_read(inode))
+			i_size_write(inode, pos);
+		inode_set_mtime_to_ts(inode, current_time(inode));
+	}
+	inode_unlock(inode);
+	return total;
+}
+
+static int dsfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+			struct iattr *attr)
+{
+	struct inode *inode = d_inode(dentry);
+	struct dsfs_conn *conn = dsfs_conn_of(inode);
+	struct dsfs_setattr_in in = {};
+	struct dsfs_attr out;
+	int ret;
+
+	ret = setattr_prepare(idmap, dentry, attr);
+	if (ret)
+		return ret;
+	if (!conn)
+		return -EROFS;
+
+	if (attr->ia_valid & ATTR_MODE) {
+		in.valid |= DSFS_SETATTR_MODE;
+		in.mode = attr->ia_mode;
+	}
+	if (attr->ia_valid & ATTR_SIZE) {
+		in.valid |= DSFS_SETATTR_SIZE;
+		in.size = attr->ia_size;
+	}
+	if (attr->ia_valid & ATTR_MTIME) {
+		in.valid |= DSFS_SETATTR_MTIME;
+		in.mtime_ns = (u64)attr->ia_mtime.tv_sec * NSEC_PER_SEC +
+			      attr->ia_mtime.tv_nsec;
+	}
+	if (!in.valid)
+		return 0;
+
+	ret = dsfs_request(conn, DSFS_OP_SETATTR, inode->i_ino, 0, 0,
+			   &in, sizeof(in), &out, sizeof(out));
+	if (ret < 0)
+		return ret;
+
+	setattr_copy(idmap, inode, attr);
+	if (attr->ia_valid & ATTR_SIZE) {
+		truncate_setsize(inode, attr->ia_size);
+		i_size_write(inode, attr->ia_size);
+	}
+	mark_inode_dirty(inode);
+	return 0;
+}
+
 static int dsfs_getattr(struct mnt_idmap *idmap, const struct path *path,
 			struct kstat *stat, u32 request_mask, unsigned int flags)
 {
@@ -329,10 +602,17 @@ static int dsfs_getattr(struct mnt_idmap *idmap, const struct path *path,
 static const struct inode_operations dsfs_dir_inode_operations = {
 	.lookup = dsfs_lookup,
 	.getattr = dsfs_getattr,
+	.setattr = dsfs_setattr,
+	.create = dsfs_create,
+	.mkdir = dsfs_mkdir,
+	.unlink = dsfs_unlink,
+	.rmdir = dsfs_rmdir,
+	.rename = dsfs_rename,
 };
 
 static const struct inode_operations dsfs_file_inode_operations = {
 	.getattr = dsfs_getattr,
+	.setattr = dsfs_setattr,
 };
 
 static const struct file_operations dsfs_dir_operations = {
@@ -342,10 +622,21 @@ static const struct file_operations dsfs_dir_operations = {
 	.iterate_shared = dsfs_readdir,
 };
 
+/* Write-through means there is nothing to flush: fsync is a no-op that
+ * honestly reports success rather than pretending to sync a cache we do
+ * not keep.
+ */
+static int dsfs_fsync(struct file *file, loff_t start, loff_t end, int datasync)
+{
+	return 0;
+}
+
 static const struct file_operations dsfs_file_operations = {
 	.owner = THIS_MODULE,
 	.llseek = generic_file_llseek,
 	.read_iter = dsfs_read_iter,
+	.write_iter = dsfs_write_iter,
+	.fsync = dsfs_fsync,
 };
 
 /* ------------------------------------------------------------ superblock */

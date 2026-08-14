@@ -59,7 +59,10 @@ struct dsfs_node *dsfs_child(struct dsfs_node *dir, const char *name);
 struct dsfs_req {
 	struct list_head list;
 	struct dsfs_in_header hdr;
-	char in_payload[DSFS_MAX_NAME];
+	/* Allocated per request: a name is 255 bytes, but a write carries up
+	 * to DSFS_MAX_PAYLOAD, so this cannot be a fixed inline array.
+	 */
+	void *in_buf;
 	u32 in_len;
 	void *out_buf;
 	u32 out_max;
