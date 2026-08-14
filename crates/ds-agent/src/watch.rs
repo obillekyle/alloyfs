@@ -336,10 +336,16 @@ fn flush(
         // event wins, so drop the degraded halves it would duplicate — but
         // ONLY exact halves (a real Modified on the target must survive for
         // cache freshness).
-        if pending.get(&from).is_some_and(|p| matches!(p.kind, EventKind::Removed)) {
+        if pending
+            .get(&from)
+            .is_some_and(|p| matches!(p.kind, EventKind::Removed))
+        {
             pending.remove(&from);
         }
-        if pending.get(&to).is_some_and(|p| matches!(p.kind, EventKind::Created)) {
+        if pending
+            .get(&to)
+            .is_some_and(|p| matches!(p.kind, EventKind::Created))
+        {
             pending.remove(&to);
         }
         export.rename_version(&from, &to);
@@ -400,9 +406,24 @@ mod tests {
 
         let mut pending = HashMap::new();
         let mut renames = Vec::new();
-        ingest(&export, &mut pending, &mut renames, rename_event(RenameMode::From, vec![from.clone()]));
-        ingest(&export, &mut pending, &mut renames, rename_event(RenameMode::To, vec![to.clone()]));
-        ingest(&export, &mut pending, &mut renames, rename_event(RenameMode::Both, vec![from, to]));
+        ingest(
+            &export,
+            &mut pending,
+            &mut renames,
+            rename_event(RenameMode::From, vec![from.clone()]),
+        );
+        ingest(
+            &export,
+            &mut pending,
+            &mut renames,
+            rename_event(RenameMode::To, vec![to.clone()]),
+        );
+        ingest(
+            &export,
+            &mut pending,
+            &mut renames,
+            rename_event(RenameMode::Both, vec![from, to]),
+        );
 
         let hub = export.events.clone();
         let mut rx = hub.subscribe(None).unwrap().1;
@@ -426,7 +447,12 @@ mod tests {
 
         let mut pending = HashMap::new();
         let mut renames = Vec::new();
-        ingest(&export, &mut pending, &mut renames, rename_event(RenameMode::Both, vec![from, to.clone()]));
+        ingest(
+            &export,
+            &mut pending,
+            &mut renames,
+            rename_event(RenameMode::Both, vec![from, to.clone()]),
+        );
         ingest(
             &export,
             &mut pending,
@@ -443,7 +469,9 @@ mod tests {
         flush(&export, &hub, &mut pending, &mut renames);
         let batch = rx.try_recv().expect("one batch published");
         assert_eq!(batch.len(), 2, "rename + modify both survive: {batch:?}");
-        assert!(batch.iter().any(|e| matches!(e.kind, EventKind::RenamedFrom { .. })));
+        assert!(batch
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::RenamedFrom { .. })));
         assert!(
             batch
                 .iter()

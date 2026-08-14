@@ -1,13 +1,17 @@
 # Registers the drive-sync agent as a Windows Scheduled Task that starts at
 # logon and restarts on failure. Run from an elevated PowerShell:
 #   powershell -ExecutionPolicy Bypass -File scripts\install-agent-task.ps1
+#   powershell ... -File scripts\install-agent-task.ps1 -Exe D:\tools\drive-sync.exe
 # Remove with:
 #   Unregister-ScheduledTask -TaskName "drive-sync-agent" -Confirm:$false
+param(
+    [string]$Exe = "C:\MyApps\drive-sync.exe",
+    [string]$Arguments = "serve"
+)
 
-$exe = "C:\MyApps\drive-sync.exe"
-if (-not (Test-Path $exe)) { throw "drive-sync.exe not found at $exe" }
+if (-not (Test-Path $Exe)) { throw "drive-sync.exe not found at $Exe (pass -Exe)" }
 
-$action = New-ScheduledTaskAction -Execute $exe -Argument "serve"
+$action = New-ScheduledTaskAction -Execute $Exe -Argument $Arguments
 $trigger = New-ScheduledTaskTrigger -AtLogOn
 $settings = New-ScheduledTaskSettingsSet `
     -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) `

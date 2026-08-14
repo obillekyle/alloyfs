@@ -214,16 +214,19 @@ connection and silently off with any v2 peer.
 
 ## Running the agent as a service
 
-- **Linux (systemd)**: [scripts/drive-sync.service](scripts/drive-sync.service) —
-  copy to `/etc/systemd/system/`, adjust `User=`/`--config`, then
-  `systemctl enable --now drive-sync`. Logs land in journald
-  (`journalctl -u drive-sync -f`); the agent restarts on failure.
+- **Linux (systemd)**: [scripts/drive-sync.service](scripts/drive-sync.service)
+  is a template unit — copy to `/etc/systemd/system/drive-sync@.service`,
+  then `systemctl enable --now drive-sync@youruser` (the instance name picks
+  the user whose config and exports it serves). Logs land in journald
+  (`journalctl -u drive-sync@youruser -f`); the agent restarts on failure.
 - **Windows (Scheduled Task)**: [scripts/install-agent-task.ps1](scripts/install-agent-task.ps1)
-  (elevated PowerShell) registers a `drive-sync-agent` task that starts
-  `drive-sync serve` at logon and restarts it on failure.
+  (elevated PowerShell; `-Exe` overrides the binary path) registers a
+  `drive-sync-agent` task that starts `drive-sync serve` at logon and
+  restarts it on failure.
 - Mounts don't need service treatment: a mount already **auto-reconnects**
   through server restarts, so an agent coming back after a reboot picks up
-  its clients where they left off (open files reopen; locks are lost).
+  its clients where they left off (open files reopen; uncontended locks are
+  re-acquired — see below).
 
 ## Known issues
 
@@ -240,17 +243,34 @@ connection and silently off with any v2 peer.
   included.)
 - **Do not build with LTO.** `lto = "thin"` miscompiles the WinFsp path
   (reads through the drive hang); the release profile pins `lto = false`.
-- Sequential reads use a per-handle readahead window (16 × 128 KiB in
-  flight once a sequential pattern is detected), which saturates the link:
-  measured *faster than raw `ssh cat`* on the same connection. Absolute
-  throughput is bounded by your link speed.
+- Sequential reads use a per-handle readahead window (32 × 128 KiB in
+  flight once a sequential-ish pattern is detected; out-of-order and
+  overlapped kernel reads are tolerated, and recently served blocks are
+  retained for sub-chunk re-reads). Measured on a ~2 MB/s, 60 ms ssh link
+  with compressible data: raw pipelined transport 14.6 MB/s, 1 MiB kernel
+  reads through the mount 6.4 MB/s (2× the previous ceiling), 128 KiB
+  kernel reads 4.0 MB/s — small-read throughput is bounded by per-request
+  dispatch cost, not the wire. `drive-sync bench <url> <path> --depth N`
+  measures the transport without the kernel in the loop; mount with
+  `DS_READ_STATS=1` to get per-file window counters on release.
 - Mounts **auto-reconnect**: on connection loss the client re-dials (tcp or
   a fresh ssh spawn) with backoff, re-attaches, re-opens every live file
   handle on the new session (open fds keep working — verified across a full
   server kill), and resubscribes the event stream from the last applied
-  sequence number. Advisory locks do NOT survive a reconnect. Requests are
-  also bounded by a 30 s timeout so a wedged server can never hang the
-  mount forever.
+  sequence number. Advisory locks are **replayed** on the new session: an
+  uncontended lock survives; if another client won the lock during the gap,
+  the handle is poisoned and further I/O on it fails with EIO — a loud
+  signal that mutual exclusion was interrupted, which is the one thing an
+  application can actually react to. Requests are bounded by a 30 s timeout
+  (blocking lock waits instead by peer liveness — a busy server can hold a
+  waiter indefinitely, a wedged one fails it in ~20 s) so a dead or stuck
+  server can never hang the mount forever.
+- **A killed (not unmounted) Windows mount can leave its drive letter
+  registered** — remounting on the same letter then fails with "Object Name
+  already exists". Unmount with Ctrl-C when possible; after a hard kill,
+  pick a fresh letter or restart the WinFsp service
+  (`net stop winfsp.launcher & net start winfsp.launcher`) / reboot to
+  reclaim the letter.
 
 ## Honest limitations (by design or by platform)
 

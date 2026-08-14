@@ -1,20 +1,18 @@
-# systemd unit for the drive-sync agent (Linux server).
-# Install:
-#   sudo cp scripts/drive-sync.service /etc/systemd/system/
+# systemd template unit for the drive-sync agent (Linux server).
+# The instance name is the user whose config and exports it serves:
+#   sudo cp scripts/drive-sync.service /etc/systemd/system/drive-sync@.service
 #   sudo systemctl daemon-reload
-#   sudo systemctl enable --now drive-sync
-# Logs: journalctl -u drive-sync -f
-#
-# Adjust User= and the --config path to the account that owns the exports.
+#   sudo systemctl enable --now drive-sync@okyle
+# Logs: journalctl -u drive-sync@okyle -f
 
 [Unit]
-Description=drive-sync agent (virtual drive exports)
+Description=drive-sync agent for %i (virtual drive exports)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
-User=okyle
-ExecStart=/usr/local/bin/drive-sync serve --config /home/okyle/.config/drive-sync/agent.toml
+User=%i
+ExecStart=/usr/local/bin/drive-sync serve --config /home/%i/.config/drive-sync/agent.toml
 Restart=on-failure
 RestartSec=2
 Environment=RUST_LOG=info
