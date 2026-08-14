@@ -16,8 +16,13 @@ use crate::error::ErrorCode;
 /// v3: `Request::Auth` + `ErrorCode::AuthRequired` (TCP shared-secret auth)
 /// and `Frame::Compressed` (transparent large-frame compression). Both sides
 /// send the new variants only when the negotiated version is >= 3.
+///
+/// v4: `Request::Symlink` / `Request::ReadLink` + `Response::Target`.
+/// Symlinks could previously be read (resolved server-side) but never
+/// created through a mount. Gated the same way: a v3 peer cannot decode
+/// these variants, so they are sent only when the negotiated version is >= 4.
 pub const PROTO_VERSION_MIN: u16 = 1;
-pub const PROTO_VERSION_MAX: u16 = 3;
+pub const PROTO_VERSION_MAX: u16 = 4;
 
 /// Read/write payloads are capped to this many bytes per request so one huge
 /// file operation can never monopolize the connection (head-of-line blocking).
@@ -250,6 +255,22 @@ pub enum Request {
     Auth {
         token: String,
     },
+    /// v4+: create a symbolic link at `link` pointing at `target`.
+    ///
+    /// `target` is an opaque string, not a `RelPath`: a symlink's target is
+    /// whatever text the creator chose and may be relative ("../sibling"),
+    /// which is not a valid export-relative path and must not be validated as
+    /// one. The server resolves it — relative to the link's own directory —
+    /// and refuses anything landing outside the export, the same rule already
+    /// applied when reading them.
+    Symlink {
+        target: String,
+        link: RelPath,
+    },
+    /// v4+: read a symbolic link's target, verbatim as stored.
+    ReadLink {
+        path: RelPath,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -291,6 +312,9 @@ pub enum Response {
         auto_cache_max: Option<u64>,
         auto_cache_budget: Option<u64>,
     },
+    /// v4+: a symlink's target, exactly as stored on the server. Appended
+    /// last (see `Request::ReadLink`).
+    Target(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

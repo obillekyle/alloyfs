@@ -915,6 +915,61 @@ impl RemoteFs {
         }
     }
 
+    /// Create a symlink at `parent/name` pointing at `target`.
+    ///
+    /// Unlike `link`, only the LINK's location decides where this goes: the
+    /// target is opaque text that may not resolve to anything yet, so there is
+    /// no second path to route on. A link created in the overlay stays local;
+    /// one created on the server is sent there and validated against the
+    /// export boundary by the agent.
+    pub fn symlink(&self, parent: u64, name: &str, target: &str) -> Result<(u64, Attr), FsError> {
+        let dir = self.path_of(parent)?;
+        let link = dir.join(name);
+        if self.is_overlay(&link) {
+            let attr = self.overlay_ref().symlink(target, &link)?;
+            let ino = self.ino.get_or_alloc(link);
+            return Ok((ino, attr));
+        }
+        self.require_proto(4, "symlink")?;
+        let attr = expect_resp!(
+            self.call(Request::Symlink {
+                target: target.to_string(),
+                link: link.clone(),
+            })?,
+            Response::Attr(attr) => attr
+        );
+        let ino = self.ino.get_or_alloc(link);
+        self.cache_attr(ino, attr);
+        Ok((ino, attr))
+    }
+
+    /// A symlink's target, verbatim as stored.
+    pub fn readlink(&self, ino: u64) -> Result<String, FsError> {
+        let path = self.path_of(ino)?;
+        if self.is_overlay(&path) {
+            return self.overlay_ref().readlink(&path);
+        }
+        self.require_proto(4, "readlink")?;
+        Ok(expect_resp!(
+            self.call(Request::ReadLink { path })?,
+            Response::Target(t) => t
+        ))
+    }
+
+    /// Refuse an operation the negotiated protocol cannot carry.
+    ///
+    /// Sending a v4 variant to a v3 peer would not fail cleanly — postcard
+    /// would decode the variant index as something else entirely, or as
+    /// garbage. Better to say so.
+    fn require_proto(&self, need: u16, what: &str) -> Result<(), FsError> {
+        let have = self.conn().proto;
+        if have < need {
+            tracing::warn!(have, need, what, "the server is too old for this operation");
+            return Err(ErrorCode::VersionMismatch.into());
+        }
+        Ok(())
+    }
+
     // ------------------------------------------------------ locks & handles
 
     pub fn lock(&self, fh: u64, kind: alloyfs_proto::LockKind, wait: bool) -> Result<(), FsError> {

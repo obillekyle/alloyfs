@@ -30,6 +30,54 @@ pub(crate) fn resolve_unchecked(root_canon: &Path, rel: &RelPath) -> Result<Path
     Ok(canon)
 }
 
+/// Where a symlink at `link` pointing to `target` would land, as an
+/// export-relative path — or `None` if it escapes the export.
+///
+/// This is deliberately LEXICAL. `canonicalize` is wrong here twice over: a
+/// symlink is allowed to dangle, so the target may not exist yet and
+/// canonicalize would fail on a perfectly legal link; and where the target
+/// does exist, canonicalize would follow it, so a link to a link could be
+/// judged by the wrong destination. Resolving the text is the only check that
+/// matches what the kernel will actually do when someone walks the link.
+///
+/// An absolute target is refused outright. On the server it means a path in
+/// the server's own root, which is outside the export by definition — and on
+/// a client it would mean something different again, which is worse.
+pub(crate) fn symlink_lands_inside(link: &RelPath, target: &str) -> Option<String> {
+    if target.is_empty() {
+        return None;
+    }
+    // Absolute in either dialect, or a Windows drive letter.
+    let bytes = target.as_bytes();
+    if target.starts_with('/') || target.starts_with('\\') {
+        return None;
+    }
+    if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
+        return None;
+    }
+
+    // Start in the link's own directory: a relative target is resolved from
+    // there, not from the export root.
+    let (parent, _) = link.split()?;
+    let mut stack: Vec<&str> = if parent.is_root() {
+        Vec::new()
+    } else {
+        parent.0.split('/').collect()
+    };
+    for comp in target.split(['/', '\\']) {
+        match comp {
+            "" | "." => {}
+            ".." => {
+                // Popping past the export root is the escape we are here to
+                // catch: "../../etc/passwd" from one level down.
+                stack.pop()?;
+            }
+            other => stack.push(other),
+        }
+    }
+    Some(stack.join("/"))
+}
+
 /// Real (block_size, blocks, blocks_free) for the filesystem holding `path`.
 /// None on failure — the caller keeps its placeholders.
 #[cfg(unix)]

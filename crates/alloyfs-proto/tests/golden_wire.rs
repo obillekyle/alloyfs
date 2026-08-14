@@ -248,6 +248,20 @@ fn canonical() -> Vec<(&'static str, Frame)> {
                 auto_cache_budget: None,
             }),
         ),
+        (
+            "req_symlink",
+            req(Request::Symlink {
+                // Relative on purpose: a target is opaque text, not a path we
+                // validate, and the encoding must not care.
+                target: "../elsewhere/file.txt".into(),
+                link: path(),
+            }),
+        ),
+        ("req_read_link", req(Request::ReadLink { path: path() })),
+        (
+            "resp_target",
+            ok(Response::Target("../elsewhere/file.txt".into())),
+        ),
         // --- every ErrorCode (as Err) ---
         ("err_not_found", err(ErrorCode::NotFound)),
         ("err_permission_denied", err(ErrorCode::PermissionDenied)),
@@ -325,8 +339,10 @@ fn _variant_tripwire(
         Request::Subscribe { .. } => {}
         Request::Statfs => {}
         Request::Link { .. } => {}
-        Request::MountDefaults => {} // v2: golden added, PROTO_VERSION_MAX bumped
-        Request::Auth { .. } => {}   // v3: golden added, PROTO_VERSION_MAX bumped
+        Request::MountDefaults => {}  // v2: golden added, PROTO_VERSION_MAX bumped
+        Request::Auth { .. } => {}    // v3: golden added, PROTO_VERSION_MAX bumped
+        Request::Symlink { .. } => {} // v4: golden added, PROTO_VERSION_MAX bumped
+        Request::ReadLink { .. } => {} // v4: golden added, PROTO_VERSION_MAX bumped
     }
     match response {
         Response::AttachOk { .. } => {}
@@ -339,6 +355,7 @@ fn _variant_tripwire(
         Response::Subscribed { .. } => {}
         Response::Ok => {}
         Response::MountDefaults { .. } => {} // v2: golden added, PROTO_VERSION_MAX bumped
+        Response::Target(..) => {}           // v4: golden added, PROTO_VERSION_MAX bumped
     }
     match code {
         ErrorCode::NotFound => {}
@@ -386,8 +403,8 @@ fn _variant_tripwire(
 const GOLDEN: &[(&str, &str)] = &[
     // hello/hello_ack embed PROTO_VERSION_MAX — they legitimately move when
     // the protocol version bumps (v3: auth + compression).
-    ("hello", "00010306676f6c64656e"),
-    ("hello_ack", "010306676f6c64656e"),
+    ("hello", "00010406676f6c64656e"),
+    ("hello_ack", "010406676f6c64656e"),
     ("ping", "0507"),
     ("pong", "0607"),
     ("compressed", "0706676f6c64656e"),
@@ -422,6 +439,9 @@ const GOLDEN: &[(&str, &str)] = &[
     ("resp_subscribed", "0307000737"),
     ("resp_ok", "03070008"),
     ("resp_mount_defaults", "03070009010f6e6f64655f6d6f64756c65732f2a2a01062a2e6c6f636b012a00"),
+    ("req_symlink", "020715152e2e2f656c736577686572652f66696c652e7478740c6469722f66696c652e747874"),
+    ("req_read_link", "0207160c6469722f66696c652e747874"),
+    ("resp_target", "0307000a152e2e2f656c736577686572652f66696c652e747874"),
     ("err_not_found", "03070100"),
     ("err_permission_denied", "03070101"),
     ("err_already_exists", "03070102"),

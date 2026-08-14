@@ -223,6 +223,35 @@ impl Overlay {
         Ok(attr_from_metadata(&md, 0))
     }
 
+    /// Symlink inside the overlay. No escape check here: the overlay is this
+    /// machine's own directory, not a boundary being defended — the same
+    /// reasoning that makes advisory locks a no-op on overlay handles.
+    pub fn symlink(&self, target: &str, link: &RelPath) -> Result<Attr, FsError> {
+        let link_full = self.abs(link);
+        if let Some(parent) = link_full.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| io_to_code(&e))?;
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, &link_full).map_err(|e| io_to_code(&e))?;
+        #[cfg(windows)]
+        {
+            let resolved = link_full.parent().map(|p| p.join(target));
+            if resolved.is_some_and(|p| p.is_dir()) {
+                std::os::windows::fs::symlink_dir(target, &link_full).map_err(|e| io_to_code(&e))?;
+            } else {
+                std::os::windows::fs::symlink_file(target, &link_full).map_err(|e| io_to_code(&e))?;
+            }
+        }
+        let md = std::fs::symlink_metadata(&link_full).map_err(|e| io_to_code(&e))?;
+        Ok(attr_from_metadata(&md, 0))
+    }
+
+    pub fn readlink(&self, path: &RelPath) -> Result<String, FsError> {
+        let target = std::fs::read_link(self.abs(path)).map_err(|e| io_to_code(&e))?;
+        let target = target.to_str().ok_or(ErrorCode::InvalidPath)?;
+        Ok(target.replace('\\', "/"))
+    }
+
     pub fn flush(&self, fh: u64) -> Result<(), FsError> {
         let h = self.handle(fh)?;
         let _ = h.file.sync_data(); // best-effort, matches remote Flush

@@ -1417,3 +1417,115 @@ async fn a_chunked_write_does_not_conflict_with_itself() {
         expected
     );
 }
+
+// --------------------------------------------------------------------- 22
+
+/// Symlinks, end to end: create through the client, read the target back,
+/// and see it as a Symlink in a listing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn symlink_create_and_read() {
+    let agent = start_agent(AgentOpts::default());
+    let s = connect(&agent, ClientOptions::default()).await;
+    mkfile(&s.fs, ROOT_INO, "real.txt", b"contents").await;
+
+    let (ino, attr) = on_fs(&s.fs, |fs| fs.symlink(ROOT_INO, "link.txt", "real.txt"))
+        .await
+        .expect("symlink");
+    assert_eq!(attr.kind, FileKind::Symlink, "a symlink must report as one");
+
+    let target = on_fs(&s.fs, move |fs| fs.readlink(ino)).await.expect("readlink");
+    assert_eq!(target, "real.txt");
+
+    // And it is a real symlink on the server, not a copy.
+    let md = std::fs::symlink_metadata(agent.dir.path().join("link.txt")).unwrap();
+    assert!(md.file_type().is_symlink());
+}
+
+/// A relative target pointing within the export is fine, including one that
+/// walks up out of a subdirectory and back down.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_relative_target_inside_the_export_is_allowed() {
+    let agent = start_agent(AgentOpts::default());
+    let s = connect(&agent, ClientOptions::default()).await;
+    mkfile(&s.fs, ROOT_INO, "real.txt", b"contents").await;
+    let (sub, _) = on_fs(&s.fs, |fs| fs.mkdir(ROOT_INO, "sub", 0o755)).await.unwrap();
+
+    let (ino, _) = on_fs(&s.fs, move |fs| fs.symlink(sub, "up.txt", "../real.txt"))
+        .await
+        .expect("a target inside the export must be allowed");
+    assert_eq!(
+        on_fs(&s.fs, move |fs| fs.readlink(ino)).await.unwrap(),
+        "../real.txt",
+        "the target is stored verbatim, not rewritten"
+    );
+}
+
+/// The export boundary. A symlink is the cheapest way to turn a read of an
+/// exported directory into a read of the whole server, so a target that
+/// escapes must be refused at creation — including a dangling one, since the
+/// day that path appears the link becomes a hole.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_target_escaping_the_export_is_refused() {
+    let agent = start_agent(AgentOpts::default());
+    let s = connect(&agent, ClientOptions::default()).await;
+    let (sub, _) = on_fs(&s.fs, |fs| fs.mkdir(ROOT_INO, "sub", 0o755)).await.unwrap();
+
+    for (name, target) in [
+        ("a", ".."),
+        ("b", "../../etc/passwd"),
+        ("c", "/etc/passwd"),
+        ("d", "sub/../../outside"),
+        ("e", "\\windows\\system32"),
+        ("f", "C:\\Windows"),
+    ] {
+        let t = target.to_string();
+        let err = on_fs(&s.fs, move |fs| fs.symlink(ROOT_INO, name, &t))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            remote_code(err),
+            ErrorCode::PermissionDenied,
+            "target {target:?} was not refused"
+        );
+        assert!(
+            !agent.dir.path().join(name).exists(),
+            "target {target:?} was refused but a link was still created"
+        );
+    }
+
+    // One level down, ".." is still inside — the check is about where it
+    // lands, not how many times it walks up.
+    on_fs(&s.fs, move |fs| fs.symlink(sub, "ok", ".."))
+        .await
+        .expect("landing on the export root is inside it");
+}
+
+/// A symlink into an excluded path would otherwise be a way to read exactly
+/// what the export config says is invisible.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_target_inside_an_excluded_path_is_refused() {
+    let agent = start_agent(AgentOpts {
+        excludes: vec!["secrets/**".into()],
+        ..AgentOpts::default()
+    });
+    std::fs::create_dir(agent.dir.path().join("secrets")).unwrap();
+    std::fs::write(agent.dir.path().join("secrets/key.txt"), b"shh").unwrap();
+    let s = connect(&agent, ClientOptions::default()).await;
+
+    let err = on_fs(&s.fs, |fs| fs.symlink(ROOT_INO, "peek", "secrets/key.txt"))
+        .await
+        .unwrap_err();
+    assert_eq!(remote_code(err), ErrorCode::PermissionDenied);
+}
+
+/// readlink on something that is not a link must say so rather than
+/// inventing a target.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn readlink_on_a_regular_file_is_refused() {
+    let agent = start_agent(AgentOpts::default());
+    let s = connect(&agent, ClientOptions::default()).await;
+    let ino = mkfile(&s.fs, ROOT_INO, "real.txt", b"contents").await;
+
+    let err = on_fs(&s.fs, move |fs| fs.readlink(ino)).await.unwrap_err();
+    assert_eq!(remote_code(err), ErrorCode::InvalidPath);
+}

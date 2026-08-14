@@ -666,6 +666,68 @@ impl SessionInner {
         Ok(Response::Attr(attr_from_metadata(&md, export.bump(&link))))
     }
 
+    /// Create a symlink, refusing any that would point out of the export.
+    ///
+    /// The check is on where the link LANDS, not on whether the target
+    /// currently exists — a dangling symlink is legal and must stay creatable,
+    /// but a dangling symlink to `../../etc/passwd` must not, because the day
+    /// that path appears it becomes a hole in the export boundary.
+    fn symlink(&self, target: String, link: RelPath) -> Result<Response, ErrorCode> {
+        let export = self.writable_export()?;
+        let link_full = export.resolve_new(&link)?;
+
+        let landing = crate::fsutil::symlink_lands_inside(&link, &target).ok_or_else(|| {
+            tracing::warn!(%link, target, "refusing a symlink that escapes the export");
+            ErrorCode::PermissionDenied
+        })?;
+        // Where it lands must also survive the export's excludes: a link is
+        // otherwise a trivial way to read a path the config says is invisible.
+        if export.exclude.is_excluded(&RelPath(landing.clone())) {
+            tracing::warn!(%link, target, "refusing a symlink into an excluded path");
+            return Err(ErrorCode::PermissionDenied);
+        }
+
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &link_full).or_code()?;
+        #[cfg(windows)]
+        {
+            // Windows needs to know at creation time whether the target is a
+            // directory, and cannot be told later. An absent target is
+            // assumed to be a file: that is the common case, and a dangling
+            // link is what the caller asked for.
+            let resolved = export.root.join(landing.replace('/', "\\"));
+            if resolved.is_dir() {
+                std::os::windows::fs::symlink_dir(&target, &link_full).or_code()?;
+            } else {
+                std::os::windows::fs::symlink_file(&target, &link_full).or_code()?;
+            }
+        }
+
+        let md = std::fs::symlink_metadata(&link_full).or_code()?;
+        export.events.note_local_write(&link, self.id);
+        Ok(Response::Attr(attr_from_metadata(&md, export.bump(&link))))
+    }
+
+    /// Read a symlink's target, verbatim.
+    ///
+    /// Uses `resolve_new` rather than `resolve`: `resolve` canonicalizes,
+    /// which follows the very link we are being asked to describe, and would
+    /// fail outright on a dangling one. The parent is still resolved and
+    /// checked, so the link itself cannot be reached from outside the export.
+    fn readlink(&self, path: RelPath) -> Result<Response, ErrorCode> {
+        let export = self.export()?;
+        let full = export.resolve_new(&path)?;
+        let md = std::fs::symlink_metadata(&full).or_code()?;
+        if !md.file_type().is_symlink() {
+            return Err(ErrorCode::InvalidPath);
+        }
+        let target = std::fs::read_link(&full).or_code()?;
+        let target = target.to_str().ok_or(ErrorCode::InvalidPath)?;
+        // Normalize separators so a Windows-created link reads the same to a
+        // Unix client; the wire form is always forward slashes.
+        Ok(Response::Target(target.replace('\\', "/")))
+    }
+
     fn release(&self, fh: u64) -> Result<Response, ErrorCode> {
         if let Some((_, of)) = self.handles.remove(&fh) {
             // Closing a handle drops any lock it held (flock semantics).
@@ -736,6 +798,8 @@ impl SessionInner {
             Request::Rmdir { path } => self.rmdir(path),
             Request::Rename { from, to, replace } => self.rename(from, to, replace),
             Request::Link { target, link } => self.link(target, link),
+            Request::Symlink { target, link } => self.symlink(target, link),
+            Request::ReadLink { path } => self.readlink(path),
             Request::Statfs => self.statfs(),
             Request::MountDefaults => self.mount_defaults(),
             // Handled in async context (handle()); never reach the pool.
