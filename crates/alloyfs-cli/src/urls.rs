@@ -109,9 +109,49 @@ pub fn dialer_for(
     })
 }
 
-/// Stable per-(server, export) key for local data dirs:
+/// Sanitize one path component: keep it recognisable, keep it legal on both
+/// platforms, and never let it escape its parent.
+fn sanitize(s: &str) -> String {
+    let out: String = s
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || "._-".contains(c) {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    // A component that sanitizes to "", "." or ".." would climb out of the
+    // tree or collide with the directory itself.
+    match out.trim_matches('.') {
+        "" => "_".to_string(),
+        _ => out,
+    }
+}
+
+/// The per-host directory name: `azure`, `127.0.0.1-7440`.
+///
+/// Host AND port, so two agents on one machine stay separate — but not the
+/// scheme, so mounting the same export over ssh and over tcp deliberately
+/// shares one overlay. It is the same server namespace either way, and
+/// splitting it would strand local-only files behind a transport choice.
+pub fn host_key(url: &str) -> String {
+    let after_scheme = url.split("://").nth(1).unwrap_or(url);
+    let host = after_scheme.split('/').next().unwrap_or("host");
+    // Drop any user@ prefix: it selects a login, not a namespace.
+    let host = host.rsplit('@').next().unwrap_or(host);
+    sanitize(&host.to_lowercase())
+}
+
+/// The per-export directory name within a host.
+pub fn export_key(export: &str) -> String {
+    sanitize(&export.to_lowercase())
+}
+
+/// Pre-layout key, kept ONLY to find and migrate old directories:
 /// sanitize(host)-sanitize(export)-fnv1a8(normalized identity).
-pub fn mount_key(url: &str, export: &str) -> String {
+pub fn legacy_mount_key(url: &str, export: &str) -> String {
     let normalized = format!("{}/{export}", url.trim_end_matches('/').to_lowercase());
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for b in normalized.bytes() {
@@ -156,16 +196,52 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mount_key_is_stable_and_sanitized() {
-        let a = mount_key("ssh://azure", "projects");
-        let b = mount_key("ssh://azure", "projects");
-        assert_eq!(a, b, "same inputs, same key");
+    fn host_and_export_keys_are_path_safe() {
+        // These become real directory names, so they must be stable,
+        // recognisable, and incapable of escaping their parent.
+        assert_eq!(host_key("ssh://azure/projects"), "azure");
+        assert_eq!(
+            host_key("ssh://kyle@azure/projects"),
+            "azure",
+            "login is not identity"
+        );
+        assert_eq!(host_key("tcp://127.0.0.1:7440/p"), "127.0.0.1-7440");
+        assert_eq!(host_key("SSH://AZURE/p"), "azure", "case-insensitive");
+
+        // Same host+export over different transports SHARES a directory:
+        // it is one server namespace, and splitting it would strand
+        // local-only overlay files behind a transport choice.
+        assert_eq!(host_key("ssh://azure/p"), host_key("ssh://azure/other"));
+
+        assert_eq!(export_key("pro/jects"), "pro-jects");
+
+        // The real invariant is not "contains no dots" — `..-..-etc` is a
+        // perfectly ordinary filename, since `..` only means "parent" when
+        // it is the WHOLE component. What must hold is that the result is a
+        // single component that is never `.` or `..`.
+        for probe in ["../../etc", "..", ".", "", "..\\..\\windows", "a/b/c"] {
+            let k = export_key(probe);
+            assert!(
+                !k.contains('/') && !k.contains('\\'),
+                "{probe:?} → {k:?} spans directories"
+            );
+            assert!(
+                k != "." && k != ".." && !k.is_empty(),
+                "{probe:?} → {k:?} is not a usable name"
+            );
+        }
+        assert_eq!(export_key(""), "_", "never empty");
+        assert_eq!(export_key("."), "_", "never the directory itself");
+        assert_eq!(export_key(".."), "_", "never the parent");
+    }
+
+    #[test]
+    fn legacy_key_still_derivable_for_migration() {
+        // Only needed to FIND old directories; must stay byte-identical.
+        let a = legacy_mount_key("ssh://azure", "projects");
+        assert_eq!(a, legacy_mount_key("ssh://azure", "projects"));
         assert!(a.starts_with("azure-projects-"));
         assert_eq!(a.len(), "azure-projects-".len() + 8);
-        let c = mount_key("ssh://azure:2222", "projects");
-        assert_ne!(a, c, "port changes identity");
-        let d = mount_key("tcp://127.0.0.1:7440", "pro/jects");
-        assert!(!d.contains('/'), "sanitized: {d}");
     }
 
     #[test]

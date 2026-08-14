@@ -507,6 +507,7 @@ async fn overlay_routing() {
     let opts = ClientOptions {
         excludes: vec!["*.local".into()],
         data_dir: data_dir.path().to_path_buf(),
+        cache_dir: data_dir.path().join("cache"),
         mount_key: "t".into(),
         ..ClientOptions::default()
     };
@@ -559,6 +560,7 @@ async fn overlay_exdev_boundary() {
     let opts = ClientOptions {
         excludes: vec!["*.local".into()],
         data_dir: data_dir.path().to_path_buf(),
+        cache_dir: data_dir.path().join("cache"),
         mount_key: "t".into(),
         ..ClientOptions::default()
     };
@@ -600,6 +602,7 @@ async fn autocache_fresh_serve_write_invalidate() {
 
     let opts = ClientOptions {
         data_dir: data_dir.path().to_path_buf(),
+        cache_dir: data_dir.path().join("cache"),
         mount_key: "t".into(),
         auto_cache_max: Some(1 << 20),
         auto_cache_budget: Some(10 << 20),
@@ -879,6 +882,7 @@ async fn server_defaults_negotiated() {
     // No excludes, no sizes: everything below must come from the server.
     let opts = ClientOptions {
         data_dir: data_dir.path().to_path_buf(),
+        cache_dir: data_dir.path().join("cache"),
         mount_key: "t".into(),
         ..ClientOptions::default()
     };
@@ -923,6 +927,7 @@ async fn server_defaults_opt_out_and_precedence() {
     // perfectly ordinary remote file.
     let opts = ClientOptions {
         data_dir: data_dir.path().to_path_buf(),
+        cache_dir: data_dir.path().join("cache"),
         mount_key: "t".into(),
         no_server_defaults: true,
         ..ClientOptions::default()
@@ -942,6 +947,7 @@ async fn server_defaults_opt_out_and_precedence() {
     std::fs::write(agent.dir.path().join("small.bin"), &content).unwrap();
     let opts = ClientOptions {
         data_dir: data_dir.path().to_path_buf(),
+        cache_dir: data_dir.path().join("cache"),
         mount_key: "t2".into(),
         auto_cache_max: Some(0),
         ..ClientOptions::default()

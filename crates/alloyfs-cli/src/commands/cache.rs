@@ -1,30 +1,51 @@
 use std::path::PathBuf;
 
-use crate::config::default_data_dir;
-use crate::urls::{mount_key, parse_url, require_export};
+use crate::config::{app_dir, cache_root};
+use crate::urls::{export_key, host_key, parse_url, require_export};
 
-/// `cache clear`: delete a mount's blobs + manifest (SAFE while unmounted).
-/// The overlay (local-only excluded files) is NEVER touched — deleting that
-/// would lose the only copy.
+/// Delete downloaded blobs. Safe by construction: the cache tree contains
+/// nothing but re-downloadable data, and the overlay — files that exist on
+/// no server — lives under `data/`, which this never touches.
 pub fn clear(target: Option<String>, all: bool, data_dir: Option<PathBuf>) -> anyhow::Result<()> {
-    let base = data_dir.unwrap_or_else(default_data_dir).join("cache");
+    let root = match &data_dir {
+        Some(r) => r.join("cache"),
+        None => app_dir().join("cache"),
+    };
+
     if all {
-        if base.exists() {
-            std::fs::remove_dir_all(&base)?;
+        if root.is_dir() {
+            std::fs::remove_dir_all(&root)?;
         }
-        println!("cleared all caches under {}", base.display());
+        println!("cleared every cached blob under {}", root.display());
         return Ok(());
     }
-    let url = target.ok_or_else(|| anyhow::anyhow!("pass a mount url (with export) or --all"))?;
+
+    let url = target.ok_or_else(|| anyhow::anyhow!("give a mount url, or --all"))?;
     let (_, export) = parse_url(&url)?;
     let export = require_export(export, &url)?;
-    let key = mount_key(&url, &export);
-    let dir = base.join(&key);
-    let manifest = base.join(format!("{key}.manifest.json"));
-    if dir.exists() {
-        std::fs::remove_dir_all(&dir)?;
+    let host = host_key(&url);
+    let key = export_key(&export);
+
+    let dir = match &data_dir {
+        Some(r) => r.join("cache").join(&host),
+        None => cache_root(&host),
+    };
+    let blobs = dir.join(&key);
+    let manifest = dir.join(format!("{key}.manifest.json"));
+
+    let mut removed = false;
+    if blobs.is_dir() {
+        std::fs::remove_dir_all(&blobs)?;
+        removed = true;
     }
-    let _ = std::fs::remove_file(&manifest);
-    println!("cleared cache for {key}");
+    if manifest.is_file() {
+        std::fs::remove_file(&manifest)?;
+        removed = true;
+    }
+    if removed {
+        println!("cleared the cache for {host}/{key}");
+    } else {
+        println!("nothing cached for {host}/{key}");
+    }
     Ok(())
 }

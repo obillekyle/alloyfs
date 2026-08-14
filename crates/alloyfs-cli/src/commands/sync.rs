@@ -5,8 +5,8 @@
 
 use std::path::PathBuf;
 
-use crate::config::default_data_dir;
-use crate::urls::{connect_target, dialer_for, mount_key, require_export, whoami};
+use crate::config::data_root;
+use crate::urls::{connect_target, dialer_for, export_key, host_key, require_export, whoami};
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
@@ -26,7 +26,12 @@ pub async fn run(
     let export = require_export(export, &url)?;
     tracing::info!(server = conn.server_name, proto = conn.proto, "connected");
 
-    let data_dir = data_dir.unwrap_or_else(default_data_dir);
+    // ~/.alloyfs/data/<host>/ — sync keeps only durable state (baselines).
+    let host = host_key(&url);
+    let data_dir = match data_dir {
+        Some(root) => root.join("data").join(&host),
+        None => data_root(&host),
+    };
     // Same export synced into two different local dirs must not share state.
     let dir_tag = {
         let canon = std::fs::canonicalize(&dir)
@@ -43,7 +48,7 @@ pub async fn run(
     let opts = alloyfs_client::SyncOptions {
         excludes,
         data_dir,
-        sync_key: format!("{}-{dir_tag}", mount_key(&url, &export)),
+        sync_key: format!("{}-{dir_tag}", export_key(&export)),
         debounce: std::time::Duration::from_millis(debounce_ms),
         conflict_policy: policy,
         dialer: Some(dialer_for(&url, &remote_cmd, &whoami(), token)),

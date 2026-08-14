@@ -1,9 +1,13 @@
-# systemd template unit for the alloyfs agent (Linux server).
+# systemd template unit for the AlloyFS agent (Linux server).
 # The instance name is the user whose config and exports it serves:
 #   sudo cp scripts/alloyfs.service /etc/systemd/system/alloyfs@.service
 #   sudo systemctl daemon-reload
 #   sudo systemctl enable --now alloyfs@okyle
 # Logs: journalctl -u alloyfs@okyle -f
+#
+# No --config: the agent finds ~<user>/.alloyfs/config.yml on its own (or an
+# alloyfs.yml beside the binary), and creates a starter one if none exists.
+# Passing an explicit path here would silently defeat both.
 
 [Unit]
 Description=alloyfs agent for %i (virtual drive exports)
@@ -12,7 +16,7 @@ Wants=network-online.target
 
 [Service]
 User=%i
-ExecStart=/usr/local/bin/alloyfs serve --config /home/%i/.config/alloyfs/agent.toml
+ExecStart=/usr/local/bin/alloyfs serve
 Restart=on-failure
 RestartSec=2
 Environment=RUST_LOG=info

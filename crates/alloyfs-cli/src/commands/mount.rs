@@ -1,8 +1,10 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::config::{default_data_dir, parse_size, MountConfig};
-use crate::urls::{connect_target, dialer_for, mount_key, require_export, whoami};
+use crate::config::{cache_root, data_root, migrate_legacy_mount, parse_size, MountConfig};
+use crate::urls::{
+    connect_target, dialer_for, export_key, host_key, legacy_mount_key, require_export, whoami,
+};
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
@@ -42,13 +44,23 @@ pub async fn run(
     };
     let no_server_defaults = no_server_defaults || file_cfg.no_server_defaults;
     let token = token.or(file_cfg.token);
-    let data_dir = data_dir.or(file_cfg.data_dir).unwrap_or_else(default_data_dir);
 
     let (conn, export) = connect_target(&url, &remote_cmd, &whoami(), token.as_deref()).await?;
     let export = require_export(export, &url)?;
     tracing::info!(server = conn.server_name, proto = conn.proto, "connected");
+
+    // ~/.alloyfs/{data,cache}/<host>/, with --data-dir overriding the root.
+    let host = host_key(&url);
+    let export_key = export_key(&export);
+    migrate_legacy_mount(&legacy_mount_key(&url, &export), &host, &export_key);
+    let (data_dir, cache_dir) = match data_dir.or(file_cfg.data_dir) {
+        Some(root) => (root.join("data").join(&host), root.join("cache").join(&host)),
+        None => (data_root(&host), cache_root(&host)),
+    };
+
     let opts = alloyfs_client::ClientOptions {
-        mount_key: mount_key(&url, &export),
+        mount_key: export_key,
+        cache_dir,
         excludes,
         pins,
         auto_cache_max,

@@ -30,22 +30,29 @@ pub async fn run(
     // Frees locks/handles of clients that vanish without disconnecting
     // (heartbeats arrive every 10 s; 30 s of silence = dead).
     registry.spawn_lease_reaper(std::time::Duration::from_secs(30));
-    if let Some(http) = cfg.agent.http_listen.clone() {
-        let registry = registry.clone();
-        let token = cfg.agent.http_token.clone();
-        tokio::spawn(async move {
-            if let Err(e) = alloyfs_http::serve(&http, registry, token).await {
-                tracing::error!(error = %e, "http api failed");
-            }
-        });
-    }
+
     let name = format!("alloyfs/{}", env!("CARGO_PKG_VERSION"));
     if stdio_mode {
         // One session over our own stdin/stdout (the ssh exec channel).
         // stdout carries protocol frames; logging is stderr-only. No tcp_token
         // check: reaching this process already required an ssh login.
+        //
+        // Note what is NOT started here: the HTTP API. A --stdio agent is a
+        // short-lived per-mount process spawned by ssh, and every one of them
+        // tried to bind the configured HTTP port — so each mount logged a
+        // bind failure once a resident agent held it. The API belongs to the
+        // long-running server, not to a mount's transport.
         stdio::serve(&name, Arc::new(AgentSession::new(registry))).await?;
     } else {
+        if let Some(http) = cfg.agent.http_listen.clone() {
+            let registry = registry.clone();
+            let token = cfg.agent.http_token.clone();
+            tokio::spawn(async move {
+                if let Err(e) = alloyfs_http::serve(&http, registry, token).await {
+                    tracing::error!(error = %e, "http api failed");
+                }
+            });
+        }
         let listen = cfg.agent.tcp_listen.unwrap_or(addr);
         let token = cfg.agent.tcp_token.clone();
         if token.is_none() && !alloyfs_common::is_loopback_listen(&listen) {

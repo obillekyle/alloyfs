@@ -54,7 +54,14 @@ pub type Dialer = Arc<dyn Fn() -> BoxFuture<'static, anyhow::Result<Arc<MuxConne
 #[derive(Clone)]
 pub struct ClientOptions {
     pub excludes: Vec<String>,
+    /// Durable per-host tree: the overlay lives here and losing it loses
+    /// files that exist on no server.
     pub data_dir: PathBuf,
+    /// Disposable per-host tree: blobs only, safe to delete at any time.
+    /// Kept separate from `data_dir` so "clear the cache" can never reach
+    /// the overlay.
+    pub cache_dir: PathBuf,
+    /// Directory name for this export within those trees.
     pub mount_key: String,
     /// None = no explicit choice: a server suggestion (v2+) applies, else
     /// the fallback below. `Some(0)` is an explicit OFF that beats both.
@@ -75,6 +82,7 @@ impl Default for ClientOptions {
         Self {
             excludes: Vec::new(),
             data_dir: PathBuf::new(),
+            cache_dir: PathBuf::new(),
             mount_key: String::new(),
             auto_cache_max: None,
             auto_cache_budget: None,
@@ -209,11 +217,8 @@ impl RemoteFs {
         let cache_enabled = auto_cache_max > 0 || !opts.pins.is_empty();
         let mut fetch_rx = None;
         let cache = if cache_enabled {
-            let root = opts.data_dir.join("cache").join(&opts.mount_key);
-            let manifest = opts
-                .data_dir
-                .join("cache")
-                .join(format!("{}.manifest.json", opts.mount_key));
+            let root = opts.cache_dir.join(&opts.mount_key);
+            let manifest = opts.cache_dir.join(format!("{}.manifest.json", opts.mount_key));
             let (cache, rx) = AutoCache::load(crate::autocache::AutoCacheConfig {
                 max_file_size: auto_cache_max,
                 budget: auto_cache_budget.max(1),
