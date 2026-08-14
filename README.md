@@ -324,18 +324,19 @@ limitations") — and it is Linux-only. If you don't need real inotify inside
 a mount, skip `--with-module` entirely and nothing else changes.
 
 The trade runs both ways, so pick per workload rather than assuming newer is
-better. `--backend kernel` serves 11 operations; FUSE serves 21. What you gain
+better. `--backend kernel` serves 13 operations; FUSE serves 21. What you gain
 is that a remote change arrives as a real inotify event instead of a cache
-invalidation. What you give up is `statfs`, `link`, and — read this one
-carefully — **cross-machine advisory locking**.
+invalidation. What you give up is `statfs`, `link`, and `fcntl(F_GETLK)` —
+which returns `ENOLCK` rather than answering, because the wire protocol has no
+way to ask *who* holds a lock and a confident wrong answer is worse than none.
+Callers that get `ENOLCK` fall back to attempting the lock, which is checked
+properly.
 
-> **`--backend kernel` does not forward file locks, and does not fail loudly
-> about it.** The module implements neither `.lock` nor `.flock`, so the VFS
-> falls back to its local-only path: `flock()` and `fcntl(F_SETLK)` on the
-> mount **succeed**, but the lock exists solely inside that one kernel and is
-> never sent to the agent. Two machines mounting the same export will each be
-> told they hold an exclusive lock. If anything in your workload coordinates
-> through locks, use `--backend fuse`, which forwards them properly.
+Locks themselves are forwarded on both backends: `flock()` and
+`fcntl(F_SETLK/F_SETLKW)` reach the agent and exclude other machines. They are
+whole-file on the wire, so a byte range is coarsened to the whole file — safe
+(over-locking) rather than unsafe. Stage 8 of the kernel test suite mounts one
+export twice and asserts the two mounts exclude each other.
 
 With `--with-module`, the module is installed through
 [DKMS](packaging/dkms.conf) rather than as a bare `.ko`. An out-of-tree
@@ -460,13 +461,12 @@ every future DKMS rebuild is covered once the key is enrolled.
   shipped:** `--backend kernel` (the module injects genuine fsnotify, so a
   remote change is indistinguishable from a local one) and `alloyfs sync`,
   which gives you an ordinary directory that every watcher already understands.
-- **Whole-file advisory locks only, and silently local-only on
-  `--backend kernel`.** Byte-range locks are coarsened to whole-file. Worse,
-  the kernel backend forwards no locks at all: it implements neither `.lock`
-  nor `.flock`, so the VFS grants them locally and the agent never hears about
-  them — a lock taken on one machine does not exclude another. Use
-  `--backend fuse` wherever locks carry meaning. Don't host live database files
-  (SQLite/Postgres) on a shared mount on any backend.
+- **Whole-file advisory locks only.** Byte-range locks are coarsened to the
+  whole file on every backend, and `fcntl(F_GETLK)` returns `ENOLCK` on
+  `--backend kernel` because the protocol cannot ask who a holder is. Taking
+  locks works and excludes other machines on both backends. Don't host live
+  database files (SQLite/Postgres) on a shared mount regardless: they want
+  byte ranges and `F_GETLK`.
 - **Symlinks are resolved server-side** within the export (escaping links are
   refused); symlinks cannot be created through the mount.
 - **Windows volumes are case-sensitive** to faithfully mirror Linux exports.

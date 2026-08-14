@@ -33,7 +33,9 @@ done
 gcc -static -Os -Wall -Wextra -o "$ROOT/bin/alloyfs-inotify" tools/alloyfs-inotify.c
 gcc -static -Os -Wall -Wextra -o "$ROOT/bin/alloyd" tools/alloyd.c
 gcc -static -Os -Wall -Wextra -pthread -o "$ROOT/bin/alloyfs-devtest" tools/alloyfs-devtest.c
-strip "$ROOT/bin/alloyfs-inotify" "$ROOT/bin/alloyd" "$ROOT/bin/alloyfs-devtest" 2>/dev/null || true
+gcc -static -Os -Wall -Wextra -o "$ROOT/bin/alloyfs-lock" tools/alloyfs-lock.c
+strip "$ROOT/bin/alloyfs-inotify" "$ROOT/bin/alloyd" "$ROOT/bin/alloyfs-devtest" \
+      "$ROOT/bin/alloyfs-lock" 2>/dev/null || true
 
 # Not a probe: compiling it IS the assertion that the Rust daemon's hand-rolled
 # struct offsets still match alloyfs.h. Nothing ships in the image.

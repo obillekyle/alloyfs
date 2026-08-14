@@ -115,7 +115,13 @@ fn u64_at(b: &[u8], off: usize) -> u64 {
 /// Serve one request off the async runtime (the server blocks on RPCs) and
 /// decode the response frame the way `alloyfs_dev_write` would.
 async fn call(fx: &Fixture, req: Vec<u8>) -> Reply {
-    let server = fx.server.clone();
+    call_on(&fx.server, req).await
+}
+
+/// `call`, against a specific daemon — for the multi-client lock tests, where
+/// the whole point is that two daemons are talking to one agent.
+async fn call_on(server: &Arc<Server>, req: Vec<u8>) -> Reply {
+    let server = server.clone();
     let unique = InHeader::parse(&req).unwrap().unique;
     let frame = tokio::task::spawn_blocking(move || server.handle(&req))
         .await
@@ -786,4 +792,251 @@ async fn a_remote_rename_invalidates_the_cached_read_handle() {
         "a-much-longer-body",
         "the new name served the handle cached for the old one"
     );
+}
+
+// ------------------------------------------------------------------- locks
+
+/// Two independent clients against ONE agent. A lock that only excludes the
+/// process that took it proves nothing, so every contention assertion below
+/// needs two real connections rather than two handles on one.
+async fn two_clients() -> (tempfile::TempDir, Arc<Server>, Arc<Server>) {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let mut cfg = AgentConfig::default();
+    cfg.exports.insert(
+        "test".to_string(),
+        ExportConfig {
+            path: dir.path().to_path_buf(),
+            read_only: false,
+            exclude: Vec::new(),
+            client: None,
+        },
+    );
+    let registry = Arc::new(ExportRegistry::from_config(&cfg).expect("registry"));
+    let mut servers = Vec::new();
+    for who in ["client-a", "client-b"] {
+        let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
+        let handler: Arc<dyn RequestHandler> = Arc::new(AgentSession::new(registry.clone()));
+        tokio::spawn(async move {
+            let _ = serve_connection(server_io, "test-agent", handler).await;
+        });
+        let conn = MuxConnection::establish(client_io, who).await.expect("handshake");
+        let fs = RemoteFs::attach_with(conn, "test", ClientOptions::default())
+            .await
+            .expect("attach");
+        servers.push(Arc::new(Server::new(fs)));
+    }
+    let b = servers.pop().unwrap();
+    let a = servers.pop().unwrap();
+    (dir, a, b)
+}
+
+/// `struct alloyfs_lock_in`, as the module writes it.
+fn lock_in(kind: u32, wait: bool) -> Vec<u8> {
+    let mut v = Vec::new();
+    v.extend_from_slice(&kind.to_ne_bytes());
+    v.extend_from_slice(&u32::from(wait).to_ne_bytes());
+    v
+}
+
+async fn lookup_ino(server: &Arc<Server>, unique: u64, name: &str) -> u64 {
+    call_on(
+        server,
+        request(abi::OP_LOOKUP, unique, abi::ROOT_NODEID, 0, 0, name.as_bytes()),
+    )
+    .await
+    .attr()
+    .nodeid
+}
+
+/// The headline behaviour: a lock taken through one mount is visible to
+/// another. Before this, both clients were granted the same exclusive lock
+/// and neither was told anything was wrong.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_exclusive_lock_excludes_the_other_client() {
+    let (dir, a, b) = two_clients().await;
+    std::fs::write(dir.path().join("shared.txt"), b"contended").unwrap();
+    let ino_a = lookup_ino(&a, 100, "shared.txt").await;
+    let ino_b = lookup_ino(&b, 101, "shared.txt").await;
+
+    let taken = call_on(
+        &a,
+        request(
+            abi::OP_LOCK,
+            102,
+            ino_a,
+            0,
+            0,
+            &lock_in(abi::LOCK_EXCLUSIVE, false),
+        ),
+    )
+    .await;
+    assert_eq!(taken.error, 0, "the first exclusive lock must be granted");
+
+    let refused = call_on(
+        &b,
+        request(
+            abi::OP_LOCK,
+            103,
+            ino_b,
+            0,
+            0,
+            &lock_in(abi::LOCK_EXCLUSIVE, false),
+        ),
+    )
+    .await;
+    assert_eq!(
+        refused.error,
+        -abi::EAGAIN,
+        "a contended F_SETLK must report EAGAIN, not succeed"
+    );
+
+    // ...and releasing it hands the lock over.
+    let freed = call_on(&a, request(abi::OP_UNLOCK, 104, ino_a, 0, 0, b"")).await;
+    assert_eq!(freed.error, 0);
+    let regained = call_on(
+        &b,
+        request(
+            abi::OP_LOCK,
+            105,
+            ino_b,
+            0,
+            0,
+            &lock_in(abi::LOCK_EXCLUSIVE, false),
+        ),
+    )
+    .await;
+    assert_eq!(regained.error, 0, "the lock must be available once released");
+}
+
+/// Shared locks coexist; an exclusive one still has to wait for them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shared_locks_coexist_but_still_block_an_exclusive() {
+    let (dir, a, b) = two_clients().await;
+    std::fs::write(dir.path().join("shared.txt"), b"readers").unwrap();
+    let ino_a = lookup_ino(&a, 110, "shared.txt").await;
+    let ino_b = lookup_ino(&b, 111, "shared.txt").await;
+
+    let first = call_on(
+        &a,
+        request(abi::OP_LOCK, 112, ino_a, 0, 0, &lock_in(abi::LOCK_SHARED, false)),
+    )
+    .await;
+    assert_eq!(first.error, 0);
+    let second = call_on(
+        &b,
+        request(abi::OP_LOCK, 113, ino_b, 0, 0, &lock_in(abi::LOCK_SHARED, false)),
+    )
+    .await;
+    assert_eq!(second.error, 0, "two readers must both be granted");
+
+    let writer = call_on(
+        &b,
+        request(
+            abi::OP_LOCK,
+            114,
+            ino_b,
+            0,
+            0,
+            &lock_in(abi::LOCK_EXCLUSIVE, false),
+        ),
+    )
+    .await;
+    assert_ne!(writer.error, 0, "an exclusive lock cannot join a shared one");
+}
+
+/// A held lock must survive the events that refresh a handle's cached bytes.
+/// Dropping the handle to clear stale data (which is what the daemon used to
+/// do) would release the lock as a side effect, and nothing would say so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_remote_modify_does_not_steal_a_held_lock() {
+    let (dir, a, b) = two_clients().await;
+    std::fs::write(dir.path().join("shared.txt"), b"before").unwrap();
+    let ino_a = lookup_ino(&a, 120, "shared.txt").await;
+    let ino_b = lookup_ino(&b, 121, "shared.txt").await;
+    assert_eq!(
+        call_on(
+            &a,
+            request(
+                abi::OP_LOCK,
+                122,
+                ino_a,
+                0,
+                0,
+                &lock_in(abi::LOCK_EXCLUSIVE, false)
+            )
+        )
+        .await
+        .error,
+        0
+    );
+
+    // The same path that used to call drop_handle.
+    std::fs::write(dir.path().join("shared.txt"), b"changed underneath").unwrap();
+    let server = a.clone();
+    tokio::task::spawn_blocking(move || {
+        server.notification_for(&event(123, EventKind::Modified, "shared.txt"))
+    })
+    .await
+    .expect("notify");
+
+    let still_locked = call_on(
+        &b,
+        request(
+            abi::OP_LOCK,
+            124,
+            ino_b,
+            0,
+            0,
+            &lock_in(abi::LOCK_EXCLUSIVE, false),
+        ),
+    )
+    .await;
+    assert_eq!(
+        still_locked.error,
+        -abi::EAGAIN,
+        "the lock was released by a cache refresh"
+    );
+
+    // And the refresh still did its job: A sees the new bytes.
+    let fresh = call_on(&a, request(abi::OP_READ, 125, ino_a, 0, 4096, b"")).await;
+    assert_eq!(String::from_utf8_lossy(&fresh.payload), "changed underneath");
+}
+
+/// Unlocking something never locked is the ordinary case, not an error: the
+/// VFS sends an unlock on close for every file, locked or not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unlocking_an_unlocked_file_succeeds() {
+    let fx = fixture().await;
+    std::fs::write(fx.dir.path().join("plain.txt"), b"x").unwrap();
+    let ino = call(
+        &fx,
+        request(abi::OP_LOOKUP, 130, abi::ROOT_NODEID, 0, 0, b"plain.txt"),
+    )
+    .await
+    .attr()
+    .nodeid;
+    let r = call(&fx, request(abi::OP_UNLOCK, 131, ino, 0, 0, b"")).await;
+    assert_eq!(r.error, 0, "close-time unlock of an unlocked file must not fail");
+}
+
+/// A lock kind we do not recognise is refused rather than defaulted —
+/// quietly downgrading an exclusive request to shared is the exact failure
+/// locking exists to prevent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_malformed_lock_request_is_refused() {
+    let fx = fixture().await;
+    std::fs::write(fx.dir.path().join("plain.txt"), b"x").unwrap();
+    let ino = call(
+        &fx,
+        request(abi::OP_LOOKUP, 140, abi::ROOT_NODEID, 0, 0, b"plain.txt"),
+    )
+    .await
+    .attr()
+    .nodeid;
+
+    let bad_kind = call(&fx, request(abi::OP_LOCK, 141, ino, 0, 0, &lock_in(99, false))).await;
+    assert_eq!(bad_kind.error, -abi::EINVAL);
+
+    let truncated = call(&fx, request(abi::OP_LOCK, 142, ino, 0, 0, &[0u8; 3])).await;
+    assert_eq!(truncated.error, -abi::EINVAL);
 }

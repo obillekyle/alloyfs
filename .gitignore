@@ -12,3 +12,6 @@ kernel/**/.*.cmd
 kernel/**/Module.symvers
 kernel/**/modules.order
 kernel/test/out/
+
+# Agent worktrees and session scratch — never part of the tree
+/.claude/

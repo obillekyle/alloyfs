@@ -85,6 +85,10 @@ struct Handle {
     fh: u64,
     write: bool,
     used: u64,
+    /// An advisory lock is held on this handle. The cache must not evict it:
+    /// releasing the handle releases the lock, and the process that thinks it
+    /// holds it gets no say in the matter.
+    locked: bool,
 }
 
 #[derive(Default)]
@@ -146,6 +150,8 @@ impl Server {
             abi::OP_RENAME => self.op_rename(h.nodeid, payload),
             abi::OP_WRITE => self.op_write(h.nodeid, h.offset, payload),
             abi::OP_SETATTR => self.op_setattr(h.nodeid, payload),
+            abi::OP_LOCK => self.op_lock(h.nodeid, payload),
+            abi::OP_UNLOCK => self.op_unlock(h.nodeid),
             _ => Err(abi::ENOSYS),
         }
     }
@@ -281,11 +287,32 @@ impl Server {
         cache.tick += 1;
         let used = cache.tick;
         let mut stale = Vec::new();
-        if let Some(old) = cache.map.insert(nodeid, Handle { fh, write, used }) {
+        let locked = cache.map.get(&nodeid).is_some_and(|h| h.locked);
+        if let Some(old) = cache.map.insert(
+            nodeid,
+            Handle {
+                fh,
+                write,
+                used,
+                // Carry the flag across a replacement: the new handle is the
+                // one a later unlock will be sent to.
+                locked,
+            },
+        ) {
             stale.push(old.fh);
         }
         while cache.map.len() > HANDLE_CACHE_CAP {
-            let Some(victim) = cache.map.iter().min_by_key(|(_, h)| h.used).map(|(id, _)| *id) else {
+            // Locked handles are not eviction candidates. If every entry is
+            // locked the cache simply grows past its cap — bounded by the
+            // number of files something has actually locked, and far better
+            // than evicting a lock out from under a caller.
+            let Some(victim) = cache
+                .map
+                .iter()
+                .filter(|(_, h)| !h.locked)
+                .min_by_key(|(_, h)| h.used)
+                .map(|(id, _)| *id)
+            else {
                 break;
             };
             if let Some(h) = cache.map.remove(&victim) {
@@ -301,6 +328,26 @@ impl Server {
         let h = self.handles.lock().unwrap().map.remove(&nodeid);
         if let Some(h) = h {
             self.fs.release(h.fh);
+        }
+    }
+
+    /// Record whether the handle for `nodeid` currently owns an advisory lock.
+    fn mark_locked(&self, nodeid: u64, locked: bool) {
+        if let Some(h) = self.handles.lock().unwrap().map.get_mut(&nodeid) {
+            h.locked = locked;
+        }
+    }
+
+    /// The file behind `nodeid` changed underneath our cached handle: drop
+    /// what that handle has prefetched, keeping the handle itself.
+    ///
+    /// This used to release the handle outright, which fixed the staleness
+    /// but would now silently drop any advisory lock held on it. The stale
+    /// bytes live in the handle's readahead window, so clear exactly that.
+    fn refresh_handle(&self, nodeid: u64) {
+        let fh = self.handles.lock().unwrap().map.get(&nodeid).map(|h| h.fh);
+        if let Some(fh) = fh {
+            self.fs.invalidate_read_cache(fh);
         }
     }
 
@@ -336,6 +383,49 @@ impl Server {
         // not keep serving the pre-write size to the next GETATTR.
         self.fs.invalidate_attr(nodeid);
         Ok(abi::write_out(n))
+    }
+
+    // ------------------------------------------------------------- locks
+
+    /// Take an advisory lock on the server, so it means something to the
+    /// other machines mounting this export.
+    ///
+    /// The handle is opened for WRITE where the export allows it, even for a
+    /// shared lock. That is not about access: `handle_for` upgrades a
+    /// read-only handle by opening a new one and releasing the old, and the
+    /// lock lives on the old one — so a plain `read; flock; write` sequence
+    /// would drop its own lock halfway through. Taking the write handle up
+    /// front means no upgrade can happen while the lock is held. A read-only
+    /// export cannot be written anyway, so falling back there loses nothing.
+    ///
+    /// MAY BLOCK for as long as the caller asked it to: `wait` is F_SETLKW,
+    /// and the whole point is to sleep until the holder lets go. Each request
+    /// is dispatched on its own blocking task, so a sleeper parks one pool
+    /// thread rather than the mount.
+    fn op_lock(&self, nodeid: u64, payload: &[u8]) -> Result<Vec<u8>, i32> {
+        let req = abi::parse_lock_in(payload).ok_or(abi::EINVAL)?;
+        let fh = match self.handle_for(nodeid, true) {
+            Ok(fh) => fh,
+            Err(_) => self.handle_for(nodeid, false)?,
+        };
+        self.fs.lock(fh, req.kind, req.wait).map_err(|e| errno_of(&e))?;
+        self.mark_locked(nodeid, true);
+        Ok(Vec::new())
+    }
+
+    /// Release the advisory lock on `nodeid`.
+    ///
+    /// A missing handle is success, not an error. The VFS unlocks on close
+    /// whether or not anything was ever locked, so "no handle here" is the
+    /// ordinary path for every file that was opened and never locked.
+    fn op_unlock(&self, nodeid: u64) -> Result<Vec<u8>, i32> {
+        let fh = self.handles.lock().unwrap().map.get(&nodeid).map(|h| h.fh);
+        let Some(fh) = fh else {
+            return Ok(Vec::new());
+        };
+        self.fs.unlock(fh).map_err(|e| errno_of(&e))?;
+        self.mark_locked(nodeid, false);
+        Ok(Vec::new())
     }
 
     // -------------------------------------------------------- mutations
@@ -471,18 +561,16 @@ impl Server {
                 n.isdir = matches!(attr.kind, FileKind::Dir);
                 self.record_kind(ino, n.isdir);
                 self.forget_dir(parent);
-                self.drop_handle(ino);
+                self.refresh_handle(ino);
             }
             EventKind::AttrChanged => {
                 n.code = abi::NOTIFY_ATTRIB;
                 if let Some(id) = self.nodeid_of(&ev.path) {
                     n.isdir = self.is_dir(id);
                     // A truncate reaches us as an attr change on some
-                    // backends, and a handle opened over the longer file
-                    // would go on answering for the bytes past the new EOF.
-                    // Reopening after a chmod costs one RPC; being wrong
-                    // about file contents costs rather more.
-                    self.drop_handle(id);
+                    // backends, and bytes prefetched over the longer file
+                    // would go on answering for the range past the new EOF.
+                    self.refresh_handle(id);
                 }
             }
             EventKind::Removed => {
@@ -505,8 +593,9 @@ impl Server {
                     n.isdir = self.is_dir(id);
                     // The destination inherits the source's nodeid, so the
                     // handle cached under it outlives the move and would
-                    // answer reads of the new name from the old open file.
-                    self.drop_handle(id);
+                    // answer reads of the new name from bytes prefetched
+                    // before it.
+                    self.refresh_handle(id);
                 }
                 self.forget_dir(parent);
                 self.forget_dir(parent2);

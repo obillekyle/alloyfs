@@ -34,6 +34,7 @@ SAME_SIZE(struct alloyfs_setattr_in, 24);	/* SETATTR_IN_LEN */
 SAME_SIZE(struct alloyfs_write_out, 8);		/* WRITE_OUT_LEN */
 SAME_SIZE(struct alloyfs_notify_entry, 32);	/* NOTIFY_ENTRY_LEN */
 SAME_SIZE(struct alloyfs_dirent, 24);		/* DIRENT_LEN */
+SAME_SIZE(struct alloyfs_lock_in, 8);		/* LOCK_IN_LEN */
 
 /* --- field offsets, against the u32_at()/u64_at() calls in abi.rs --------- */
 SAME_OFFSET(struct alloyfs_in_header, len, 0);
@@ -74,11 +75,17 @@ SAME_OFFSET(struct alloyfs_dirent, off, 8);
 SAME_OFFSET(struct alloyfs_dirent, namelen, 16);
 SAME_OFFSET(struct alloyfs_dirent, type, 20);
 
+SAME_OFFSET(struct alloyfs_lock_in, kind, 0);
+SAME_OFFSET(struct alloyfs_lock_in, wait, 4);
+
 /* --- constants ----------------------------------------------------------- */
 _Static_assert(ALLOYFS_MAX_PAYLOAD == 128 * 1024, "MAX_PAYLOAD changed");
 _Static_assert(ALLOYFS_MAX_NAME == 255, "MAX_NAME changed");
 _Static_assert(ALLOYFS_ROOT_NODEID == 1, "ROOT_NODEID changed");
 _Static_assert(ALLOYFS_OP_SETATTR == 11, "opcode numbering changed");
+_Static_assert(ALLOYFS_OP_UNLOCK == 13, "opcode numbering changed");
+_Static_assert(ALLOYFS_LOCK_EXCLUSIVE == 2, "lock kind numbering changed");
+_Static_assert(ALLOYFS_ABI_VERSION == 2, "ABI version changed — check both ends");
 _Static_assert(ALLOYFS_NOTIFY_RENAME == 5, "notify code numbering changed");
 _Static_assert(ALLOYFS_NOTIFY_F_ISDIR == 1, "notify flags changed");
 

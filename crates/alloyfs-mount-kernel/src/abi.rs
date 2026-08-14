@@ -47,6 +47,13 @@ pub const OP_RMDIR: u32 = 8;
 pub const OP_RENAME: u32 = 9;
 pub const OP_WRITE: u32 = 10;
 pub const OP_SETATTR: u32 = 11;
+pub const OP_LOCK: u32 = 12;
+pub const OP_UNLOCK: u32 = 13;
+
+pub const LOCK_SHARED: u32 = 1;
+pub const LOCK_EXCLUSIVE: u32 = 2;
+/// `struct alloyfs_lock_in`: two u32.
+pub const LOCK_IN_LEN: usize = 8;
 
 pub const SETATTR_MODE: u32 = 1 << 0;
 pub const SETATTR_SIZE: u32 = 1 << 1;
@@ -195,6 +202,33 @@ pub fn parse_setattr_in(payload: &[u8]) -> Option<SetattrIn> {
         mode: u32_at(payload, 4),
         size: u64_at(payload, 8),
         mtime_ns: u64_at(payload, 16),
+    })
+}
+
+/// A lock request from the kernel: which flavour, and whether to wait.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LockIn {
+    pub kind: alloyfs_proto::LockKind,
+    pub wait: bool,
+}
+
+/// Decode `struct alloyfs_lock_in`.
+///
+/// An unrecognised `kind` is refused rather than defaulted. Guessing here
+/// would mean silently taking a shared lock where the caller asked for an
+/// exclusive one, which is the one failure mode locking exists to prevent.
+pub fn parse_lock_in(payload: &[u8]) -> Option<LockIn> {
+    if payload.len() < LOCK_IN_LEN {
+        return None;
+    }
+    let kind = match u32_at(payload, 0) {
+        LOCK_SHARED => alloyfs_proto::LockKind::Shared,
+        LOCK_EXCLUSIVE => alloyfs_proto::LockKind::Exclusive,
+        _ => return None,
+    };
+    Some(LockIn {
+        kind,
+        wait: u32_at(payload, 4) != 0,
     })
 }
 

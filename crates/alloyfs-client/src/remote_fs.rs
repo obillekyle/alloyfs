@@ -339,6 +339,20 @@ impl RemoteFs {
         self.attr_cache.clear();
     }
 
+    /// Throw away everything this handle has prefetched or retained, so the
+    /// next read goes back to the server.
+    ///
+    /// For callers that hold a handle open across remote changes. Closing and
+    /// reopening the handle would also work, and is what the kernel daemon
+    /// used to do — but a handle can own an advisory lock, and dropping it to
+    /// refresh some cached bytes would quietly hand that lock to whoever asked
+    /// next. This keeps the handle, and with it the lock.
+    pub fn invalidate_read_cache(&self, fh: u64) {
+        if let Some(state) = self.open_files.get(&fh) {
+            state.ra.clear();
+        }
+    }
+
     /// Is this path routed to the local overlay?
     pub(crate) fn is_overlay(&self, path: &RelPath) -> bool {
         self.overlay.as_ref().is_some_and(|o| o.excluded(path))

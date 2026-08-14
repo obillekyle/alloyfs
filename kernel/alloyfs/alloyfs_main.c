@@ -8,6 +8,7 @@
  */
 #define pr_fmt(fmt) "alloyfs: " fmt
 
+#include <linux/filelock.h>	/* locks_lock_file_wait, lock_is_* */
 #include <linux/fs.h>
 #include <linux/fs_context.h>
 #include <linux/fs_parser.h>
@@ -631,12 +632,104 @@ static int alloyfs_fsync(struct file *file, loff_t start, loff_t end, int datasy
 	return 0;
 }
 
+/* ---------------------------------------------------------------- locks */
+
+/*
+ * Advisory locks, forwarded to the daemon so they exclude OTHER MACHINES.
+ *
+ * Without these the filesystem is not lock-free, which would at least be
+ * obvious — it is silently WRONG. With no ->lock and no ->flock the VFS
+ * happily grants every request from its own lock list, so two machines each
+ * take the same exclusive lock and neither is told.
+ *
+ * The order below is the part worth reading. The daemon keeps one server
+ * handle per nodeid and shares it between every process on this machine, so
+ * the server cannot tell two local openers apart and would grant both. Local
+ * exclusion therefore has to come from the VFS list, and it has to happen
+ * FIRST: succeeding there is what proves we are this machine's only candidate,
+ * which in turn is what makes the rollback safe. Asking the server first and
+ * unlocking after a local conflict would release a lock a sibling process
+ * legitimately holds, because it is the very same handle.
+ */
+static void alloyfs_undo_local_lock(struct file *file, struct file_lock *fl)
+{
+	unsigned char saved = fl->c.flc_type;
+
+	/* Same request, inverted, so it matches the entry we just made. */
+	fl->c.flc_type = F_UNLCK;
+	locks_lock_file_wait(file, fl);
+	fl->c.flc_type = saved;
+}
+
+static int alloyfs_lock_common(struct file *file, struct file_lock *fl)
+{
+	struct inode *inode = file_inode(file);
+	struct alloyfs_conn *conn = alloyfs_conn_of(inode);
+	struct alloyfs_lock_in in;
+	int ret;
+
+	/* locks_lock_file_wait() BUGs on anything that is neither, and this
+	 * is reachable from userspace. */
+	if (!(fl->c.flc_flags & (FL_POSIX | FL_FLOCK)))
+		return -EINVAL;
+
+	/* No daemon (the mount is being torn down): there is nothing left to
+	 * be coherent with, so local semantics are the honest answer. */
+	if (!conn)
+		return locks_lock_file_wait(file, fl);
+
+	if (lock_is_unlock(fl)) {
+		/* Release locally first: a close path must never leave a stuck
+		 * entry behind because an RPC failed. */
+		ret = locks_lock_file_wait(file, fl);
+		if (ret)
+			return ret;
+		return alloyfs_request(conn, ALLOYFS_OP_UNLOCK, inode->i_ino,
+				    0, 0, NULL, 0, NULL, 0);
+	}
+
+	ret = locks_lock_file_wait(file, fl);
+	if (ret)
+		return ret;
+
+	memset(&in, 0, sizeof(in));
+	in.kind = lock_is_write(fl) ? ALLOYFS_LOCK_EXCLUSIVE : ALLOYFS_LOCK_SHARED;
+	in.wait = (fl->c.flc_flags & FL_SLEEP) ? 1 : 0;
+	ret = alloyfs_request(conn, ALLOYFS_OP_LOCK, inode->i_ino, 0, 0,
+			   &in, sizeof(in), NULL, 0);
+	if (ret < 0) {
+		alloyfs_undo_local_lock(file, fl);
+		return ret;
+	}
+	return 0;
+}
+
+static int alloyfs_file_lock(struct file *file, int cmd, struct file_lock *fl)
+{
+	/*
+	 * F_GETLK asks "who would block me?". Answering from the local list
+	 * would report "nobody" while another machine holds the file, and a
+	 * confident wrong answer is worse than no answer — callers that get
+	 * ENOLCK fall back to just trying the lock, which IS checked.
+	 */
+	if (cmd == F_GETLK)
+		return -ENOLCK;
+	return alloyfs_lock_common(file, fl);
+}
+
+static int alloyfs_file_flock(struct file *file, int cmd, struct file_lock *fl)
+{
+	return alloyfs_lock_common(file, fl);
+}
+
 static const struct file_operations alloyfs_file_operations = {
 	.owner = THIS_MODULE,
 	.llseek = generic_file_llseek,
 	.read_iter = alloyfs_read_iter,
 	.write_iter = alloyfs_write_iter,
 	.fsync = alloyfs_fsync,
+	.lock = alloyfs_file_lock,
+	.flock = alloyfs_file_flock,
 };
 
 /* ------------------------------------------------------------ superblock */

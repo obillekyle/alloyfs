@@ -17,7 +17,7 @@
 
 #include <linux/types.h>
 
-#define ALLOYFS_ABI_VERSION 1
+#define ALLOYFS_ABI_VERSION 2
 #define ALLOYFS_ROOT_NODEID 1ULL
 
 /* Largest payload either direction; bounds every kernel-side allocation. */
@@ -40,6 +40,21 @@ enum alloyfs_opcode {
 	ALLOYFS_OP_RENAME = 9,	/* nodeid = parent, payload = rename_in + names */
 	ALLOYFS_OP_WRITE = 10,	/* nodeid = file, offset, payload = data */
 	ALLOYFS_OP_SETATTR = 11,	/* nodeid = target, payload = setattr_in */
+	/* --- stage 8: advisory locks, forwarded so they mean something
+	 * BETWEEN machines. Whole-file only, because that is all the wire
+	 * protocol carries; a byte range is coarsened to the whole file,
+	 * which is safe (over-locking) rather than unsafe (under-locking).
+	 */
+	ALLOYFS_OP_LOCK = 12,	/* nodeid = file, payload = lock_in */
+	ALLOYFS_OP_UNLOCK = 13,	/* nodeid = file */
+};
+
+#define ALLOYFS_LOCK_SHARED 1
+#define ALLOYFS_LOCK_EXCLUSIVE 2
+
+struct alloyfs_lock_in {
+	__u32 kind;		/* ALLOYFS_LOCK_* */
+	__u32 wait;		/* non-zero = block until granted (F_SETLKW) */
 };
 
 /* CREATE / MKDIR request payload, followed by the name. */
