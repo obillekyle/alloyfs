@@ -549,11 +549,23 @@ impl SessionInner {
         if !of.writable {
             return Err(ErrorCode::BadHandle);
         }
-        // Conflict *detection*, not prevention: last writer wins, but the
-        // loser's client gets told and can surface it.
+        // A client that sends `expect_version` is asking to be STOPPED, not
+        // merely told: reporting a conflict after the bytes have landed is a
+        // notification that the data it was protecting is already gone. So a
+        // mismatch refuses the write and nothing is written.
+        //
+        // Only opt-in clients are affected. `expect_version: None` — every
+        // client before this, and every mount without --detect-conflicts —
+        // keeps the old last-writer-wins behaviour untouched.
         let conflict = matches!(expect_version, Some(v) if v != export.version_of(&of.path));
         if conflict {
-            tracing::warn!(path = %of.path, "write conflict (concurrent modification)");
+            tracing::warn!(
+                path = %of.path,
+                expected = ?expect_version,
+                actual = export.version_of(&of.path),
+                "refusing a write over a concurrent modification"
+            );
+            return Err(ErrorCode::Conflict);
         }
         write_fully(&of.file, &data, offset).or_code()?;
         export.events.note_local_write(&of.path, self.id);

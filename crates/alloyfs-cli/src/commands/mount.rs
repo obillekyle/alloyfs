@@ -30,6 +30,7 @@ pub async fn run(
     auto_cache_budget: Option<String>,
     data_dir: Option<PathBuf>,
     no_server_defaults: bool,
+    detect_conflicts: bool,
     token: Option<String>,
     backend: Backend,
 ) -> anyhow::Result<()> {
@@ -83,6 +84,7 @@ pub async fn run(
         auto_cache_max_fallback: 2 * 1024 * 1024,
         auto_cache_budget_fallback: 512 * 1024 * 1024,
         no_server_defaults,
+        detect_conflicts: detect_conflicts || file_cfg.detect_conflicts,
         // Survive connection loss: re-dial, re-attach, re-open handles,
         // resubscribe events. Locks do not survive (documented).
         dialer: Some(dialer_for(&url, &remote_cmd, &whoami(), token)),

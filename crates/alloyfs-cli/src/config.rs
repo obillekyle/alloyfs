@@ -19,6 +19,9 @@ pub struct MountConfig {
     /// Ignore the server's suggested client settings for this mount.
     #[serde(default)]
     pub no_server_defaults: bool,
+    /// Refuse writes over concurrently-modified files (CLI: --detect-conflicts).
+    #[serde(default)]
+    pub detect_conflicts: bool,
     /// Shared secret for token-protected TCP servers (agent.tcp_token).
     pub token: Option<String>,
 }

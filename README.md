@@ -246,6 +246,38 @@ links (the ~2 MB/s ssh path this project grew up on) that translates almost
 directly into throughput. No configuration, no flags: it's negotiated per
 connection and silently off with any v2 peer.
 
+## Write conflicts (`--detect-conflicts`)
+
+By default a mount is last-writer-wins: if two machines have the same file
+open and both save, the later save wins and the earlier one is gone. That is
+what every network filesystem does, and it is almost always what you want —
+the alternative is an editor that sometimes refuses to save.
+
+```bash
+alloyfs mount ssh://host/projects /mnt/p --detect-conflicts
+```
+
+With the flag on, each write carries the file version the handle last saw, and
+the server **refuses** the write if the file has changed since. The application
+gets `EIO` and the file on the server is untouched. It is a refusal, not a
+report: being told your colleague's edit was overwritten, after it was
+overwritten, is not a safeguard.
+
+Worth knowing before turning it on:
+
+- **Off is the default and stays the default.** A mount without the flag sends
+  no version and behaves exactly as before.
+- **Whole-file granularity.** The version bumps on any write, so two people
+  editing opposite ends of one file still conflict.
+- **A refused large write may be partial.** Writes are chunked, so if the
+  conflict is detected on a later chunk, earlier chunks have already landed.
+  The log names the offset.
+- **Sync mode ignores it.** `alloyfs sync` pre-checks conflicts itself and
+  keeps the loser as `.sync-conflict-<ts>`, which is a better answer when
+  there is a whole directory to reconcile.
+
+Set it per mount in a config file with `detect_conflicts: true`.
+
 ## Sync mode: a real directory instead of a mount
 
 ```bash

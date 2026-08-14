@@ -67,6 +67,12 @@ enum Command {
         /// sizes published by the export's `client:` config section).
         #[arg(long)]
         no_server_defaults: bool,
+        /// Refuse to write over a file another machine changed since this
+        /// mount last read it, instead of silently winning. Off by default:
+        /// it trades a failed save for a lost edit, and which of those you
+        /// prefer depends on what the mount is for.
+        #[arg(long)]
+        detect_conflicts: bool,
         /// Shared secret for token-protected TCP servers (agent.tcp_token).
         #[arg(long)]
         token: Option<String>,
@@ -202,6 +208,7 @@ async fn main() -> anyhow::Result<()> {
             auto_cache_budget,
             data_dir,
             no_server_defaults,
+            detect_conflicts,
             token,
             backend,
         } => {
@@ -216,6 +223,7 @@ async fn main() -> anyhow::Result<()> {
                 auto_cache_budget,
                 data_dir,
                 no_server_defaults,
+                detect_conflicts,
                 token,
                 backend,
             )

@@ -420,7 +420,12 @@ async fn write_conflict_last_writer_wins() {
         .await
         .unwrap();
 
-    // s1's raw write pins the now-stale version: flagged, but still applied.
+    // s1's raw write pins the now-stale version, and is REFUSED.
+    //
+    // This used to assert the opposite: the write landed and carried a
+    // `conflict` flag. Telling a client its data was clobbered, after the
+    // clobbering, is a notification rather than a safeguard — so a request
+    // that pins a version now means "stop if this is not still true".
     let resp = s1
         .conn()
         .request(Request::Write {
@@ -430,20 +435,32 @@ async fn write_conflict_last_writer_wins() {
             expect_version: Some(v1),
         })
         .await
-        .expect("transport")
-        .expect("write");
-    match resp {
-        Response::Written { conflict, n, .. } => {
-            assert!(conflict, "stale expect_version must be reported as a conflict");
-            assert_eq!(n, 6);
-        }
-        other => panic!("expected Written, got {other:?}"),
-    }
+        .expect("transport");
+    assert!(
+        matches!(resp, Err(ErrorCode::Conflict)),
+        "a stale expect_version must refuse the write, got {resp:?}"
+    );
     assert_eq!(
         std::fs::read(agent.dir.path().join("w.txt")).unwrap(),
-        b"FINAL!",
-        "last writer wins on disk"
+        b"second",
+        "the refused write must not have touched the file"
     );
+
+    // And without the pin, the old last-writer-wins behaviour is untouched —
+    // every existing client sends None and must not start failing.
+    let resp = s1
+        .conn()
+        .request(Request::Write {
+            fh: fh1,
+            offset: 0,
+            data: Bytes::from_static(b"FINAL!"),
+            expect_version: None,
+        })
+        .await
+        .expect("transport")
+        .expect("an unpinned write still wins");
+    assert!(matches!(resp, Response::Written { n: 6, .. }));
+    assert_eq!(std::fs::read(agent.dir.path().join("w.txt")).unwrap(), b"FINAL!");
 }
 
 // --------------------------------------------------------------------- 13
@@ -1296,4 +1313,107 @@ async fn retained_blocks_invalidated_by_write() {
     })
     .await
     .unwrap();
+}
+
+// --------------------------------------------------------------------- 21
+
+/// `--detect-conflicts` end to end, through RemoteFs rather than raw frames.
+///
+/// Two mounts of one export. The second writes; the first then tries to save
+/// over it and is stopped instead of silently winning.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn detect_conflicts_refuses_to_clobber() {
+    let agent = start_agent(AgentOpts::default());
+    let careful = connect(
+        &agent,
+        ClientOptions {
+            detect_conflicts: true,
+            ..ClientOptions::default()
+        },
+    )
+    .await;
+    let other = connect(&agent, ClientOptions::default()).await;
+
+    let fh1 = on_fs(&careful.fs, |fs| {
+        fs.create(ROOT_INO, "shared.txt", 0o644, rw()).unwrap().1
+    })
+    .await;
+
+    // Someone else changes the file behind this handle's back.
+    let (ino, _) = lookup_path(&other.fs, "shared.txt").await.unwrap();
+    let fh2 = on_fs(&other.fs, move |fs| fs.open(ino, rw()).unwrap().0).await;
+    on_fs(&other.fs, move |fs| fs.write(fh2, 0, b"theirs"))
+        .await
+        .unwrap();
+
+    let err = on_fs(&careful.fs, move |fs| fs.write(fh1, 0, b"mine"))
+        .await
+        .expect_err("the write must be refused");
+    assert!(
+        matches!(err, alloyfs_client::FsError::Remote(ErrorCode::Conflict)),
+        "expected a conflict, got {err:?}"
+    );
+    assert_eq!(
+        std::fs::read(agent.dir.path().join("shared.txt")).unwrap(),
+        b"theirs",
+        "the refused write must not have touched the file"
+    );
+}
+
+/// The same race, with the flag off: the write wins silently. This is the
+/// default, and it must stay the default — turning it on for everyone would
+/// make ordinary editors start failing saves on a shared mount.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn without_the_flag_the_last_writer_still_wins() {
+    let agent = start_agent(AgentOpts::default());
+    let s1 = connect(&agent, ClientOptions::default()).await;
+    let s2 = connect(&agent, ClientOptions::default()).await;
+
+    let fh1 = on_fs(&s1.fs, |fs| {
+        fs.create(ROOT_INO, "shared.txt", 0o644, rw()).unwrap().1
+    })
+    .await;
+    let (ino, _) = lookup_path(&s2.fs, "shared.txt").await.unwrap();
+    let fh2 = on_fs(&s2.fs, move |fs| fs.open(ino, rw()).unwrap().0).await;
+    on_fs(&s2.fs, move |fs| fs.write(fh2, 0, b"theirs"))
+        .await
+        .unwrap();
+
+    on_fs(&s1.fs, move |fs| fs.write(fh1, 0, b"mine!!"))
+        .await
+        .expect("an unpinned write still wins");
+    assert_eq!(
+        std::fs::read(agent.dir.path().join("shared.txt")).unwrap(),
+        b"mine!!"
+    );
+}
+
+/// A write big enough to be chunked must not conflict with itself. Each chunk
+/// bumps the server's version, so sending the same expectation for every chunk
+/// would fail on the second one — the expectation has to advance.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_chunked_write_does_not_conflict_with_itself() {
+    let agent = start_agent(AgentOpts::default());
+    let s = connect(
+        &agent,
+        ClientOptions {
+            detect_conflicts: true,
+            ..ClientOptions::default()
+        },
+    )
+    .await;
+
+    let fh = on_fs(&s.fs, |fs| fs.create(ROOT_INO, "big.bin", 0o644, rw()).unwrap().1).await;
+
+    // Several DATA_CHUNKs worth, so the client's write loop runs more than once.
+    let payload = vec![b'z'; 3 * alloyfs_proto::DATA_CHUNK as usize + 17];
+    let expected = payload.len();
+    let wrote = on_fs(&s.fs, move |fs| fs.write(fh, 0, &payload))
+        .await
+        .expect("a chunked write must not conflict with itself");
+    assert_eq!(wrote as usize, expected);
+    assert_eq!(
+        std::fs::metadata(agent.dir.path().join("big.bin")).unwrap().len() as usize,
+        expected
+    );
 }

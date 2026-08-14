@@ -75,6 +75,11 @@ pub struct ClientOptions {
     pub dialer: Option<Dialer>,
     /// Ignore the server's suggested client settings entirely.
     pub no_server_defaults: bool,
+    /// Refuse to write over a file another machine changed since this handle
+    /// last saw it. Off by default: it trades "your editor's save failed" for
+    /// "your colleague's edit vanished", and which of those is worse depends
+    /// entirely on what the mount is for.
+    pub detect_conflicts: bool,
 }
 
 impl Default for ClientOptions {
@@ -91,6 +96,7 @@ impl Default for ClientOptions {
             pins: Vec::new(),
             dialer: None,
             no_server_defaults: false,
+            detect_conflicts: false,
         }
     }
 }
@@ -116,6 +122,11 @@ pub(crate) struct OpenState {
     /// lock/flush with EIO — mutual exclusion may have been broken and the
     /// application must find out; release still works.
     pub poisoned: AtomicBool,
+    /// Server version this handle last saw, for --detect-conflicts. Seeded at
+    /// open, advanced by our own writes. 0 = unknown, which never conflicts:
+    /// refusing a write because we never learned a version would be a bug
+    /// wearing the clothes of a safety feature.
+    pub version: AtomicU64,
 }
 
 pub struct RemoteFs {
@@ -133,6 +144,8 @@ pub struct RemoteFs {
     conn_epoch: tokio::sync::watch::Sender<u64>,
     /// Highest event seq the pump has applied — reconnect resubscribes here.
     pub(crate) last_event_seq: AtomicU64,
+    /// Send `expect_version` with writes and refuse to clobber (opt-in).
+    detect_conflicts: bool,
 }
 
 impl RemoteFs {
@@ -250,6 +263,7 @@ impl RemoteFs {
             dialer: opts.dialer.clone(),
             conn_epoch: epoch_tx,
             last_event_seq: AtomicU64::new(0),
+            detect_conflicts: opts.detect_conflicts,
         });
 
         if let (Some(cache), Some(rx)) = (fs.cache.clone(), fetch_rx) {
@@ -485,6 +499,7 @@ impl RemoteFs {
                 ra: ReadAhead::new(),
                 lock: std::sync::Mutex::new(None),
                 poisoned: AtomicBool::new(false),
+                version: AtomicU64::new(attr.version),
             },
         );
         Ok((fh, attr))
@@ -662,20 +677,56 @@ impl RemoteFs {
         }
         self.check_poisoned(fh)?;
         let server_fh = self.server_fh(fh);
+        // The version this write is allowed to overwrite. `None` when the flag
+        // is off (the server then never checks) or when we never learned one.
+        //
+        // It has to be threaded through the chunk loop rather than read once:
+        // our OWN write bumps the server's version, so a large write sending
+        // the same expectation for every chunk would conflict with itself
+        // after the first one.
+        let mut expect = if self.detect_conflicts {
+            self.open_files
+                .get(&fh)
+                .map(|s| s.version.load(Ordering::Relaxed))
+                .filter(|v| *v != 0)
+        } else {
+            None
+        };
         let mut pos = 0usize;
         while pos < data.len() {
             let chunk = &data[pos..(pos + DATA_CHUNK as usize).min(data.len())];
-            let (n, conflict) = expect_resp!(
-                self.call(Request::Write {
-                    fh: server_fh,
-                    offset: offset + pos as u64,
-                    data: Bytes::copy_from_slice(chunk),
-                    expect_version: None,
-                })?,
-                Response::Written { n, conflict, .. } => (n, conflict)
+            let written = match self.call(Request::Write {
+                fh: server_fh,
+                offset: offset + pos as u64,
+                data: Bytes::copy_from_slice(chunk),
+                expect_version: expect,
+            }) {
+                Ok(resp) => resp,
+                // A conflict is a refusal now, not a flag on a write that has
+                // already happened: nothing was written for this chunk.
+                // Earlier chunks of a large write may have landed, which is
+                // the same partial-write hazard any interrupted write-through
+                // has — worth logging the offset so it is diagnosable.
+                Err(FsError::Remote(ErrorCode::Conflict)) => {
+                    tracing::warn!(
+                        fh,
+                        offset = offset + pos as u64,
+                        bytes_already_written = pos,
+                        "refused: the file changed on another machine (--detect-conflicts)"
+                    );
+                    return Err(ErrorCode::Conflict.into());
+                }
+                Err(e) => return Err(e),
+            };
+            let (n, new_version) = expect_resp!(
+                written,
+                Response::Written { n, new_version, .. } => (n, new_version)
             );
-            if conflict {
-                tracing::warn!(fh, "server reported concurrent modification");
+            if let Some(state) = self.open_files.get(&fh) {
+                state.version.store(new_version, Ordering::Relaxed);
+            }
+            if expect.is_some() {
+                expect = Some(new_version);
             }
             pos += n as usize;
             if n == 0 {
@@ -736,6 +787,7 @@ impl RemoteFs {
                 ra: ReadAhead::new(),
                 lock: std::sync::Mutex::new(None),
                 poisoned: AtomicBool::new(false),
+                version: AtomicU64::new(attr.version),
             },
         );
         Ok((ino, fh, attr))
