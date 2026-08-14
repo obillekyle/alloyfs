@@ -48,13 +48,24 @@ fn wire_errors_become_the_matching_errno() {
 /// and EIO is the only honest answer to that.
 #[test]
 fn unmapped_codes_fall_through_to_eio() {
-    for code in [ErrorCode::Io, ErrorCode::Conflict, ErrorCode::VersionMismatch] {
+    for code in [ErrorCode::Io, ErrorCode::Conflict, ErrorCode::NotAttached] {
         assert_eq!(
             errno(&FsError::Remote(code)).code(),
             Errno::EIO.code(),
             "{code:?}"
         );
     }
+}
+
+/// "The server is too old for this operation" is not an I/O error, and
+/// reporting it as one sends people looking at the wrong layer. It did
+/// exactly that once, during the first live symlink attempt.
+#[test]
+fn an_old_server_is_not_an_io_error() {
+    assert_eq!(
+        errno(&FsError::Remote(ErrorCode::VersionMismatch)).code(),
+        Errno::EOPNOTSUPP.code()
+    );
 }
 
 fn flags(raw: i32) -> FuseOpenFlags {
