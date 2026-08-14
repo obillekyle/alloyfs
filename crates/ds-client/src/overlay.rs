@@ -182,10 +182,8 @@ impl Overlay {
         if let Some(parent) = to_full.parent() {
             std::fs::create_dir_all(parent).map_err(|e| io_to_code(&e))?;
         }
-        #[cfg(windows)]
-        if replace && to_full.is_file() {
-            let _ = std::fs::remove_file(&to_full);
-        }
+        // std::fs::rename replaces atomically on both platforms (see the
+        // matching note in ds-agent's rename).
         std::fs::rename(&from_full, &to_full).map_err(|e| io_to_code(&e).into())
     }
 

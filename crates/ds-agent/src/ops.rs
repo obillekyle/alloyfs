@@ -393,6 +393,19 @@ impl SessionInner {
     // ---- one method per request; dispatch_blocking is just the phone book --
 
     fn attach(&self, export: String) -> Result<Response, ErrorCode> {
+        // Re-attaching to the SAME export is idempotent (harmless retry);
+        // a different export would silently keep serving the first one —
+        // refuse instead of misbinding the session.
+        if let Some(current) = self.attached.get() {
+            if current.name != export {
+                tracing::warn!(
+                    attached = current.name,
+                    requested = export,
+                    "second attach to a different export refused"
+                );
+                return Err(ErrorCode::AlreadyExists);
+            }
+        }
         let export = self.registry.get(&export).ok_or(ErrorCode::NoSuchExport)?;
         let md = std::fs::metadata(&export.root).or_code()?;
         let attr = attr_from_metadata(&md, 0);
@@ -607,13 +620,10 @@ impl SessionInner {
         if !replace && to_full.exists() {
             return Err(ErrorCode::AlreadyExists);
         }
-        // Windows note: std::fs::rename fails if `to` exists; POSIX replaces
-        // atomically. Cross-platform "replace" is therefore remove-then-rename
-        // on Windows (a non-atomic window we accept and document).
-        #[cfg(windows)]
-        if replace && to_full.exists() {
-            let _ = std::fs::remove_file(&to_full);
-        }
+        // std::fs::rename replaces atomically on BOTH platforms now (Windows
+        // uses FileRenameInfoEx with POSIX semantics since ~Rust 1.78 —
+        // verified on this toolchain, including with the target open), so no
+        // remove-then-rename window is needed.
         std::fs::rename(&from_full, &to_full).or_code()?;
         export.events.note_local_write(&from, self.id);
         export.events.note_local_write(&to, self.id);
@@ -642,8 +652,19 @@ impl SessionInner {
     }
 
     fn statfs(&self) -> Result<Response, ErrorCode> {
-        // Real numbers come with a platform statvfs call later; these
-        // placeholders are already enough for `df` not to error.
+        // Real filesystem numbers for the attached export's volume.
+        // Placeholders remain for pre-attach callers (`drive-sync stress`
+        // sends Statfs without attaching) and syscall failure — `df` erroring
+        // would be worse than `df` lying.
+        if let Some(export) = self.attached.get() {
+            if let Some((block_size, blocks, blocks_free)) = crate::fsutil::fs_space(&export.root) {
+                return Ok(Response::Statfs {
+                    block_size,
+                    blocks,
+                    blocks_free,
+                });
+            }
+        }
         Ok(Response::Statfs {
             block_size: 4096,
             blocks: 1 << 24,

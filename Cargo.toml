@@ -51,6 +51,7 @@ axum = "0.8"
 tokio-stream = { version = "0.1", features = ["sync"] }
 fuser = "0.17"
 libc = "0.2"
+windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 winfsp = { version = "0.13.0", default-features = false, features = ["system", "delayload", "notify"] }
 
 # The upstream winfsp-sys build script needs our llvm-mingw/bindgen fixes; the

@@ -333,13 +333,16 @@ dependencies = [
  "ds-proto",
  "ds-transport",
  "globset",
+ "libc",
  "notify",
  "serde",
  "serde_yaml",
+ "tempfile",
  "thiserror",
  "tokio",
  "toml",
  "tracing",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
