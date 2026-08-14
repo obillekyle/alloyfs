@@ -69,6 +69,13 @@ struct dsfs_req {
 	u32 out_len;
 	int error;
 	bool finished;
+	/*
+	 * Two owners at most: the sleeping caller, and whoever holds it on a
+	 * queue (the daemon, once it has read the request). Refcounting is
+	 * what lets a KILLED caller walk away immediately instead of waiting
+	 * for a daemon that may never answer — see dsfs_request().
+	 */
+	refcount_t refs;
 	struct completion done;
 };
 

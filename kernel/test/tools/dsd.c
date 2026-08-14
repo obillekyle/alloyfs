@@ -8,7 +8,7 @@
  * sends the matching notification, which is exactly the shape of the real
  * thing (remote event arrives → tell the kernel → watchers see it).
  *
- *   dsd [--fd N] [--ctl PATH] [--die-after N] [--hang-on OP] [--corrupt-len]
+ *   dsd [--fd N] [--ctl PATH] [--die-after N] [--hang-on OP] [--corrupt-after N]
  *
  * With --fd it serves a descriptor it inherited, which is how the harness
  * gets the daemon and `mount -o fd=N` onto the SAME connection: the kernel
@@ -52,7 +52,8 @@ static unsigned long long next_nodeid = 5;
 
 static long die_after = -1;
 static const char *hang_on;
-static int corrupt_len;
+static long corrupt_after = -1;	/* corrupt every reply from this one on */
+static long replies;
 
 static void add(unsigned long long nodeid, unsigned long long parent,
 		const char *name, unsigned int mode, const char *data)
@@ -131,9 +132,18 @@ static int reply(int fd, unsigned long long unique, int error,
 	h->unique = unique;
 	if (len)
 		memcpy(buf + sizeof(*h), payload, len);
-	if (corrupt_len)
+	if (corrupt_after >= 0 && replies >= corrupt_after)
 		h->len = 0xffffffff;	/* the kernel must reject this */
-	return write(fd, buf, sizeof(*h) + len) < 0 ? -1 : 0;
+	replies++;
+	if (write(fd, buf, sizeof(*h) + len) < 0) {
+		/* The harness greps for this: proof the kernel REFUSED the
+		 * frame rather than believing a bogus length.
+		 */
+		fprintf(stderr, "WRITE-REJECTED %d\n", errno);
+		fflush(stderr);
+		return -1;
+	}
+	return 0;
 }
 
 /* Unsolicited notification: unique == 0, `error` carries the code. */
@@ -479,8 +489,8 @@ int main(int argc, char **argv)
 			die_after = atol(argv[++i]);
 		else if (!strcmp(argv[i], "--hang-on") && i + 1 < argc)
 			hang_on = argv[++i];
-		else if (!strcmp(argv[i], "--corrupt-len"))
-			corrupt_len = 1;
+		else if (!strcmp(argv[i], "--corrupt-after") && i + 1 < argc)
+			corrupt_after = atol(argv[++i]);
 	}
 
 	seed_tree();

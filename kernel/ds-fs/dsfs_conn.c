@@ -34,6 +34,13 @@ static void dsfs_req_free(struct dsfs_req *req)
 	kfree(req);
 }
 
+/* Drop one reference; the last one frees. */
+static void dsfs_req_put(struct dsfs_req *req)
+{
+	if (refcount_dec_and_test(&req->refs))
+		dsfs_req_free(req);
+}
+
 struct dsfs_conn *dsfs_conn_get(struct dsfs_conn *conn)
 {
 	refcount_inc(&conn->refs);
@@ -65,6 +72,7 @@ static void dsfs_conn_abort(struct dsfs_conn *conn)
 		req->error = -ECONNABORTED;
 		req->finished = true;
 		complete(&req->done);
+		dsfs_req_put(req);	/* the queue's reference */
 	}
 	wake_up_all(&conn->waitq);
 }
@@ -117,38 +125,51 @@ int dsfs_request(struct dsfs_conn *conn, u32 opcode, u64 nodeid, u64 offset,
 		}
 	}
 
+	refcount_set(&req->refs, 1);	/* ours */
+
 	spin_lock(&conn->lock);
 	if (!conn->connected) {
 		spin_unlock(&conn->lock);
-		dsfs_req_free(req);
+		dsfs_req_put(req);
 		return -ECONNABORTED;
 	}
 	req->hdr.unique = ++conn->next_unique;
+	refcount_inc(&req->refs);	/* the queue's */
 	list_add_tail(&req->list, &conn->pending);
 	spin_unlock(&conn->lock);
 	wake_up_interruptible(&conn->waitq);
 
 	/* Killable, not interruptible: a stray SIGWINCH must not tear down a
-	 * filesystem operation, but ^C on a hung mount has to work.
+	 * filesystem operation, but SIGKILL on a hung mount has to work.
 	 */
 	ret = wait_for_completion_killable(&req->done);
 	if (ret) {
-		spin_lock(&conn->lock);
-		if (!req->finished) {
-			list_del_init(&req->list);
-			req->error = -EINTR;
-		}
-		spin_unlock(&conn->lock);
-		/* If the daemon completed it concurrently we still own the
-		 * request here; either way nobody else will touch it.
+		bool ours;
+
+		/*
+		 * We were killed. Reclaim the request if it is still queued;
+		 * if the daemon has already taken it, IT owns that reference
+		 * and will drop it when it finishes.
+		 *
+		 * Either way we return NOW. Waiting for a completion that a
+		 * silent daemon may never signal is what puts a process in
+		 * unkillable D state — the exact failure stage 5 caught here.
 		 */
-		wait_for_completion(&req->done);
+		spin_lock(&conn->lock);
+		ours = !list_empty(&req->list);
+		if (ours)
+			list_del_init(&req->list);
+		spin_unlock(&conn->lock);
+		if (ours)
+			dsfs_req_put(req);	/* the queue's reference */
+		dsfs_req_put(req);		/* ours */
+		return -EINTR;
 	}
 
 	ret = req->error ? req->error : (int)req->out_len;
 	if (ret > 0 && out_buf)
 		memcpy(out_buf, req->out_buf, req->out_len);
-	dsfs_req_free(req);
+	dsfs_req_put(req);
 	return ret;
 }
 
@@ -204,6 +225,11 @@ static ssize_t dsfs_dev_read(struct file *file, char __user *ubuf, size_t count,
 		}
 		req = list_first_entry_or_null(&conn->pending, struct dsfs_req, list);
 		if (req) {
+			/* Our own reference for the copy below: once the lock is
+			 * dropped, a killed caller may reclaim and free this
+			 * request while we are still reading out of it.
+			 */
+			refcount_inc(&req->refs);
 			list_move_tail(&req->list, &conn->processing);
 			spin_unlock(&conn->lock);
 			break;
@@ -223,13 +249,19 @@ static ssize_t dsfs_dev_read(struct file *file, char __user *ubuf, size_t count,
 	if (copy_to_user(ubuf, &req->hdr, sizeof(req->hdr)) ||
 	    (req->in_len &&
 	     copy_to_user(ubuf + sizeof(req->hdr), req->in_buf, req->in_len))) {
-		/* The daemon never saw it: requeue so it is not lost. */
+		/* The daemon never saw it: requeue so it is not lost — but only
+		 * if the queue still owns it. An empty list_head means a killed
+		 * caller already reclaimed it, and re-adding it would leave a
+		 * queued request with nobody holding a reference.
+		 */
 		spin_lock(&conn->lock);
-		if (!req->finished)
+		if (!list_empty(&req->list))
 			list_move(&req->list, &conn->pending);
 		spin_unlock(&conn->lock);
+		dsfs_req_put(req);
 		return -EFAULT;
 	}
+	dsfs_req_put(req);
 	return total;
 }
 
@@ -283,6 +315,11 @@ static ssize_t dsfs_dev_write(struct file *file, const char __user *ubuf,
 	if (!found)
 		return -ENOENT;	/* unknown or already-abandoned request */
 
+	/*
+	 * Removing it from `processing` above transferred the queue's
+	 * reference to us, so the buffers below stay alive even if the
+	 * original caller was killed and walked away in the meantime.
+	 */
 	if (payload > found->out_max)
 		payload = found->out_max;	/* truncate, never overflow */
 	if (payload && copy_from_user(found->out_buf, ubuf + sizeof(hdr), payload)) {
@@ -293,6 +330,7 @@ static ssize_t dsfs_dev_write(struct file *file, const char __user *ubuf,
 	}
 	found->finished = true;
 	complete(&found->done);
+	dsfs_req_put(found);
 	return hdr.len;
 }
 

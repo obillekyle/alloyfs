@@ -17,6 +17,11 @@ MEM="${DS_QEMU_MEM:-256}"
 SMP="${DS_QEMU_SMP:-1}"
 KVER="$(uname -r)"
 BUILD=1
+DEBUG_KDIR=""
+# lockdep reports one splat per lock-order violation and then stays quiet, so
+# panic_on_warn would hide everything after the first. The debug kernel keeps
+# oops=panic (a real bug still stops the run) but lets WARNs accumulate.
+PANIC_ON_WARN=1
 
 while [ $# -gt 0 ]; do
 	case "$1" in
@@ -24,6 +29,10 @@ while [ $# -gt 0 ]; do
 	--timeout) TIMEOUT="$2"; shift 2 ;;
 	--machine) MACHINE="$2"; shift 2 ;;
 	--kver)    KVER="$2"; shift 2 ;;
+	# Point at a built kernel source tree (see build-debug-kernel.sh): use
+	# ITS bzImage and build the module against ITS headers, so the checkers
+	# compiled into that kernel actually apply to our code.
+	--debug-kernel) DEBUG_KDIR="$2"; shift 2 ;;
 	--no-build) BUILD=0; shift ;;
 	*) echo "unknown option: $1" >&2; exit 2 ;;
 	esac
@@ -34,7 +43,17 @@ mkdir -p "$OUT"
 
 # Ubuntu ships /boot/vmlinuz-* as 0600 root. Stage one readable copy (cached
 # across runs) rather than loosening permissions on the host's boot image.
+KDIR="/lib/modules/$KVER/build"
 KERNEL="/boot/vmlinuz-$KVER"
+
+if [ -n "$DEBUG_KDIR" ]; then
+	KERNEL="$DEBUG_KDIR/arch/x86/boot/bzImage"
+	KDIR="$DEBUG_KDIR"
+	PANIC_ON_WARN=0
+	[ -r "$KERNEL" ] || { echo "no bzImage in $DEBUG_KDIR (build it first)" >&2; exit 1; }
+	echo "==> debug kernel: $KERNEL"
+fi
+
 if [ ! -r "$KERNEL" ]; then
 	STAGED="$OUT/vmlinuz-$KVER"
 	if [ ! -r "$STAGED" ]; then
@@ -49,8 +68,8 @@ fi
 # Stage 0 is the harness self-test: no module yet.
 KO=""
 if [ "$STAGE" -ge 1 ] && [ "$BUILD" -eq 1 ]; then
-	echo "==> building module against $KVER"
-	make -C ../ds-fs KDIR="/lib/modules/$KVER/build" >/dev/null
+	echo "==> building module against ${DEBUG_KDIR:-$KVER}"
+	make -C ../ds-fs KDIR="$KDIR" >/dev/null
 	KO="../ds-fs/ds_fs.ko"
 	[ -f "$KO" ] || { echo "module build produced no ds_fs.ko" >&2; exit 1; }
 fi
@@ -71,7 +90,7 @@ QEMU_ARGS=(
 	# reboot=triple: microvm has neither i8042 nor ACPI, so the kernel's usual
 	# reset methods dead-end and the guest hangs after its tests. A triple
 	# fault is always visible to QEMU, which exits because of -no-reboot.
-	-append "console=ttyS0 earlyprintk=serial,ttyS0 rdinit=/init nokaslr panic=-1 oops=panic panic_on_warn=1 reboot=triple loglevel=7 tsc=unstable no_timer_check"
+	-append "console=ttyS0 earlyprintk=serial,ttyS0 rdinit=/init nokaslr panic=-1 oops=panic panic_on_warn=$PANIC_ON_WARN reboot=triple loglevel=7 tsc=unstable no_timer_check${DEBUG_KDIR:+ slub_debug=FZPU}"
 	-serial "file:$SERIAL"
 )
 case "$MACHINE" in
