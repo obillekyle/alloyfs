@@ -59,9 +59,9 @@ alloyfs ping ssh://myhost
 alloyfs stress tcp://server:7440 --count 1000
 ```
 
-Agent config (`~/.config/alloyfs/agent.toml` on Linux,
-`C:\MyApps\alloyfs.toml` on Windows — picked up automatically, which is
-what makes zero-argument `serve --stdio` over SSH work):
+Agent config (`~/.alloyfs/config.yml`, created on first run — picked up
+automatically, which is what makes zero-argument `serve --stdio` over SSH
+work):
 
 ```toml
 [agent]
@@ -108,8 +108,9 @@ a bare name (`node_modules`, `.git`) matches at any depth and covers
 everything beneath it; `secret*`, `build/out`, `**/*.log` work as expected.
 
 **Client-side** (`--exclude GLOB` per mount, repeatable): matching paths live
-**only on the mounting machine**, stored under the local data dir
-(`%LOCALAPPDATA%\alloyfs\overlay\…` / `~/.local/share/alloyfs/…`).
+**only on the mounting machine**, stored in the overlay under
+`~/.alloyfs/data/<host>/overlay/<export>/` — which is why that tree is the
+one thing here you cannot re-download.
 The server never sees them; local watchers on the mount still fire natively;
 they persist across remounts. Renames across the boundary return EXDEV, which
 every tool answers with copy+delete — so `mv` in/out of an excluded directory
@@ -126,11 +127,44 @@ re-fetched in the background). `--auto-cache-budget` (default `512M`) bounds
 the cache with LRU eviction — pinned files are never evicted.
 `alloyfs cache clear <url>` wipes a mount's blobs (never the overlay).
 
+## Where things live
+
+One tree in your home directory, the same on both platforms
+(`%USERPROFILE%\.alloyfs` on Windows):
+
+```text
+~/.alloyfs/
+  config.yml                created on first run if absent
+  data/<host>/              DURABLE — nothing here can be re-downloaded
+    overlay/<export>/         files that exist on NO server
+    sync/<export>-<tag>.json  sync baselines
+  cache/<host>/             DISPOSABLE — delete any of it, any time
+    <export>/                 downloaded blobs
+```
+
+The `data` / `cache` split is deliberate: `alloyfs cache clear` operates
+only on the second tree, so it cannot reach the overlay. Directories are
+named after the host and export rather than hashed, so you can navigate
+them. Host **and port** distinguish two agents on one machine, but the
+scheme does not — mounting one export over `ssh://` and `tcp://` shares an
+overlay, since it is the same server namespace either way.
+
+**Overrides**, in order:
+
+1. `--config PATH` / `--data-dir PATH` on the command line.
+2. An `alloyfs.yml` **beside the executable** — a portable install (binary
+   and config in one folder, on a stick or a share) runs without touching
+   the home directory.
+3. `~/.alloyfs/config.yml`, created from a commented template if missing.
+
+Upgrading from an older layout needs no action: an existing config is
+found in its old location, and each mount's overlay and cache move
+themselves the first time that mount runs.
+
 ## Config files (YAML)
 
-Agent (`serve --config agent.yml`; also the auto-discovered default —
-`~/.config/alloyfs/agent.yml` on Linux, `C:\MyApps\alloyfs.yml` on
-Windows; `.toml` variants still parse for existing deployments):
+Agent (`serve --config agent.yml`; also the auto-discovered default at
+`~/.alloyfs/config.yml`, see "Where things live" below):
 
 ```yaml
 agent:
