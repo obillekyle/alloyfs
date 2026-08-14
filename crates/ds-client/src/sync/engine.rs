@@ -71,8 +71,12 @@ pub struct SyncEngine {
     conn_epoch: tokio::sync::watch::Sender<u64>,
     op_tx: mpsc::UnboundedSender<Op>,
     pub stats: SyncStats,
-    /// Keeps the OS watcher alive for the engine's lifetime.
-    _watcher: Mutex<Option<Box<dyn std::any::Any + Send>>>,
+    /// Set by `shutdown`: refuse new work and let the loops exit. Without it
+    /// a "stopped" engine keeps watching and mutating (its tasks hold Arc
+    /// clones), so two engines over one directory fight each other.
+    stopped: std::sync::atomic::AtomicBool,
+    /// Keeps the OS watcher alive; dropped by `shutdown` to end the watch.
+    watcher: Mutex<Option<Box<dyn std::any::Any + Send>>>,
 }
 
 impl SyncEngine {
@@ -148,17 +152,23 @@ impl SyncEngine {
             conn_epoch: epoch_tx,
             op_tx,
             stats: SyncStats::default(),
-            _watcher: Mutex::new(None),
+            stopped: std::sync::atomic::AtomicBool::new(false),
+            watcher: Mutex::new(None),
         });
 
+        // Watch BEFORE the first reconcile: the reconcile can create local
+        // files (conflict copies, pulled files), and a watcher installed
+        // afterwards would never see them — they'd sit unpushed until some
+        // later edit. Echoes of our own applies are handled by the
+        // suppression map, so watching early costs nothing.
+        if !opts.one_shot {
+            engine.start_local_watcher(opts.debounce)?;
+        }
         engine.enqueue(Op::Reconcile);
         tokio::spawn(executor(engine.clone(), op_rx));
         tokio::spawn(event_pump(engine.clone(), rx));
         if engine.dialer.is_some() {
             tokio::spawn(reconnect_supervisor(engine.clone()));
-        }
-        if !opts.one_shot {
-            engine.start_local_watcher(opts.debounce)?;
         }
         Ok(engine)
     }
@@ -168,7 +178,14 @@ impl SyncEngine {
         self.stats.pending.load(Relaxed) == 0
     }
 
+    /// Stop syncing and persist the baseline. After this returns the engine
+    /// accepts no new work and its watcher is gone; in-flight operations
+    /// finish, but nothing new starts.
     pub fn shutdown(&self) {
+        self.stopped.store(true, Relaxed);
+        // Dropping the notify watcher closes its channel, which ends the
+        // local-watch loop.
+        let _ = self.watcher.lock().unwrap().take();
         let m = self.manifest.lock().unwrap();
         m.flush(&self.manifest_path);
         tracing::info!(
@@ -180,6 +197,9 @@ impl SyncEngine {
     }
 
     fn enqueue(&self, op: Op) {
+        if self.stopped.load(Relaxed) {
+            return;
+        }
         self.stats.pending.fetch_add(1, Relaxed);
         if self.op_tx.send(op).is_err() {
             self.stats.pending.fetch_sub(1, Relaxed);
@@ -660,6 +680,21 @@ impl SyncEngine {
             // Ties go to the server — deterministic on both ends.
             ConflictPolicy::Newer => local.mtime_ns > remote.mtime_ns,
         };
+        // A conflict copy that itself conflicts must not spawn
+        // `x.sync-conflict-N.sync-conflict-N`: the file IS already a
+        // preservation copy, so last-writer-wins is enough.
+        if rel.contains(".sync-conflict-") {
+            tracing::warn!(
+                path = rel,
+                local_wins,
+                "conflict on a conflict copy; no further copy"
+            );
+            return if local_wins {
+                self.push(rel).await
+            } else {
+                self.pull(rel).await
+            };
+        }
         let keep = conflict_name(rel);
         tracing::warn!(
             path = rel,
@@ -678,19 +713,35 @@ impl SyncEngine {
                 full.file_name().and_then(|n| n.to_str()).unwrap_or("conflict")
             ));
             let conn = self.conn();
+            let mut kept = false;
             if download_to(&conn, rel, &staging).await.is_ok() {
-                // NOT suppressed: the watcher should see and push this copy.
-                let _ = std::fs::rename(&staging, &full);
+                kept = std::fs::rename(&staging, &full).is_ok();
             }
-            self.push(rel).await
+            let res = self.push(rel).await;
+            // Push the preserved copy explicitly rather than waiting for the
+            // watcher to notice it: during the startup reconcile there may
+            // not be a watcher yet, and a conflict copy that never reaches
+            // the other side is exactly the data loss this is preventing.
+            if kept {
+                if let Err(e) = self.push(&keep).await {
+                    tracing::warn!(path = %keep, error = %e, "conflict copy not pushed");
+                }
+            }
+            res
         } else {
             // Set the local copy aside with COPY, not rename: a rename would
             // reach the watcher as a rename pair and be replayed as a
-            // SERVER-side rename — moving the winner's file. The copy is
-            // deliberately unsuppressed so it gets pushed as a new file;
-            // the pull then overwrites the original in place.
-            let _ = std::fs::copy(self.full(rel), self.full(&keep));
-            self.pull(rel).await
+            // SERVER-side rename — moving the winner's file. The pull then
+            // overwrites the original in place.
+            let kept = std::fs::copy(self.full(rel), self.full(&keep)).is_ok();
+            let res = self.pull(rel).await;
+            // Explicit push, for the same reason as the local-wins branch.
+            if kept {
+                if let Err(e) = self.push(&keep).await {
+                    tracing::warn!(path = %keep, error = %e, "conflict copy not pushed");
+                }
+            }
+            res
         }
     }
 
@@ -771,12 +822,15 @@ impl SyncEngine {
         watcher
             .watch(&self.root, notify::RecursiveMode::Recursive)
             .map_err(|_| ErrorCode::Io)?;
-        *self._watcher.lock().unwrap() = Some(Box::new(watcher));
+        *self.watcher.lock().unwrap() = Some(Box::new(watcher));
 
         let engine = self.clone();
         tokio::spawn(async move {
             let mut co = Coalescer::new(engine.root.clone(), engine.exclude.clone());
             loop {
+                if engine.stopped.load(Relaxed) {
+                    break;
+                }
                 let timeout = if co.is_empty() {
                     Duration::from_secs(3600)
                 } else {
@@ -784,6 +838,7 @@ impl SyncEngine {
                 };
                 tokio::select! {
                     maybe = raw_rx.recv() => {
+                        // None = the watcher was dropped by shutdown().
                         let Some(event) = maybe else { break };
                         co.ingest(event);
                     }
@@ -807,6 +862,9 @@ impl SyncEngine {
 /// The single mutation loop: every filesystem/manifest change happens here.
 async fn executor(engine: Arc<SyncEngine>, mut rx: mpsc::UnboundedReceiver<Op>) {
     while let Some(op) = rx.recv().await {
+        if engine.stopped.load(Relaxed) {
+            break;
+        }
         match op {
             Op::Remote(batch) => {
                 for ev in &batch {

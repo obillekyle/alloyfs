@@ -225,6 +225,12 @@ fn merge(old: Option<&EventKind>, new: EventKind) -> Option<EventKind> {
         (Some(Created), Modified | AttrChanged) => Created,
         // Appeared then vanished: nothing happened, observably.
         (Some(Created), Removed) => return None,
+        // ANY other state followed by a removal is a removal — the file is
+        // gone, and reporting the earlier Modified instead would leave every
+        // observer believing it still exists. (A modify-then-delete inside
+        // one debounce window is exactly what a rename's degraded halves
+        // look like when a write preceded them.)
+        (Some(_), Removed) => Removed,
         // Vanished then reappeared: net effect is content replacement.
         (Some(Removed), Created) => Modified,
         // Attr change then data change: report the stronger one.
@@ -283,6 +289,32 @@ mod tests {
             matches!(&batch[1], (p, EventKind::Modified) if p.0 == "b.txt"),
             "the later Modified must survive: {batch:?}"
         );
+    }
+
+    /// A delete must survive an earlier modify in the same window: the file
+    /// is gone, and reporting Modified would leave observers believing it
+    /// still exists. This is what a rename's degraded halves look like when
+    /// a write preceded them (found by the sync battery on Windows).
+    #[test]
+    fn removal_wins_over_earlier_modify() {
+        let mut c = co();
+        c.ingest(ev(NK::Modify(MK::Data(DataChange::Any)), &["a.txt"]));
+        c.ingest(ev(NK::Remove(notify::event::RemoveKind::File), &["a.txt"]));
+        let batch = c.take_batch();
+        assert_eq!(batch.len(), 1, "{batch:?}");
+        assert!(
+            matches!(&batch[0], (p, EventKind::Removed) if p.0 == "a.txt"),
+            "{batch:?}"
+        );
+    }
+
+    /// But a create followed by a delete is still nothing at all.
+    #[test]
+    fn create_then_remove_is_silent() {
+        let mut c = co();
+        c.ingest(ev(NK::Create(notify::event::CreateKind::File), &["t.txt"]));
+        c.ingest(ev(NK::Remove(notify::event::RemoveKind::File), &["t.txt"]));
+        assert!(c.take_batch().is_empty());
     }
 
     /// Same triple-report, halves arriving AFTER the pair: still one event.
