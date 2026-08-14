@@ -71,6 +71,37 @@ enum Command {
         #[arg(long)]
         token: Option<String>,
     },
+    /// Keep a REAL local directory bidirectionally in sync with an export.
+    /// Unlike a mount, watchers on the directory get genuine file events for
+    /// remote changes (this is the Linux answer to FUSE's inotify limit).
+    /// url: tcp://host:port/export or ssh://host/export
+    Sync {
+        url: String,
+        /// Local directory (created if missing).
+        dir: PathBuf,
+        /// Remote drive-sync command for ssh:// urls.
+        #[arg(long, default_value = "drive-sync")]
+        remote_cmd: String,
+        /// Paths to skip, both directions (gitignore-style glob, repeatable).
+        #[arg(long = "exclude", value_name = "GLOB")]
+        excludes: Vec<String>,
+        /// Local change debounce in milliseconds.
+        #[arg(long, default_value_t = 250)]
+        debounce_ms: u64,
+        /// Conflict policy: newer (last writer wins), remote, or local.
+        /// The losing copy is always kept as <name>.sync-conflict-<ts>.
+        #[arg(long, default_value = "newer")]
+        conflict_policy: String,
+        /// Where the sync manifest lives. Default: per-user app data.
+        #[arg(long, value_name = "PATH")]
+        data_dir: Option<PathBuf>,
+        /// Shared secret for token-protected TCP servers.
+        #[arg(long)]
+        token: Option<String>,
+        /// Reconcile once and exit (no live watching).
+        #[arg(long)]
+        one_shot: bool,
+    },
     /// Manage the local auto-download cache.
     Cache {
         #[command(subcommand)]
@@ -180,6 +211,30 @@ async fn main() -> anyhow::Result<()> {
                 data_dir,
                 no_server_defaults,
                 token,
+            )
+            .await
+        }
+        Command::Sync {
+            url,
+            dir,
+            remote_cmd,
+            excludes,
+            debounce_ms,
+            conflict_policy,
+            data_dir,
+            token,
+            one_shot,
+        } => {
+            commands::sync::run(
+                url,
+                dir,
+                remote_cmd,
+                excludes,
+                debounce_ms,
+                conflict_policy,
+                data_dir,
+                token,
+                one_shot,
             )
             .await
         }

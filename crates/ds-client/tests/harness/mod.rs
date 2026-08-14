@@ -278,6 +278,16 @@ pub async fn connect_raw_with_server_token(agent: &TestAgent, token: &str) -> Ar
         .expect("handshake")
 }
 
+/// A bare `MuxConnection` with no token and no RemoteFs — what the sync
+/// engine battery hands to `SyncEngine::start`.
+pub async fn raw_conn(agent: &TestAgent) -> Arc<MuxConnection> {
+    let slot: SeverSlot = Arc::new(Mutex::new(None));
+    let (client_io, _server) = spawn_server_link(&agent.registry, &slot);
+    MuxConnection::establish(client_io, "test-client")
+        .await
+        .expect("handshake")
+}
+
 /// Full loopback stack: duplex pipe, `serve_connection` on the (severable)
 /// server half, `MuxConnection` + `RemoteFs::attach_with` on the client half.
 /// No dialer: a severed link stays dead.

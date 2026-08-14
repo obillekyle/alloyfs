@@ -111,8 +111,10 @@ mod tests {
     fn roundtrip_and_rename_prefix() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("m.json");
-        let mut m = SyncManifest::default();
-        m.last_seq = 9;
+        let mut m = SyncManifest {
+            last_seq: 9,
+            ..SyncManifest::default()
+        };
         m.entries.insert("a/b.txt".into(), entry(EntryKind::File));
         m.entries.insert("a".into(), entry(EntryKind::Dir));
         m.entries.insert("ax.txt".into(), entry(EntryKind::File));

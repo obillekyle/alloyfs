@@ -240,15 +240,15 @@ impl SyncEngine {
             self.suppress.remove(rel);
             return false;
         }
-        let matches = match (entry.expect, self.local_stat(rel)) {
+        // Entry stays until TTL: one mutation can echo several raw events.
+        match (entry.expect, self.local_stat(rel)) {
             (Expect::Absent, None) => true,
             (Expect::Dir, Some(s)) => s.kind == EntryKind::Dir,
             (Expect::Present { size, mtime_ns }, Some(s)) => {
                 s.kind == EntryKind::File && s.size == size && s.mtime_ns == mtime_ns
             }
             _ => false,
-        };
-        matches // entry stays until TTL: one mutation can echo several raw events
+        }
     }
 
     fn record(&self, rel: &str, kind: EntryKind, size: u64, mtime_ns: u128, version: u64) {
@@ -508,7 +508,7 @@ impl SyncEngine {
                 match remote {
                     Err(ErrorCode::NotFound) => {
                         self.manifest.lock().unwrap().entries.remove(rel);
-                        return Ok(());
+                        Ok(())
                     }
                     Ok(Response::Attr(a)) => {
                         let fresh = (b.remote_version != 0 && b.remote_version == a.version)

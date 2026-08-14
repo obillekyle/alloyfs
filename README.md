@@ -212,6 +212,41 @@ links (the ~2 MB/s ssh path this project grew up on) that translates almost
 directly into throughput. No configuration, no flags: it's negotiated per
 connection and silently off with any v2 peer.
 
+## Sync mode: a real directory instead of a mount
+
+```bash
+drive-sync sync ssh://azure/projects ~/projects
+```
+
+Bidirectional sync between a server export and a **real local directory**.
+Remote changes are applied as genuine filesystem operations, which means
+watchers on that directory receive genuine, full-fidelity inotify /
+ReadDirectoryChangesW events — create, modify, delete, rename, all of it.
+This is the answer to the one thing no mounted filesystem can do on Linux
+(the kernel only generates inotify from local syscalls): vite, chokidar,
+VS Code, `inotifywait` scripts all just work. Local edits are watched,
+debounced, and pushed back; the server's origin filtering means your own
+pushes never echo back at you.
+
+- **Conflicts**: last-writer-wins by mtime (`--conflict-policy newer`,
+  or force `remote`/`local`). The losing copy is **always** preserved
+  beside the winner as `<name>.sync-conflict-<timestamp>` — and syncs to
+  both sides like any other file. Deletes lose to edits, always.
+- **State**: a per-(server, export, directory) baseline manifest under the
+  data dir enables true three-way reconciliation at startup and after
+  outages; a clean start transfers nothing. Reconnects resume from the last
+  applied event; expired event history or a restarted server triggers a
+  full (cheap) reconcile.
+- **Excludes**: `--exclude GLOB` holds in both directions.
+- **`--one-shot`**: reconcile once and exit — a protocol-native `rsync`.
+- Limitations: symlinks aren't synced (no wire representation); like any
+  sync engine, the tree lives on your disk in full — use the mount when
+  you want on-demand access to more than fits locally.
+
+When to pick which: **mount** for drive semantics and on-demand access to
+big trees; **sync** for dev working copies on Linux where file events and
+native-speed builds matter.
+
 ## Running the agent as a service
 
 - **Linux (systemd)**: [scripts/drive-sync.service](scripts/drive-sync.service)
