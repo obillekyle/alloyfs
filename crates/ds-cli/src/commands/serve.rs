@@ -48,7 +48,7 @@ pub async fn run(
     } else {
         let listen = cfg.agent.tcp_listen.unwrap_or(addr);
         let token = cfg.agent.tcp_token.clone();
-        if token.is_none() && !is_loopback(&listen) {
+        if token.is_none() && !ds_common::is_loopback_listen(&listen) {
             anyhow::bail!(
                 "refusing to serve TCP on non-loopback {listen} without agent.tcp_token — \
                  anyone who can reach the port could mount every export"
@@ -67,12 +67,4 @@ pub async fn run(
         .await?;
     }
     Ok(())
-}
-
-fn is_loopback(listen: &str) -> bool {
-    use std::net::ToSocketAddrs;
-    match listen.to_socket_addrs() {
-        Ok(mut addrs) => addrs.all(|a| a.ip().is_loopback()),
-        Err(_) => false, // unparseable: be strict, demand a token
-    }
 }

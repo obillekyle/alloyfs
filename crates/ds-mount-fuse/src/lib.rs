@@ -21,7 +21,8 @@ use ds_client::{FsError, RemoteFs, ROOT_INO};
 use ds_proto::{Attr, ErrorCode, FileKind, OpenFlags};
 
 /// Kernel-side cache lifetime for attrs/entries we reply with. Short on
-/// purpose: real invalidation arrives with the event stream in M5.
+/// purpose: real invalidation arrives with the event stream (the pump calls
+/// `apply_events_native` below); the TTL only bounds staleness if it hiccups.
 const KERNEL_TTL: Duration = Duration::from_secs(1);
 
 fn errno(e: &FsError) -> Errno {

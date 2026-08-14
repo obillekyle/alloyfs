@@ -31,12 +31,8 @@ struct AppState {
 }
 
 pub async fn serve(listen: &str, registry: Arc<ExportRegistry>, token: Option<String>) -> anyhow::Result<()> {
-    let loopback = {
-        let host = listen.rsplit_once(':').map(|(h, _)| h).unwrap_or(listen);
-        matches!(host, "127.0.0.1" | "localhost" | "[::1]" | "::1")
-    };
     anyhow::ensure!(
-        token.is_some() || loopback,
+        token.is_some() || ds_common::is_loopback_listen(listen),
         "http_listen {listen} is not loopback: set agent.http_token (refusing to serve an \
          unauthenticated API on the network)"
     );
@@ -136,6 +132,10 @@ async fn file_post(
     let rel = RelPath(q.path);
     let full = export.resolve_new(&rel).map_err(code_to_status)?;
     let written = body.len();
+    // HTTP mutations are deliberately origin-LESS: origin tagging exists only
+    // so a mounted session doesn't hear its own writes echoed back, and an
+    // HTTP client has no session or subscription to suppress. Every mount
+    // SHOULD see these changes via the watcher — that's correct, not a gap.
     let version = tokio::task::spawn_blocking(move || -> Result<u64, ErrorCode> {
         std::fs::write(&full, &body).map_err(|_| ErrorCode::Io)?;
         Ok(export.bump(&rel))

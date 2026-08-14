@@ -41,6 +41,71 @@ pub async fn stress(url: String, count: u32, token: Option<String>) -> anyhow::R
     Ok(())
 }
 
+/// Timed pipelined read of one remote file, bypassing the kernel mount: with
+/// `--depth 1` it measures per-chunk RTT cost, with a deep window it measures
+/// what the transport can actually carry. Comparing those two against a
+/// through-mount copy of the same file pins which layer loses throughput.
+pub async fn bench(
+    url: String,
+    path: String,
+    depth: usize,
+    remote_cmd: String,
+    token: Option<String>,
+) -> anyhow::Result<()> {
+    use ds_proto::{OpenFlags, RelPath, DATA_CHUNK};
+    use futures::StreamExt;
+
+    let (conn, export) = connect_target(&url, &remote_cmd, "bench", token.as_deref()).await?;
+    let export = require_export(export, &url)?;
+    match conn.request(Request::Attach { export }).await?? {
+        Response::AttachOk { .. } => {}
+        other => anyhow::bail!("unexpected attach reply: {other:?}"),
+    }
+    let flags = OpenFlags {
+        read: true,
+        ..OpenFlags::default()
+    };
+    let (fh, attr) = match conn
+        .request(Request::Open {
+            path: RelPath(path.clone()),
+            flags,
+        })
+        .await??
+    {
+        Response::Opened { fh, attr } => (fh, attr),
+        other => anyhow::bail!("unexpected open reply: {other:?}"),
+    };
+    let size = attr.size;
+    anyhow::ensure!(size > 0, "{path} is empty — nothing to measure");
+
+    let chunks: Vec<(u64, u32)> = (0..size)
+        .step_by(DATA_CHUNK as usize)
+        .map(|off| (off, ((size - off).min(DATA_CHUNK as u64)) as u32))
+        .collect();
+    let n = chunks.len();
+    let start = Instant::now();
+    let mut stream = futures::stream::iter(chunks.into_iter().map(|(offset, len)| {
+        let conn = conn.clone();
+        async move { conn.request(Request::Read { fh, offset, len }).await }
+    }))
+    .buffer_unordered(depth.max(1));
+    let mut bytes = 0u64;
+    while let Some(resp) = stream.next().await {
+        match resp?? {
+            Response::Data(data) => bytes += data.len() as u64,
+            other => anyhow::bail!("unexpected read reply: {other:?}"),
+        }
+    }
+    let dt = start.elapsed();
+    let _ = conn.request(Request::Release { fh }).await;
+    println!(
+        "{bytes} bytes in {n} chunks, depth {depth}: {:.2} MB/s ({:.1} ms)",
+        bytes as f64 / dt.as_secs_f64() / 1_000_000.0,
+        dt.as_secs_f64() * 1000.0
+    );
+    Ok(())
+}
+
 pub async fn events(
     url: String,
     since: Option<u64>,
@@ -51,9 +116,10 @@ pub async fn events(
     let export = require_export(export, &url)?;
     let fs = ds_client::RemoteFs::attach(conn.clone(), &export).await?;
     let mut rx = conn.events();
-    let last_seq = fs.start_event_pump(|_| {}).await?;
+    // The raw receiver above sees everything the pump subscribes to,
+    // including the ring-log catch-up batches --since requests.
+    let last_seq = fs.start_event_pump_since(since, |_| {}).await?;
     tracing::info!(last_seq, "subscribed; streaming events (NDJSON)");
-    let _ = since; // catch-up via --since arrives with reconnect support
     loop {
         match rx.recv().await {
             Ok(batch) => {

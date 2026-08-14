@@ -108,6 +108,21 @@ enum Command {
         #[arg(long)]
         token: Option<String>,
     },
+    /// Timed pipelined read of one remote file (no kernel mount involved).
+    /// url: tcp://host:port/export or ssh://host/export.
+    Bench {
+        url: String,
+        /// File path inside the export.
+        path: String,
+        /// Concurrent chunk requests (1 = serial; 16 = one readahead window).
+        #[arg(long, default_value_t = 16)]
+        depth: usize,
+        #[arg(long, default_value = "drive-sync")]
+        remote_cmd: String,
+        /// Shared secret for token-protected TCP servers.
+        #[arg(long)]
+        token: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -183,5 +198,12 @@ async fn main() -> anyhow::Result<()> {
         } => commands::diag::events(url, since, remote_cmd, token).await,
         Command::Ping { url, count, token } => commands::diag::ping(url, count, token).await,
         Command::Stress { url, count, token } => commands::diag::stress(url, count, token).await,
+        Command::Bench {
+            url,
+            path,
+            depth,
+            remote_cmd,
+            token,
+        } => commands::diag::bench(url, path, depth, remote_cmd, token).await,
     }
 }

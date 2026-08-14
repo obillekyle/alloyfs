@@ -48,6 +48,19 @@ impl SizeField {
     }
 }
 
+/// Is `listen` (a "host:port" listen address) loopback-only? Resolves the
+/// address rather than string-matching, so "127.0.0.2:80" and IPv6 forms are
+/// judged correctly. Unresolvable input counts as NON-loopback — the callers
+/// use this to decide whether serving without a token is safe, and "can't
+/// tell" must fail toward requiring one.
+pub fn is_loopback_listen(listen: &str) -> bool {
+    use std::net::ToSocketAddrs;
+    match listen.to_socket_addrs() {
+        Ok(mut addrs) => addrs.all(|a| a.ip().is_loopback()),
+        Err(_) => false,
+    }
+}
+
 /// Constant-time token equality: never leak how much of a secret matched
 /// through response timing. Used by both the HTTP bearer check and the TCP
 /// `Request::Auth` handler.

@@ -10,7 +10,7 @@ pub const ROOT_INO: u64 = 1;
 /// The wire protocol speaks paths; the FUSE kernel interface speaks inode
 /// numbers. This table is where the two meet: an inode is allocated the first
 /// time a path is seen and stays stable for the lifetime of the mount (rename
-/// handling retargets entries in M5).
+/// handling retargets entries — see `rename` below).
 pub struct InodeTable {
     by_ino: DashMap<u64, RelPath>,
     by_path: DashMap<RelPath, u64>,

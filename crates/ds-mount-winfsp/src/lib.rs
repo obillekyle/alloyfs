@@ -652,7 +652,12 @@ pub struct EventSink(Arc<std::sync::Mutex<Vec<ds_proto::FsEvent>>>);
 
 impl EventSink {
     pub fn push(&self, batch: &[ds_proto::FsEvent]) {
-        self.0.lock().unwrap().extend_from_slice(batch);
+        // A poisoned mutex here just means a prior panic elsewhere; dropping
+        // notifications forever over it would silently disable the feature.
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .extend_from_slice(batch);
     }
 }
 
@@ -679,7 +684,7 @@ fn emit_one(notifier: &winfsp::notify::Notifier, path: &ds_proto::RelPath, actio
 
 impl winfsp::notify::NotifyingFileSystemContext<Vec<ds_proto::FsEvent>> for WinFspFs {
     fn should_notify(&self) -> Option<Vec<ds_proto::FsEvent>> {
-        let mut guard = self.pending_events.lock().unwrap();
+        let mut guard = self.pending_events.lock().unwrap_or_else(|p| p.into_inner());
         if guard.is_empty() {
             None
         } else {
@@ -767,7 +772,8 @@ pub fn mount(fs: Arc<RemoteFs>, mountpoint: &str, volume_label: &str) -> anyhow:
         .volume_creation_time(to_filetime(SystemTime::now()))
         .volume_serial_number(0x4453_594E) // "DSYN"
         // Short kernel-side metadata cache, mirroring the FUSE backend's 1s
-        // TTL; real invalidation arrives with the event stream in M5.
+        // TTL; real invalidation arrives with the event stream (the notify
+        // timer re-emits pump batches as ReadDirectoryChangesW).
         .file_info_timeout(1000)
         // Only post Cleanup when something actually changed (or a delete is
         // pending) — saves a callback storm on read-only workloads.

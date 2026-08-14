@@ -103,14 +103,40 @@ impl RemoteFs {
         self: &Arc<Self>,
         on_batch: impl Fn(&[FsEvent]) + Send + 'static,
     ) -> Result<u64, FsError> {
+        self.start_event_pump_since(None, on_batch).await
+    }
+
+    /// `start_event_pump` with an initial catch-up point: the first Subscribe
+    /// asks the server to replay its ring log from `since` (the CLI's
+    /// `events --since N`). `TooOld` falls back to a live subscription with a
+    /// warning rather than failing the pump.
+    pub async fn start_event_pump_since(
+        self: &Arc<Self>,
+        since: Option<u64>,
+        on_batch: impl Fn(&[FsEvent]) + Send + 'static,
+    ) -> Result<u64, FsError> {
         let conn = self.conn();
         // Receiver BEFORE Subscribe: catchup batches pushed with no receiver
         // would be silently dropped by the broadcast channel.
         let rx = conn.events();
-        let last_seq = match conn.request(Request::Subscribe { since_seq: None }).await?? {
+        let first = conn.request(Request::Subscribe { since_seq: since }).await?;
+        let resp = match first {
+            Err(ds_proto::ErrorCode::TooOld) if since.is_some() => {
+                tracing::warn!(?since, "requested seq fell off the ring log; subscribing live");
+                conn.request(Request::Subscribe { since_seq: None }).await??
+            }
+            other => other?,
+        };
+        let last_seq = match resp {
             Response::Subscribed { last_seq } => last_seq,
             _ => return Err(ds_proto::ErrorCode::Io.into()),
         };
+        // Seed the resubscription cursor so a reconnect before the first
+        // batch still resumes from the caller's point, not from zero.
+        if let Some(s) = since {
+            self.last_event_seq
+                .fetch_max(s, std::sync::atomic::Ordering::AcqRel);
+        }
         let fs = self.clone();
         tokio::spawn(async move {
             let mut rx = rx;
