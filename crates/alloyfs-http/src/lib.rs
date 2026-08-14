@@ -36,8 +36,23 @@ pub async fn serve(listen: &str, registry: Arc<ExportRegistry>, token: Option<St
         "http_listen {listen} is not loopback: set agent.http_token (refusing to serve an \
          unauthenticated API on the network)"
     );
+    let app = router(registry, token);
+    let listener = tokio::net::TcpListener::bind(listen).await?;
+    tracing::info!(%listen, "listening (http)");
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+/// The API as a `Router`, auth and body limit already layered on.
+///
+/// Split out of `serve` so it can be driven directly with
+/// `tower::ServiceExt::oneshot` — testing these endpoints should not require
+/// binding a port, and a bound port in a test is a race waiting to happen.
+/// `serve` keeps the loopback/token safety check; this does not, because a
+/// caller holding a `Router` has not yet decided where to expose it.
+pub fn router(registry: Arc<ExportRegistry>, token: Option<String>) -> Router {
     let state = Arc::new(AppState { registry, token });
-    let app = Router::new()
+    Router::new()
         .route("/api/status", get(status))
         .route("/api/exports", get(exports))
         .route("/api/exports/{name}/browse", get(browse))
@@ -47,11 +62,7 @@ pub async fn serve(listen: &str, registry: Arc<ExportRegistry>, token: Option<St
         .route("/api/exports/{name}/events", get(events_sse))
         .layer(middleware::from_fn_with_state(state.clone(), auth))
         .layer(DefaultBodyLimit::max(MAX_BODY))
-        .with_state(state);
-    let listener = tokio::net::TcpListener::bind(listen).await?;
-    tracing::info!(%listen, "listening (http)");
-    axum::serve(listener, app).await?;
-    Ok(())
+        .with_state(state)
 }
 
 use alloyfs_common::token_eq;

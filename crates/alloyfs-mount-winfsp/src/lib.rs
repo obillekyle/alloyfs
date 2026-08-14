@@ -838,3 +838,112 @@ pub fn mount(fs: Arc<RemoteFs>, mountpoint: &str, volume_label: &str) -> anyhow:
         sink: EventSink(pending),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    //! The translation layer only.
+    //!
+    //! Anything past this needs the WinFsp driver and a real mount, so these
+    //! cover the pure conversions between the wire's view of a file and
+    //! Windows's — which is exactly where this backend's bugs have been. The
+    //! NUL-length defect that produced `docs/upstream/winfsp-rs-set-name-nul-length.md`
+    //! lived in this layer.
+
+    use super::*;
+
+    fn attr(kind: FileKind, mode: u32, size: u64) -> Attr {
+        Attr {
+            kind,
+            size,
+            mtime: UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+            ctime: UNIX_EPOCH + Duration::from_secs(1_600_000_000),
+            mode,
+            version: 3,
+        }
+    }
+
+    #[test]
+    fn paths_are_normalized_from_windows_to_the_wire() {
+        let cases: &[(&str, &str)] = &[
+            (r"\", ""),
+            (r"\one.txt", "one.txt"),
+            (r"\dir\sub\file.txt", "dir/sub/file.txt"),
+            (r"\trailing\", "trailing"),
+            ("", ""),
+        ];
+        for (win, want) in cases {
+            let wide = winfsp::U16CString::from_str(win).unwrap();
+            let got = rel_path(&wide).expect("valid name");
+            assert_eq!(got.0, *want, "{win:?} normalized wrong");
+        }
+    }
+
+    /// A directory is a directory; everything else is a file, and the write
+    /// bit is the only thing that makes it read-only. Symlinks arrive already
+    /// resolved, so they must not be marked as reparse points here.
+    #[test]
+    fn attribute_bits_follow_kind_and_the_write_bit() {
+        assert_eq!(
+            attributes(&attr(FileKind::Dir, 0o755, 0)),
+            FILE_ATTRIBUTE_DIRECTORY
+        );
+        let writable = attributes(&attr(FileKind::File, 0o644, 10));
+        assert_eq!(writable & FILE_ATTRIBUTE_READONLY, 0, "0644 is writable");
+        assert_ne!(writable & FILE_ATTRIBUTE_ARCHIVE, 0);
+
+        let readonly = attributes(&attr(FileKind::File, 0o444, 10));
+        assert_ne!(readonly & FILE_ATTRIBUTE_READONLY, 0, "0444 has no write bit");
+
+        // Presented resolved, so it takes the file bits, not a reparse tag.
+        let link = attributes(&attr(FileKind::Symlink, 0o644, 10));
+        assert_eq!(link, writable);
+    }
+
+    /// Round-tripping matters because the two directions are used on opposite
+    /// sides of a `set_basic_info`: a client that reads a time and writes it
+    /// back unchanged must not drift the file's timestamp.
+    #[test]
+    fn filetime_round_trips_to_the_second() {
+        for secs in [0u64, 1, 1_000_000_000, 1_700_000_000, 2_000_000_000] {
+            let t = UNIX_EPOCH + Duration::from_secs(secs);
+            let back = from_filetime(to_filetime(t));
+            assert_eq!(back, t, "{secs} did not survive the round trip");
+        }
+    }
+
+    /// Windows counts from 1601 and Unix from 1970; getting this backwards
+    /// puts every file's date centuries out.
+    #[test]
+    fn the_unix_epoch_is_the_windows_epoch_offset() {
+        assert_eq!(to_filetime(UNIX_EPOCH), FILETIME_UNIX_DIFF_SECS * 10_000_000);
+        assert_eq!(
+            from_filetime(0),
+            UNIX_EPOCH,
+            "pre-epoch clamps rather than wrapping"
+        );
+    }
+
+    #[test]
+    fn file_info_reports_size_and_allocation() {
+        let mut fi = FileInfo::default();
+        fill_file_info(&mut fi, 42, &attr(FileKind::File, 0o644, 4097));
+        assert_eq!(fi.index_number, 42);
+        assert_eq!(fi.file_size, 4097);
+        assert_eq!(
+            fi.allocation_size,
+            ALLOCATION_UNIT * 2,
+            "allocation rounds up to whole units"
+        );
+        assert_eq!(fi.reparse_tag, 0);
+        // ctime is older than mtime here, so change_time must take the newer.
+        assert_eq!(fi.change_time, fi.last_write_time);
+    }
+
+    #[test]
+    fn an_empty_file_allocates_nothing() {
+        let mut fi = FileInfo::default();
+        fill_file_info(&mut fi, 1, &attr(FileKind::File, 0o644, 0));
+        assert_eq!(fi.file_size, 0);
+        assert_eq!(fi.allocation_size, 0);
+    }
+}

@@ -110,9 +110,11 @@ dependencies = [
  "futures",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-stream",
  "tokio-util",
+ "tower",
  "tracing",
 ]
 

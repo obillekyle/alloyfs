@@ -486,3 +486,6 @@ pub fn mount(
     tracing::info!("unmounted");
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;
