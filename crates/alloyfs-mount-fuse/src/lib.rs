@@ -39,6 +39,8 @@ fn errno(e: &FsError) -> Errno {
             ErrorCode::ReadOnly => Errno::EROFS,
             ErrorCode::WouldBlock => Errno::EAGAIN,
             ErrorCode::CrossDevice => Errno::EXDEV,
+            // An old server, not a broken disk.
+            ErrorCode::VersionMismatch => Errno::EOPNOTSUPP,
             _ => Errno::EIO,
         },
         FsError::Transport(_) => Errno::EIO,

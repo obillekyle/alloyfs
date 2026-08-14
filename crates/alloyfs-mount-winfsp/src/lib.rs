@@ -63,6 +63,10 @@ const STATUS_IO_DEVICE_ERROR: i32 = 0xC000_0185u32 as i32;
 /// this status — anything else is treated as a real error.
 const STATUS_INVALID_DEVICE_REQUEST: i32 = 0xC000_0010u32 as i32;
 const STATUS_NOT_SAME_DEVICE: i32 = 0xC000_00D4u32 as i32;
+const STATUS_BUFFER_TOO_SMALL: i32 = 0xC000_0023u32 as i32;
+const STATUS_NOT_A_REPARSE_POINT: i32 = 0xC000_0275u32 as i32;
+const STATUS_NOT_SUPPORTED: i32 = 0xC000_00BBu32 as i32;
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
 
 /// Bytes per allocation unit as advertised in `VolumeParams` (sector_size 4096
 ///   sectors_per_allocation_unit 1). `FileInfo::allocation_size` is rounded up
@@ -89,6 +93,9 @@ fn fsp_err(e: FsError) -> FspError {
             ErrorCode::ReadOnly => STATUS_MEDIA_WRITE_PROTECTED,
             ErrorCode::WouldBlock => STATUS_SHARING_VIOLATION,
             ErrorCode::CrossDevice => STATUS_NOT_SAME_DEVICE,
+            // "the server is too old for this" reads far better as "not
+            // supported" than as an I/O device error.
+            ErrorCode::VersionMismatch => STATUS_NOT_SUPPORTED,
             _ => STATUS_IO_DEVICE_ERROR,
         },
         FsError::Transport(_) => STATUS_IO_DEVICE_ERROR,
@@ -115,8 +122,11 @@ fn from_filetime(ft: u64) -> SystemTime {
 fn attributes(attr: &Attr) -> u32 {
     match attr.kind {
         FileKind::Dir => FILE_ATTRIBUTE_DIRECTORY,
-        // Symlinks are presented resolved by the server; treat as files.
-        FileKind::File | FileKind::Symlink => {
+        // A symlink is a file that also carries the reparse bit. Without it
+        // Windows never asks for the reparse data, so the link would look
+        // like an empty file to Explorer and to every API that follows one.
+        FileKind::Symlink => FILE_ATTRIBUTE_ARCHIVE | FILE_ATTRIBUTE_REPARSE_POINT,
+        FileKind::File => {
             let mut bits = FILE_ATTRIBUTE_ARCHIVE;
             if attr.mode & 0o222 == 0 {
                 bits |= FILE_ATTRIBUTE_READONLY;
@@ -130,7 +140,12 @@ fn fill_file_info(fi: &mut FileInfo, ino: u64, attr: &Attr) {
     let mtime = to_filetime(attr.mtime);
     let ctime = to_filetime(attr.ctime);
     fi.file_attributes = attributes(attr);
-    fi.reparse_tag = 0;
+    // The tag has to accompany the attribute bit: the driver reads it to
+    // decide which reparse handler applies.
+    fi.reparse_tag = match attr.kind {
+        FileKind::Symlink => IO_REPARSE_TAG_SYMLINK,
+        _ => 0,
+    };
     fi.file_size = attr.size;
     fi.allocation_size = attr.size.div_ceil(ALLOCATION_UNIT) * ALLOCATION_UNIT;
     // The protocol only carries mtime/ctime; creation and access times are
@@ -142,6 +157,91 @@ fn fill_file_info(fi: &mut FileInfo, ino: u64, attr: &Attr) {
     fi.index_number = ino;
     fi.hard_links = 0;
     fi.ea_size = 0;
+}
+
+// --------------------------------------------------------------- reparse
+
+const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
+const SYMLINK_FLAG_RELATIVE: u32 = 0x0000_0001;
+/// `REPARSE_DATA_BUFFER` up to and including `Reserved`.
+const REPARSE_HEADER_LEN: usize = 8;
+/// The `SymbolicLinkReparseBuffer` fields before `PathBuffer`.
+const SYMLINK_HEADER_LEN: usize = 12;
+
+/// Is this target absolute in Windows terms? Relative links must set
+/// SYMLINK_FLAG_RELATIVE or Explorer and the shell resolve them from the
+/// volume root instead of the link's own directory.
+fn target_is_absolute(target: &str) -> bool {
+    let b = target.as_bytes();
+    target.starts_with('\\')
+        || target.starts_with('/')
+        || (b.len() >= 2 && b[1] == b':' && b[0].is_ascii_alphabetic())
+}
+
+/// Build a symlink `REPARSE_DATA_BUFFER` for `target`.
+///
+/// SubstituteName and PrintName are the same string here. They differ on NTFS
+/// only because it stores substitute names in `\??\` form; ours are plain
+/// paths the server understands, so there is nothing to translate.
+fn encode_symlink_reparse(target: &str) -> Vec<u8> {
+    let wide: Vec<u16> = target.replace('/', "\\").encode_utf16().collect();
+    let name_bytes = wide.len() * 2;
+    let data_len = SYMLINK_HEADER_LEN + name_bytes * 2;
+
+    let mut buf = Vec::with_capacity(REPARSE_HEADER_LEN + data_len);
+    buf.extend_from_slice(&IO_REPARSE_TAG_SYMLINK.to_le_bytes());
+    buf.extend_from_slice(&(data_len as u16).to_le_bytes());
+    buf.extend_from_slice(&0u16.to_le_bytes()); // Reserved
+    buf.extend_from_slice(&0u16.to_le_bytes()); // SubstituteNameOffset
+    buf.extend_from_slice(&(name_bytes as u16).to_le_bytes()); // SubstituteNameLength
+    buf.extend_from_slice(&(name_bytes as u16).to_le_bytes()); // PrintNameOffset
+    buf.extend_from_slice(&(name_bytes as u16).to_le_bytes()); // PrintNameLength
+    let flags = if target_is_absolute(target) {
+        0
+    } else {
+        SYMLINK_FLAG_RELATIVE
+    };
+    buf.extend_from_slice(&flags.to_le_bytes());
+    for unit in wide.iter().chain(wide.iter()) {
+        buf.extend_from_slice(&unit.to_le_bytes());
+    }
+    buf
+}
+
+/// Pull the target back out of a symlink `REPARSE_DATA_BUFFER`.
+///
+/// Every offset and length is bounds-checked against the buffer the driver
+/// handed us before it is used to slice: these come from userspace via an
+/// FSCTL, so a length that indexes past the end is a thing an application can
+/// simply ask for.
+fn decode_symlink_reparse(buf: &[u8]) -> Option<String> {
+    if buf.len() < REPARSE_HEADER_LEN + SYMLINK_HEADER_LEN {
+        return None;
+    }
+    let tag = u32::from_le_bytes(buf[0..4].try_into().ok()?);
+    if tag != IO_REPARSE_TAG_SYMLINK {
+        return None;
+    }
+    let sub_off = u16::from_le_bytes(buf[8..10].try_into().ok()?) as usize;
+    let sub_len = u16::from_le_bytes(buf[10..12].try_into().ok()?) as usize;
+    if sub_len == 0 || !sub_len.is_multiple_of(2) {
+        return None;
+    }
+    let path = &buf[REPARSE_HEADER_LEN + SYMLINK_HEADER_LEN..];
+    let end = sub_off.checked_add(sub_len)?;
+    if end > path.len() {
+        return None;
+    }
+    let units: Vec<u16> = path[sub_off..end]
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    let s = String::from_utf16(&units).ok()?;
+    // NTFS-style substitute names arrive prefixed; the server has no idea
+    // what \??\ means.
+    let s = s.strip_prefix("\\??\\").unwrap_or(&s).to_string();
+    // The wire always speaks forward slashes.
+    Some(s.replace('\\', "/"))
 }
 
 /// "\dir\sub\file.txt" (or "\") -> RelPath("dir/sub/file.txt") / RelPath("").
@@ -176,6 +276,10 @@ pub struct FileContext {
 struct WinFspFs {
     fs: Arc<RemoteFs>,
     volume_label: String,
+    /// Uppercased drive prefix this volume is mounted at ("Y:"), or empty for
+    /// a UNC mount. Used to turn volume-absolute symlink targets back into
+    /// export-relative ones.
+    mount_prefix: String,
     /// Server events waiting to be re-emitted as native change notifications
     /// (drained by the WinFsp notify timer; fed by the client event pump).
     pending_events: Arc<std::sync::Mutex<Vec<alloyfs_proto::FsEvent>>>,
@@ -184,6 +288,58 @@ struct WinFspFs {
 impl WinFspFs {
     /// Path -> (ino, Attr), allocating an inode on first sight and rolling the
     /// allocation back if the server says the path doesn't exist.
+    /// Turn a symlink target that points into THIS volume into one the server
+    /// can store.
+    ///
+    /// Windows tooling writes absolute targets by habit — PowerShell's
+    /// `New-Item -Target "real.txt"` resolves to "Y:\dir\real.txt" before the
+    /// syscall is even made. The drive letter is a local artifact: the server
+    /// has never heard of Y:, and would rightly refuse it as a path outside
+    /// the export. So a target under our own mount point is rewritten
+    /// relative to the link's directory, which is what the user meant and
+    /// what stays correct if the export is later mounted elsewhere.
+    ///
+    /// Targets that are absolute somewhere ELSE (C:\Windows, a UNC share) are
+    /// left exactly as they are, and the server refuses them. That is the
+    /// right outcome: they genuinely do point out of the export.
+    fn localize_target(&self, target: &str, link_dir: &RelPath) -> String {
+        if self.mount_prefix.is_empty() {
+            return target.to_string();
+        }
+        let norm = target.replace('\\', "/");
+        let upper = norm.to_uppercase();
+        let prefix = format!("{}/", self.mount_prefix);
+        let Some(rest) = upper.strip_prefix(&prefix).map(|_| &norm[prefix.len()..]) else {
+            return target.to_string();
+        };
+        let rest = rest.trim_start_matches('/');
+
+        // Walk up out of the link's directory, then back down to the target.
+        // Both are export-relative, so the shared prefix cancels.
+        let from: Vec<&str> = if link_dir.is_root() {
+            Vec::new()
+        } else {
+            link_dir.0.split('/').collect()
+        };
+        let to: Vec<&str> = if rest.is_empty() {
+            Vec::new()
+        } else {
+            rest.split('/').collect()
+        };
+        let shared = from
+            .iter()
+            .zip(to.iter())
+            .take_while(|(a, b)| a.eq_ignore_ascii_case(b))
+            .count();
+        let mut out: Vec<&str> = vec![".."; from.len() - shared];
+        out.extend_from_slice(&to[shared..]);
+        if out.is_empty() {
+            // The link points at its own directory.
+            return ".".to_string();
+        }
+        out.join("/")
+    }
+
     fn resolve(&self, path: &RelPath) -> Result<(u64, Attr), FsError> {
         let existing = self.fs.ino.ino_of(path);
         let ino = existing.unwrap_or_else(|| self.fs.ino.get_or_alloc(path.clone()));
@@ -621,6 +777,103 @@ impl FileSystemContext for WinFspFs {
         Ok(())
     }
 
+    // ----------------------------------------------------------- symlinks
+    //
+    // Windows models a symlink as a reparse point, and creates one in two
+    // steps: CreateSymbolicLinkW makes a zero-length placeholder file, then
+    // issues FSCTL_SET_REPARSE_POINT on it. So `set_reparse_point` below is
+    // handed a file that already exists and has to turn it into a link.
+
+    fn get_reparse_point(
+        &self,
+        context: &Self::FileContext,
+        _file_name: &U16CStr,
+        buffer: &mut [u8],
+    ) -> winfsp::Result<u64> {
+        let target = self.fs.readlink(context.ino).map_err(fsp_err)?;
+        let encoded = encode_symlink_reparse(&target);
+        if encoded.len() > buffer.len() {
+            return Err(nt(STATUS_BUFFER_TOO_SMALL));
+        }
+        buffer[..encoded.len()].copy_from_slice(&encoded);
+        Ok(encoded.len() as u64)
+    }
+
+    /// Used by the driver's own reparse resolution, which has a name rather
+    /// than an open handle.
+    fn get_reparse_point_by_name(
+        &self,
+        file_name: &U16CStr,
+        _is_directory: bool,
+        buffer: &mut [u8],
+    ) -> winfsp::Result<u64> {
+        let rel = rel_path(file_name)?;
+        let (ino, attr) = self.resolve(&rel).map_err(fsp_err)?;
+        if !matches!(attr.kind, FileKind::Symlink) {
+            return Err(nt(STATUS_NOT_A_REPARSE_POINT));
+        }
+        let target = self.fs.readlink(ino).map_err(fsp_err)?;
+        let encoded = encode_symlink_reparse(&target);
+        if encoded.len() > buffer.len() {
+            return Err(nt(STATUS_BUFFER_TOO_SMALL));
+        }
+        buffer[..encoded.len()].copy_from_slice(&encoded);
+        Ok(encoded.len() as u64)
+    }
+
+    fn set_reparse_point(
+        &self,
+        _context: &Self::FileContext,
+        file_name: &U16CStr,
+        buffer: &[u8],
+    ) -> winfsp::Result<()> {
+        let target = decode_symlink_reparse(buffer).ok_or_else(|| {
+            // Junctions and every other reparse tag land here. We model one
+            // thing, and claiming otherwise would create files nothing can
+            // resolve.
+            tracing::warn!("unsupported reparse point (only symlinks are handled)");
+            nt(STATUS_NOT_SUPPORTED)
+        })?;
+
+        let rel = rel_path(file_name)?;
+        let (parent_rel, name) = rel.split().ok_or_else(|| nt(STATUS_OBJECT_NAME_INVALID))?;
+        let target = self.localize_target(&target, &parent_rel);
+        let (parent_ino, _) = self.resolve(&parent_rel).map_err(fsp_err)?;
+
+        // Replace the placeholder — but ONLY if it is one. A non-empty file
+        // here means something other than CreateSymbolicLinkW put it there,
+        // and turning a file with contents into a symlink would destroy data
+        // to satisfy a request we could just refuse.
+        match self.resolve(&rel) {
+            Ok((_, attr)) => {
+                if attr.size != 0 || matches!(attr.kind, FileKind::Dir) {
+                    tracing::warn!(%rel, size = attr.size, "refusing to replace a non-empty file with a symlink");
+                    return Err(nt(STATUS_NOT_SUPPORTED));
+                }
+                self.fs.unlink(parent_ino, name).map_err(fsp_err)?;
+            }
+            // Nothing there: fine, we are creating the link outright.
+            Err(FsError::Remote(ErrorCode::NotFound)) => {}
+            Err(e) => return Err(fsp_err(e)),
+        }
+
+        self.fs.symlink(parent_ino, name, &target).map_err(fsp_err)?;
+        Ok(())
+    }
+
+    /// Removing the reparse point would leave a regular empty file where a
+    /// symlink was. Nothing in this filesystem can represent that transition,
+    /// and silently deleting the link instead would be a surprising answer to
+    /// "clear this attribute".
+    fn delete_reparse_point(
+        &self,
+        _context: &Self::FileContext,
+        _file_name: &U16CStr,
+        _buffer: &[u8],
+    ) -> winfsp::Result<()> {
+        Err(nt(STATUS_NOT_SUPPORTED))
+    }
+
     fn get_volume_info(&self, out_volume_info: &mut VolumeInfo) -> winfsp::Result<()> {
         let (block_size, blocks, blocks_free) = self.fs.statfs().map_err(fsp_err)?;
         out_volume_info.total_size = u64::from(block_size) * blocks;
@@ -768,6 +1021,13 @@ pub fn mount(fs: Arc<RemoteFs>, mountpoint: &str, volume_label: &str) -> anyhow:
         .max_component_length(255)
         .case_sensitive_search(true)
         .case_preserved_names(true)
+        // Symlinks. `no_reparse_points_dir_check` is what winfsp documents as
+        // needed for FUSE-shaped filesystems: without it the driver refuses to
+        // open a reparse point unless the caller's FILE_DIRECTORY_FILE /
+        // FILE_NON_DIRECTORY_FILE guess matches, and a link's target kind is
+        // not something we know at open time.
+        .reparse_points(true)
+        .no_reparse_points_dir_check(true)
         .unicode_on_disk(true)
         .volume_creation_time(to_filetime(SystemTime::now()))
         .volume_serial_number(0x4453_594E) // "DSYN"
@@ -790,6 +1050,7 @@ pub fn mount(fs: Arc<RemoteFs>, mountpoint: &str, volume_label: &str) -> anyhow:
     let context = WinFspFs {
         fs,
         volume_label: volume_label.to_string(),
+        mount_prefix: mountpoint.trim_end_matches(['\\', '/']).to_uppercase(),
         pending_events: pending.clone(),
     };
     // new_with_timer: a 100 ms poll drains pending_events into
@@ -894,9 +1155,13 @@ mod tests {
         let readonly = attributes(&attr(FileKind::File, 0o444, 10));
         assert_ne!(readonly & FILE_ATTRIBUTE_READONLY, 0, "0444 has no write bit");
 
-        // Presented resolved, so it takes the file bits, not a reparse tag.
+        // A symlink is NOT just a file any more: it carries the reparse bit,
+        // which is what makes Windows ask for the target instead of treating
+        // the link as an empty file. (It also drops the read-only bit — the
+        // mode belongs to whatever the link points at, not to the link.)
         let link = attributes(&attr(FileKind::Symlink, 0o644, 10));
-        assert_eq!(link, writable);
+        assert_ne!(link, writable);
+        assert_ne!(link & FILE_ATTRIBUTE_REPARSE_POINT, 0);
     }
 
     /// Round-tripping matters because the two directions are used on opposite
@@ -937,6 +1202,83 @@ mod tests {
         assert_eq!(fi.reparse_tag, 0);
         // ctime is older than mtime here, so change_time must take the newer.
         assert_eq!(fi.change_time, fi.last_write_time);
+    }
+
+    #[test]
+    fn a_symlink_carries_the_reparse_bit_and_tag() {
+        let a = attributes(&attr(FileKind::Symlink, 0o777, 0));
+        assert_ne!(
+            a & FILE_ATTRIBUTE_REPARSE_POINT,
+            0,
+            "without this bit Windows never asks for the reparse data"
+        );
+        let mut fi = FileInfo::default();
+        fill_file_info(&mut fi, 5, &attr(FileKind::Symlink, 0o777, 0));
+        assert_eq!(fi.reparse_tag, IO_REPARSE_TAG_SYMLINK);
+        // A regular file must not claim to be one.
+        let mut fi = FileInfo::default();
+        fill_file_info(&mut fi, 5, &attr(FileKind::File, 0o644, 1));
+        assert_eq!(fi.reparse_tag, 0);
+        assert_eq!(
+            attributes(&attr(FileKind::File, 0o644, 1)) & FILE_ATTRIBUTE_REPARSE_POINT,
+            0
+        );
+    }
+
+    #[test]
+    fn symlink_reparse_buffers_round_trip() {
+        for target in ["real.txt", "../up.txt", "sub/deep/file.txt", "a b c.txt"] {
+            let buf = encode_symlink_reparse(target);
+            let back = decode_symlink_reparse(&buf).expect("decodes");
+            assert_eq!(back, target, "{target:?} did not survive the round trip");
+        }
+    }
+
+    /// A relative target must set SYMLINK_FLAG_RELATIVE or the shell resolves
+    /// it from the volume root instead of the link's own directory.
+    #[test]
+    fn the_relative_flag_tracks_the_target() {
+        let rel = encode_symlink_reparse("../up.txt");
+        let flags = u32::from_le_bytes(rel[16..20].try_into().unwrap());
+        assert_eq!(flags, SYMLINK_FLAG_RELATIVE);
+
+        for absolute in ["\\\\server\\share", "C:\\Windows"] {
+            let abs = encode_symlink_reparse(absolute);
+            let flags = u32::from_le_bytes(abs[16..20].try_into().unwrap());
+            assert_eq!(flags, 0, "{absolute:?} should not be marked relative");
+        }
+    }
+
+    /// The buffer arrives from userspace through an FSCTL, so every offset in
+    /// it is attacker-controlled. None of these may panic.
+    #[test]
+    fn malformed_reparse_buffers_are_refused() {
+        assert!(decode_symlink_reparse(&[]).is_none());
+        assert!(decode_symlink_reparse(&[0u8; 4]).is_none());
+        // Right shape, wrong tag (a junction).
+        let mut junction = encode_symlink_reparse("x.txt");
+        junction[0..4].copy_from_slice(&0xA000_0003u32.to_le_bytes());
+        assert!(decode_symlink_reparse(&junction).is_none());
+        // A length that runs past the end of the buffer.
+        let mut lying = encode_symlink_reparse("x.txt");
+        lying[10..12].copy_from_slice(&0xFFFFu16.to_le_bytes());
+        assert!(decode_symlink_reparse(&lying).is_none());
+        // An odd byte length cannot be UTF-16.
+        let mut odd = encode_symlink_reparse("x.txt");
+        odd[10..12].copy_from_slice(&3u16.to_le_bytes());
+        assert!(decode_symlink_reparse(&odd).is_none());
+        // Zero-length target.
+        let mut empty = encode_symlink_reparse("x.txt");
+        empty[10..12].copy_from_slice(&0u16.to_le_bytes());
+        assert!(decode_symlink_reparse(&empty).is_none());
+    }
+
+    /// NTFS stores substitute names in `\??\` form; the server has no idea
+    /// what that means, so it must be stripped on the way in.
+    #[test]
+    fn an_nt_prefixed_substitute_name_is_stripped() {
+        let buf = encode_symlink_reparse("\\??\\C:\\real.txt");
+        assert_eq!(decode_symlink_reparse(&buf).unwrap(), "C:/real.txt");
     }
 
     #[test]

@@ -112,6 +112,7 @@ pub const EROFS: i32 = 30;
 pub const ENAMETOOLONG: i32 = 36;
 pub const ENOSYS: i32 = 38;
 pub const ENOTEMPTY: i32 = 39;
+pub const EOPNOTSUPP: i32 = 95;
 
 // ------------------------------------------------------------------ decoding
 

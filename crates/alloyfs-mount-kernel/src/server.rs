@@ -51,6 +51,8 @@ fn errno_of(err: &FsError) -> i32 {
             ErrorCode::ReadOnly => abi::EROFS,
             ErrorCode::WouldBlock => abi::EAGAIN,
             ErrorCode::CrossDevice => abi::EXDEV,
+            // An old server, not a broken disk.
+            ErrorCode::VersionMismatch => abi::EOPNOTSUPP,
             _ => abi::EIO,
         },
         FsError::Transport(_) => abi::EIO,
