@@ -509,17 +509,38 @@ impl RemoteFs {
         let prefetch = state.ra.observe(offset, size);
         tracing::trace!(fh, offset, size, prefetch, "mount read");
 
-        // Serve [offset, offset+size) from DATA_CHUNK-aligned blocks: consume
-        // prefetched ones, fetch the rest concurrently.
+        // Serve [offset, offset+size) from DATA_CHUNK-aligned blocks:
+        // retained copies first (sub-chunk re-reads), then prefetched ones,
+        // then concurrent fetches for whatever is left.
         let chunk = DATA_CHUNK as u64;
         let first_block = ReadAhead::block_of(offset);
         let last_block = ReadAhead::block_of(offset + size.max(1) as u64 - 1);
+
+        // Top up the window BEFORE waiting on this read's own blocks: the
+        // prefetches ride the same connection while we block, so the pipe
+        // stays full instead of draining once per kernel read.
+        if prefetch {
+            for b in state.ra.missing(last_block + 1, u64::MAX) {
+                let conn = self.conn();
+                state
+                    .ra
+                    .put(b, self.rt.spawn(Self::fetch_block(conn, server_fh, b)));
+            }
+        }
+
+        use std::sync::atomic::Ordering::Relaxed;
         let mut ready: HashMap<u64, Bytes> = HashMap::new();
         let mut need: Vec<u64> = Vec::new();
         for b in first_block..=last_block {
+            if let Some(data) = state.ra.retained(b) {
+                state.ra.stats.retained_hits.fetch_add(1, Relaxed);
+                ready.insert(b, data);
+                continue;
+            }
             match state.ra.take(b) {
                 Some(task) => match self.rt.block_on(task) {
                     Ok(Some(data)) => {
+                        state.ra.stats.window_hits.fetch_add(1, Relaxed);
                         ready.insert(b, data);
                     }
                     _ => need.push(b), // prefetch failed (old conn?) — refetch
@@ -528,6 +549,7 @@ impl RemoteFs {
             }
         }
         if !need.is_empty() {
+            state.ra.stats.sync_fetches.fetch_add(need.len() as u64, Relaxed);
             let conn = self.conn();
             let fetched = self.rt.block_on(async {
                 futures::future::join_all(
@@ -549,7 +571,13 @@ impl RemoteFs {
         // EOF and ends the file.
         let mut assembled: Vec<u8> = Vec::with_capacity(((last_block - first_block + 1) * chunk) as usize);
         for b in first_block..=last_block {
-            let data = ready.get(&b).expect("all needed blocks fetched");
+            // Every block in the range was fetched above or the read already
+            // failed — but this runs on a mount dispatcher thread, where a
+            // broken invariant must become EIO, never a panic.
+            let Some(data) = ready.get(&b) else {
+                tracing::error!(block = b, "readahead invariant broken: block missing");
+                return Err(ErrorCode::Io.into());
+            };
             assembled.extend_from_slice(data);
             if data.len() < DATA_CHUNK as usize {
                 break; // EOF inside this block
@@ -562,14 +590,10 @@ impl RemoteFs {
             assembled[skip..(skip + size as usize).min(assembled.len())].to_vec()
         };
 
-        // Top up the prefetch window behind the reader's back.
-        if prefetch {
-            for b in state.ra.missing(last_block + 1, u64::MAX) {
-                let conn = self.conn();
-                state
-                    .ra
-                    .put(b, self.rt.spawn(Self::fetch_block(conn, server_fh, b)));
-            }
+        // Retain this read's blocks: the next sub-chunk kernel read of the
+        // same 128 KiB block must not pay a fresh RTT for bytes we had.
+        for (b, data) in ready {
+            state.ra.retain(b, data);
         }
         Ok(out)
     }
@@ -886,6 +910,19 @@ impl RemoteFs {
         }
         let server_fh = self.server_fh(fh);
         if let Some((_, state)) = self.open_files.remove(&fh) {
+            if crate::readahead::Stats::enabled() {
+                let s = &state.ra.stats;
+                use std::sync::atomic::Ordering::Relaxed;
+                tracing::info!(
+                    path = %state.path,
+                    window_hits = s.window_hits.load(Relaxed),
+                    retained_hits = s.retained_hits.load(Relaxed),
+                    sync_fetches = s.sync_fetches.load(Relaxed),
+                    clears = s.clears.load(Relaxed),
+                    tolerated_ooo = s.tolerated_ooo.load(Relaxed),
+                    "read stats (DS_READ_STATS)"
+                );
+            }
             state.ra.clear();
             if state.wrote.load(Ordering::Relaxed) {
                 if let Some(cache) = &self.cache {

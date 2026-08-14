@@ -1136,3 +1136,156 @@ async fn lock_lost_to_contender_poisons_handle() {
         "poisoned handle must fail lock too"
     );
 }
+
+// --------------------------------------------------------------------- 28
+
+/// replace:true rename onto an existing file is atomic on both platforms
+/// (std::fs::rename uses POSIX semantics on Windows since ~1.78).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rename_replace_atomic() {
+    let agent = start_agent(AgentOpts::default());
+    let s = connect(&agent, ClientOptions::default()).await;
+
+    mkfile(&s.fs, ROOT_INO, "src.txt", b"the new content").await;
+    mkfile(&s.fs, ROOT_INO, "dst.txt", b"about to be replaced").await;
+
+    on_fs(&s.fs, |fs| {
+        fs.rename(ROOT_INO, "src.txt", ROOT_INO, "dst.txt", true)
+    })
+    .await
+    .expect("replace:true rename must succeed onto an existing target");
+    assert_eq!(
+        std::fs::read(agent.dir.path().join("dst.txt")).unwrap(),
+        b"the new content"
+    );
+    assert!(!agent.dir.path().join("src.txt").exists());
+}
+
+// --------------------------------------------------------------------- 29
+
+/// A session is bound to ONE export: attaching again to the same name is an
+/// idempotent no-op, attaching to a different name is refused instead of
+/// silently serving the wrong export.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn second_attach_refused() {
+    let agent = start_agent(AgentOpts::default());
+    let s = connect(&agent, ClientOptions::default()).await;
+
+    let same = s
+        .conn()
+        .request(Request::Attach {
+            export: "test".into(),
+        })
+        .await
+        .expect("transport");
+    assert!(
+        matches!(same, Ok(Response::AttachOk { .. })),
+        "same-export re-attach must stay idempotent: {same:?}"
+    );
+
+    let other = s
+        .conn()
+        .request(Request::Attach {
+            export: "other".into(),
+        })
+        .await
+        .expect("transport");
+    assert_eq!(
+        other.unwrap_err(),
+        ErrorCode::AlreadyExists,
+        "different-export attach must be refused"
+    );
+}
+
+// --------------------------------------------------------------------- 30
+
+/// WinFsp dispatcher threads and cache-manager read-ahead deliver
+/// "sequential" streams slightly out of order and overlapping. The window
+/// must tolerate that (serving correct bytes without collapsing); this
+/// pattern used to clear the whole window on every deviation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn readahead_tolerates_out_of_order_reads() {
+    let agent = start_agent(AgentOpts::default());
+    let chunk = 128 * 1024usize;
+    let data = patterned(12 * chunk);
+    std::fs::write(agent.dir.path().join("ooo.bin"), &data).unwrap();
+    let s = connect(&agent, ClientOptions::default()).await;
+
+    let (ino, _) = lookup_path(&s.fs, "ooo.bin").await.unwrap();
+    let got = on_fs(&s.fs, move |fs| {
+        let (fh, _) = fs.open(ino, ro())?;
+        // Overlapped dispatch: mostly forward, occasionally a block early or
+        // a re-read of the previous one — the shape WinFsp actually sends.
+        let order = [0usize, 1, 3, 2, 4, 5, 5, 7, 6, 8, 9, 10, 11];
+        let mut out = vec![0u8; 12 * chunk];
+        for &b in &order {
+            let piece = fs.read(fh, (b * chunk) as u64, chunk as u32)?;
+            out[b * chunk..b * chunk + piece.len()].copy_from_slice(&piece);
+        }
+        fs.release(fh);
+        Ok::<_, ds_client::FsError>(out)
+    })
+    .await
+    .unwrap();
+    assert!(
+        got == data,
+        "out-of-order reads must still assemble the exact file"
+    );
+}
+
+// --------------------------------------------------------------------- 31
+
+/// Sub-chunk kernel reads (64 KiB paging I/O) hit each 128 KiB block twice;
+/// the second half must come from the retained block, and above all must be
+/// the RIGHT bytes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn readahead_subchunk_strides() {
+    let agent = start_agent(AgentOpts::default());
+    let data = patterned(1024 * 1024);
+    std::fs::write(agent.dir.path().join("strides.bin"), &data).unwrap();
+    let s = connect(&agent, ClientOptions::default()).await;
+
+    let (ino, _) = lookup_path(&s.fs, "strides.bin").await.unwrap();
+    let got = on_fs(&s.fs, move |fs| {
+        let (fh, _) = fs.open(ino, ro())?;
+        let stride = 64 * 1024usize;
+        let mut out = Vec::with_capacity(1024 * 1024);
+        for i in 0..(1024 * 1024 / stride) {
+            out.extend_from_slice(&fs.read(fh, (i * stride) as u64, stride as u32)?);
+        }
+        fs.release(fh);
+        Ok::<_, ds_client::FsError>(out)
+    })
+    .await
+    .unwrap();
+    assert!(got == data, "64K strides must reassemble the exact file");
+}
+
+// --------------------------------------------------------------------- 32
+
+/// A write invalidates retained blocks too: a sub-chunk re-read after a
+/// write must see the new bytes, never a stale retained copy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retained_blocks_invalidated_by_write() {
+    let agent = start_agent(AgentOpts::default());
+    let data = patterned(256 * 1024);
+    std::fs::write(agent.dir.path().join("w.bin"), &data).unwrap();
+    let s = connect(&agent, ClientOptions::default()).await;
+
+    let (ino, _) = lookup_path(&s.fs, "w.bin").await.unwrap();
+    on_fs(&s.fs, move |fs| {
+        let (fh, _) = fs.open(ino, rw())?;
+        let first = fs.read(fh, 0, 64 * 1024)?; // retains block 0
+        assert_eq!(first[0], patterned(1)[0]);
+        fs.write(fh, 0, b"XXXX")?; // clears the handle's window + retention
+        let again = fs.read(fh, 0, 4)?;
+        assert_eq!(
+            &again, b"XXXX",
+            "read-after-write must not serve a retained stale block"
+        );
+        fs.release(fh);
+        Ok::<_, ds_client::FsError>(())
+    })
+    .await
+    .unwrap();
+}
