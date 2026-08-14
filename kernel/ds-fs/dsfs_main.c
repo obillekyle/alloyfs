@@ -1,14 +1,16 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * ds-fs stage 1: filesystem registration and an in-memory tree.
+ * Filesystem registration, inodes, and the VFS operations.
  *
- * Deliberately minimal — this exists so dsfs_notify.c has real inodes and
- * real dentries to notify on. The daemon transport arrives in stage 2.
+ * Every operation has two implementations behind one entry point: the
+ * in-memory stage-1 tree, and a round-trip to the daemon. Which one runs is
+ * decided by whether the superblock has a connection.
  */
 #define pr_fmt(fmt) "dsfs: " fmt
 
 #include <linux/fs.h>
 #include <linux/fs_context.h>
+#include <linux/fs_parser.h>
 #include <linux/module.h>
 #include <linux/pagemap.h>
 #include <linux/slab.h>
@@ -24,6 +26,7 @@ struct super_block *dsfs_sb;
 static atomic_long_t dsfs_next_ino = ATOMIC_LONG_INIT(2);	/* 1 is the root */
 
 static const struct inode_operations dsfs_dir_inode_operations;
+static const struct inode_operations dsfs_file_inode_operations;
 static const struct file_operations dsfs_dir_operations;
 static const struct file_operations dsfs_file_operations;
 
@@ -68,41 +71,70 @@ struct dsfs_node *dsfs_child(struct dsfs_node *dir, const char *name)
 	return NULL;
 }
 
-/* ----------------------------------------------------------------- inode */
+/* ----------------------------------------------------------------- inodes */
 
-struct inode *dsfs_iget(struct super_block *sb, struct dsfs_node *node)
+static void dsfs_init_inode(struct inode *inode, umode_t mode, loff_t size)
 {
-	struct inode *inode;
-
-	/* One inode per node, keyed by our own ino so repeated lookups of the
-	 * same name return the same inode — inotify marks pin inodes, and a
-	 * fresh inode per lookup would silently drop watches.
-	 */
-	inode = iget_locked(sb, node->ino);
-	if (!inode)
-		return ERR_PTR(-ENOMEM);
-	if (!(inode->i_state & I_NEW))
-		return inode;
-
-	inode->i_mode = node->mode;
+	inode->i_mode = mode;
 	inode->i_uid = GLOBAL_ROOT_UID;
 	inode->i_gid = GLOBAL_ROOT_GID;
-	inode->i_private = node;
 	simple_inode_init_ts(inode);
-
-	if (S_ISDIR(node->mode)) {
+	if (S_ISDIR(mode)) {
 		inode->i_op = &dsfs_dir_inode_operations;
 		inode->i_fop = &dsfs_dir_operations;
 		set_nlink(inode, 2);
 		inode->i_size = 0;
 	} else {
-		inode->i_op = &simple_dir_inode_operations;	/* getattr/setattr defaults */
+		inode->i_op = &dsfs_file_inode_operations;
 		inode->i_fop = &dsfs_file_operations;
 		set_nlink(inode, 1);
-		inode->i_size = node->size;
+		inode->i_size = size;
 	}
+}
+
+/*
+ * One inode per node/nodeid. Reusing the same inode across lookups is not an
+ * optimisation but a correctness requirement: an inotify mark pins an inode,
+ * and handing out a fresh one per lookup would silently drop watches.
+ */
+struct inode *dsfs_iget_node(struct super_block *sb, struct dsfs_node *node)
+{
+	struct inode *inode = iget_locked(sb, node->ino);
+
+	if (!inode)
+		return ERR_PTR(-ENOMEM);
+	if (!(inode->i_state & I_NEW))
+		return inode;
+	inode->i_private = node;
+	dsfs_init_inode(inode, node->mode, node->size);
 	unlock_new_inode(inode);
 	return inode;
+}
+
+struct inode *dsfs_iget_attr(struct super_block *sb, const struct dsfs_attr *attr)
+{
+	struct inode *inode = iget_locked(sb, (unsigned long)attr->nodeid);
+
+	if (!inode)
+		return ERR_PTR(-ENOMEM);
+	if (!(inode->i_state & I_NEW)) {
+		/* Refresh: the daemon is authoritative about size/mtime. */
+		i_size_write(inode, attr->size);
+		return inode;
+	}
+	inode->i_private = NULL;
+	dsfs_init_inode(inode, attr->mode, attr->size);
+	if (attr->nlink)
+		set_nlink(inode, attr->nlink);
+	unlock_new_inode(inode);
+	return inode;
+}
+
+static struct dsfs_conn *dsfs_conn_of(struct inode *inode)
+{
+	struct dsfs_sb_info *sbi = DSFS_SB(inode->i_sb);
+
+	return sbi ? sbi->conn : NULL;
 }
 
 /* ------------------------------------------------------------ operations */
@@ -110,20 +142,40 @@ struct inode *dsfs_iget(struct super_block *sb, struct dsfs_node *node)
 static struct dentry *dsfs_lookup(struct inode *dir, struct dentry *dentry,
 				  unsigned int flags)
 {
-	struct dsfs_node *dnode = dir->i_private;
-	struct dsfs_node *child;
+	struct dsfs_conn *conn = dsfs_conn_of(dir);
 	struct inode *inode = NULL;
 
-	if (dentry->d_name.len > NAME_MAX)
+	if (dentry->d_name.len > DSFS_MAX_NAME)
 		return ERR_PTR(-ENAMETOOLONG);
 
-	mutex_lock(&dsfs_lock);
-	child = dsfs_child(dnode, dentry->d_name.name);
-	if (child) {
-		inode = dsfs_iget(dir->i_sb, child);
-		if (IS_ERR(inode)) {
-			mutex_unlock(&dsfs_lock);
+	if (conn) {
+		struct dsfs_attr attr;
+		int ret = dsfs_request(conn, DSFS_OP_LOOKUP, dir->i_ino, 0, 0,
+				       dentry->d_name.name, dentry->d_name.len,
+				       &attr, sizeof(attr));
+
+		if (ret == -ENOENT)
+			return d_splice_alias(NULL, dentry);	/* negative */
+		if (ret < 0)
+			return ERR_PTR(ret);
+		if (ret < (int)sizeof(attr))
+			return ERR_PTR(-EIO);
+		inode = dsfs_iget_attr(dir->i_sb, &attr);
+		if (IS_ERR(inode))
 			return ERR_CAST(inode);
+		return d_splice_alias(inode, dentry);
+	}
+
+	mutex_lock(&dsfs_lock);
+	{
+		struct dsfs_node *child = dsfs_child(dir->i_private, dentry->d_name.name);
+
+		if (child) {
+			inode = dsfs_iget_node(dir->i_sb, child);
+			if (IS_ERR(inode)) {
+				mutex_unlock(&dsfs_lock);
+				return ERR_CAST(inode);
+			}
 		}
 	}
 	mutex_unlock(&dsfs_lock);
@@ -134,18 +186,64 @@ static struct dentry *dsfs_lookup(struct inode *dir, struct dentry *dentry,
 	return d_splice_alias(inode, dentry);
 }
 
+static int dsfs_readdir_remote(struct file *file, struct dir_context *ctx,
+			       struct dsfs_conn *conn)
+{
+	struct inode *inode = file_inode(file);
+	void *buf = kmalloc(DSFS_MAX_PAYLOAD, GFP_KERNEL);
+	int ret = 0;
+
+	if (!buf)
+		return -ENOMEM;
+
+	for (;;) {
+		size_t pos = 0;
+		int len = dsfs_request(conn, DSFS_OP_READDIR, inode->i_ino,
+				       ctx->pos, DSFS_MAX_PAYLOAD, NULL, 0,
+				       buf, DSFS_MAX_PAYLOAD);
+
+		if (len <= 0) {
+			ret = len;	/* 0 = end of directory */
+			break;
+		}
+		while (pos + sizeof(struct dsfs_dirent) <= (size_t)len) {
+			struct dsfs_dirent *de = buf + pos;
+			size_t entry = DSFS_DIRENT_SIZE(de->namelen);
+			const char *name = (const char *)(de + 1);
+
+			/* Daemon-supplied: refuse anything that would read
+			 * past the buffer or produce an illegal name.
+			 */
+			if (de->namelen == 0 || de->namelen > DSFS_MAX_NAME ||
+			    pos + entry > (size_t)len) {
+				ret = -EIO;
+				goto out;
+			}
+			if (!dir_emit(ctx, name, de->namelen, de->nodeid, de->type))
+				goto out;
+			ctx->pos = de->off;
+			pos += entry;
+		}
+	}
+out:
+	kfree(buf);
+	return ret;
+}
+
 static int dsfs_readdir(struct file *file, struct dir_context *ctx)
 {
 	struct inode *inode = file_inode(file);
-	struct dsfs_node *dnode = inode->i_private;
+	struct dsfs_conn *conn = dsfs_conn_of(inode);
 	struct dsfs_node *child;
 	loff_t i = 2;
 
 	if (!dir_emit_dots(file, ctx))
 		return 0;
+	if (conn)
+		return dsfs_readdir_remote(file, ctx, conn);
 
 	mutex_lock(&dsfs_lock);
-	list_for_each_entry(child, &dnode->children, sibling) {
+	list_for_each_entry(child, &((struct dsfs_node *)inode->i_private)->children, sibling) {
 		if (i++ < ctx->pos)
 			continue;
 		if (!dir_emit(ctx, child->name, strlen(child->name), child->ino,
@@ -161,30 +259,80 @@ static int dsfs_readdir(struct file *file, struct dir_context *ctx)
 static ssize_t dsfs_read_iter(struct kiocb *iocb, struct iov_iter *to)
 {
 	struct inode *inode = file_inode(iocb->ki_filp);
-	struct dsfs_node *node = inode->i_private;
+	struct dsfs_conn *conn = dsfs_conn_of(inode);
+	struct dsfs_node *node;
 	ssize_t ret = 0;
 	loff_t pos = iocb->ki_pos;
+	size_t want = iov_iter_count(to);
 	size_t avail;
 
-	mutex_lock(&dsfs_lock);
-	if (pos < node->size) {
-		avail = node->size - pos;
-		if (node->data) {
-			ret = copy_to_iter(node->data + pos, min(avail, iov_iter_count(to)), to);
-		} else {
-			/* No backing buffer: report zeroes, which is enough for
-			 * the size/stat assertions this stage makes.
-			 */
-			ret = iov_iter_zero(min(avail, iov_iter_count(to)), to);
+	if (conn) {
+		void *buf;
+		int len;
+
+		want = min_t(size_t, want, DSFS_MAX_PAYLOAD);
+		if (!want)
+			return 0;
+		buf = kmalloc(want, GFP_KERNEL);
+		if (!buf)
+			return -ENOMEM;
+		len = dsfs_request(conn, DSFS_OP_READ, inode->i_ino, pos, want,
+				   NULL, 0, buf, want);
+		if (len < 0) {
+			kfree(buf);
+			return len;
 		}
+		ret = copy_to_iter(buf, len, to);
+		iocb->ki_pos = pos + ret;
+		kfree(buf);
+		return ret;
+	}
+
+	mutex_lock(&dsfs_lock);
+	node = inode->i_private;
+	if (node && pos < node->size) {
+		avail = node->size - pos;
+		if (node->data)
+			ret = copy_to_iter(node->data + pos, min(avail, want), to);
+		else
+			ret = iov_iter_zero(min(avail, want), to);
 		iocb->ki_pos = pos + ret;
 	}
 	mutex_unlock(&dsfs_lock);
 	return ret;
 }
 
+static int dsfs_getattr(struct mnt_idmap *idmap, const struct path *path,
+			struct kstat *stat, u32 request_mask, unsigned int flags)
+{
+	struct inode *inode = d_inode(path->dentry);
+	struct dsfs_conn *conn = dsfs_conn_of(inode);
+
+	/* The daemon is authoritative; refresh size/mtime before answering so
+	 * a stat() right after an injected event sees the new values.
+	 */
+	if (conn) {
+		struct dsfs_attr attr;
+		int ret = dsfs_request(conn, DSFS_OP_GETATTR, inode->i_ino, 0, 0,
+				       NULL, 0, &attr, sizeof(attr));
+
+		if (ret >= (int)sizeof(attr)) {
+			i_size_write(inode, attr.size);
+			if (attr.nlink)
+				set_nlink(inode, attr.nlink);
+		}
+	}
+	generic_fillattr(idmap, request_mask, inode, stat);
+	return 0;
+}
+
 static const struct inode_operations dsfs_dir_inode_operations = {
 	.lookup = dsfs_lookup,
+	.getattr = dsfs_getattr,
+};
+
+static const struct inode_operations dsfs_file_inode_operations = {
+	.getattr = dsfs_getattr,
 };
 
 static const struct file_operations dsfs_dir_operations = {
@@ -204,11 +352,19 @@ static const struct file_operations dsfs_file_operations = {
 
 static void dsfs_put_super(struct super_block *sb)
 {
-	struct dsfs_node *root = sb->s_fs_info;
+	struct dsfs_sb_info *sbi = DSFS_SB(sb);
 
 	mutex_lock(&dsfs_lock);
-	if (root)
-		dsfs_node_free(root);
+	if (sbi) {
+		if (sbi->root_node)
+			dsfs_node_free(sbi->root_node);
+		if (sbi->conn) {
+			/* Release sleepers before the mount disappears. */
+			dsfs_conn_shutdown(sbi->conn);
+			dsfs_conn_put(sbi->conn);
+		}
+		kfree(sbi);
+	}
 	sb->s_fs_info = NULL;
 	if (dsfs_sb == sb)
 		dsfs_sb = NULL;
@@ -248,9 +404,41 @@ static int dsfs_build_tree(struct dsfs_node *root)
 	return 0;
 }
 
+/* ------------------------------------------------------------ mount options */
+
+enum dsfs_param { Opt_fd };
+
+static const struct fs_parameter_spec dsfs_fs_parameters[] = {
+	fsparam_u32("fd", Opt_fd),
+	{}
+};
+
+struct dsfs_fc {
+	unsigned int fd;
+	bool have_fd;
+};
+
+static int dsfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
+{
+	struct dsfs_fc *ctx = fc->fs_private;
+	struct fs_parse_result result;
+	int opt = fs_parse(fc, dsfs_fs_parameters, param, &result);
+
+	if (opt < 0)
+		return opt;
+	switch (opt) {
+	case Opt_fd:
+		ctx->fd = result.uint_32;
+		ctx->have_fd = true;
+		return 0;
+	}
+	return -EINVAL;
+}
+
 static int dsfs_fill_super(struct super_block *sb, struct fs_context *fc)
 {
-	struct dsfs_node *root_node;
+	struct dsfs_fc *ctx = fc->fs_private;
+	struct dsfs_sb_info *sbi;
 	struct inode *root_inode;
 	int err;
 
@@ -261,30 +449,58 @@ static int dsfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	sb->s_maxbytes = MAX_LFS_FILESIZE;
 	sb->s_time_gran = 1;
 
-	root_node = kzalloc(sizeof(*root_node), GFP_KERNEL);
-	if (!root_node)
+	sbi = kzalloc(sizeof(*sbi), GFP_KERNEL);
+	if (!sbi)
 		return -ENOMEM;
-	INIT_LIST_HEAD(&root_node->children);
-	INIT_LIST_HEAD(&root_node->sibling);
-	strscpy(root_node->name, "/", sizeof(root_node->name));
-	root_node->mode = S_IFDIR | 0755;
-	root_node->ino = 1;
-	sb->s_fs_info = root_node;
+	sb->s_fs_info = sbi;
 
-	err = dsfs_build_tree(root_node);
-	if (err)
-		return err;
+	if (ctx->have_fd) {
+		struct dsfs_attr attr;
+		int ret;
 
-	root_inode = dsfs_iget(sb, root_node);
+		sbi->conn = dsfs_conn_from_fd(ctx->fd);
+		if (!sbi->conn) {
+			pr_err("fd=%u is not an open /dev/ds-fs\n", ctx->fd);
+			return -EINVAL;
+		}
+		ret = dsfs_request(sbi->conn, DSFS_OP_GETATTR, DSFS_ROOT_NODEID,
+				   0, 0, NULL, 0, &attr, sizeof(attr));
+		if (ret < (int)sizeof(attr)) {
+			pr_err("daemon did not describe the root (%d)\n", ret);
+			return ret < 0 ? ret : -EIO;
+		}
+		if (!S_ISDIR(attr.mode)) {
+			pr_err("daemon root is not a directory\n");
+			return -ENOTDIR;
+		}
+		attr.nodeid = DSFS_ROOT_NODEID;
+		root_inode = dsfs_iget_attr(sb, &attr);
+	} else {
+		struct dsfs_node *root_node = kzalloc(sizeof(*root_node), GFP_KERNEL);
+
+		if (!root_node)
+			return -ENOMEM;
+		INIT_LIST_HEAD(&root_node->children);
+		INIT_LIST_HEAD(&root_node->sibling);
+		strscpy(root_node->name, "/", sizeof(root_node->name));
+		root_node->mode = S_IFDIR | 0755;
+		root_node->ino = 1;
+		sbi->root_node = root_node;
+
+		err = dsfs_build_tree(root_node);
+		if (err)
+			return err;
+		root_inode = dsfs_iget_node(sb, root_node);
+	}
+
 	if (IS_ERR(root_inode))
 		return PTR_ERR(root_inode);
-
 	sb->s_root = d_make_root(root_inode);
 	if (!sb->s_root)
 		return -ENOMEM;
 
 	dsfs_sb = sb;
-	pr_info("mounted (in-memory stage-1 tree)\n");
+	pr_info("mounted (%s)\n", sbi->conn ? "daemon-backed" : "in-memory stage-1 tree");
 	return 0;
 }
 
@@ -293,12 +509,24 @@ static int dsfs_get_tree(struct fs_context *fc)
 	return get_tree_nodev(fc, dsfs_fill_super);
 }
 
+static void dsfs_free_fc(struct fs_context *fc)
+{
+	kfree(fc->fs_private);
+}
+
 static const struct fs_context_operations dsfs_context_ops = {
+	.parse_param = dsfs_parse_param,
 	.get_tree = dsfs_get_tree,
+	.free = dsfs_free_fc,
 };
 
 static int dsfs_init_fs_context(struct fs_context *fc)
 {
+	struct dsfs_fc *ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
+
+	if (!ctx)
+		return -ENOMEM;
+	fc->fs_private = ctx;
 	fc->ops = &dsfs_context_ops;
 	return 0;
 }
@@ -307,29 +535,38 @@ static struct file_system_type dsfs_type = {
 	.owner = THIS_MODULE,
 	.name = "dsfs",
 	.init_fs_context = dsfs_init_fs_context,
+	.parameters = dsfs_fs_parameters,
 	.kill_sb = kill_anon_super,
 	.fs_flags = 0,
 };
 
 static int __init dsfs_module_init(void)
 {
-	int err = register_filesystem(&dsfs_type);
+	int err = dsfs_conn_init();
 
 	if (err)
 		return err;
+	err = register_filesystem(&dsfs_type);
+	if (err)
+		goto err_conn;
 	err = dsfs_notify_init();
-	if (err) {
-		unregister_filesystem(&dsfs_type);
-		return err;
-	}
-	pr_info("loaded\n");
+	if (err)
+		goto err_fs;
+	pr_info("loaded (abi %d)\n", DSFS_ABI_VERSION);
 	return 0;
+
+err_fs:
+	unregister_filesystem(&dsfs_type);
+err_conn:
+	dsfs_conn_exit();
+	return err;
 }
 
 static void __exit dsfs_module_exit(void)
 {
 	dsfs_notify_exit();
 	unregister_filesystem(&dsfs_type);
+	dsfs_conn_exit();
 	pr_info("unloaded\n");
 }
 
@@ -337,5 +574,5 @@ module_init(dsfs_module_init);
 module_exit(dsfs_module_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("drive-sync filesystem (stage 1: fsnotify injection spike)");
+MODULE_DESCRIPTION("drive-sync filesystem with real fsnotify for remote changes");
 MODULE_AUTHOR("drive-sync");

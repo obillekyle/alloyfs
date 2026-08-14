@@ -28,7 +28,8 @@ done
 
 # Our probes, statically linked so the initramfs needs no libc.
 gcc -static -Os -Wall -Wextra -o "$ROOT/bin/ds-inotify" tools/ds-inotify.c
-strip "$ROOT/bin/ds-inotify" 2>/dev/null || true
+gcc -static -Os -Wall -Wextra -o "$ROOT/bin/dsd" tools/dsd.c
+strip "$ROOT/bin/ds-inotify" "$ROOT/bin/dsd" 2>/dev/null || true
 
 [ -n "$KO" ] && cp "$KO" "$ROOT/lib/modules/"
 

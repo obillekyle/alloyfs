@@ -151,7 +151,7 @@ static int dsfs_do_create(const char *dirpath, const char *name, bool isdir)
 	 */
 	child = dsfs_cached_child(dir_dentry, &q);
 	if (child && d_really_is_negative(child)) {
-		inode = dsfs_iget(dsfs_sb, node);
+		inode = dsfs_iget_node(dsfs_sb, node);
 		if (!IS_ERR(inode))
 			d_instantiate(child, inode);
 	}
@@ -346,6 +346,14 @@ int dsfs_inject(const char *line)
 {
 	char *buf, *p, *cmd, *a1, *a2, *a3, *a4;
 	int ret;
+
+	/* The /proc trigger mutates the in-memory tree, which a daemon-backed
+	 * mount does not have — there the daemon owns the namespace and will
+	 * drive injection over the device instead (stage 3). Everything below
+	 * the trigger is shared by both modes.
+	 */
+	if (dsfs_sb && DSFS_SB(dsfs_sb) && DSFS_SB(dsfs_sb)->conn)
+		return -EOPNOTSUPP;
 
 	buf = kstrdup(line, GFP_KERNEL);
 	if (!buf)
