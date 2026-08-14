@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 ds-proto.workspace = true
+notify.workspace = true
 globset.workspace = true
 anyhow.workspace = true
 serde.workspace = true

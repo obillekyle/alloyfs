@@ -15,6 +15,7 @@
 use ds_proto::RelPath;
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 
+#[derive(Clone)]
 pub struct ExcludeSet {
     set: GlobSet,
     empty: bool,

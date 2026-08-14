@@ -14,15 +14,13 @@
 //! a batch when the export has been quiet for `debounce`, when the pending map
 //! is large, or when the oldest pending change has waited too long.
 
-use std::collections::HashMap;
-use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
+use ds_common::coalesce::Coalescer;
 use ds_proto::{ErrorCode, EventKind, FsEvent, RelPath};
-use notify::event::{CreateKind, EventKind as NotifyKind, ModifyKind, RemoveKind, RenameMode};
 use notify::{RecursiveMode, Watcher as _};
 use tokio::sync::{broadcast, mpsc};
 
@@ -44,16 +42,24 @@ const ORIGIN_TTL: Duration = Duration::from_secs(2);
 pub struct EventHub {
     seq: AtomicU64,
     log: Mutex<std::collections::VecDeque<FsEvent>>,
+    log_cap: usize,
     tx: broadcast::Sender<Vec<FsEvent>>,
     recent_local: DashMap<RelPath, (u64, Instant)>,
 }
 
 impl EventHub {
     pub fn new() -> Arc<Self> {
+        Self::with_capacity(EVENT_LOG_CAP)
+    }
+
+    /// A hub with a custom ring size — tests use tiny rings to exercise the
+    /// `TooOld` path without publishing thousands of events.
+    pub fn with_capacity(log_cap: usize) -> Arc<Self> {
         let (tx, _) = broadcast::channel(256);
         Arc::new(Self {
             seq: AtomicU64::new(0),
-            log: Mutex::new(std::collections::VecDeque::with_capacity(EVENT_LOG_CAP)),
+            log: Mutex::new(std::collections::VecDeque::with_capacity(log_cap)),
+            log_cap,
             tx,
             recent_local: DashMap::new(),
         })
@@ -111,7 +117,7 @@ impl EventHub {
                     new_version: None, // filled by the caller when it knows better
                     origin,
                 };
-                if log.len() == EVENT_LOG_CAP {
+                if log.len() == self.log_cap {
                     log.pop_front();
                 }
                 log.push_back(event.clone());
@@ -121,43 +127,6 @@ impl EventHub {
         // Send fails only with zero subscribers — which is fine.
         let _ = self.tx.send(batch);
     }
-}
-
-/// What we remember about a path between flushes.
-#[derive(Clone, Debug)]
-struct Pending {
-    kind: EventKind,
-    first_seen: Instant,
-}
-
-fn merge(old: Option<&EventKind>, new: EventKind) -> Option<EventKind> {
-    use EventKind::*;
-    Some(match (old, new) {
-        // A file that appeared and was then modified is still just "Created"
-        // from any observer's point of view.
-        (Some(Created), Modified | AttrChanged) => Created,
-        // Appeared then vanished: nothing happened, observably.
-        (Some(Created), Removed) => return None,
-        // Vanished then reappeared: net effect is content replacement.
-        (Some(Removed), Created) => Modified,
-        // Attr change then data change: report the stronger one.
-        (Some(AttrChanged), Modified) => Modified,
-        (Some(Modified), AttrChanged) => Modified,
-        // Renames and resyncs always win outright.
-        (_, ev @ (RenamedFrom { .. } | ResyncRequired)) => ev,
-        (Some(old), _) => old.clone(),
-        (None, ev) => ev,
-    })
-}
-
-/// Convert an absolute path inside the export to wire form.
-fn rel_of(root: &Path, abs: &Path) -> Option<RelPath> {
-    let rel = abs.strip_prefix(root).ok()?;
-    let s = rel.to_str()?;
-    if s.is_empty() {
-        return None; // events on the root itself aren't interesting
-    }
-    Some(RelPath(s.replace('\\', "/")))
 }
 
 /// Spawn the watcher + coalescer for one export. The returned guard keeps the
@@ -197,11 +166,13 @@ async fn coalesce_loop(
     debounce: Duration,
     mut raw_rx: mpsc::UnboundedReceiver<notify::Event>,
 ) {
-    let mut pending: HashMap<RelPath, Pending> = HashMap::new();
-    let mut renames: Vec<(RelPath, RelPath)> = Vec::new(); // (from, to), flushed with the batch
+    // The collapse/pairing/exclude semantics live in ds_common::coalesce —
+    // ONE copy, shared with the sync engine's local watcher. This loop owns
+    // only the pacing and the server-side publish (version bumps + hub).
+    let mut co = Coalescer::new(export.root.clone(), export.exclude.clone());
 
     loop {
-        let timeout = if pending.is_empty() && renames.is_empty() {
+        let timeout = if co.is_empty() {
             Duration::from_secs(3600) // idle: nothing to flush, just wait
         } else {
             debounce
@@ -209,158 +180,40 @@ async fn coalesce_loop(
         tokio::select! {
             maybe = raw_rx.recv() => {
                 let Some(event) = maybe else { break }; // watcher dropped
-                ingest(&export, &mut pending, &mut renames, event);
+                co.ingest(event);
                 // Overflow guards: flush early on a huge or old backlog.
-                let oldest = pending.values().map(|p| p.first_seen).min();
-                if pending.len() >= BATCH_MAX
-                    || oldest.is_some_and(|t| t.elapsed() >= MAX_LATENCY)
+                if co.len() >= BATCH_MAX
+                    || co.oldest_age().is_some_and(|age| age >= MAX_LATENCY)
                 {
-                    flush(&export, &hub, &mut pending, &mut renames);
+                    publish_batch(&export, &hub, co.take_batch());
                 }
             }
             _ = tokio::time::sleep(timeout) => {
-                flush(&export, &hub, &mut pending, &mut renames);
+                publish_batch(&export, &hub, co.take_batch());
             }
         }
     }
     // Drain on shutdown so nothing observed is silently dropped.
-    flush(&export, &hub, &mut pending, &mut renames);
+    publish_batch(&export, &hub, co.take_batch());
 }
 
-fn ingest(
-    export: &Export,
-    pending: &mut HashMap<RelPath, Pending>,
-    renames: &mut Vec<(RelPath, RelPath)>,
-    event: notify::Event,
-) {
-    let mut push = |path: RelPath, kind: EventKind| {
-        // Server-excluded paths never produce events — invisible means silent.
-        if export.exclude.is_excluded(&path) {
-            return;
-        }
-        match merge(pending.get(&path).map(|p| &p.kind), kind) {
-            Some(kind) => {
-                let first_seen = pending
-                    .get(&path)
-                    .map(|p| p.first_seen)
-                    .unwrap_or_else(Instant::now);
-                pending.insert(path, Pending { kind, first_seen });
-            }
-            None => {
-                pending.remove(&path);
-            }
-        }
-    };
-
-    match event.kind {
-        NotifyKind::Create(CreateKind::Any | CreateKind::File | CreateKind::Folder | _) => {
-            for p in &event.paths {
-                if let Some(rel) = rel_of(&export.root, p) {
-                    push(rel, EventKind::Created);
-                }
-            }
-        }
-        NotifyKind::Modify(ModifyKind::Name(mode)) => match (mode, event.paths.as_slice()) {
-            (RenameMode::Both, [from, to]) => {
-                if let (Some(f), Some(t)) = (rel_of(&export.root, from), rel_of(&export.root, to)) {
-                    // Renames across the exclude boundary degrade to the
-                    // visible half: into-excluded looks like a removal,
-                    // out-of-excluded looks like a creation.
-                    let fx = export.exclude.is_excluded(&f);
-                    let tx = export.exclude.is_excluded(&t);
-                    match (fx, tx) {
-                        (true, true) => {}
-                        (true, false) => push(t, EventKind::Created),
-                        (false, true) => push(f, EventKind::Removed),
-                        (false, false) => renames.push((f, t)),
-                    }
-                }
-            }
-            // Unpaired halves degrade to Remove/Create — still correct for
-            // cache invalidation, just less precise.
-            (RenameMode::From, [from]) => {
-                if let Some(f) = rel_of(&export.root, from) {
-                    push(f, EventKind::Removed);
-                }
-            }
-            (RenameMode::To, [to]) => {
-                if let Some(t) = rel_of(&export.root, to) {
-                    push(t, EventKind::Created);
-                }
-            }
-            _ => {
-                for p in &event.paths {
-                    if let Some(rel) = rel_of(&export.root, p) {
-                        push(rel, EventKind::Modified);
-                    }
-                }
-            }
-        },
-        NotifyKind::Modify(ModifyKind::Metadata(_)) => {
-            for p in &event.paths {
-                if let Some(rel) = rel_of(&export.root, p) {
-                    push(rel, EventKind::AttrChanged);
-                }
-            }
-        }
-        NotifyKind::Modify(_) => {
-            for p in &event.paths {
-                if let Some(rel) = rel_of(&export.root, p) {
-                    push(rel, EventKind::Modified);
-                }
-            }
-        }
-        NotifyKind::Remove(RemoveKind::Any | RemoveKind::File | RemoveKind::Folder | _) => {
-            for p in &event.paths {
-                if let Some(rel) = rel_of(&export.root, p) {
-                    push(rel, EventKind::Removed);
-                }
-            }
-        }
-        NotifyKind::Any | NotifyKind::Access(_) | NotifyKind::Other => {}
-    }
-}
-
-fn flush(
-    export: &Export,
-    hub: &EventHub,
-    pending: &mut HashMap<RelPath, Pending>,
-    renames: &mut Vec<(RelPath, RelPath)>,
-) {
-    if pending.is_empty() && renames.is_empty() {
+/// Server-side effects per coalesced batch: version bookkeeping, then hub
+/// fan-out. (Watcher-observed changes bump versions too, so remote edits
+/// made directly on the server are visible to version-based caching.)
+fn publish_batch(export: &Export, hub: &EventHub, batch: Vec<(RelPath, EventKind)>) {
+    if batch.is_empty() {
         return;
     }
-    let mut batch: Vec<(RelPath, EventKind)> = Vec::with_capacity(pending.len() + renames.len());
-    for (from, to) in renames.drain(..) {
-        // Some backends report one rename as From + To + Both: the paired
-        // event wins, so drop the degraded halves it would duplicate — but
-        // ONLY exact halves (a real Modified on the target must survive for
-        // cache freshness).
-        if pending
-            .get(&from)
-            .is_some_and(|p| matches!(p.kind, EventKind::Removed))
-        {
-            pending.remove(&from);
+    for (path, kind) in &batch {
+        match kind {
+            EventKind::RenamedFrom { to } => {
+                export.rename_version(path, to);
+            }
+            EventKind::Removed => {}
+            _ => {
+                export.bump(path);
+            }
         }
-        if pending
-            .get(&to)
-            .is_some_and(|p| matches!(p.kind, EventKind::Created))
-        {
-            pending.remove(&to);
-        }
-        export.rename_version(&from, &to);
-        batch.push((from, EventKind::RenamedFrom { to }));
-    }
-    // Deterministic order helps tests and debugging; HashMap order is noise.
-    let mut items: Vec<(RelPath, Pending)> = pending.drain().collect();
-    items.sort_by(|a, b| a.0.cmp(&b.0));
-    for (path, p) in items {
-        // Watcher-observed changes bump versions too, so remote edits made
-        // directly on the server are visible to version-based caching.
-        if !matches!(p.kind, EventKind::Removed) {
-            export.bump(&path);
-        }
-        batch.push((path, p.kind));
     }
     tracing::debug!(export = export.name, n = batch.len(), "event batch");
     hub.publish(batch);
@@ -387,6 +240,12 @@ mod tests {
         (dir, export)
     }
 
+    use notify::event::{DataChange, EventKind as NotifyKind, ModifyKind, RenameMode};
+
+    fn coalescer(export: &Export) -> Coalescer {
+        Coalescer::new(export.root.clone(), export.exclude.clone())
+    }
+
     fn rename_event(mode: RenameMode, paths: Vec<std::path::PathBuf>) -> notify::Event {
         notify::Event {
             kind: NotifyKind::Modify(ModifyKind::Name(mode)),
@@ -404,30 +263,14 @@ mod tests {
         let from = export.root.join("old.txt");
         let to = export.root.join("new.txt");
 
-        let mut pending = HashMap::new();
-        let mut renames = Vec::new();
-        ingest(
-            &export,
-            &mut pending,
-            &mut renames,
-            rename_event(RenameMode::From, vec![from.clone()]),
-        );
-        ingest(
-            &export,
-            &mut pending,
-            &mut renames,
-            rename_event(RenameMode::To, vec![to.clone()]),
-        );
-        ingest(
-            &export,
-            &mut pending,
-            &mut renames,
-            rename_event(RenameMode::Both, vec![from, to]),
-        );
+        let mut co = coalescer(&export);
+        co.ingest(rename_event(RenameMode::From, vec![from.clone()]));
+        co.ingest(rename_event(RenameMode::To, vec![to.clone()]));
+        co.ingest(rename_event(RenameMode::Both, vec![from, to]));
 
         let hub = export.events.clone();
         let mut rx = hub.subscribe(None).unwrap().1;
-        flush(&export, &hub, &mut pending, &mut renames);
+        publish_batch(&export, &hub, co.take_batch());
         let batch = rx.try_recv().expect("one batch published");
         assert_eq!(batch.len(), 1, "exactly one event, got {batch:?}");
         assert!(
@@ -445,28 +288,17 @@ mod tests {
         let from = export.root.join("old.txt");
         let to = export.root.join("new.txt");
 
-        let mut pending = HashMap::new();
-        let mut renames = Vec::new();
-        ingest(
-            &export,
-            &mut pending,
-            &mut renames,
-            rename_event(RenameMode::Both, vec![from, to.clone()]),
-        );
-        ingest(
-            &export,
-            &mut pending,
-            &mut renames,
-            notify::Event {
-                kind: NotifyKind::Modify(ModifyKind::Data(notify::event::DataChange::Any)),
-                paths: vec![to],
-                attrs: Default::default(),
-            },
-        );
+        let mut co = coalescer(&export);
+        co.ingest(rename_event(RenameMode::Both, vec![from, to.clone()]));
+        co.ingest(notify::Event {
+            kind: NotifyKind::Modify(ModifyKind::Data(DataChange::Any)),
+            paths: vec![to],
+            attrs: Default::default(),
+        });
 
         let hub = export.events.clone();
         let mut rx = hub.subscribe(None).unwrap().1;
-        flush(&export, &hub, &mut pending, &mut renames);
+        publish_batch(&export, &hub, co.take_batch());
         let batch = rx.try_recv().expect("one batch published");
         assert_eq!(batch.len(), 2, "rename + modify both survive: {batch:?}");
         assert!(batch

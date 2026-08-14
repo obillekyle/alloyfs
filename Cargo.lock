@@ -398,6 +398,7 @@ dependencies = [
  "anyhow",
  "ds-proto",
  "globset",
+ "notify",
  "serde",
 ]
 

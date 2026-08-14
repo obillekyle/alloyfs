@@ -3,6 +3,7 @@
 //! exclude semantics (they sit on opposite ends of the wire), and this crate
 //! is what makes drift impossible.
 
+pub mod coalesce;
 mod exclude;
 mod fs;
 
