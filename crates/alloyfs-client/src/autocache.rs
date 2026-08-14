@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use alloyfs_common::ExcludeSet;
-use alloyfs_common::{io_to_code, read_fully};
+use alloyfs_common::{read_fully, OrCode};
 
 pub(crate) struct AutoCacheConfig {
     pub max_file_size: u64,
@@ -372,9 +372,9 @@ pub(crate) fn blob_path(root: &std::path::Path, rel: &RelPath) -> PathBuf {
 /// Convenience wrapper so callers get FsError-flavored IO errors.
 pub(crate) fn stage_write(path: &std::path::Path, data: &[u8]) -> Result<(), alloyfs_proto::ErrorCode> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| io_to_code(&e))?;
+        std::fs::create_dir_all(parent).or_code()?;
     }
-    std::fs::write(path, data).map_err(|e| io_to_code(&e))
+    std::fs::write(path, data).or_code()
 }
 
 #[cfg(test)]

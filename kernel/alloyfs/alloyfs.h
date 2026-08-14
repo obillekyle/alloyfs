@@ -24,7 +24,9 @@
 
 #include "uapi/alloyfs.h"
 
-#define ALLOYFS_MAGIC 0x64736673	/* "alloyfs" */
+#define ALLOYFS_MAGIC 0x64736673	/* "dsfs" — the pre-rename value, frozen: it is
+					 * baked into every mounted superblock and
+					 * changing it would strand existing mounts. */
 
 /* ------------------------------------------------------- in-memory tree */
 

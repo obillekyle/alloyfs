@@ -51,7 +51,7 @@ fn file_type(kind: FileKind) -> FileType {
     match kind {
         FileKind::File => FileType::RegularFile,
         FileKind::Dir => FileType::Directory,
-        FileKind::Symlink => FileType::Symlink, // presented resolved; only reached transiently
+        FileKind::Symlink => FileType::Symlink,
     }
 }
 

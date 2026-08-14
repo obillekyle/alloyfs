@@ -328,12 +328,20 @@ impl RemoteFs {
             req,
             Request::Getattr { .. } | Request::Readdir { .. } | Request::Read { .. } | Request::Statfs
         );
-        let first = self.rt.block_on(conn.request(req.clone()));
+        // Only the retryable variants need a spare copy. Cloning
+        // unconditionally allocated a fresh RelPath String on EVERY
+        // operation — including every write, whose payload is a Bytes that
+        // would have been cloned along with it — to serve a retry the other
+        // variants can never take.
+        let saved = retryable.then(|| req.clone());
+        let first = self.rt.block_on(conn.request(req));
         match first {
             Err(TransportError::Closed) if retryable => {
                 let now = self.conn();
                 if !Arc::ptr_eq(&conn, &now) && !now.is_closed() {
-                    return Ok(self.rt.block_on(now.request(req))??);
+                    // `saved` is Some whenever `retryable` is.
+                    let again = saved.expect("retryable requests keep a copy");
+                    return Ok(self.rt.block_on(now.request(again))??);
                 }
                 Err(TransportError::Closed.into())
             }

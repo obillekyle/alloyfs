@@ -276,12 +276,7 @@ async fn browse(
     let entries = tokio::task::spawn_blocking(move || export.browse(&rel))
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .map_err(|e| match e {
-            ErrorCode::NotFound => StatusCode::NOT_FOUND,
-            ErrorCode::PermissionDenied | ErrorCode::InvalidPath => StatusCode::FORBIDDEN,
-            ErrorCode::NotADirectory => StatusCode::BAD_REQUEST,
-            _ => StatusCode::INTERNAL_SERVER_ERROR,
-        })?;
+        .map_err(code_to_status)?;
     Ok(Json(
         entries
             .into_iter()

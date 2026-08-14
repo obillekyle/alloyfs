@@ -12,8 +12,8 @@
  * `unique` the response must echo back; the kernel matches on it, so the
  * daemon may answer out of order.
  */
-#ifndef _UAPI_DS_FS_H
-#define _UAPI_DS_FS_H
+#ifndef _UAPI_ALLOYFS_H
+#define _UAPI_ALLOYFS_H
 
 #include <linux/types.h>
 
@@ -191,4 +191,4 @@ struct alloyfs_dirent {
 #define ALLOYFS_DIRENT_SIZE(namelen) \
 	ALLOYFS_DIRENT_ALIGN(sizeof(struct alloyfs_dirent) + (namelen))
 
-#endif /* _UAPI_DS_FS_H */
+#endif /* _UAPI_ALLOYFS_H */

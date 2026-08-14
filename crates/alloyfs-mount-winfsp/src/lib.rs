@@ -1050,7 +1050,11 @@ pub fn mount(fs: Arc<RemoteFs>, mountpoint: &str, volume_label: &str) -> anyhow:
     let context = WinFspFs {
         fs,
         volume_label: volume_label.to_string(),
-        mount_prefix: mountpoint.trim_end_matches(['\\', '/']).to_uppercase(),
+        // Forward slashes, to match the form `localize_target` compares in.
+        // A drive letter has no separator so this was invisible there, but a
+        // directory mountpoint ("C:\mnt\alloy") kept its backslashes and the
+        // prefix test could never match, silently disabling the rewrite.
+        mount_prefix: mountpoint.replace('\\', "/").trim_end_matches('/').to_uppercase(),
         pending_events: pending.clone(),
     };
     // new_with_timer: a 100 ms poll drains pending_events into

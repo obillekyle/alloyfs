@@ -466,8 +466,12 @@ impl SessionInner {
         }
         entries.sort_by(|a, b| a.name.cmp(&b.name));
         let start = cursor as usize;
-        let page: Vec<DirEntry> = entries.iter().skip(start).take(READDIR_PAGE).cloned().collect();
-        let next_cursor = if start + page.len() < entries.len() {
+        let total = entries.len();
+        // `into_iter`, not `iter().cloned()`: `entries` is dead after this, so
+        // cloning every returned DirEntry (name String included) bought
+        // nothing.
+        let page: Vec<DirEntry> = entries.into_iter().skip(start).take(READDIR_PAGE).collect();
+        let next_cursor = if start + page.len() < total {
             Some((start + page.len()) as u64)
         } else {
             None
@@ -557,8 +561,7 @@ impl SessionInner {
         // Only opt-in clients are affected. `expect_version: None` — every
         // client before this, and every mount without --detect-conflicts —
         // keeps the old last-writer-wins behaviour untouched.
-        let conflict = matches!(expect_version, Some(v) if v != export.version_of(&of.path));
-        if conflict {
+        if matches!(expect_version, Some(v) if v != export.version_of(&of.path)) {
             tracing::warn!(
                 path = %of.path,
                 expected = ?expect_version,
@@ -573,7 +576,10 @@ impl SessionInner {
         Ok(Response::Written {
             n: data.len() as u32,
             new_version,
-            conflict,
+            // Always false now: a conflict returns above rather than writing
+            // and flagging. The field is frozen by the append-only wire rule
+            // and no client reads it.
+            conflict: false,
         })
     }
 

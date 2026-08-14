@@ -13,7 +13,7 @@ use dashmap::DashMap;
 
 use crate::remote_fs::FsError;
 use alloyfs_common::ExcludeSet;
-use alloyfs_common::{attr_from_metadata, io_to_code, read_fully, write_fully};
+use alloyfs_common::{attr_from_metadata, read_fully, write_fully, OrCode};
 
 /// Overlay file handles carry this bit; server handles are a small counter
 /// (asserted clear on the remote path), so the namespaces can't collide.
@@ -21,8 +21,6 @@ pub(crate) const OVERLAY_FH_BIT: u64 = 1 << 63;
 
 struct OverlayHandle {
     file: File,
-    #[allow(dead_code)]
-    path: RelPath,
 }
 
 pub(crate) struct Overlay {
@@ -63,7 +61,7 @@ impl Overlay {
     }
 
     pub fn getattr(&self, p: &RelPath) -> Result<Attr, FsError> {
-        let md = std::fs::symlink_metadata(self.abs(p)).map_err(|e| io_to_code(&e))?;
+        let md = std::fs::symlink_metadata(self.abs(p)).or_code()?;
         Ok(attr_from_metadata(&md, 0))
     }
 
@@ -74,20 +72,14 @@ impl Overlay {
             .write(wants_write)
             .truncate(flags.truncate)
             .open(self.abs(p))
-            .map_err(|e| io_to_code(&e))?;
-        let md = file.metadata().map_err(|e| io_to_code(&e))?;
+            .or_code()?;
+        let md = file.metadata().or_code()?;
         if md.is_dir() {
             return Err(ErrorCode::IsADirectory.into());
         }
         let fh = OVERLAY_FH_BIT | self.next_fh.fetch_add(1, Ordering::Relaxed);
         let attr = attr_from_metadata(&md, 0);
-        self.handles.insert(
-            fh,
-            OverlayHandle {
-                file,
-                path: p.clone(),
-            },
-        );
+        self.handles.insert(fh, OverlayHandle { file });
         Ok((fh, attr))
     }
 
@@ -95,7 +87,7 @@ impl Overlay {
         let full = self.abs(p);
         if let Some(parent) = full.parent() {
             // First write into a fresh excluded subtree materializes it.
-            std::fs::create_dir_all(parent).map_err(|e| io_to_code(&e))?;
+            std::fs::create_dir_all(parent).or_code()?;
         }
         let mut opts = File::options();
         opts.read(true).write(true);
@@ -104,32 +96,26 @@ impl Overlay {
         } else {
             opts.create(true).truncate(flags.truncate);
         }
-        let file = opts.open(&full).map_err(|e| io_to_code(&e))?;
+        let file = opts.open(&full).or_code()?;
         let _ = mode; // local umask/ACL decides
-        let md = file.metadata().map_err(|e| io_to_code(&e))?;
+        let md = file.metadata().or_code()?;
         let fh = OVERLAY_FH_BIT | self.next_fh.fetch_add(1, Ordering::Relaxed);
         let attr = attr_from_metadata(&md, 0);
-        self.handles.insert(
-            fh,
-            OverlayHandle {
-                file,
-                path: p.clone(),
-            },
-        );
+        self.handles.insert(fh, OverlayHandle { file });
         Ok((fh, attr))
     }
 
     pub fn read(&self, fh: u64, offset: u64, len: u32) -> Result<Vec<u8>, FsError> {
         let h = self.handle(fh)?;
         let mut buf = vec![0u8; len as usize];
-        let n = read_fully(&h.file, &mut buf, offset).map_err(|e| io_to_code(&e))?;
+        let n = read_fully(&h.file, &mut buf, offset).or_code()?;
         buf.truncate(n);
         Ok(buf)
     }
 
     pub fn write(&self, fh: u64, offset: u64, data: &[u8]) -> Result<u32, FsError> {
         let h = self.handle(fh)?;
-        write_fully(&h.file, data, offset).map_err(|e| io_to_code(&e))?;
+        write_fully(&h.file, data, offset).or_code()?;
         Ok(data.len() as u32)
     }
 
@@ -158,19 +144,19 @@ impl Overlay {
     pub fn mkdir(&self, p: &RelPath) -> Result<Attr, FsError> {
         let full = self.abs(p);
         if let Some(parent) = full.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| io_to_code(&e))?;
+            std::fs::create_dir_all(parent).or_code()?;
         }
-        std::fs::create_dir(&full).map_err(|e| io_to_code(&e))?;
-        let md = std::fs::metadata(&full).map_err(|e| io_to_code(&e))?;
+        std::fs::create_dir(&full).or_code()?;
+        let md = std::fs::metadata(&full).or_code()?;
         Ok(attr_from_metadata(&md, 0))
     }
 
     pub fn unlink(&self, p: &RelPath) -> Result<(), FsError> {
-        std::fs::remove_file(self.abs(p)).map_err(|e| io_to_code(&e).into())
+        Ok(std::fs::remove_file(self.abs(p)).or_code()?)
     }
 
     pub fn rmdir(&self, p: &RelPath) -> Result<(), FsError> {
-        std::fs::remove_dir(self.abs(p)).map_err(|e| io_to_code(&e).into())
+        Ok(std::fs::remove_dir(self.abs(p)).or_code()?)
     }
 
     pub fn rename(&self, from: &RelPath, to: &RelPath, replace: bool) -> Result<(), FsError> {
@@ -180,11 +166,11 @@ impl Overlay {
             return Err(ErrorCode::AlreadyExists.into());
         }
         if let Some(parent) = to_full.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| io_to_code(&e))?;
+            std::fs::create_dir_all(parent).or_code()?;
         }
         // std::fs::rename replaces atomically on both platforms (see the
         // matching note in alloyfs-agent's rename).
-        std::fs::rename(&from_full, &to_full).map_err(|e| io_to_code(&e).into())
+        Ok(std::fs::rename(&from_full, &to_full).or_code()?)
     }
 
     pub fn setattr(
@@ -196,30 +182,24 @@ impl Overlay {
     ) -> Result<Attr, FsError> {
         let full = self.abs(p);
         if let Some(size) = size {
-            let f = File::options()
-                .write(true)
-                .open(&full)
-                .map_err(|e| io_to_code(&e))?;
-            f.set_len(size).map_err(|e| io_to_code(&e))?;
+            let f = File::options().write(true).open(&full).or_code()?;
+            f.set_len(size).or_code()?;
         }
         if let Some(mtime) = mtime {
-            let f = File::options()
-                .write(true)
-                .open(&full)
-                .map_err(|e| io_to_code(&e))?;
-            f.set_modified(mtime).map_err(|e| io_to_code(&e))?;
+            let f = File::options().write(true).open(&full).or_code()?;
+            f.set_modified(mtime).or_code()?;
         }
-        let md = std::fs::metadata(&full).map_err(|e| io_to_code(&e))?;
+        let md = std::fs::metadata(&full).or_code()?;
         Ok(attr_from_metadata(&md, 0))
     }
 
     pub fn link(&self, target: &RelPath, link: &RelPath) -> Result<Attr, FsError> {
         let link_full = self.abs(link);
         if let Some(parent) = link_full.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| io_to_code(&e))?;
+            std::fs::create_dir_all(parent).or_code()?;
         }
-        std::fs::hard_link(self.abs(target), &link_full).map_err(|e| io_to_code(&e))?;
-        let md = std::fs::metadata(&link_full).map_err(|e| io_to_code(&e))?;
+        std::fs::hard_link(self.abs(target), &link_full).or_code()?;
+        let md = std::fs::metadata(&link_full).or_code()?;
         Ok(attr_from_metadata(&md, 0))
     }
 
@@ -229,25 +209,25 @@ impl Overlay {
     pub fn symlink(&self, target: &str, link: &RelPath) -> Result<Attr, FsError> {
         let link_full = self.abs(link);
         if let Some(parent) = link_full.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| io_to_code(&e))?;
+            std::fs::create_dir_all(parent).or_code()?;
         }
         #[cfg(unix)]
-        std::os::unix::fs::symlink(target, &link_full).map_err(|e| io_to_code(&e))?;
+        std::os::unix::fs::symlink(target, &link_full).or_code()?;
         #[cfg(windows)]
         {
             let resolved = link_full.parent().map(|p| p.join(target));
             if resolved.is_some_and(|p| p.is_dir()) {
-                std::os::windows::fs::symlink_dir(target, &link_full).map_err(|e| io_to_code(&e))?;
+                std::os::windows::fs::symlink_dir(target, &link_full).or_code()?;
             } else {
-                std::os::windows::fs::symlink_file(target, &link_full).map_err(|e| io_to_code(&e))?;
+                std::os::windows::fs::symlink_file(target, &link_full).or_code()?;
             }
         }
-        let md = std::fs::symlink_metadata(&link_full).map_err(|e| io_to_code(&e))?;
+        let md = std::fs::symlink_metadata(&link_full).or_code()?;
         Ok(attr_from_metadata(&md, 0))
     }
 
     pub fn readlink(&self, path: &RelPath) -> Result<String, FsError> {
-        let target = std::fs::read_link(self.abs(path)).map_err(|e| io_to_code(&e))?;
+        let target = std::fs::read_link(self.abs(path)).or_code()?;
         let target = target.to_str().ok_or(ErrorCode::InvalidPath)?;
         Ok(target.replace('\\', "/"))
     }

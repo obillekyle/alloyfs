@@ -35,8 +35,6 @@ pub const DATA_CHUNK: u32 = 128 * 1024;
 pub struct RelPath(pub String);
 
 impl RelPath {
-    pub const ROOT: &'static str = "";
-
     pub fn validate(&self) -> Result<(), ErrorCode> {
         let s = &self.0;
         if s.starts_with('/') || s.contains('\\') {
