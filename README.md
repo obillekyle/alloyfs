@@ -323,6 +323,20 @@ inotify does not fire for remote changes on a FUSE mount (see "Honest
 limitations") — and it is Linux-only. If you don't need real inotify inside
 a mount, skip `--with-module` entirely and nothing else changes.
 
+The trade runs both ways, so pick per workload rather than assuming newer is
+better. `--backend kernel` serves 11 operations; FUSE serves 21. What you gain
+is that a remote change arrives as a real inotify event instead of a cache
+invalidation. What you give up is `statfs`, `link`, and — read this one
+carefully — **cross-machine advisory locking**.
+
+> **`--backend kernel` does not forward file locks, and does not fail loudly
+> about it.** The module implements neither `.lock` nor `.flock`, so the VFS
+> falls back to its local-only path: `flock()` and `fcntl(F_SETLK)` on the
+> mount **succeed**, but the lock exists solely inside that one kernel and is
+> never sent to the agent. Two machines mounting the same export will each be
+> told they hold an exclusive lock. If anything in your workload coordinates
+> through locks, use `--backend fuse`, which forwards them properly.
+
 With `--with-module`, the module is installed through
 [DKMS](packaging/dkms.conf) rather than as a bare `.ko`. An out-of-tree
 module is only valid for the exact kernel it was compiled against, and
@@ -436,15 +450,23 @@ every future DKMS rebuild is covered once the key is enrolled.
 
 ## Honest limitations (by design or by platform)
 
-- **Linux inotify on the mount does not fire for remote changes.** The kernel
-  only generates inotify from local VFS activity, and FUSE has no passthrough
-  (the 2021 RFC was never merged). alloyfs keeps *reads* fresh via kernel
-  cache invalidation, and offers a userspace event stream (local socket + SSE)
-  for tools that need change notifications on Linux. Windows mounts do get
-  native events. Polling watchers (VS Code's fallback, `git status`) work fine
-  everywhere.
-- **Whole-file advisory locks only.** Byte-range locks are coarsened. Don't
-  host live database files (SQLite/Postgres) on a shared mount.
+- **Linux inotify on a FUSE mount does not fire for remote changes.** The
+  kernel only generates inotify from local VFS activity, and FUSE has no
+  passthrough (the 2021 RFC was never merged). On the default FUSE backend
+  alloyfs keeps *reads* fresh via kernel cache invalidation, and offers a
+  userspace event stream (local socket + SSE) for tools that need change
+  notifications. Windows mounts get native events. Polling watchers (VS Code's
+  fallback, `git status`) work fine everywhere. **Two ways out on Linux, both
+  shipped:** `--backend kernel` (the module injects genuine fsnotify, so a
+  remote change is indistinguishable from a local one) and `alloyfs sync`,
+  which gives you an ordinary directory that every watcher already understands.
+- **Whole-file advisory locks only, and silently local-only on
+  `--backend kernel`.** Byte-range locks are coarsened to whole-file. Worse,
+  the kernel backend forwards no locks at all: it implements neither `.lock`
+  nor `.flock`, so the VFS grants them locally and the agent never hears about
+  them — a lock taken on one machine does not exclude another. Use
+  `--backend fuse` wherever locks carry meaning. Don't host live database files
+  (SQLite/Postgres) on a shared mount on any backend.
 - **Symlinks are resolved server-side** within the export (escaping links are
   refused); symlinks cannot be created through the mount.
 - **Windows volumes are case-sensitive** to faithfully mirror Linux exports.
