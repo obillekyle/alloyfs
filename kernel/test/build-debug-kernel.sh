@@ -16,9 +16,9 @@ set -euo pipefail
 
 VER="${1:-6.14.11}"
 SERIES="v6.x"
-ROOT="${DS_KBUILD_ROOT:-$HOME/kbuild}"
+ROOT="${ALLOYFS_KBUILD_ROOT:-$HOME/kbuild}"
 SRC="$ROOT/linux-$VER"
-JOBS="${DS_KBUILD_JOBS:-$(nproc)}"
+JOBS="${ALLOYFS_KBUILD_JOBS:-$(nproc)}"
 
 mkdir -p "$ROOT"
 cd "$ROOT"

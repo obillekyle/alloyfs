@@ -27,10 +27,10 @@ for a in sh mount umount mkdir mkfifo rmdir insmod rmmod lsmod dmesg cat ls slee
 done
 
 # Our probes, statically linked so the initramfs needs no libc.
-gcc -static -Os -Wall -Wextra -o "$ROOT/bin/ds-inotify" tools/ds-inotify.c
-gcc -static -Os -Wall -Wextra -o "$ROOT/bin/dsd" tools/dsd.c
-gcc -static -Os -Wall -Wextra -pthread -o "$ROOT/bin/ds-devtest" tools/ds-devtest.c
-strip "$ROOT/bin/ds-inotify" "$ROOT/bin/dsd" "$ROOT/bin/ds-devtest" 2>/dev/null || true
+gcc -static -Os -Wall -Wextra -o "$ROOT/bin/alloyfs-inotify" tools/alloyfs-inotify.c
+gcc -static -Os -Wall -Wextra -o "$ROOT/bin/alloyd" tools/alloyd.c
+gcc -static -Os -Wall -Wextra -pthread -o "$ROOT/bin/alloyfs-devtest" tools/alloyfs-devtest.c
+strip "$ROOT/bin/alloyfs-inotify" "$ROOT/bin/alloyd" "$ROOT/bin/alloyfs-devtest" 2>/dev/null || true
 
 [ -n "$KO" ] && cp "$KO" "$ROOT/lib/modules/"
 
@@ -50,22 +50,22 @@ mount -t sysfs    sys  /sys
 mount -t devtmpfs dev  /dev
 mount -t tmpfs    tmp  /tmp   # scratch for test logs, and the tmpfs the
                               # differential assertions compare us against
-echo "DS-BOOT-OK"
-echo "DS-STAGE: $STAGE"
+echo "ALLOYFS-BOOT-OK"
+echo "ALLOYFS-STAGE: $STAGE"
 
 fail=0
 for t in /tests/$STAGE-*.sh; do
 	[ -e "\$t" ] || continue
-	echo "DS-CASE: \$t"
+	echo "ALLOYFS-CASE: \$t"
 	if sh "\$t"; then
-		echo "DS-PASS: \$t"
+		echo "ALLOYFS-PASS: \$t"
 	else
-		echo "DS-FAIL: \$t"
+		echo "ALLOYFS-FAIL: \$t"
 		fail=1
 	fi
 done
-echo "DS-FAILED: \$fail"
-echo "DS-DONE"
+echo "ALLOYFS-FAILED: \$fail"
+echo "ALLOYFS-DONE"
 # microvm has no ACPI, so poweroff cannot signal QEMU. A guest RESET does:
 # QEMU runs with -no-reboot, so a reboot terminates it immediately.
 sync

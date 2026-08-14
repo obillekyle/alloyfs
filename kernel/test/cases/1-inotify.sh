@@ -3,8 +3,8 @@
 # rename cookie? Everything else in the project is downstream of this answer.
 . /tests/lib.sh
 
-MNT=/mnt/dsfs
-INJ=/proc/dsfs-inject
+MNT=/mnt/alloyfs
+INJ=/proc/alloyfs-inject
 
 # inotify mask constants (uapi/linux/inotify.h)
 M_MODIFY=00000002
@@ -17,10 +17,10 @@ M_DELETE_SELF=00000400
 M_IGNORED=00008000
 M_ISDIR=40000000
 
-insmod /lib/modules/ds_fs.ko || { echo "  FAIL: insmod"; exit 1; }
+insmod /lib/modules/alloyfs.ko || { echo "  FAIL: insmod"; exit 1; }
 mkdir -p $MNT
-mount -t dsfs none $MNT || { echo "  FAIL: mount"; exit 1; }
-check "module loaded"  grep -q dsfs /proc/filesystems
+mount -t alloyfs none $MNT || { echo "  FAIL: mount"; exit 1; }
+check "module loaded"  grep -q alloyfs /proc/filesystems
 check "inject present" test -w $INJ
 
 # The tree the module builds at mount time.
@@ -33,7 +33,7 @@ eq    "sub/b.txt contents" "bee" "$(cat $MNT/sub/b.txt)"
 # so the injection can't race the watch being installed.
 watch_start() {  # watch_start <logfile> <paths...>
 	log="$1"; shift
-	ds-inotify -t 3 "$@" > "$log" 2>&1 &
+	alloyfs-inotify -t 3 "$@" > "$log" 2>&1 &
 	echo $! > /tmp/probe.pid
 	n=0
 	while ! grep -q '^READY' "$log" 2>/dev/null; do
@@ -136,7 +136,7 @@ echo "delete sub y.txt" > $INJ
 watch_wait
 
 echo "  --- tmpfs (real syscalls) ---"; transcript /tmp/ref.log
-echo "  --- dsfs (injected) ---";       transcript /tmp/ours.log
+echo "  --- alloyfs (injected) ---";       transcript /tmp/ours.log
 # tmpfs adds OPEN/CLOSE_WRITE from touch(1) actually opening the file; compare
 # only the dirent events both sides should agree on.
 ref=$(transcript /tmp/ref.log | grep -E "^($M_CREATE|$M_MOVED_FROM|$M_MOVED_TO|$M_DELETE) ")
@@ -146,8 +146,8 @@ eq "dirent transcript matches tmpfs" "$ref" "$ours"
 # --- 10: clean teardown -----------------------------------------------------
 check "no queue overflow" sh -c '! grep -q " 00004000 " /tmp/ev1.log /tmp/ev5.log'
 umount $MNT
-check "unmounted"  sh -c '! grep -q " dsfs " /proc/mounts'
-rmmod ds_fs
-check "rmmod clean" sh -c '! lsmod | grep -q ds_fs'
+check "unmounted"  sh -c '! grep -q " alloyfs " /proc/mounts'
+rmmod alloyfs
+check "rmmod clean" sh -c '! lsmod | grep -q alloyfs'
 
 summary

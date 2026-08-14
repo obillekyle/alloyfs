@@ -15,7 +15,7 @@ check "inotify available" test -d /proc/sys/fs/inotify
 # against a filesystem the kernel definitely notifies on (tmpfs), so a
 # failure here means a broken probe, not a broken driver.
 mkdir -p /tmp/w
-ds-inotify -t 3 /tmp/w > /tmp/ev.log 2>&1 &
+alloyfs-inotify -t 3 /tmp/w > /tmp/ev.log 2>&1 &
 probe=$!
 # Wait for READY so we can't race the watch being added.
 tries=0

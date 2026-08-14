@@ -1,15 +1,15 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/ds-proto",
-    "crates/ds-common",
-    "crates/ds-transport",
-    "crates/ds-agent",
-    "crates/ds-client",
-    "crates/ds-mount-fuse",
-    "crates/ds-mount-winfsp",
-    "crates/ds-http",
-    "crates/ds-cli",
+    "crates/alloyfs-proto",
+    "crates/alloyfs-common",
+    "crates/alloyfs-transport",
+    "crates/alloyfs-agent",
+    "crates/alloyfs-client",
+    "crates/alloyfs-mount-fuse",
+    "crates/alloyfs-mount-winfsp",
+    "crates/alloyfs-http",
+    "crates/alloyfs-cli",
 ]
 
 [workspace.package]
@@ -18,14 +18,14 @@ edition = "2021"
 license = "MIT"
 
 [workspace.dependencies]
-ds-proto = { path = "crates/ds-proto" }
-ds-common = { path = "crates/ds-common" }
-ds-transport = { path = "crates/ds-transport" }
-ds-agent = { path = "crates/ds-agent" }
-ds-client = { path = "crates/ds-client" }
-ds-mount-fuse = { path = "crates/ds-mount-fuse" }
-ds-mount-winfsp = { path = "crates/ds-mount-winfsp" }
-ds-http = { path = "crates/ds-http" }
+alloyfs-proto = { path = "crates/alloyfs-proto" }
+alloyfs-common = { path = "crates/alloyfs-common" }
+alloyfs-transport = { path = "crates/alloyfs-transport" }
+alloyfs-agent = { path = "crates/alloyfs-agent" }
+alloyfs-client = { path = "crates/alloyfs-client" }
+alloyfs-mount-fuse = { path = "crates/alloyfs-mount-fuse" }
+alloyfs-mount-winfsp = { path = "crates/alloyfs-mount-winfsp" }
+alloyfs-http = { path = "crates/alloyfs-http" }
 
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1.1", features = ["use-std"] }

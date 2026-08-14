@@ -1,0 +1,23 @@
+# systemd template unit for the alloyfs agent (Linux server).
+# The instance name is the user whose config and exports it serves:
+#   sudo cp scripts/alloyfs.service /etc/systemd/system/alloyfs@.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now alloyfs@okyle
+# Logs: journalctl -u alloyfs@okyle -f
+
+[Unit]
+Description=alloyfs agent for %i (virtual drive exports)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=%i
+ExecStart=/usr/local/bin/alloyfs serve --config /home/%i/.config/alloyfs/agent.toml
+Restart=on-failure
+RestartSec=2
+Environment=RUST_LOG=info
+# The agent only needs to read/write the exported folders.
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

@@ -2,9 +2,9 @@
 # Build the module + initramfs, boot them under QEMU, and turn the serial log
 # into an exit code. Drivable non-interactively:
 #
-#   ssh azure 'cd ~/drive-sync/kernel/test && ./run.sh --stage 1'
+#   ssh azure 'cd ~/alloyfs/kernel/test && ./run.sh --stage 1'
 #
-# Exit 0 ONLY when the guest reached DS-DONE with zero DS-FAIL lines and no
+# Exit 0 ONLY when the guest reached ALLOYFS-DONE with zero ALLOYFS-FAIL lines and no
 # kernel splat. A panic/oops/WARN kills QEMU immediately (panic=-1 oops=panic
 # panic_on_warn=1), so a crashed guest is a fast failure, never a hang.
 set -euo pipefail
@@ -12,9 +12,9 @@ cd "$(dirname "$0")"
 
 STAGE=0
 TIMEOUT=180
-MACHINE="${DS_QEMU_MACHINE:-microvm}"
-MEM="${DS_QEMU_MEM:-256}"
-SMP="${DS_QEMU_SMP:-1}"
+MACHINE="${ALLOYFS_QEMU_MACHINE:-microvm}"
+MEM="${ALLOYFS_QEMU_MEM:-256}"
+SMP="${ALLOYFS_QEMU_SMP:-1}"
 KVER="$(uname -r)"
 BUILD=1
 DEBUG_KDIR=""
@@ -69,9 +69,9 @@ fi
 KO=""
 if [ "$STAGE" -ge 1 ] && [ "$BUILD" -eq 1 ]; then
 	echo "==> building module against ${DEBUG_KDIR:-$KVER}"
-	make -C ../ds-fs KDIR="$KDIR" >/dev/null
-	KO="../ds-fs/ds_fs.ko"
-	[ -f "$KO" ] || { echo "module build produced no ds_fs.ko" >&2; exit 1; }
+	make -C ../alloyfs KDIR="$KDIR" >/dev/null
+	KO="../alloyfs/alloyfs.ko"
+	[ -f "$KO" ] || { echo "module build produced no alloyfs.ko" >&2; exit 1; }
 fi
 
 echo "==> building initramfs (stage $STAGE)"
@@ -124,17 +124,17 @@ if grep -nE 'Kernel panic|BUG:|WARNING:|general protection fault|unable to handl
 	exit 1
 fi
 
-if ! grep -q '^DS-DONE' "$SERIAL"; then
-	echo "FAIL: guest never reached DS-DONE (timeout or early exit). Tail:" >&2
+if ! grep -q '^ALLOYFS-DONE' "$SERIAL"; then
+	echo "FAIL: guest never reached ALLOYFS-DONE (timeout or early exit). Tail:" >&2
 	tail -40 "$SERIAL" >&2
 	exit 1
 fi
 
-if grep -q '^DS-FAIL:' "$SERIAL"; then
+if grep -q '^ALLOYFS-FAIL:' "$SERIAL"; then
 	echo "FAIL: failing cases:" >&2
-	grep -n -B30 '^DS-FAIL:' "$SERIAL" | tail -60 >&2
+	grep -n -B30 '^ALLOYFS-FAIL:' "$SERIAL" | tail -60 >&2
 	exit 1
 fi
 
-passed=$(grep -c '^DS-PASS:' "$SERIAL" || true)
+passed=$(grep -c '^ALLOYFS-PASS:' "$SERIAL" || true)
 echo "PASS: stage $STAGE — $passed case(s), ${elapsed}s, log: $SERIAL"

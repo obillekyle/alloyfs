@@ -4,22 +4,22 @@
 # point: applications should not be able to tell which side made a change.
 . /tests/lib.sh
 
-MNT=/mnt/dsfs
-CTL=/tmp/dsd.ctl
+MNT=/mnt/alloyfs
+CTL=/tmp/alloyd.ctl
 
 M_MODIFY=00000002
 M_CREATE=00000100
 M_DELETE=00000200
 
-insmod /lib/modules/ds_fs.ko || { echo "  FAIL: insmod"; exit 1; }
+insmod /lib/modules/alloyfs.ko || { echo "  FAIL: insmod"; exit 1; }
 mkdir -p $MNT
 mkfifo $CTL 2>/dev/null
 
-exec 3<> /dev/ds-fs || { echo "  FAIL: cannot open /dev/ds-fs"; exit 1; }
-dsd --fd 3 --ctl $CTL > /tmp/dsd.log 2>&1 &
-DSD_PID=$!
+exec 3<> /dev/alloyfs || { echo "  FAIL: cannot open /dev/alloyfs"; exit 1; }
+alloyd --fd 3 --ctl $CTL > /tmp/alloyd.log 2>&1 &
+ALLOYD_PID=$!
 sleep 0.3
-mount -t dsfs -o fd=3 none $MNT || { echo "  FAIL: mount"; cat /tmp/dsd.log; exit 1; }
+mount -t alloyfs -o fd=3 none $MNT || { echo "  FAIL: mount"; cat /tmp/alloyd.log; exit 1; }
 ok "daemon-backed mount up"
 
 # --- create + write + read back ---------------------------------------------
@@ -62,7 +62,7 @@ mv $MNT/to.txt $MNT/dest/moved.txt
 eq "cross-dir rename" "movable" "$(cat $MNT/dest/moved.txt)"
 
 # --- a LOCAL write produces fsnotify from the VFS, unaided ------------------
-ds-inotify -t 3 $MNT > /tmp/w1.log 2>&1 &
+alloyfs-inotify -t 3 $MNT > /tmp/w1.log 2>&1 &
 P=$!
 n=0; while ! grep -q '^READY' /tmp/w1.log 2>/dev/null; do n=$((n+1)); [ $n -gt 200 ] && break; sleep 0.02; done
 echo local > $MNT/watched.txt
@@ -74,7 +74,7 @@ check "local modify notified"  grep -q "^EV 1 $M_MODIFY 0 watched.txt$" /tmp/w1.
 check "local delete notified"  grep -q "^EV 1 $M_DELETE 0 watched.txt$" /tmp/w1.log
 
 # --- and a REMOTE change is indistinguishable to the same watcher -----------
-ds-inotify -t 3 $MNT > /tmp/w2.log 2>&1 &
+alloyfs-inotify -t 3 $MNT > /tmp/w2.log 2>&1 &
 P=$!
 n=0; while ! grep -q '^READY' /tmp/w2.log 2>/dev/null; do n=$((n+1)); [ $n -gt 200 ] && break; sleep 0.02; done
 echo "create / from-server.txt hello" > $CTL
@@ -89,12 +89,12 @@ check "oversized write reports failure, not silent truncation" \
 	sh -c "test ! -f $MNT/big.bin || test \$(stat -c %s $MNT/big.bin) -lt 1024"
 
 # --- teardown ---------------------------------------------------------------
-kill -9 $DSD_PID 2>/dev/null
+kill -9 $ALLOYD_PID 2>/dev/null
 exec 3>&-
 sleep 0.2
 umount $MNT
-check "unmounted" sh -c '! grep -q " dsfs " /proc/mounts'
-rmmod ds_fs
-check "rmmod clean" sh -c '! lsmod | grep -q ds_fs'
+check "unmounted" sh -c '! grep -q " alloyfs " /proc/mounts'
+rmmod alloyfs
+check "rmmod clean" sh -c '! lsmod | grep -q alloyfs'
 
 summary

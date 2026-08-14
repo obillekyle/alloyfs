@@ -1,0 +1,20 @@
+[package]
+name = "alloyfs-http"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+alloyfs-proto.workspace = true
+alloyfs-common.workspace = true
+alloyfs-agent.workspace = true
+axum.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tokio-util.workspace = true
+bytes.workspace = true
+futures.workspace = true
+anyhow.workspace = true
+tracing.workspace = true

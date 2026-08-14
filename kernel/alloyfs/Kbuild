@@ -1,0 +1,5 @@
+# SPDX-License-Identifier: GPL-2.0-only
+obj-m := alloyfs.o
+alloyfs-y := alloyfs_main.o alloyfs_notify.o alloyfs_conn.o
+ccflags-y += -I$(src)
+ccflags-y += -Wall -Wextra -Wno-unused-parameter

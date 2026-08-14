@@ -11,22 +11,22 @@
 # scans dmesg for anything they had to say.
 . /tests/lib.sh
 
-MNT=/mnt/dsfs
-CTL=/tmp/dsd.ctl
+MNT=/mnt/alloyfs
+CTL=/tmp/alloyd.ctl
 
-insmod /lib/modules/ds_fs.ko || { echo "  FAIL: insmod"; exit 1; }
+insmod /lib/modules/alloyfs.ko || { echo "  FAIL: insmod"; exit 1; }
 mkdir -p $MNT
 mkfifo $CTL 2>/dev/null
 
-start() {  # start [dsd args...] — fresh connection + mount
-	exec 3<> /dev/ds-fs || return 1
-	dsd --fd 3 --ctl $CTL "$@" > /tmp/dsd.log 2>&1 &
-	DSD_PID=$!
+start() {  # start [alloyd args...] — fresh connection + mount
+	exec 3<> /dev/alloyfs || return 1
+	alloyd --fd 3 --ctl $CTL "$@" > /tmp/alloyd.log 2>&1 &
+	ALLOYD_PID=$!
 	sleep 0.3
-	mount -t dsfs -o fd=3 none $MNT
+	mount -t alloyfs -o fd=3 none $MNT
 }
 stop() {
-	kill -9 $DSD_PID 2>/dev/null
+	kill -9 $ALLOYD_PID 2>/dev/null
 	exec 3>&-
 	sleep 0.2
 	umount $MNT 2>/dev/null
@@ -70,7 +70,7 @@ start --corrupt-after 1 || { echo "  FAIL: mount"; exit 1; }
 cat $MNT/one.txt > /dev/null 2>&1 &
 STUCK=$!
 sleep 0.6
-check "kernel refused the bogus frame" grep -q "^WRITE-REJECTED" /tmp/dsd.log
+check "kernel refused the bogus frame" grep -q "^WRITE-REJECTED" /tmp/alloyd.log
 kill -9 $STUCK 2>/dev/null
 n=0
 while kill -0 $STUCK 2>/dev/null; do
@@ -94,7 +94,7 @@ echo "  .. section 3"
 start || { echo "  FAIL: mount"; exit 1; }
 ls $MNT > /dev/null 2>&1
 eq "served correctly before the death" "first file" "$(cat $MNT/one.txt)"
-kill -9 $DSD_PID 2>/dev/null    # abrupt: no close(), no goodbye
+kill -9 $ALLOYD_PID 2>/dev/null    # abrupt: no close(), no goodbye
 exec 3>&-                       # ...and our duplicate goes too
 sleep 0.3
 check "operations fail after abrupt daemon death" \
@@ -136,7 +136,7 @@ start --hang-on lookup || { echo "  FAIL: mount"; exit 1; }
 cat $MNT/one.txt > /dev/null 2>&1 &
 STUCK=$!
 sleep 0.3
-kill -9 $DSD_PID 2>/dev/null   # daemon dies with the request outstanding
+kill -9 $ALLOYD_PID 2>/dev/null   # daemon dies with the request outstanding
 exec 3>&-
 sleep 0.4
 kill -9 $STUCK 2>/dev/null
@@ -149,7 +149,7 @@ echo "  .. section 6"
 # "It didn't crash" is far too weak a claim. Each case below names the exact
 # error the kernel owes for that input; a wrong-but-nonzero errno is still a
 # bug, and would hide real confusion about which check fired.
-ds-devtest --neg > /tmp/neg.log 2>&1
+alloyfs-devtest --neg > /tmp/neg.log 2>&1
 while read -r kw name want got; do
 	[ "$kw" = "RESULT" ] || continue
 	eq "errno: $name" "$want" "$got"
@@ -160,23 +160,23 @@ check "negative suite actually ran" test "$nneg" -ge 15
 # --- 6b. fuzz the device ----------------------------------------------------
 # Enumeration only covers what I thought of. This is 20k writes of structured
 # garbage plus interleaved reads, seeded so a failure is reproducible.
-ds-devtest --fuzz 20000 > /tmp/fuzz.log 2>&1
+alloyfs-devtest --fuzz 20000 > /tmp/fuzz.log 2>&1
 check "fuzz completed" grep -q '^FUZZ-DONE' /tmp/fuzz.log
 grep '^FUZZ-SEED' /tmp/fuzz.log
 
 # --- 6c. close racing in-flight syscalls ------------------------------------
-ds-devtest --race 40 > /tmp/race.log 2>&1
+alloyfs-devtest --race 40 > /tmp/race.log 2>&1
 check "close/read/write race survived" grep -q '^RACE-DONE' /tmp/race.log
 
 # The device must still work after all that.
-ds-devtest --neg > /tmp/neg2.log 2>&1
+alloyfs-devtest --neg > /tmp/neg2.log 2>&1
 check "device still sane after fuzzing" \
 	grep -q '^RESULT unknown_unique 2 2' /tmp/neg2.log
 
 echo "  .. section 7"
 # --- 7. module unload with everything gone ----------------------------------
-rmmod ds_fs
-check "rmmod clean" sh -c '! lsmod | grep -q ds_fs'
+rmmod alloyfs
+check "rmmod clean" sh -c '! lsmod | grep -q alloyfs'
 
 # --- 8. what the kernel's own checkers thought ------------------------------
 # On the debug kernel this is where lockdep, DEBUG_OBJECTS and slab poisoning

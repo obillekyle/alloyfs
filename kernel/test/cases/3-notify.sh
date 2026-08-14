@@ -1,10 +1,10 @@
-# Stage 3: the payoff. A DAEMON reports a remote change over /dev/ds-fs and
+# Stage 3: the payoff. A DAEMON reports a remote change over /dev/alloyfs and
 # real inotify watchers on the mount see it — no syscall touched those files.
 # This is the thing FUSE structurally cannot do.
 . /tests/lib.sh
 
-MNT=/mnt/dsfs
-CTL=/tmp/dsd.ctl
+MNT=/mnt/alloyfs
+CTL=/tmp/alloyd.ctl
 
 M_MODIFY=00000002
 M_ATTRIB=00000004
@@ -13,15 +13,15 @@ M_MOVED_TO=00000080
 M_CREATE=00000100
 M_DELETE=00000200
 
-insmod /lib/modules/ds_fs.ko || { echo "  FAIL: insmod"; exit 1; }
+insmod /lib/modules/alloyfs.ko || { echo "  FAIL: insmod"; exit 1; }
 mkdir -p $MNT
 mkfifo $CTL 2>/dev/null
 
-exec 3<> /dev/ds-fs || { echo "  FAIL: cannot open /dev/ds-fs"; exit 1; }
-dsd --fd 3 --ctl $CTL > /tmp/dsd.log 2>&1 &
-DSD_PID=$!
+exec 3<> /dev/alloyfs || { echo "  FAIL: cannot open /dev/alloyfs"; exit 1; }
+alloyd --fd 3 --ctl $CTL > /tmp/alloyd.log 2>&1 &
+ALLOYD_PID=$!
 sleep 0.3
-mount -t dsfs -o fd=3 none $MNT || { echo "  FAIL: mount"; cat /tmp/dsd.log; exit 1; }
+mount -t alloyfs -o fd=3 none $MNT || { echo "  FAIL: mount"; cat /tmp/alloyd.log; exit 1; }
 ok "daemon-backed mount up"
 
 # The kernel only notifies on paths it has cached — an unwalked subtree
@@ -31,7 +31,7 @@ ls $MNT/dir > /dev/null
 
 watch_start() {  # watch_start <logfile> <paths...>
 	log="$1"; shift
-	ds-inotify -t 3 "$@" > "$log" 2>&1 &
+	alloyfs-inotify -t 3 "$@" > "$log" 2>&1 &
 	echo $! > /tmp/probe.pid
 	n=0
 	while ! grep -q '^READY' "$log" 2>/dev/null; do
@@ -110,12 +110,12 @@ sleep 0.2
 ok "notification for unwalked path did not crash"
 
 # --- teardown ---------------------------------------------------------------
-kill -9 $DSD_PID 2>/dev/null
+kill -9 $ALLOYD_PID 2>/dev/null
 exec 3>&-
 sleep 0.2
 umount $MNT
-check "unmounted" sh -c '! grep -q " dsfs " /proc/mounts'
-rmmod ds_fs
-check "rmmod clean" sh -c '! lsmod | grep -q ds_fs'
+check "unmounted" sh -c '! grep -q " alloyfs " /proc/mounts'
+rmmod alloyfs
+check "rmmod clean" sh -c '! lsmod | grep -q alloyfs'
 
 summary

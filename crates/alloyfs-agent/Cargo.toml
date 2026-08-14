@@ -1,0 +1,31 @@
+[package]
+name = "alloyfs-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+alloyfs-proto.workspace = true
+alloyfs-common.workspace = true
+alloyfs-transport.workspace = true
+tokio.workspace = true
+bytes.workspace = true
+serde.workspace = true
+toml.workspace = true
+serde_yaml.workspace = true
+globset.workspace = true
+notify.workspace = true
+dashmap.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true

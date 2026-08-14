@@ -12,6 +12,157 @@ dependencies = [
 ]
 
 [[package]]
+name = "alloyfs-agent"
+version = "0.1.0"
+dependencies = [
+ "alloyfs-common",
+ "alloyfs-proto",
+ "alloyfs-transport",
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "dashmap",
+ "globset",
+ "libc",
+ "notify",
+ "serde",
+ "serde_yaml",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "toml",
+ "tracing",
+ "windows-sys 0.60.2",
+]
+
+[[package]]
+name = "alloyfs-cli"
+version = "0.1.0"
+dependencies = [
+ "alloyfs-agent",
+ "alloyfs-client",
+ "alloyfs-common",
+ "alloyfs-http",
+ "alloyfs-mount-fuse",
+ "alloyfs-mount-winfsp",
+ "alloyfs-proto",
+ "alloyfs-transport",
+ "anyhow",
+ "async-trait",
+ "clap",
+ "futures",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "winfsp",
+]
+
+[[package]]
+name = "alloyfs-client"
+version = "0.1.0"
+dependencies = [
+ "alloyfs-agent",
+ "alloyfs-common",
+ "alloyfs-proto",
+ "alloyfs-transport",
+ "anyhow",
+ "bytes",
+ "dashmap",
+ "futures",
+ "globset",
+ "notify",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "alloyfs-common"
+version = "0.1.0"
+dependencies = [
+ "alloyfs-proto",
+ "anyhow",
+ "globset",
+ "notify",
+ "serde",
+]
+
+[[package]]
+name = "alloyfs-http"
+version = "0.1.0"
+dependencies = [
+ "alloyfs-agent",
+ "alloyfs-common",
+ "alloyfs-proto",
+ "anyhow",
+ "axum",
+ "bytes",
+ "futures",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "alloyfs-mount-fuse"
+version = "0.1.0"
+dependencies = [
+ "alloyfs-client",
+ "alloyfs-proto",
+ "anyhow",
+ "fuser",
+ "libc",
+ "tracing",
+]
+
+[[package]]
+name = "alloyfs-mount-winfsp"
+version = "0.1.0"
+dependencies = [
+ "alloyfs-client",
+ "alloyfs-proto",
+ "anyhow",
+ "tracing",
+ "winfsp",
+]
+
+[[package]]
+name = "alloyfs-proto"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "lz4_flex",
+ "postcard",
+ "serde",
+ "thiserror",
+ "tokio-util",
+]
+
+[[package]]
+name = "alloyfs-transport"
+version = "0.1.0"
+dependencies = [
+ "alloyfs-proto",
+ "async-trait",
+ "dashmap",
+ "futures",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "anstream"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -319,157 +470,6 @@ dependencies = [
  "lock_api",
  "once_cell",
  "parking_lot_core",
-]
-
-[[package]]
-name = "ds-agent"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "bytes",
- "dashmap",
- "ds-common",
- "ds-proto",
- "ds-transport",
- "globset",
- "libc",
- "notify",
- "serde",
- "serde_yaml",
- "tempfile",
- "thiserror",
- "tokio",
- "toml",
- "tracing",
- "windows-sys 0.60.2",
-]
-
-[[package]]
-name = "ds-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "clap",
- "ds-agent",
- "ds-client",
- "ds-common",
- "ds-http",
- "ds-mount-fuse",
- "ds-mount-winfsp",
- "ds-proto",
- "ds-transport",
- "futures",
- "serde",
- "serde_json",
- "serde_yaml",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "winfsp",
-]
-
-[[package]]
-name = "ds-client"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytes",
- "dashmap",
- "ds-agent",
- "ds-common",
- "ds-proto",
- "ds-transport",
- "futures",
- "globset",
- "notify",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "ds-common"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "ds-proto",
- "globset",
- "notify",
- "serde",
-]
-
-[[package]]
-name = "ds-http"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "bytes",
- "ds-agent",
- "ds-common",
- "ds-proto",
- "futures",
- "serde",
- "serde_json",
- "tokio",
- "tokio-stream",
- "tokio-util",
- "tracing",
-]
-
-[[package]]
-name = "ds-mount-fuse"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "ds-client",
- "ds-proto",
- "fuser",
- "libc",
- "tracing",
-]
-
-[[package]]
-name = "ds-mount-winfsp"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "ds-client",
- "ds-proto",
- "tracing",
- "winfsp",
-]
-
-[[package]]
-name = "ds-proto"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "lz4_flex",
- "postcard",
- "serde",
- "thiserror",
- "tokio-util",
-]
-
-[[package]]
-name = "ds-transport"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "dashmap",
- "ds-proto",
- "futures",
- "thiserror",
- "tokio",
- "tokio-util",
- "tracing",
 ]
 
 [[package]]

@@ -43,7 +43,7 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
         env:
-          DS_TEST_DEADLINE_MULT: "3" # generous event-timing ceilings on shared runners
+          ALLOYFS_TEST_DEADLINE_MULT: "3" # generous event-timing ceilings on shared runners
       # Exercises the pinned profile as-is (lto=false is load-bearing; see
       # the comment in the workspace Cargo.toml — do not override profiles).
       - run: cargo build --workspace --release

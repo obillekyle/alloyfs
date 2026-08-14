@@ -1,0 +1,15 @@
+[package]
+name = "alloyfs-mount-fuse"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# All real dependencies are Unix-only: on Windows this crate compiles to an
+# empty library so `cargo build` at the workspace root works everywhere.
+[target.'cfg(unix)'.dependencies]
+alloyfs-proto.workspace = true
+alloyfs-client.workspace = true
+fuser.workspace = true
+libc.workspace = true
+tracing.workspace = true
+anyhow.workspace = true

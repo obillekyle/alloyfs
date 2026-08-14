@@ -1,6 +1,6 @@
-# drive-sync
+# AlloyFS
 
-Cross-platform virtual drive service: any host runs an **agent** that exports
+**AlloyFS** is a cross-platform virtual drive service: any host runs an **agent** that exports
 folders; any other host **mounts** an export as a *real local drive* — a drive
 letter on Windows (via [WinFsp](https://winfsp.dev)), a mountpoint on Linux
 (via FUSE). Not SMB, not WebDAV, not a sync folder.
@@ -29,7 +29,7 @@ Working today, verified on Windows 11 + Ubuntu 24.04:
 - Live change events end-to-end: server-side watching (debounced/coalesced,
   sequenced), pushed to every client; **native `ReadDirectoryChangesW`
   re-emission on Windows** (editors auto-refresh), sub-second kernel cache
-  invalidation on Linux; `drive-sync events` NDJSON tail anywhere
+  invalidation on Linux; `alloyfs events` NDJSON tail anywhere
 - Multi-client concurrency: whole-file advisory locks (fcntl forwarding on
   Linux), sessions with heartbeats, 30 s lease reaper for dead clients,
   write-conflict detection scaffolding
@@ -41,26 +41,26 @@ Working today, verified on Windows 11 + Ubuntu 24.04:
 
 ```bash
 # serve (on the machine with the files)
-drive-sync serve --tcp 0.0.0.0:7440 --export projects=/home/you/projects
+alloyfs serve --tcp 0.0.0.0:7440 --export projects=/home/you/projects
 
 # mount over TCP (LAN)
-drive-sync mount tcp://server:7440/projects /mnt/projects   # Linux
-drive-sync mount tcp://server:7440/projects X:              # Windows
+alloyfs mount tcp://server:7440/projects /mnt/projects   # Linux
+alloyfs mount tcp://server:7440/projects X:              # Windows
 
 # mount over SSH — no daemon, no open port; reuses your ssh config.
-# The remote side needs drive-sync on PATH and a config file (below).
-drive-sync mount ssh://myhost/projects X:
+# The remote side needs alloyfs on PATH and a config file (below).
+alloyfs mount ssh://myhost/projects X:
 
 # live change feed (NDJSON)
-drive-sync events ssh://myhost/projects
+alloyfs events ssh://myhost/projects
 
 # diagnostics
-drive-sync ping ssh://myhost
-drive-sync stress tcp://server:7440 --count 1000
+alloyfs ping ssh://myhost
+alloyfs stress tcp://server:7440 --count 1000
 ```
 
-Agent config (`~/.config/drive-sync/agent.toml` on Linux,
-`C:\MyApps\drive-sync.toml` on Windows — picked up automatically, which is
+Agent config (`~/.config/alloyfs/agent.toml` on Linux,
+`C:\MyApps\alloyfs.toml` on Windows — picked up automatically, which is
 what makes zero-argument `serve --stdio` over SSH work):
 
 ```toml
@@ -109,7 +109,7 @@ everything beneath it; `secret*`, `build/out`, `**/*.log` work as expected.
 
 **Client-side** (`--exclude GLOB` per mount, repeatable): matching paths live
 **only on the mounting machine**, stored under the local data dir
-(`%LOCALAPPDATA%\drive-sync\overlay\…` / `~/.local/share/drive-sync/…`).
+(`%LOCALAPPDATA%\alloyfs\overlay\…` / `~/.local/share/alloyfs/…`).
 The server never sees them; local watchers on the mount still fire natively;
 they persist across remounts. Renames across the boundary return EXDEV, which
 every tool answers with copy+delete — so `mv` in/out of an excluded directory
@@ -124,12 +124,12 @@ disk; `--pin GLOB` forces caching regardless of size. The event stream keeps
 copies fresh (stale blobs are rejected by a size+mtime+version check and
 re-fetched in the background). `--auto-cache-budget` (default `512M`) bounds
 the cache with LRU eviction — pinned files are never evicted.
-`drive-sync cache clear <url>` wipes a mount's blobs (never the overlay).
+`alloyfs cache clear <url>` wipes a mount's blobs (never the overlay).
 
 ## Config files (YAML)
 
 Agent (`serve --config agent.yml`; also the auto-discovered default —
-`~/.config/drive-sync/agent.yml` on Linux, `C:\MyApps\drive-sync.yml` on
+`~/.config/alloyfs/agent.yml` on Linux, `C:\MyApps\alloyfs.yml` on
 Windows; `.toml` variants still parse for existing deployments):
 
 ```yaml
@@ -215,7 +215,7 @@ connection and silently off with any v2 peer.
 ## Sync mode: a real directory instead of a mount
 
 ```bash
-drive-sync sync ssh://azure/projects ~/projects
+alloyfs sync ssh://azure/projects ~/projects
 ```
 
 Bidirectional sync between a server export and a **real local directory**.
@@ -249,14 +249,14 @@ native-speed builds matter.
 
 ## Running the agent as a service
 
-- **Linux (systemd)**: [scripts/drive-sync.service](scripts/drive-sync.service)
-  is a template unit — copy to `/etc/systemd/system/drive-sync@.service`,
-  then `systemctl enable --now drive-sync@youruser` (the instance name picks
+- **Linux (systemd)**: [scripts/alloyfs.service](scripts/alloyfs.service)
+  is a template unit — copy to `/etc/systemd/system/alloyfs@.service`,
+  then `systemctl enable --now alloyfs@youruser` (the instance name picks
   the user whose config and exports it serves). Logs land in journald
-  (`journalctl -u drive-sync@youruser -f`); the agent restarts on failure.
+  (`journalctl -u alloyfs@youruser -f`); the agent restarts on failure.
 - **Windows (Scheduled Task)**: [scripts/install-agent-task.ps1](scripts/install-agent-task.ps1)
   (elevated PowerShell; `-Exe` overrides the binary path) registers a
-  `drive-sync-agent` task that starts `drive-sync serve` at logon and
+  `alloyfs-agent` task that starts `alloyfs serve` at logon and
   restarts it on failure.
 - Mounts don't need service treatment: a mount already **auto-reconnects**
   through server restarts, so an agent coming back after a reboot picks up
@@ -269,7 +269,7 @@ native-speed builds matter.
   identical failure on rclone drives) requires the volume to be registered
   with the Windows Mount Manager — bun canonicalizes paths with
   `GetFinalPathNameByHandle`, which doesn't round-trip on session-local DOS
-  drives, producing its famous unhelpful ENOENT. drive-sync now registers
+  drives, producing its famous unhelpful ENOENT. alloyfs now registers
   with the Mount Manager automatically **when run as Administrator** (and
   falls back to a session drive with a logged warning otherwise). bun also
   needs POSIX-semantics renames for its lockfile, which the volume now
@@ -285,9 +285,9 @@ native-speed builds matter.
   with compressible data: raw pipelined transport 14.6 MB/s, 1 MiB kernel
   reads through the mount 6.4 MB/s (2× the previous ceiling), 128 KiB
   kernel reads 4.0 MB/s — small-read throughput is bounded by per-request
-  dispatch cost, not the wire. `drive-sync bench <url> <path> --depth N`
+  dispatch cost, not the wire. `alloyfs bench <url> <path> --depth N`
   measures the transport without the kernel in the loop; mount with
-  `DS_READ_STATS=1` to get per-file window counters on release.
+  `ALLOYFS_READ_STATS=1` to get per-file window counters on release.
 - Mounts **auto-reconnect**: on connection loss the client re-dials (tcp or
   a fresh ssh spawn) with backoff, re-attaches, re-opens every live file
   handle on the new session (open fds keep working — verified across a full
@@ -311,7 +311,7 @@ native-speed builds matter.
 
 - **Linux inotify on the mount does not fire for remote changes.** The kernel
   only generates inotify from local VFS activity, and FUSE has no passthrough
-  (the 2021 RFC was never merged). drive-sync keeps *reads* fresh via kernel
+  (the 2021 RFC was never merged). alloyfs keeps *reads* fresh via kernel
   cache invalidation, and offers a userspace event stream (local socket + SSE)
   for tools that need change notifications on Linux. Windows mounts do get
   native events. Polling watchers (VS Code's fallback, `git status`) work fine
@@ -346,7 +346,7 @@ test tells you exactly what to do.
 ## Building
 
 Rust workspace; `cargo build` at the root. Platform bridges are isolated:
-`ds-mount-fuse` only compiles on Unix, `ds-mount-winfsp` only on Windows.
+`alloyfs-mount-fuse` only compiles on Unix, `alloyfs-mount-winfsp` only on Windows.
 
 - **Linux**: `apt install build-essential pkg-config fuse3 libfuse3-dev`, then rustup.
 - **Windows**: WinFsp 2.1+ (with SDK feature) is the one required install.
@@ -356,12 +356,12 @@ Rust workspace; `cargo build` at the root. Platform bridges are isolated:
 
 ## Architecture (one paragraph)
 
-One binary. `ds-proto` defines a length-prefixed postcard frame protocol
+One binary. `alloyfs-proto` defines a length-prefixed postcard frame protocol
 (requests/responses multiplexed by correlation id, plus server-push event
 frames) spoken over any byte stream — TCP today, SSH stdio next. The agent
-(`ds-agent`) canonicalizes every path against the export root (escape-proof),
+(`alloyfs-agent`) canonicalizes every path against the export root (escape-proof),
 tracks per-file versions, and will fan out watcher events to subscribed
-sessions. The client (`ds-client`) presents a synchronous `RemoteFs` facade
+sessions. The client (`alloyfs-client`) presents a synchronous `RemoteFs` facade
 (inode↔path table, TTL attr cache) that platform backends adapt to their
-callback dialect: `ds-mount-fuse` (fuser 0.17) and `ds-mount-winfsp`
+callback dialect: `alloyfs-mount-fuse` (fuser 0.17) and `alloyfs-mount-winfsp`
 (winfsp-rs 0.13). A future ProjFS backend slots in behind the same seam.
