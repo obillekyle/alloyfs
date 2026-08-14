@@ -455,6 +455,11 @@ impl SyncEngine {
                         Err(e) => return Err(e.into()),
                     }
                     self.record(rel, EntryKind::Dir, 0, 0, 0);
+                    // inotify races adding watches on brand-new directories:
+                    // children created before the watch attached were never
+                    // reported. Scan the subtree and push whatever the
+                    // manifest doesn't know about yet.
+                    self.push_new_dir_contents(rel).await;
                     return Ok(());
                 }
                 // Remote moved since our baseline? Conflict — never clobber.
@@ -590,6 +595,48 @@ impl SyncEngine {
         }
     }
 
+    /// Push everything under a freshly created local directory that the
+    /// manifest doesn't know (the watcher may have missed it — see caller).
+    async fn push_new_dir_contents(&self, rel: &str) {
+        let Ok(snap) = snapshot_local(&self.full(rel), &self.exclude) else {
+            return;
+        };
+        for (child, stat) in snap {
+            let child_rel = format!("{rel}/{child}");
+            let known = {
+                let m = self.manifest.lock().unwrap();
+                m.entries.get(&child_rel).map(|b| (b.kind, b.size, b.mtime_ns))
+            };
+            if known == Some((stat.kind, stat.size, stat.mtime_ns))
+                || (stat.kind == EntryKind::Dir && known.is_some_and(|(k, _, _)| k == EntryKind::Dir))
+            {
+                continue;
+            }
+            let outcome = if stat.kind == EntryKind::Dir {
+                match self
+                    .conn()
+                    .request(Request::Mkdir {
+                        path: RelPath(child_rel.clone()),
+                        mode: 0o755,
+                    })
+                    .await
+                {
+                    Ok(Ok(_)) | Ok(Err(ErrorCode::AlreadyExists)) => {
+                        self.record(&child_rel, EntryKind::Dir, 0, 0, 0);
+                        Ok(())
+                    }
+                    Ok(Err(e)) => Err(FsError::from(e)),
+                    Err(e) => Err(e.into()),
+                }
+            } else {
+                self.push(&child_rel).await
+            };
+            if let Err(e) = outcome {
+                tracing::warn!(path = %child_rel, error = %e, "new-dir child push failed");
+            }
+        }
+    }
+
     /// Unconditional upload of the local file (parents pushed first by batch
     /// ordering / reconcile ordering).
     async fn push(&self, rel: &str) -> Result<(), FsError> {
@@ -637,9 +684,12 @@ impl SyncEngine {
             }
             self.push(rel).await
         } else {
-            // Set the local copy aside (unsuppressed → it gets pushed as a
-            // new file), then take the remote version.
-            let _ = std::fs::rename(self.full(rel), self.full(&keep));
+            // Set the local copy aside with COPY, not rename: a rename would
+            // reach the watcher as a rename pair and be replayed as a
+            // SERVER-side rename — moving the winner's file. The copy is
+            // deliberately unsuppressed so it gets pushed as a new file;
+            // the pull then overwrites the original in place.
+            let _ = std::fs::copy(self.full(rel), self.full(&keep));
             self.pull(rel).await
         }
     }

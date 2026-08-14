@@ -21,6 +21,12 @@ struct SyncSession {
 }
 
 async fn start_sync(agent: &TestAgent, opts_fn: impl FnOnce(&mut SyncOptions)) -> SyncSession {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()),
+        )
+        .with_test_writer()
+        .try_init();
     let local = tempfile::TempDir::new().unwrap();
     let data = tempfile::TempDir::new().unwrap();
     let conn = harness::raw_conn(agent).await;
