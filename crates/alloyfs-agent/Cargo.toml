@@ -23,6 +23,10 @@ tracing.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# The session tests speak the wire protocol directly, so they need the codec
+# and a Sink/Stream to drive it — no socket, just a duplex pipe.
+futures.workspace = true
+tokio-util.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

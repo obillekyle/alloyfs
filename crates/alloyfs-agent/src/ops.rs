@@ -255,7 +255,17 @@ struct SessionInner {
     attached: std::sync::OnceLock<Arc<Export>>,
     handles: DashMap<u64, Arc<OpenFile>>,
     next_fh: AtomicU64,
-    push: std::sync::OnceLock<EventPusher>,
+    /// The connection's server→client push handle.
+    ///
+    /// Clearable, and that is the whole point. An `EventPusher` owns a clone
+    /// of the connection's outbound `mpsc::Sender`, and `serve_connection`
+    /// finishes by waiting for that channel to close. Holding one past the end
+    /// of the session deadlocked the serve loop: the sender could not drop
+    /// until the handler dropped, the handler could not drop until the loop
+    /// returned, and the loop was waiting on the sender. One task and one
+    /// socket write half leaked per disconnected client. `disconnected()`
+    /// drops it — see the test in tests/session_leak.rs.
+    push: std::sync::Mutex<Option<EventPusher>>,
     /// Updated on every request; the lease reaper compares against it.
     last_seen: std::sync::Mutex<std::time::Instant>,
     /// v3 TCP auth: `Some` on token-protected listeners, `None` on stdio
@@ -282,7 +292,7 @@ impl AgentSession {
             attached: std::sync::OnceLock::new(),
             handles: DashMap::new(),
             next_fh: AtomicU64::new(1),
-            push: std::sync::OnceLock::new(),
+            push: std::sync::Mutex::new(None),
             last_seen: std::sync::Mutex::new(std::time::Instant::now()),
             authed: AtomicBool::new(token.is_none()),
             required_token: token,
@@ -295,7 +305,8 @@ impl AgentSession {
     /// session's connection to the export's event hub.
     fn subscribe(&self, since_seq: Option<u64>) -> Result<Response, ErrorCode> {
         let export = self.inner.export()?;
-        let push = self.inner.push.get().cloned().ok_or(ErrorCode::Io)?;
+        // Cloned out under the lock, never held across an await.
+        let push = self.inner.push.lock().unwrap().clone().ok_or(ErrorCode::Io)?;
         let session_id = self.inner.id;
         let (catchup, mut rx) = export.events.subscribe(since_seq)?;
         let last_seq = export.events.last_seq();
@@ -774,7 +785,7 @@ impl RequestHandler for AgentSession {
     }
 
     async fn connected(&self, push: EventPusher) {
-        let _ = self.inner.push.set(push);
+        *self.inner.push.lock().unwrap() = Some(push);
     }
 
     async fn disconnected(&self) {
@@ -783,5 +794,9 @@ impl RequestHandler for AgentSession {
             tracing::info!(released, "session ended, released handles/locks");
         }
         self.inner.registry.sessions.remove(&self.inner.id);
+        // Drop the outbound sender. `serve_connection` waits for that channel
+        // to close before it returns, so keeping it here wedges the connection
+        // open forever — see the field comment.
+        self.inner.push.lock().unwrap().take();
     }
 }

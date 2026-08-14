@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -8,6 +9,11 @@ use tokio_util::codec::{FramedRead, FramedWrite};
 use alloyfs_proto::{ErrorCode, Frame, FrameCodec, Request, Response, PROTO_VERSION_MAX, PROTO_VERSION_MIN};
 
 use crate::mux::TransportError;
+
+/// How long the outbound writer may keep running after the read side has
+/// finished. Long enough to flush replies a half-closed peer is still waiting
+/// for, short enough that a stuck sender cannot pin the connection.
+const WRITER_DRAIN_GRACE: Duration = Duration::from_secs(5);
 
 /// Server→client push handle: lets the agent inject `Events` frames into a
 /// session's outgoing stream, interleaved safely with responses.
@@ -114,7 +120,7 @@ where
     let (out_tx, mut out_rx) = mpsc::channel::<Frame>(256);
     handler.connected(EventPusher { tx: out_tx.clone() }).await;
 
-    let write_task = tokio::spawn(async move {
+    let mut write_task = tokio::spawn(async move {
         while let Some(frame) = out_rx.recv().await {
             if writer.send(&frame).await.is_err() {
                 break;
@@ -145,6 +151,29 @@ where
 
     drop(out_tx);
     handler.disconnected().await;
-    let _ = write_task.await;
+    // Drain the writer, but never wait on it forever.
+    //
+    // Waiting outright means waiting for every clone of the outbound sender to
+    // drop, and two things hold one: an in-flight request task (a blocking
+    // `Lock { wait: true }` can sit there for minutes) and the handler itself,
+    // via the `EventPusher` handed to `connected`. The handler is only dropped
+    // once this function returns — so a handler that keeps its pusher closes
+    // the cycle, and the connection wedges: one leaked task and one leaked
+    // socket write half per disconnected client. Not hypothetical; the agent
+    // did exactly that until tests/session_leak.rs caught it.
+    //
+    // Handlers are still expected to release their pusher in `disconnected()`,
+    // and the agent now does. The grace period makes the loop's exit
+    // independent of whether they remember, while still flushing replies that
+    // are genuinely on their way out — a peer is allowed to shut down only its
+    // write side and go on reading, and aborting outright would lose the
+    // responses it is still waiting for.
+    if tokio::time::timeout(WRITER_DRAIN_GRACE, &mut write_task)
+        .await
+        .is_err()
+    {
+        tracing::debug!("writer still had senders after disconnect; abandoning it");
+        write_task.abort();
+    }
     result
 }
