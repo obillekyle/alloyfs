@@ -99,8 +99,14 @@ if [ ! -f .config ]; then
 	make olddefconfig >/dev/null
 fi
 
-echo "==> building bzImage + modules_prepare with -j$JOBS (this is the long part)"
-make -j"$JOBS" bzImage modules_prepare
+# `modules` (not just modules_prepare) is required: it is the modpost pass over
+# the built kernel that writes Module.symvers, and without that file an
+# out-of-tree build resolves NOTHING — every symbol down to _printk comes back
+# undefined. defconfig only builds a handful of modules, so the extra cost is
+# small next to the vmlinux link.
+echo "==> building bzImage + modules with -j$JOBS (this is the long part)"
+make -j"$JOBS" bzImage modules
+[ -f Module.symvers ] || { echo "no Module.symvers: out-of-tree builds will fail" >&2; exit 1; }
 
 echo
 echo "kernel:  $SRC/arch/x86/boot/bzImage"
