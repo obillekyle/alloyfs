@@ -59,11 +59,13 @@ winfsp = { version = "0.13.0", default-features = false, features = ["system", "
 [patch.crates-io]
 winfsp-sys = { path = "vendor/winfsp-sys" }
 
-# Final binaries: strip debug symbols. LTO is deliberately OFF: thin-LTO
-# miscompiles the WinFsp FFI path (reads through the mounted drive hang hard
-# in kernel waits; debug and non-LTO release are fine). Likely latent UB in
-# the FFI glue that cross-crate optimization exposes — investigate before
-# ever re-enabling.
+# Final binaries: strip debug symbols. LTO is deliberately OFF: with
+# lto = "thin", reads through a mounted drive hang hard in kernel waits,
+# while debug and non-LTO release are both fine. Bisected by toggling
+# CARGO_PROFILE_RELEASE_LTO; the CAUSE is unproven, and the likeliest
+# explanation is latent UB in our own FFI glue that cross-crate inlining
+# exposes rather than a compiler bug. See docs/upstream/thin-lto-winfsp-ffi-hang.md
+# before re-enabling.
 [profile.release]
 lto = false
 strip = true
