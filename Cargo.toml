@@ -7,6 +7,7 @@ members = [
     "crates/alloyfs-agent",
     "crates/alloyfs-client",
     "crates/alloyfs-mount-fuse",
+    "crates/alloyfs-mount-kernel",
     "crates/alloyfs-mount-winfsp",
     "crates/alloyfs-http",
     "crates/alloyfs-cli",
@@ -24,6 +25,7 @@ alloyfs-transport = { path = "crates/alloyfs-transport" }
 alloyfs-agent = { path = "crates/alloyfs-agent" }
 alloyfs-client = { path = "crates/alloyfs-client" }
 alloyfs-mount-fuse = { path = "crates/alloyfs-mount-fuse" }
+alloyfs-mount-kernel = { path = "crates/alloyfs-mount-kernel" }
 alloyfs-mount-winfsp = { path = "crates/alloyfs-mount-winfsp" }
 alloyfs-http = { path = "crates/alloyfs-http" }
 

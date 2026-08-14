@@ -1,0 +1,520 @@
+//! Request serving: one kernel request in, one response frame out.
+//!
+//! Deliberately free of any I/O and of any Linux-only API, so the whole
+//! opcode surface is exercised by unit tests on every platform and the
+//! Linux half of this crate is reduced to "read bytes, call `handle`, write
+//! bytes".
+//!
+//! Two mappings do the real work:
+//!
+//!   * **nodeid ↔ path.** The kernel addresses everything by nodeid; the wire
+//!     protocol speaks paths. `RemoteFs::ino` is exactly that table, and its
+//!     `ROOT_INO` is 1 — the same number the ABI reserves for the root — so
+//!     the kernel's inode numbers *are* the client's inode numbers.
+//!   * **nodeid → open handle.** The ABI has no OPEN/RELEASE: a READ names a
+//!     file, not a handle. So reads and writes borrow a handle from a small
+//!     LRU cache, opening one on demand and releasing the eviction victim.
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use alloyfs_client::{FsError, RemoteFs, ROOT_INO};
+use alloyfs_proto::{Attr, ErrorCode, EventKind, FileKind, FsEvent, OpenFlags, RelPath};
+
+use crate::abi::{self, InHeader, KernelAttr, Notification};
+
+/// How many server handles the daemon keeps open on behalf of the kernel.
+/// Small on purpose: a handle is server-side state (and possibly a lease), so
+/// the cache is a working set, not a registry.
+const HANDLE_CACHE_CAP: usize = 64;
+
+/// A directory listing is fetched whole and paged out across READDIR calls;
+/// this bounds how long one listing may serve continuation calls.
+const DIR_CACHE_TTL: Duration = Duration::from_secs(5);
+
+/// The kernel emits "." and ".." itself before calling us, so its cursor
+/// starts at 2 and child *i* lives at position *i* + 2.
+const DOTS: u64 = 2;
+
+fn errno_of(err: &FsError) -> i32 {
+    match err {
+        FsError::Remote(code) => match code {
+            ErrorCode::NotFound | ErrorCode::NoSuchExport => abi::ENOENT,
+            ErrorCode::PermissionDenied => abi::EACCES,
+            ErrorCode::AlreadyExists => abi::EEXIST,
+            ErrorCode::NotADirectory => abi::ENOTDIR,
+            ErrorCode::IsADirectory => abi::EISDIR,
+            ErrorCode::NotEmpty => abi::ENOTEMPTY,
+            ErrorCode::InvalidPath => abi::EINVAL,
+            ErrorCode::BadHandle => abi::EBADF,
+            ErrorCode::ReadOnly => abi::EROFS,
+            ErrorCode::WouldBlock => abi::EAGAIN,
+            ErrorCode::CrossDevice => abi::EXDEV,
+            _ => abi::EIO,
+        },
+        FsError::Transport(_) => abi::EIO,
+    }
+}
+
+fn nanos_since_epoch(t: SystemTime) -> u64 {
+    t.duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos().min(u64::MAX as u128) as u64)
+        .unwrap_or(0)
+}
+
+/// A name straight off the wire from the kernel. Everything about it is
+/// checked here because the rest of this crate treats it as a path component.
+fn name_of(bytes: &[u8]) -> Result<&str, i32> {
+    if bytes.is_empty() {
+        return Err(abi::EINVAL);
+    }
+    if bytes.len() > abi::MAX_NAME {
+        return Err(abi::ENAMETOOLONG);
+    }
+    let name = std::str::from_utf8(bytes).map_err(|_| abi::EINVAL)?;
+    // A name is one component: no separators, no dots, no interior NUL.
+    if name.contains('/') || name.contains('\0') || name == "." || name == ".." {
+        return Err(abi::EINVAL);
+    }
+    Ok(name)
+}
+
+#[derive(Clone, Copy)]
+struct Handle {
+    fh: u64,
+    write: bool,
+    used: u64,
+}
+
+#[derive(Default)]
+struct HandleCache {
+    map: HashMap<u64, Handle>,
+    tick: u64,
+}
+
+struct DirListing {
+    at: Instant,
+    entries: Vec<(String, u64, bool)>, // name, nodeid, isdir
+}
+
+pub struct Server {
+    fs: Arc<RemoteFs>,
+    handles: Mutex<HandleCache>,
+    dirs: Mutex<HashMap<u64, DirListing>>,
+    /// Is this nodeid a directory? Recorded from every attr we hand out, so a
+    /// notification about a *deleted* name can still set FS_ISDIR correctly —
+    /// by then there is nothing left to stat.
+    kinds: Mutex<HashMap<u64, bool>>,
+}
+
+impl Server {
+    pub fn new(fs: Arc<RemoteFs>) -> Self {
+        Self {
+            fs,
+            handles: Mutex::new(HandleCache::default()),
+            dirs: Mutex::new(HashMap::new()),
+            kinds: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Serve one request buffer as read from the device. `None` means the
+    /// bytes were not a well-formed request (nothing to answer, and no
+    /// `unique` to answer it with).
+    pub fn handle(&self, buf: &[u8]) -> Option<Vec<u8>> {
+        let h = InHeader::parse(buf)?;
+        let payload = &buf[abi::IN_HEADER_LEN..h.len as usize];
+        Some(match self.dispatch(&h, payload) {
+            Ok(out) => abi::response(h.unique, 0, &out),
+            Err(errno) => {
+                tracing::debug!(op = h.opcode, nodeid = h.nodeid, errno, "request failed");
+                abi::response(h.unique, -errno, &[])
+            }
+        })
+    }
+
+    fn dispatch(&self, h: &InHeader, payload: &[u8]) -> Result<Vec<u8>, i32> {
+        match h.opcode {
+            abi::OP_LOOKUP => self.op_lookup(h.nodeid, payload),
+            abi::OP_GETATTR => self.op_getattr(h.nodeid),
+            abi::OP_READDIR => self.op_readdir(h.nodeid, h.offset, h.size as usize),
+            abi::OP_READ => self.op_read(h.nodeid, h.offset, h.size),
+            abi::OP_CREATE => self.op_create(h.nodeid, payload, false),
+            abi::OP_MKDIR => self.op_create(h.nodeid, payload, true),
+            abi::OP_UNLINK => self.op_remove(h.nodeid, payload, false),
+            abi::OP_RMDIR => self.op_remove(h.nodeid, payload, true),
+            abi::OP_RENAME => self.op_rename(h.nodeid, payload),
+            abi::OP_WRITE => self.op_write(h.nodeid, h.offset, payload),
+            abi::OP_SETATTR => self.op_setattr(h.nodeid, payload),
+            _ => Err(abi::ENOSYS),
+        }
+    }
+
+    // ------------------------------------------------------------- attrs
+
+    /// Server attr → kernel attr, remembering the kind for later.
+    ///
+    /// Symlinks are presented as regular files: the module has no `get_link`,
+    /// so an inode with S_IFLNK would be a mode the VFS cannot service. The
+    /// client resolves symlinks server-side anyway.
+    fn kernel_attr(&self, nodeid: u64, a: &Attr) -> KernelAttr {
+        let isdir = matches!(a.kind, FileKind::Dir);
+        self.record_kind(nodeid, isdir);
+        let perm = match a.mode & 0o7777 {
+            // Exports served by a backend with no Unix modes report 0; an
+            // inode with no permission bits is unusable to anything but root.
+            0 => {
+                if isdir {
+                    0o755
+                } else {
+                    0o644
+                }
+            }
+            bits => bits,
+        };
+        KernelAttr {
+            nodeid,
+            size: a.size,
+            mtime_ns: nanos_since_epoch(a.mtime),
+            mode: if isdir { abi::S_IFDIR } else { abi::S_IFREG } | perm,
+            nlink: if isdir { 2 } else { 1 },
+        }
+    }
+
+    fn op_lookup(&self, parent: u64, payload: &[u8]) -> Result<Vec<u8>, i32> {
+        let name = name_of(payload)?;
+        let (ino, attr) = self.fs.lookup(parent, name).map_err(|e| errno_of(&e))?;
+        Ok(self.kernel_attr(ino, &attr).to_bytes())
+    }
+
+    fn op_getattr(&self, nodeid: u64) -> Result<Vec<u8>, i32> {
+        let attr = self.fs.getattr(nodeid).map_err(|e| errno_of(&e))?;
+        Ok(self.kernel_attr(nodeid, &attr).to_bytes())
+    }
+
+    // ----------------------------------------------------------- readdir
+
+    /// The listing to page from. A cursor at the start always refetches; a
+    /// continuation reuses the listing it started on, so paging cannot skip or
+    /// duplicate entries because the directory changed underneath it.
+    fn dir_entries(&self, nodeid: u64, offset: u64) -> Result<Vec<(String, u64, bool)>, i32> {
+        if offset > DOTS {
+            if let Some(hit) = self.dirs.lock().unwrap().get(&nodeid) {
+                if hit.at.elapsed() < DIR_CACHE_TTL {
+                    return Ok(hit.entries.clone());
+                }
+            }
+        }
+        let listing = self.fs.readdir(nodeid).map_err(|e| errno_of(&e))?;
+        let entries: Vec<(String, u64, bool)> = listing
+            .into_iter()
+            .map(|(name, ino, attr)| {
+                let isdir = matches!(attr.kind, FileKind::Dir);
+                self.kinds.lock().unwrap().insert(ino, isdir);
+                (name, ino, isdir)
+            })
+            .collect();
+        self.dirs.lock().unwrap().insert(
+            nodeid,
+            DirListing {
+                at: Instant::now(),
+                entries: entries.clone(),
+            },
+        );
+        Ok(entries)
+    }
+
+    fn op_readdir(&self, nodeid: u64, offset: u64, size: usize) -> Result<Vec<u8>, i32> {
+        let limit = size.min(abi::MAX_PAYLOAD);
+        let entries = self.dir_entries(nodeid, offset)?;
+        let first = offset.saturating_sub(DOTS) as usize;
+        let mut out = Vec::new();
+        for (i, (name, ino, isdir)) in entries.iter().enumerate().skip(first) {
+            let ty = if *isdir { abi::DT_DIR } else { abi::DT_REG };
+            // `off` resumes AFTER this entry: child i sits at i + DOTS, so the
+            // next cursor is i + DOTS + 1.
+            if !abi::push_dirent(&mut out, limit, *ino, i as u64 + DOTS + 1, ty, name) {
+                if out.is_empty() {
+                    // Nothing fits at all — returning an empty reply would
+                    // mean "end of directory" and silently truncate it.
+                    return Err(abi::EINVAL);
+                }
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    // -------------------------------------------------------- open handles
+
+    /// A server handle for `nodeid`, opening one if the cache has none good
+    /// enough. Never holds the cache lock across an RPC.
+    fn handle_for(&self, nodeid: u64, want_write: bool) -> Result<u64, i32> {
+        {
+            let mut cache = self.handles.lock().unwrap();
+            cache.tick += 1;
+            let tick = cache.tick;
+            if let Some(h) = cache.map.get_mut(&nodeid) {
+                if h.write || !want_write {
+                    h.used = tick;
+                    return Ok(h.fh);
+                }
+            }
+        }
+        let flags = OpenFlags {
+            read: true,
+            write: want_write,
+            ..OpenFlags::default()
+        };
+        let (fh, _attr) = self.fs.open(nodeid, flags).map_err(|e| errno_of(&e))?;
+        for stale in self.install_handle(nodeid, fh, want_write) {
+            self.fs.release(stale);
+        }
+        Ok(fh)
+    }
+
+    /// Insert `fh` and return the handles that must be released: the one it
+    /// replaced (a racing opener, or a read-only handle we outgrew) plus the
+    /// LRU victim when the cache is full.
+    fn install_handle(&self, nodeid: u64, fh: u64, write: bool) -> Vec<u64> {
+        let mut cache = self.handles.lock().unwrap();
+        cache.tick += 1;
+        let used = cache.tick;
+        let mut stale = Vec::new();
+        if let Some(old) = cache.map.insert(nodeid, Handle { fh, write, used }) {
+            stale.push(old.fh);
+        }
+        while cache.map.len() > HANDLE_CACHE_CAP {
+            let Some(victim) = cache.map.iter().min_by_key(|(_, h)| h.used).map(|(id, _)| *id) else {
+                break;
+            };
+            if let Some(h) = cache.map.remove(&victim) {
+                stale.push(h.fh);
+            }
+        }
+        stale
+    }
+
+    /// Forget (and release) any handle for `nodeid` — used when the file it
+    /// names is gone.
+    fn drop_handle(&self, nodeid: u64) {
+        let h = self.handles.lock().unwrap().map.remove(&nodeid);
+        if let Some(h) = h {
+            self.fs.release(h.fh);
+        }
+    }
+
+    /// Release every cached handle. Called once the mount is finished with.
+    pub fn close_handles(&self) {
+        let handles: Vec<Handle> = {
+            let mut cache = self.handles.lock().unwrap();
+            cache.map.drain().map(|(_, h)| h).collect()
+        };
+        for h in handles {
+            self.fs.release(h.fh);
+        }
+    }
+
+    // ------------------------------------------------------------- data
+
+    fn op_read(&self, nodeid: u64, offset: u64, size: u32) -> Result<Vec<u8>, i32> {
+        let size = size.min(abi::MAX_PAYLOAD as u32);
+        if size == 0 {
+            return Ok(Vec::new());
+        }
+        let fh = self.handle_for(nodeid, false)?;
+        self.fs.read(fh, offset, size).map_err(|e| errno_of(&e))
+    }
+
+    fn op_write(&self, nodeid: u64, offset: u64, data: &[u8]) -> Result<Vec<u8>, i32> {
+        if data.is_empty() {
+            return Ok(abi::write_out(0));
+        }
+        let fh = self.handle_for(nodeid, true)?;
+        let n = self.fs.write(fh, offset, data).map_err(|e| errno_of(&e))?;
+        // The kernel updated i_size from the reply; our own attr cache must
+        // not keep serving the pre-write size to the next GETATTR.
+        self.fs.invalidate_attr(nodeid);
+        Ok(abi::write_out(n))
+    }
+
+    // -------------------------------------------------------- mutations
+
+    fn op_create(&self, parent: u64, payload: &[u8], dir: bool) -> Result<Vec<u8>, i32> {
+        let (mode, name_bytes) = abi::parse_create_in(payload).ok_or(abi::EINVAL)?;
+        let name = name_of(name_bytes)?;
+        let perm = mode & 0o7777;
+        self.forget_dir(parent);
+        if dir {
+            let (ino, attr) = self.fs.mkdir(parent, name, perm).map_err(|e| errno_of(&e))?;
+            return Ok(self.kernel_attr(ino, &attr).to_bytes());
+        }
+        let flags = OpenFlags {
+            read: true,
+            write: true,
+            ..OpenFlags::default()
+        };
+        let (ino, fh, attr) = self
+            .fs
+            .create(parent, name, perm, flags)
+            .map_err(|e| errno_of(&e))?;
+        // Keep the handle: a create is nearly always followed by writes on the
+        // same file, and the ABI gives us no other moment to open it.
+        for stale in self.install_handle(ino, fh, true) {
+            self.fs.release(stale);
+        }
+        Ok(self.kernel_attr(ino, &attr).to_bytes())
+    }
+
+    fn op_remove(&self, parent: u64, payload: &[u8], dir: bool) -> Result<Vec<u8>, i32> {
+        let name = name_of(payload)?;
+        // Resolve before removing: afterwards there is no path to look up, and
+        // a cached handle to a deleted file must not linger.
+        let victim = self
+            .fs
+            .ino
+            .path_of(parent)
+            .and_then(|p| self.fs.ino.ino_of(&p.join(name)));
+        let res = if dir {
+            self.fs.rmdir(parent, name)
+        } else {
+            self.fs.unlink(parent, name)
+        };
+        res.map_err(|e| errno_of(&e))?;
+        self.forget_dir(parent);
+        if let Some(ino) = victim {
+            self.drop_handle(ino);
+        }
+        Ok(Vec::new())
+    }
+
+    fn op_rename(&self, parent: u64, payload: &[u8]) -> Result<Vec<u8>, i32> {
+        let (newparent, from, to) = abi::parse_rename_in(payload).ok_or(abi::EINVAL)?;
+        let from = name_of(from)?;
+        let to = name_of(to)?;
+        // The kernel enforces RENAME_NOREPLACE itself before sending, so a
+        // rename that reaches us is always allowed to replace.
+        self.fs
+            .rename(parent, from, newparent, to, true)
+            .map_err(|e| errno_of(&e))?;
+        self.forget_dir(parent);
+        self.forget_dir(newparent);
+        Ok(Vec::new())
+    }
+
+    fn op_setattr(&self, nodeid: u64, payload: &[u8]) -> Result<Vec<u8>, i32> {
+        let si = abi::parse_setattr_in(payload).ok_or(abi::EINVAL)?;
+        let size = (si.valid & abi::SETATTR_SIZE != 0).then_some(si.size);
+        let mode = (si.valid & abi::SETATTR_MODE != 0).then_some(si.mode & 0o7777);
+        let mtime = (si.valid & abi::SETATTR_MTIME != 0)
+            .then(|| UNIX_EPOCH.checked_add(Duration::from_nanos(si.mtime_ns)))
+            .flatten();
+        let attr = self
+            .fs
+            .setattr(nodeid, size, mtime, mode)
+            .map_err(|e| errno_of(&e))?;
+        Ok(self.kernel_attr(nodeid, &attr).to_bytes())
+    }
+
+    /// Drop a cached listing whose directory we just changed.
+    fn forget_dir(&self, nodeid: u64) {
+        self.dirs.lock().unwrap().remove(&nodeid);
+    }
+
+    // ---------------------------------------------------- notifications
+
+    fn nodeid_of(&self, path: &RelPath) -> Option<u64> {
+        if path.is_root() {
+            Some(ROOT_INO)
+        } else {
+            self.fs.ino.ino_of(path)
+        }
+    }
+
+    fn is_dir(&self, nodeid: u64) -> bool {
+        self.kinds.lock().unwrap().get(&nodeid).copied().unwrap_or(false)
+    }
+
+    fn record_kind(&self, nodeid: u64, isdir: bool) {
+        self.kinds.lock().unwrap().insert(nodeid, isdir);
+    }
+
+    /// Turn one server event into the notification the kernel needs to re-emit
+    /// it as a genuine fsnotify event.
+    ///
+    /// MAY BLOCK ON THE NETWORK: `Created`/`Modified` stat the path to learn
+    /// its kind and new size. Call it from a plain thread — never from the
+    /// event pump's async task.
+    pub fn notification_for(&self, ev: &FsEvent) -> Option<Notification> {
+        let (parent_path, name) = ev.path.split()?;
+        let parent = self.nodeid_of(&parent_path)?;
+        let mut n = Notification {
+            code: abi::NOTIFY_ATTRIB,
+            parent,
+            parent2: 0,
+            size: 0,
+            isdir: false,
+            name: name.to_string(),
+            name2: String::new(),
+        };
+        match &ev.kind {
+            EventKind::Created | EventKind::Modified => {
+                // The lookup also refreshes the attr the kernel will ask for
+                // the moment a watcher reacts to this event.
+                let (ino, attr) = self.fs.lookup(parent, name).ok()?;
+                n.code = if matches!(ev.kind, EventKind::Created) {
+                    abi::NOTIFY_CREATE
+                } else {
+                    abi::NOTIFY_MODIFY
+                };
+                n.size = attr.size;
+                n.isdir = matches!(attr.kind, FileKind::Dir);
+                self.record_kind(ino, n.isdir);
+                self.forget_dir(parent);
+                self.drop_handle(ino);
+            }
+            EventKind::AttrChanged => {
+                n.code = abi::NOTIFY_ATTRIB;
+                if let Some(id) = self.nodeid_of(&ev.path) {
+                    n.isdir = self.is_dir(id);
+                    // A truncate reaches us as an attr change on some
+                    // backends, and a handle opened over the longer file
+                    // would go on answering for the bytes past the new EOF.
+                    // Reopening after a chmod costs one RPC; being wrong
+                    // about file contents costs rather more.
+                    self.drop_handle(id);
+                }
+            }
+            EventKind::Removed => {
+                n.code = abi::NOTIFY_DELETE;
+                if let Some(id) = self.nodeid_of(&ev.path) {
+                    n.isdir = self.is_dir(id);
+                    self.drop_handle(id);
+                }
+                self.forget_dir(parent);
+            }
+            EventKind::RenamedFrom { to } => {
+                let (to_parent_path, to_name) = to.split()?;
+                let parent2 = self.nodeid_of(&to_parent_path)?;
+                n.code = abi::NOTIFY_RENAME;
+                n.parent2 = parent2;
+                n.name2 = to_name.to_string();
+                // `RemoteFs::apply_events` has already retargeted the inode
+                // table, so the surviving nodeid is the destination's.
+                if let Some(id) = self.nodeid_of(to) {
+                    n.isdir = self.is_dir(id);
+                    // The destination inherits the source's nodeid, so the
+                    // handle cached under it outlives the move and would
+                    // answer reads of the new name from the old open file.
+                    self.drop_handle(id);
+                }
+                self.forget_dir(parent);
+                self.forget_dir(parent2);
+            }
+            // Nothing addressable: the client flushed its caches, and the
+            // kernel re-asks us on the next operation anyway.
+            EventKind::ResyncRequired => return None,
+        }
+        Some(n)
+    }
+}

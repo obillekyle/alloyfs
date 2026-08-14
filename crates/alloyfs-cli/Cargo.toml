@@ -29,6 +29,10 @@ serde_yaml.workspace = true
 [target.'cfg(unix)'.dependencies]
 alloyfs-mount-fuse.workspace = true
 
+# The kernel-module backend only exists on Linux (and only matters there).
+[target.'cfg(target_os = "linux")'.dependencies]
+alloyfs-mount-kernel.workspace = true
+
 [target.'cfg(windows)'.dependencies]
 alloyfs-mount-winfsp.workspace = true
 

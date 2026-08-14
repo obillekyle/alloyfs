@@ -44,6 +44,7 @@ dependencies = [
  "alloyfs-common",
  "alloyfs-http",
  "alloyfs-mount-fuse",
+ "alloyfs-mount-kernel",
  "alloyfs-mount-winfsp",
  "alloyfs-proto",
  "alloyfs-transport",
@@ -122,6 +123,21 @@ dependencies = [
  "anyhow",
  "fuser",
  "libc",
+ "tracing",
+]
+
+[[package]]
+name = "alloyfs-mount-kernel"
+version = "0.1.0"
+dependencies = [
+ "alloyfs-agent",
+ "alloyfs-client",
+ "alloyfs-proto",
+ "alloyfs-transport",
+ "anyhow",
+ "libc",
+ "tempfile",
+ "tokio",
  "tracing",
 ]
 

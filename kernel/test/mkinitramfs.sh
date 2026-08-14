@@ -4,6 +4,9 @@
 # and skipping gzip saves a second of every iteration.
 #
 #   ./mkinitramfs.sh <stage> <out-dir> [module.ko]
+#
+# ALLOYFS_BIN=/path/to/alloyfs adds the real Rust client to the image, together
+# with its interpreter and shared libraries (stage 6 runs it in the guest).
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -22,7 +25,7 @@ cp "$BUSYBOX" "$ROOT/bin/busybox"
 # Applets the harness uses. busybox resolves these via argv[0].
 for a in sh mount umount mkdir mkfifo rmdir insmod rmmod lsmod dmesg cat ls sleep \
          kill poweroff reboot sync grep sort md5sum dd echo printf test true \
-         false touch rm mv cp stat find head tail wc env date; do
+         false touch rm mv cp stat find head tail wc env date ip ifconfig; do
 	ln -sf busybox "$ROOT/bin/$a"
 done
 
@@ -31,6 +34,23 @@ gcc -static -Os -Wall -Wextra -o "$ROOT/bin/alloyfs-inotify" tools/alloyfs-inoti
 gcc -static -Os -Wall -Wextra -o "$ROOT/bin/alloyd" tools/alloyd.c
 gcc -static -Os -Wall -Wextra -pthread -o "$ROOT/bin/alloyfs-devtest" tools/alloyfs-devtest.c
 strip "$ROOT/bin/alloyfs-inotify" "$ROOT/bin/alloyd" "$ROOT/bin/alloyfs-devtest" 2>/dev/null || true
+
+# Not a probe: compiling it IS the assertion that the Rust daemon's hand-rolled
+# struct offsets still match alloyfs.h. Nothing ships in the image.
+gcc -fsyntax-only -Wall -Wextra tools/alloyfs-abi-check.c
+
+# The real client, for stage 6. It is an ordinary dynamically-linked binary, so
+# ld.so and every library it names come with it — `ldd` lists the absolute
+# paths, and -L copies through the symlinks.
+if [ -n "${ALLOYFS_BIN:-}" ]; then
+	[ -x "$ALLOYFS_BIN" ] || { echo "ALLOYFS_BIN=$ALLOYFS_BIN is not executable" >&2; exit 1; }
+	cp "$ALLOYFS_BIN" "$ROOT/bin/alloyfs"
+	for lib in $(ldd "$ALLOYFS_BIN" | grep -oE '/[^ ]*\.so[^ ]*'); do
+		mkdir -p "$ROOT$(dirname "$lib")"
+		cp -Lu "$lib" "$ROOT$lib"
+	done
+	echo "  + alloyfs client: $(du -h "$ROOT/bin/alloyfs" | cut -f1) + $(ldd "$ALLOYFS_BIN" | grep -cE '/[^ ]*\.so') libs"
+fi
 
 [ -n "$KO" ] && cp "$KO" "$ROOT/lib/modules/"
 

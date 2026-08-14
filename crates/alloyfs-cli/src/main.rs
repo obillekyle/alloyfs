@@ -70,6 +70,11 @@ enum Command {
         /// Shared secret for token-protected TCP servers (agent.tcp_token).
         #[arg(long)]
         token: Option<String>,
+        /// Linux mount driver. `fuse` works everywhere; `kernel` uses the
+        /// alloyfs module (real inotify events for remote changes) and needs
+        /// /dev/alloyfs plus CAP_SYS_ADMIN.
+        #[arg(long, value_enum, default_value_t = commands::mount::Backend::Fuse)]
+        backend: commands::mount::Backend,
     },
     /// Keep a REAL local directory bidirectionally in sync with an export.
     /// Unlike a mount, watchers on the directory get genuine file events for
@@ -198,6 +203,7 @@ async fn main() -> anyhow::Result<()> {
             data_dir,
             no_server_defaults,
             token,
+            backend,
         } => {
             commands::mount::run(
                 url,
@@ -211,6 +217,7 @@ async fn main() -> anyhow::Result<()> {
                 data_dir,
                 no_server_defaults,
                 token,
+                backend,
             )
             .await
         }

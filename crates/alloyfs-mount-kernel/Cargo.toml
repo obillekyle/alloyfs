@@ -1,0 +1,24 @@
+[package]
+name = "alloyfs-mount-kernel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The ABI codec and the request-serving logic are platform-independent on
+# purpose: they compile (and are unit-tested) everywhere, so a Windows
+# `cargo test --workspace` still covers the wire format and every opcode.
+# Only the /dev/alloyfs + mount(2) plumbing is Linux-gated.
+[dependencies]
+alloyfs-proto.workspace = true
+alloyfs-client.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+alloyfs-agent.workspace = true
+alloyfs-transport.workspace = true
+tempfile.workspace = true

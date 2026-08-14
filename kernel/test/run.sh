@@ -23,10 +23,12 @@ DEBUG_KDIR=""
 # oops=panic (a real bug still stops the run) but lets WARNs accumulate.
 PANIC_ON_WARN=1
 
+TIMEOUT_SET=0
+
 while [ $# -gt 0 ]; do
 	case "$1" in
 	--stage)   STAGE="$2"; shift 2 ;;
-	--timeout) TIMEOUT="$2"; shift 2 ;;
+	--timeout) TIMEOUT="$2"; TIMEOUT_SET=1; shift 2 ;;
 	--machine) MACHINE="$2"; shift 2 ;;
 	--kver)    KVER="$2"; shift 2 ;;
 	# Point at a built kernel source tree (see build-debug-kernel.sh): use
@@ -40,6 +42,26 @@ done
 
 OUT="out"
 mkdir -p "$OUT"
+
+# Stage 6 replaces the C test daemon with the real Rust client, which has to be
+# built and carried into the guest. The image lives in guest RAM and the client
+# is an order of magnitude bigger than the C probes, so the box needs more of
+# it — and a release build plus a real agent handshake needs more wall clock.
+if [ "$STAGE" -ge 6 ]; then
+	if [ -z "${ALLOYFS_BIN:-}" ]; then
+		CARGO="${CARGO:-$(command -v cargo || echo "$HOME/.cargo/bin/cargo")}"
+		[ -x "$CARGO" ] || { echo "cargo not found (set CARGO= or ALLOYFS_BIN=)" >&2; exit 1; }
+		echo "==> building the alloyfs client (release)"
+		( cd ../.. && "$CARGO" build --release --bin alloyfs ) >/dev/null
+		ALLOYFS_BIN="$(cd ../.. && pwd)/target/release/alloyfs"
+	fi
+	[ -x "$ALLOYFS_BIN" ] || { echo "no alloyfs binary at $ALLOYFS_BIN" >&2; exit 1; }
+	export ALLOYFS_BIN
+	# ~13 MB of image (client + glibc + busybox) plus two tokio processes.
+	# Modest on purpose: the build host has under a gigabyte itself.
+	MEM="${ALLOYFS_QEMU_MEM:-384}"
+	[ "$TIMEOUT_SET" -eq 1 ] || TIMEOUT=300
+fi
 
 # Ubuntu ships /boot/vmlinuz-* as 0600 root. Stage one readable copy (cached
 # across runs) rather than loosening permissions on the host's boot image.
