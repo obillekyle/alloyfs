@@ -105,8 +105,12 @@ int dsfs_request(struct dsfs_conn *conn, u32 opcode, u64 nodeid, u64 offset,
 struct inode *dsfs_iget_node(struct super_block *sb, struct dsfs_node *node);
 struct inode *dsfs_iget_attr(struct super_block *sb, const struct dsfs_attr *attr);
 
+/* Upper bound on a notification payload: the fixed entry plus two names. */
+#define DSFS_NOTIFY_MAX (sizeof(struct dsfs_notify_entry) + 2 * DSFS_MAX_NAME)
+
 /* dsfs_notify.c — the point of the whole exercise. */
 int dsfs_inject(const char *line);
+int dsfs_notify_from_daemon(int code, const void *payload, u32 len);
 int dsfs_notify_init(void);
 void dsfs_notify_exit(void);
 

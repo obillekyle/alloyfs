@@ -20,7 +20,7 @@ mkdir -p "$ROOT"/{bin,dev,proc,sys,tmp,tests,mnt,lib/modules}
 
 cp "$BUSYBOX" "$ROOT/bin/busybox"
 # Applets the harness uses. busybox resolves these via argv[0].
-for a in sh mount umount mkdir rmdir insmod rmmod lsmod dmesg cat ls sleep \
+for a in sh mount umount mkdir mkfifo rmdir insmod rmmod lsmod dmesg cat ls sleep \
          kill poweroff reboot sync grep sort md5sum dd echo printf test true \
          false touch rm mv cp stat find head tail wc env date; do
 	ln -sf busybox "$ROOT/bin/$a"

@@ -242,6 +242,24 @@ static ssize_t dsfs_dev_write(struct file *file, const char __user *ubuf,
 		return -EINVAL;
 	payload = hdr.len - sizeof(hdr);
 
+	/* unique == 0 is an unsolicited notification, not a reply: `error`
+	 * carries the notify code. This is the path that makes remote changes
+	 * visible to inotify — the reason the module exists.
+	 */
+	if (hdr.unique == 0) {
+		void *buf;
+		int ret;
+
+		if (payload > DSFS_NOTIFY_MAX)
+			return -EINVAL;
+		buf = memdup_user(ubuf + sizeof(hdr), payload);
+		if (IS_ERR(buf))
+			return PTR_ERR(buf);
+		ret = dsfs_notify_from_daemon(hdr.error, buf, payload);
+		kfree(buf);
+		return ret ? ret : (ssize_t)hdr.len;
+	}
+
 	spin_lock(&conn->lock);
 	list_for_each_entry(req, &conn->processing, list) {
 		if (req->hdr.unique == hdr.unique) {
