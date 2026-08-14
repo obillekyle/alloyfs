@@ -281,12 +281,105 @@ When to pick which: **mount** for drive semantics and on-demand access to
 big trees; **sync** for dev working copies on Linux where file events and
 native-speed builds matter.
 
+## Installing (Linux)
+
+```bash
+cargo build --release                 # as yourself — never under sudo
+sudo packaging/install.sh --user you --start
+sudo packaging/uninstall.sh           # reverses all of it
+```
+
+That installs the binary and the systemd unit and starts the agent. Add
+`--with-module` to also install the optional kernel module (below). Both
+scripts are idempotent — re-running `install.sh` is how you upgrade — and
+both refuse with an explanation rather than a stack trace when run without
+root. `install.sh` deliberately never invokes cargo: doing that under sudo
+leaves a root-owned `target/` that breaks every later developer build.
+
+| Path | What | Removed by `uninstall.sh` |
+| --- | --- | --- |
+| `/usr/local/bin/alloyfs` | the one binary (agent, client, CLI) | yes |
+| `/etc/systemd/system/alloyfs@.service` | template unit; instances are disabled and stopped first | yes |
+| `/usr/src/alloyfs-<version>/` | module sources for DKMS | yes |
+| `/lib/modules/<kernel>/updates/dkms/alloyfs.ko*` | the built module | yes |
+| `/etc/udev/rules.d/60-alloyfs.rules` | ownership of `/dev/alloyfs` | yes |
+| `/etc/modules-load.d/alloyfs.conf` | loads the module at boot | yes |
+| the `alloyfs` group | who may open `/dev/alloyfs` | yes (`--keep-group` to keep it) |
+| `~/.alloyfs/` | config, `data/`, `cache/` | **no, never** |
+
+That last row is the one deliberate asymmetry. `data/` holds the overlay —
+files that exist on no server and cannot be re-downloaded — so uninstalling
+the software is not allowed to be how you lose them. Delete it yourself if
+you actually mean to. Useful flags: `--prefix DIR`, `--binary PATH`,
+`--no-service`, `--no-autoload`.
+
+`install.sh --user NAME` enables `alloyfs@NAME`; `--start` starts it too.
+
+### The kernel module is optional
+
+Everything above works without it. **FUSE is the default and fully supported
+mount backend**; the kernel module exists to close exactly one gap — Linux
+inotify does not fire for remote changes on a FUSE mount (see "Honest
+limitations") — and it is Linux-only. If you don't need real inotify inside
+a mount, skip `--with-module` entirely and nothing else changes.
+
+With `--with-module`, the module is installed through
+[DKMS](packaging/dkms.conf) rather than as a bare `.ko`. An out-of-tree
+module is only valid for the exact kernel it was compiled against, and
+distributions ship new kernels every few weeks; without DKMS the module
+silently stops loading after the next upgrade and reboot, and the only
+symptom is that `/dev/alloyfs` has quietly vanished. DKMS keeps the *source*
+in `/usr/src` and rebuilds it from a kernel-upgrade hook, so the module
+follows the kernel instead of rotting against it. The DKMS package version
+is the workspace version, so `dkms status` and `alloyfs --version` always
+agree.
+
+### Who may open /dev/alloyfs
+
+The module registers its device as `0600 root:root` — the right default,
+since that is what devtmpfs creates the node with before udev runs, so it is
+never briefly more open than intended. But the agent runs unprivileged (the
+unit runs it as `User=%i`), so as shipped it cannot open the device at all.
+[`packaging/60-alloyfs.rules`](packaging/60-alloyfs.rules) closes that gap by
+handing the device to a dedicated `alloyfs` group at mode `0660`.
+
+It is a group and not `0666` because opening this device makes the opener a
+filesystem **server**: it answers every lookup, read and readdir for the
+alloyfs mounts bound to it, and can inject fsnotify events into them. That is
+enough to feed attacker-chosen bytes to a process that believes it is reading
+its own disk, and to change a file's contents between two reads of it. So
+membership in `alloyfs` *is* the permission model — adding a user to that
+group is the deliberate statement that the account may serve filesystems on
+this machine. `install.sh --with-module --user NAME` adds that one user;
+everyone else stays out. (Mounting remains separately privileged, so an
+unprivileged server with nothing pointed at it can affect nobody.)
+
+### Secure Boot
+
+On a Secure Boot machine with module signature enforcement (Ubuntu's default
+— check `cat /sys/module/module/parameters/sig_enforce`), DKMS signs the
+module with a machine-owner key that has to be **enrolled by a human at the
+console**, which no installer can do on your behalf; that is the entire point
+of Secure Boot. `install.sh` detects this, finishes the installation, and
+tells you the one-time step:
+
+```bash
+sudo mokutil --import /var/lib/shim-signed/mok/MOK.der
+# then reboot and choose "Enroll MOK" in the blue MOK Manager screen
+```
+
+Until that is done `modprobe alloyfs` fails with `Key was rejected by
+service` and `/dev/alloyfs` does not exist. FUSE mounts are unaffected, and
+every future DKMS rebuild is covered once the key is enrolled.
+
 ## Running the agent as a service
 
-- **Linux (systemd)**: [scripts/alloyfs.service](scripts/alloyfs.service)
-  is a template unit — copy to `/etc/systemd/system/alloyfs@.service`,
-  then `systemctl enable --now alloyfs@youruser` (the instance name picks
-  the user whose config and exports it serves). Logs land in journald
+- **Linux (systemd)**: `sudo packaging/install.sh --user youruser --start`
+  installs [scripts/alloyfs.service](scripts/alloyfs.service) as the template
+  unit `alloyfs@.service` and enables the instance for you (the instance name
+  picks the user whose config and exports it serves). By hand it is just a
+  copy to `/etc/systemd/system/alloyfs@.service` plus
+  `systemctl enable --now alloyfs@youruser`. Logs land in journald
   (`journalctl -u alloyfs@youruser -f`); the agent restarts on failure.
 - **Windows (Scheduled Task)**: [scripts/install-agent-task.ps1](scripts/install-agent-task.ps1)
   (elevated PowerShell; `-Exe` overrides the binary path) registers a
@@ -383,6 +476,9 @@ Rust workspace; `cargo build` at the root. Platform bridges are isolated:
 `alloyfs-mount-fuse` only compiles on Unix, `alloyfs-mount-winfsp` only on Windows.
 
 - **Linux**: `apt install build-essential pkg-config fuse3 libfuse3-dev`, then rustup.
+  For the optional kernel module, additionally
+  `apt install dkms linux-headers-$(uname -r)`; `packaging/install.sh
+  --with-module` checks for both and says which one is missing.
 - **Windows**: WinFsp 2.1+ (with SDK feature) is the one required install.
   The reference build uses the fully-portable llvm-mingw toolchain targeting
   `x86_64-pc-windows-gnullvm` (no Visual Studio needed); see

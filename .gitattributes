@@ -6,3 +6,7 @@ vendor/winfsp-sys/winfsp/** -text
 # shebangs and the Kbuild files even when checked out on Windows.
 kernel/** text eol=lf
 scripts/*.sh text eol=lf
+scripts/*.service text eol=lf
+# Installed verbatim onto Linux systems (shell, dkms.conf, udev rules,
+# systemd units): CRLF would break shebangs and udev rule parsing.
+packaging/** text eol=lf

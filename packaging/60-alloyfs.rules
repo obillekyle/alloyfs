@@ -1,0 +1,47 @@
+# udev rule for /dev/alloyfs, the AlloyFS kernel module's control device.
+# Installed by packaging/install.sh as /etc/udev/rules.d/60-alloyfs.rules.
+#
+# ## Why this file has to exist
+#
+# The module registers its misc device with mode 0600 owned by root
+# (kernel/alloyfs/alloyfs_conn.c). That is the correct DEFAULT — it is the
+# permission the node is created with by devtmpfs, before udev has had a
+# chance to run, so there is never an instant in which the device is more open
+# than intended. But it also means the only process that can open the device
+# is root, while the AlloyFS agent deliberately runs unprivileged (the systemd
+# template unit runs it as `User=%i`). Without a rule like this one, the
+# kernel mount backend is simply unusable by the daemon it exists to serve.
+#
+# ## Why not just make it world-accessible
+#
+# Opening /dev/alloyfs makes the opener a filesystem SERVER. It answers every
+# lookup, read, write and readdir for the alloyfs mounts bound to that
+# connection, and it can inject fsnotify events into them. Anyone who can open
+# the device and get a mount pointed at them therefore controls what other
+# processes on this machine READ from a filesystem — which is a straight path
+# to feeding attacker-chosen bytes to something that trusts its own disk, and
+# to serving content that changes between one read and the next (a TOCTOU
+# primitive against anything that validates a file and then re-opens it).
+# It is also an unprivileged handle on kernel code that parses a binary
+# protocol, so it is worth treating as attack surface in its own right.
+#
+# So: 0666 is out of the question, and so is a rule that hands the device to
+# every logged-in user via uaccess/seat tagging. The device is a service
+# endpoint, not a piece of desktop hardware; it does not belong to whoever
+# happens to be sitting at the console.
+#
+# ## The rule
+#
+# Access is granted to one dedicated system group, `alloyfs`, which
+# install.sh creates and leaves EMPTY unless you name a user
+# (`install.sh --user alice`). Membership is the whole permission model:
+# adding a user to this group is the deliberate act of saying "this account
+# may serve alloyfs filesystems on this machine". Note that mounting is still
+# separately privileged — an unprivileged server with no way to mount can only
+# serve filesystems that root chose to point at it.
+#
+# Rule ordering: 60- puts this after systemd's own device rules (which set the
+# baseline ownership) and before any local 70-/90- overrides, matching the
+# convention for rules that adjust permissions on a specific device.
+
+KERNEL=="alloyfs", SUBSYSTEM=="misc", GROUP="alloyfs", MODE="0660"
