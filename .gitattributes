@@ -2,3 +2,7 @@
 # (headers/libs/dlls under vendor/) — EOL mangling there breaks builds.
 * text=auto
 vendor/winfsp-sys/winfsp/** -text
+# The kernel tree is built and run on Linux only; CRLF would break the
+# shebangs and the Kbuild files even when checked out on Windows.
+kernel/** text eol=lf
+scripts/*.sh text eol=lf

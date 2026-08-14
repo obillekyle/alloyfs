@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: GPL-2.0-only
+obj-m := ds_fs.o
+ds_fs-y := dsfs_main.o dsfs_notify.o
+ccflags-y += -Wall -Wextra -Wno-unused-parameter

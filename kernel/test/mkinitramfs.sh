@@ -16,7 +16,7 @@ BUSYBOX="${BUSYBOX:-/usr/bin/busybox}"
 
 ROOT="$OUT/root"
 rm -rf "$ROOT"
-mkdir -p "$ROOT"/{bin,dev,proc,sys,tests,mnt,lib/modules}
+mkdir -p "$ROOT"/{bin,dev,proc,sys,tmp,tests,mnt,lib/modules}
 
 cp "$BUSYBOX" "$ROOT/bin/busybox"
 # Applets the harness uses. busybox resolves these via argv[0].
@@ -46,6 +46,8 @@ export PATH=/bin
 mount -t proc     proc /proc
 mount -t sysfs    sys  /sys
 mount -t devtmpfs dev  /dev
+mount -t tmpfs    tmp  /tmp   # scratch for test logs, and the tmpfs the
+                              # differential assertions compare us against
 echo "DS-BOOT-OK"
 echo "DS-STAGE: $STAGE"
 
