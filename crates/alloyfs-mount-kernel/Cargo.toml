@@ -3,6 +3,7 @@ name = "alloyfs-mount-kernel"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 
 # The ABI codec and the request-serving logic are platform-independent on
 # purpose: they compile (and are unit-tested) everywhere, so a Windows

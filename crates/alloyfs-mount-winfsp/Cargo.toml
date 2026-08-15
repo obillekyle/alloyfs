@@ -3,6 +3,7 @@ name = "alloyfs-mount-winfsp"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 
 # All real dependencies are Windows-only: on other platforms this crate
 # compiles to an empty library so `cargo build` at the workspace root works
