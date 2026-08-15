@@ -13,7 +13,7 @@ dependencies = [
 
 [[package]]
 name = "alloyfs-agent"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "alloyfs-common",
  "alloyfs-proto",
@@ -37,7 +37,7 @@ dependencies = [
 
 [[package]]
 name = "alloyfs-cli"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "alloyfs-agent",
  "alloyfs-client",
@@ -62,7 +62,7 @@ dependencies = [
 
 [[package]]
 name = "alloyfs-client"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "alloyfs-agent",
  "alloyfs-common",
@@ -84,7 +84,7 @@ dependencies = [
 
 [[package]]
 name = "alloyfs-common"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "alloyfs-proto",
  "anyhow",
@@ -95,7 +95,7 @@ dependencies = [
 
 [[package]]
 name = "alloyfs-http"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "alloyfs-agent",
  "alloyfs-common",
@@ -116,7 +116,7 @@ dependencies = [
 
 [[package]]
 name = "alloyfs-mount-fuse"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "alloyfs-client",
  "alloyfs-proto",
@@ -128,7 +128,7 @@ dependencies = [
 
 [[package]]
 name = "alloyfs-mount-kernel"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "alloyfs-agent",
  "alloyfs-client",
@@ -143,7 +143,7 @@ dependencies = [
 
 [[package]]
 name = "alloyfs-mount-winfsp"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "alloyfs-client",
  "alloyfs-proto",
@@ -154,7 +154,7 @@ dependencies = [
 
 [[package]]
 name = "alloyfs-proto"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "lz4_flex",
@@ -166,7 +166,7 @@ dependencies = [
 
 [[package]]
 name = "alloyfs-transport"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "alloyfs-proto",
  "async-trait",
