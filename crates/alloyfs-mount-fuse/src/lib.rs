@@ -46,17 +46,17 @@ struct DsFuse {
 }
 
 impl DsFuse {
-    fn file_attr(&self, ino: u64, a: &Attr) -> FileAttr {
+    fn file_attr(&self, ino: u64, attr: &Attr) -> FileAttr {
         FileAttr {
             ino: INodeNo(ino),
-            size: a.size,
-            blocks: a.size.div_ceil(512),
-            atime: a.mtime,
-            mtime: a.mtime,
-            ctime: a.ctime,
-            crtime: a.ctime,
-            kind: file_type(a.kind),
-            perm: (a.mode & 0o7777) as u16,
+            size: attr.size,
+            blocks: attr.size.div_ceil(512),
+            atime: attr.mtime,
+            mtime: attr.mtime,
+            ctime: attr.ctime,
+            crtime: attr.ctime,
+            kind: file_type(attr.kind),
+            perm: (attr.mode & 0o7777) as u16,
             nlink: 1,
             // The server's uid/gid mean nothing on this machine; present
             // everything as owned by whoever mounted.

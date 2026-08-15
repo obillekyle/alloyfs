@@ -152,13 +152,13 @@ impl AutoCache {
         self.state.lock().unwrap()
     }
 
-    pub fn pin_match(&self, p: &RelPath) -> bool {
-        self.pins.is_excluded(p)
+    pub fn pin_match(&self, path: &RelPath) -> bool {
+        self.pins.is_excluded(path)
     }
 
     /// Should the walker/fetcher cache this file at all?
-    pub fn wants(&self, p: &RelPath, size: u64) -> bool {
-        self.pin_match(p) || (self.cfg.max_file_size > 0 && size <= self.cfg.max_file_size)
+    pub fn wants(&self, path: &RelPath, size: u64) -> bool {
+        self.pin_match(path) || (self.cfg.max_file_size > 0 && size <= self.cfg.max_file_size)
     }
 
     /// May the cached blob serve reads for `path`, given a current server

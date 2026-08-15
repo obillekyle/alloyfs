@@ -122,24 +122,24 @@ impl Server {
         })
     }
 
-    fn dispatch(&self, h: &InHeader, payload: &[u8]) -> Result<Vec<u8>, i32> {
-        match h.opcode {
-            abi::OP_LOOKUP => self.op_lookup(h.nodeid, payload),
-            abi::OP_GETATTR => self.op_getattr(h.nodeid),
-            abi::OP_READDIR => self.op_readdir(h.nodeid, h.offset, h.size as usize),
-            abi::OP_READ => self.op_read(h.nodeid, h.offset, h.size),
-            abi::OP_CREATE => self.op_create(h.nodeid, payload, false),
-            abi::OP_MKDIR => self.op_create(h.nodeid, payload, true),
-            abi::OP_UNLINK => self.op_remove(h.nodeid, payload, false),
-            abi::OP_RMDIR => self.op_remove(h.nodeid, payload, true),
-            abi::OP_RENAME => self.op_rename(h.nodeid, payload),
-            abi::OP_WRITE => self.op_write(h.nodeid, h.offset, payload),
-            abi::OP_SETATTR => self.op_setattr(h.nodeid, payload),
-            abi::OP_LOCK => self.op_lock(h.nodeid, payload),
-            abi::OP_UNLOCK => self.op_unlock(h.nodeid),
-            abi::OP_SYMLINK => self.op_symlink(h.nodeid, payload),
-            abi::OP_READLINK => self.op_readlink(h.nodeid),
-            abi::OP_LINK => self.op_link(h.nodeid, payload),
+    fn dispatch(&self, header: &InHeader, payload: &[u8]) -> Result<Vec<u8>, i32> {
+        match header.opcode {
+            abi::OP_LOOKUP => self.op_lookup(header.nodeid, payload),
+            abi::OP_GETATTR => self.op_getattr(header.nodeid),
+            abi::OP_READDIR => self.op_readdir(header.nodeid, header.offset, header.size as usize),
+            abi::OP_READ => self.op_read(header.nodeid, header.offset, header.size),
+            abi::OP_CREATE => self.op_create(header.nodeid, payload, false),
+            abi::OP_MKDIR => self.op_create(header.nodeid, payload, true),
+            abi::OP_UNLINK => self.op_remove(header.nodeid, payload, false),
+            abi::OP_RMDIR => self.op_remove(header.nodeid, payload, true),
+            abi::OP_RENAME => self.op_rename(header.nodeid, payload),
+            abi::OP_WRITE => self.op_write(header.nodeid, header.offset, payload),
+            abi::OP_SETATTR => self.op_setattr(header.nodeid, payload),
+            abi::OP_LOCK => self.op_lock(header.nodeid, payload),
+            abi::OP_UNLOCK => self.op_unlock(header.nodeid),
+            abi::OP_SYMLINK => self.op_symlink(header.nodeid, payload),
+            abi::OP_READLINK => self.op_readlink(header.nodeid),
+            abi::OP_LINK => self.op_link(header.nodeid, payload),
             abi::OP_STATFS => self.op_statfs(),
             _ => Err(abi::ENOSYS),
         }
@@ -152,10 +152,10 @@ impl Server {
     /// Symlinks report S_IFLNK now that the module implements `get_link`.
     /// They used to be flattened to regular files, because an inode the VFS
     /// could not resolve was worse than a slightly dishonest mode.
-    fn kernel_attr(&self, nodeid: u64, a: &Attr) -> KernelAttr {
-        let isdir = matches!(a.kind, FileKind::Dir);
+    fn kernel_attr(&self, nodeid: u64, attr: &Attr) -> KernelAttr {
+        let isdir = matches!(attr.kind, FileKind::Dir);
         self.record_kind(nodeid, isdir);
-        let perm = match a.mode & 0o7777 {
+        let perm = match attr.mode & 0o7777 {
             // Exports served by a backend with no Unix modes report 0; an
             // inode with no permission bits is unusable to anything but root.
             0 => {
@@ -167,15 +167,15 @@ impl Server {
             }
             bits => bits,
         };
-        let kind_bits = match a.kind {
+        let kind_bits = match attr.kind {
             FileKind::Dir => abi::S_IFDIR,
             FileKind::Symlink => abi::S_IFLNK,
             FileKind::File => abi::S_IFREG,
         };
         KernelAttr {
             nodeid,
-            size: a.size,
-            mtime_ns: nanos_since_epoch(a.mtime),
+            size: attr.size,
+            mtime_ns: nanos_since_epoch(attr.mtime),
             mode: kind_bits | perm,
             nlink: if isdir { 2 } else { 1 },
         }

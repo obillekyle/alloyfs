@@ -44,13 +44,13 @@ impl Overlay {
         })
     }
 
-    pub fn excluded(&self, p: &RelPath) -> bool {
-        self.matcher.is_excluded(p)
+    pub fn excluded(&self, path: &RelPath) -> bool {
+        self.matcher.is_excluded(path)
     }
 
-    fn abs(&self, p: &RelPath) -> PathBuf {
+    fn abs(&self, path: &RelPath) -> PathBuf {
         let mut full = self.root.clone();
-        for comp in p.0.split('/').filter(|c| !c.is_empty()) {
+        for comp in path.0.split('/').filter(|c| !c.is_empty()) {
             full.push(comp);
         }
         full
@@ -60,18 +60,18 @@ impl Overlay {
         self.handles.get(&fh).ok_or(FsError::Remote(ErrorCode::BadHandle))
     }
 
-    pub fn getattr(&self, p: &RelPath) -> Result<Attr, FsError> {
-        let md = std::fs::symlink_metadata(self.abs(p)).or_code()?;
+    pub fn getattr(&self, path: &RelPath) -> Result<Attr, FsError> {
+        let md = std::fs::symlink_metadata(self.abs(path)).or_code()?;
         Ok(attr_from_metadata(&md, 0))
     }
 
-    pub fn open(&self, p: &RelPath, flags: OpenFlags) -> Result<(u64, Attr), FsError> {
+    pub fn open(&self, path: &RelPath, flags: OpenFlags) -> Result<(u64, Attr), FsError> {
         let wants_write = flags.write || flags.truncate || flags.append;
         let file = File::options()
             .read(true)
             .write(wants_write)
             .truncate(flags.truncate)
-            .open(self.abs(p))
+            .open(self.abs(path))
             .or_code()?;
         let md = file.metadata().or_code()?;
         if md.is_dir() {
@@ -83,8 +83,8 @@ impl Overlay {
         Ok((fh, attr))
     }
 
-    pub fn create(&self, p: &RelPath, flags: OpenFlags, mode: u32) -> Result<(u64, Attr), FsError> {
-        let full = self.abs(p);
+    pub fn create(&self, path: &RelPath, flags: OpenFlags, mode: u32) -> Result<(u64, Attr), FsError> {
+        let full = self.abs(path);
         if let Some(parent) = full.parent() {
             // First write into a fresh excluded subtree materializes it.
             std::fs::create_dir_all(parent).or_code()?;
@@ -141,8 +141,8 @@ impl Overlay {
         out
     }
 
-    pub fn mkdir(&self, p: &RelPath) -> Result<Attr, FsError> {
-        let full = self.abs(p);
+    pub fn mkdir(&self, path: &RelPath) -> Result<Attr, FsError> {
+        let full = self.abs(path);
         if let Some(parent) = full.parent() {
             std::fs::create_dir_all(parent).or_code()?;
         }
@@ -151,12 +151,12 @@ impl Overlay {
         Ok(attr_from_metadata(&md, 0))
     }
 
-    pub fn unlink(&self, p: &RelPath) -> Result<(), FsError> {
-        Ok(std::fs::remove_file(self.abs(p)).or_code()?)
+    pub fn unlink(&self, path: &RelPath) -> Result<(), FsError> {
+        Ok(std::fs::remove_file(self.abs(path)).or_code()?)
     }
 
-    pub fn rmdir(&self, p: &RelPath) -> Result<(), FsError> {
-        Ok(std::fs::remove_dir(self.abs(p)).or_code()?)
+    pub fn rmdir(&self, path: &RelPath) -> Result<(), FsError> {
+        Ok(std::fs::remove_dir(self.abs(path)).or_code()?)
     }
 
     pub fn rename(&self, from: &RelPath, to: &RelPath, replace: bool) -> Result<(), FsError> {
@@ -175,12 +175,12 @@ impl Overlay {
 
     pub fn setattr(
         &self,
-        p: &RelPath,
+        path: &RelPath,
         size: Option<u64>,
         mtime: Option<SystemTime>,
         _mode: Option<u32>,
     ) -> Result<Attr, FsError> {
-        let full = self.abs(p);
+        let full = self.abs(path);
         if let Some(size) = size {
             let f = File::options().write(true).open(&full).or_code()?;
             f.set_len(size).or_code()?;

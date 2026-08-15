@@ -336,8 +336,8 @@ pub fn response(unique: u64, error: i32, payload: &[u8]) -> Vec<u8> {
 }
 
 /// Round an entry size up to the 8-byte dirent alignment.
-pub fn dirent_align(x: usize) -> usize {
-    (x + 7) & !7
+pub fn dirent_align(size: usize) -> usize {
+    (size + 7) & !7
 }
 
 pub fn dirent_size(namelen: usize) -> usize {
