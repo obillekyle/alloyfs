@@ -1,7 +1,7 @@
 //! Client/agent configuration: YAML mount config, size parsing, default
 //! paths. CLI flags always override file values.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use alloyfs_agent::AgentConfig;
 
@@ -183,30 +183,68 @@ exports: {}
 #      auto_cache_max: 2M
 ";
 
+/// Names an auto-discovered config may have, most preferred first. JSON is
+/// accepted because YAML parses it — see `AgentConfig::from_path`.
+const CONFIG_NAMES: &[&str] = &["alloyfs.yml", "alloyfs.yaml", "alloyfs.json"];
+
+/// The per-user config keeps its own name: `~/.alloyfs/alloyfs.yml` would
+/// stutter, and this file predates the discovered ones.
+const HOME_CONFIG_NAMES: &[&str] = &["config.yml", "config.yaml", "config.json"];
+
+/// First of `names` that exists in `dir`. The order of `names` is the
+/// preference order, so this is where "`.yml` beats `.json`" is decided.
+fn first_existing(dir: &Path, names: &[&str]) -> Option<PathBuf> {
+    names
+        .iter()
+        .map(|name| dir.join(name))
+        .find(|candidate| candidate.is_file())
+}
+
 /// The config to use when `--config` was not given.
 ///
-/// Order: an `alloyfs.yml` beside the executable (portable install) wins,
-/// then `~/.alloyfs/config.yml`, then the pre-layout locations. If nothing
-/// exists at all, the home config is CREATED from a commented template and
-/// returned — a first run should leave you with a file to edit, not an
+/// Order:
+///
+/// 1. `./alloyfs.{yml,yaml,json}` — the directory you are standing in, which
+///    is what `alloyfs init` writes. This is the same convention as cargo,
+///    npm and docker compose: a tool invoked inside a project reads that
+///    project's config.
+/// 2. The same names beside the executable, for a portable install where the
+///    binary and its config travel together.
+/// 3. `~/.alloyfs/config.{yml,yaml,json}` — the per-user default.
+/// 4. Pre-layout locations, for installs predating the current layout.
+///
+/// If nothing exists anywhere, the home config is CREATED from a commented
+/// template and returned: a first run should leave you a file to edit, not an
 /// error telling you to invent one.
+///
+/// The working directory is checked FIRST, above the executable's own folder.
+/// Standing in a directory is the most deliberate signal available about which
+/// config was meant — and the alternative surprises worse, by having a
+/// portable binary silently ignore the config sitting right next to you.
+/// Whichever is chosen is logged, because "which config is this agent
+/// actually serving" should never need guessing.
 pub fn default_config_path() -> Option<PathBuf> {
-    // Portable override: next to the binary.
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            for name in ["alloyfs.yml", "alloyfs.yaml"] {
-                let candidate = dir.join(name);
-                if candidate.is_file() {
-                    tracing::info!(path = %candidate.display(), "using the config beside the executable");
-                    return Some(candidate);
-                }
-            }
-        }
+    if let Some(found) = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| first_existing(&cwd, CONFIG_NAMES))
+    {
+        tracing::info!(path = %found.display(), "using the config in the current directory");
+        return Some(found);
+    }
+
+    // Portable install: next to the binary.
+    if let Some(found) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().and_then(|dir| first_existing(dir, CONFIG_NAMES)))
+    {
+        tracing::info!(path = %found.display(), "using the config beside the executable");
+        return Some(found);
     }
 
     let home_config = app_dir().join("config.yml");
-    if home_config.is_file() {
-        return Some(home_config);
+    if let Some(found) = first_existing(&app_dir(), HOME_CONFIG_NAMES) {
+        tracing::info!(path = %found.display(), "using the per-user config");
+        return Some(found);
     }
 
     // Pre-layout locations, so an existing install keeps working. This
@@ -281,4 +319,84 @@ pub fn load_agent_config(config: Option<PathBuf>, inline_exports: &[String]) -> 
         );
     }
     Ok(cfg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The order within one directory. Pinned because a reorder would be
+    /// SILENT: every candidate parses, so picking the wrong one does not fail,
+    /// it just serves whatever the other file said.
+    #[test]
+    fn yaml_is_preferred_over_json_in_one_directory() {
+        let dir = tempfile::TempDir::new().unwrap();
+        for name in CONFIG_NAMES.iter().rev() {
+            std::fs::write(dir.path().join(name), "exports: {}\n").unwrap();
+            // Each write adds a *more* preferred name, so the answer must move.
+            assert_eq!(
+                first_existing(dir.path(), CONFIG_NAMES).unwrap(),
+                dir.path().join(name)
+            );
+        }
+    }
+
+    /// `default_config_path` cannot be tested directly — it reads the process's
+    /// working directory and `$HOME`, both global. What it composes can be:
+    /// this asserts the two name lists it searches, so dropping `.json` or
+    /// renaming the per-user file is a test failure rather than a support
+    /// question.
+    #[test]
+    fn the_searched_names_are_the_documented_ones() {
+        assert_eq!(CONFIG_NAMES, ["alloyfs.yml", "alloyfs.yaml", "alloyfs.json"]);
+        assert_eq!(HOME_CONFIG_NAMES, ["config.yml", "config.yaml", "config.json"]);
+    }
+
+    #[test]
+    fn an_empty_directory_yields_nothing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        assert!(first_existing(dir.path(), CONFIG_NAMES).is_none());
+        // A directory named like a config is not a config.
+        std::fs::create_dir(dir.path().join("alloyfs.yml")).unwrap();
+        assert!(first_existing(dir.path(), CONFIG_NAMES).is_none());
+    }
+
+    /// JSON has to actually load, not merely be listed. YAML 1.2 is a superset
+    /// of JSON, which is why there is no second parser — this asserts the
+    /// assumption rather than trusting it.
+    #[test]
+    fn a_json_config_parses_through_the_yaml_loader() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("alloyfs.json");
+        std::fs::write(
+            &path,
+            r#"{"agent":{"tcp_listen":"127.0.0.1:7440"},
+                "exports":{"docs":{"path":"/srv/docs","read_only":true}}}"#,
+        )
+        .unwrap();
+
+        let cfg = alloyfs_agent::AgentConfig::from_path(&path).expect("json config loads");
+        let export = cfg.exports.get("docs").expect("export present");
+        assert_eq!(export.path, std::path::PathBuf::from("/srv/docs"));
+        assert!(export.read_only);
+        assert_eq!(cfg.agent.tcp_listen.as_deref(), Some("127.0.0.1:7440"));
+    }
+
+    /// The same document in both dialects has to produce the same config —
+    /// otherwise "JSON is just YAML" is a claim rather than a fact.
+    #[test]
+    fn json_and_yaml_agree() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let j = dir.path().join("a.json");
+        let y = dir.path().join("a.yml");
+        std::fs::write(&j, r#"{"exports":{"p":{"path":"/srv/p"}}}"#).unwrap();
+        std::fs::write(&y, "exports:\n  p:\n    path: /srv/p\n").unwrap();
+
+        let from_json = alloyfs_agent::AgentConfig::from_path(&j).unwrap();
+        let from_yaml = alloyfs_agent::AgentConfig::from_path(&y).unwrap();
+        assert_eq!(
+            from_json.exports.get("p").unwrap().path,
+            from_yaml.exports.get("p").unwrap().path
+        );
+    }
 }

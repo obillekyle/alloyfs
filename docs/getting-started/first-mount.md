@@ -10,7 +10,7 @@ On the machine with the files, in the folder you want to share:
 ```bash
 cd ~/projects
 alloyfs init
-alloyfs serve --config alloyfs.yml
+alloyfs serve
 ```
 
 `alloyfs init` writes an `alloyfs.yml` describing that directory — export name

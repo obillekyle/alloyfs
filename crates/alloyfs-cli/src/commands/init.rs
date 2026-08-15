@@ -62,13 +62,12 @@ fn render(name: &str, path: &Path) -> String {
         "\
 # AlloyFS configuration, written by `alloyfs init`.
 #
-# Serve it:      alloyfs serve --config alloyfs.yml
+# Serve it:      alloyfs serve        (run from this directory)
 # Mount it:      alloyfs mount tcp://127.0.0.1:7440/{name} /some/mountpoint
 #
-# This file is NOT picked up automatically from the current directory — that
-# would mean running alloyfs somewhere unexpected could serve whatever a
-# config there said to. Pass --config, or move it next to the binary, or to
-# ~/.alloyfs/config.yml.
+# `alloyfs serve` picks this up automatically when run from here, the way
+# cargo finds Cargo.toml. Elsewhere, pass --config, or keep the per-user one
+# at ~/.alloyfs/config.yml. The agent logs which config it loaded on startup.
 
 agent:
   # A non-loopback address REQUIRES tcp_token; the agent refuses to start
@@ -128,10 +127,11 @@ pub fn run(dir: Option<PathBuf>, name: Option<String>, global: bool, force: bool
     println!("  export {name} -> {}", config_path(&dir));
     println!();
     if global {
-        println!("`alloyfs serve` will find it automatically.");
+        println!("`alloyfs serve` will find it from anywhere.");
     } else {
         println!("Serve it with:");
-        println!("  alloyfs serve --config {}", target.display());
+        println!("  alloyfs serve            (from this directory)");
+        println!("  alloyfs serve --config {}   (from anywhere)", target.display());
     }
     Ok(())
 }

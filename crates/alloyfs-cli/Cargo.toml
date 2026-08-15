@@ -40,3 +40,6 @@ alloyfs-mount-winfsp.workspace = true
 # gnullvm-aware). Target-gated so non-Windows builds never compile winfsp.
 [target.'cfg(windows)'.build-dependencies]
 winfsp.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

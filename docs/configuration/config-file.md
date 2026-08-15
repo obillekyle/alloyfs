@@ -16,21 +16,28 @@ leaving you to write one. See [Your first mount](#/getting-started/first-mount).
 
 `alloyfs serve` looks, in order:
 
-1. **`alloyfs.yml` beside the executable** — a portable install (binary plus
-   config in one folder, or on a stick) works without touching the home
-   directory, and wins over everything else.
-2. **`~/.alloyfs/config.yml`** (`%USERPROFILE%\.alloyfs\config.yml`) — the
-   normal location. If nothing exists anywhere, `serve` writes a commented
-   template here, so a first run leaves you a file to edit rather than an error
-   telling you to invent one.
+1. **`./alloyfs.yml`**, `./alloyfs.yaml`, `./alloyfs.json` — the directory you
+   are standing in. This is what `alloyfs init` writes, and the same convention
+   cargo, npm and docker compose use: a tool run inside a project reads that
+   project's config.
+2. **The same names beside the executable** — a portable install, where the
+   binary and its config travel together.
+3. **`~/.alloyfs/config.{yml,yaml,json}`** (`%USERPROFILE%\.alloyfs\` on
+   Windows) — the per-user default.
 
-`--config <PATH>` overrides both, and is how you use a config that `init` wrote
-into a project directory.
+If nothing exists anywhere, `serve` writes a commented template to the per-user
+location, so a first run leaves you a file to edit rather than an error telling
+you to invent one.
 
-**The working directory is not searched.** A config sitting in whatever folder
-you happen to be in could otherwise decide what a `serve` publishes, which is
-not something the current directory should get a vote on. That is why
-`init` prints the `--config` line rather than assuming.
+`--config <PATH>` skips the search entirely.
+
+**The agent logs which config it loaded**, every start. "Which config is this
+agent actually serving" should never need guessing — especially now that the
+answer depends on where you ran it from.
+
+JSON is accepted because the YAML parser reads it: YAML 1.2 is a superset of
+JSON, so a `.json` config is just a config, with no second parser and no second
+set of quirks to learn.
 
 **Mounting needs no config at all.** `alloyfs mount` takes everything from
 flags; a mount config (a different, smaller schema — see below) is optional and

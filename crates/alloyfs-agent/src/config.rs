@@ -73,14 +73,18 @@ impl AgentConfig {
         Ok(toml::from_str(text)?)
     }
 
-    /// Parse by extension: .yml/.yaml → YAML (preferred), .toml → TOML
+    /// Parse by extension: .yml/.yaml/.json → YAML (preferred), .toml → TOML
     /// (back-compat), anything else tries YAML then TOML.
+    ///
+    /// JSON goes through the YAML parser deliberately rather than pulling in a
+    /// second one: YAML 1.2 is a superset of JSON, so every valid JSON config
+    /// already parses, and one parser means one set of behaviours to know.
     pub fn from_path(path: &std::path::Path) -> anyhow::Result<Self> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("reading config {}: {e}", path.display()))?;
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
         match ext.to_ascii_lowercase().as_str() {
-            "yml" | "yaml" => Ok(serde_yaml::from_str(&text)?),
+            "yml" | "yaml" | "json" => Ok(serde_yaml::from_str(&text)?),
             "toml" => Self::from_toml(&text),
             _ => serde_yaml::from_str(&text).or_else(|ye| {
                 Self::from_toml(&text)

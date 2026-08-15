@@ -9,7 +9,7 @@ deliver remote changes as genuine `inotify` events.
 
 ```bash
 # on the machine with the files
-alloyfs init && alloyfs serve --config alloyfs.yml
+alloyfs init && alloyfs serve
 
 # on another machine
 alloyfs mount ssh://host/projects /mnt/projects     # Linux
@@ -51,7 +51,7 @@ Then, in the folder you want to share:
 
 ```bash
 alloyfs init
-alloyfs serve --config alloyfs.yml
+alloyfs serve
 ```
 
 `alloyfs init` writes the config for that directory, so there is nothing to
