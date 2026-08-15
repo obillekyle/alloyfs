@@ -85,6 +85,13 @@ jobs:
 
       # Every `[[bin]]` the workspace declares, asked of cargo rather than
       # written down. `--no-deps` keeps it to this workspace's own crates.
+      #
+      # **`tr -d '\r'` is not decoration.** On a Windows runner this is Git
+      # Bash, jq writes CRLF, and `read -r` keeps the carriage return — so the
+      # name comes through as `alloyfs\r` and the copy fails with
+      # `cannot stat 'target/release/alloyfs'$'\r''.exe'`. Same family as the
+      # `alloyfs-0.1.0\r` directory name packaging/install.sh already guards
+      # against.
       - name: Collect the binaries
         shell: bash
         run: |
@@ -93,6 +100,7 @@ jobs:
           [ "${{ runner.os }}" = "Windows" ] && ext=".exe"
           cargo metadata --format-version 1 --no-deps \
             | jq -r '.packages[].targets[] | select(.kind[] == "bin") | .name' \
+            | tr -d '\r' \
             | while read -r bin; do
                 cp "target/release/$bin$ext" "dist/$bin-${{ matrix.target }}$ext"
               done
