@@ -7,7 +7,7 @@ use alloyfs_transport::{stdio, tcp, RequestHandler};
 use crate::config::load_agent_config;
 
 pub async fn run(
-    addr: String,
+    addr: Option<String>,
     stdio_mode: bool,
     config: Option<PathBuf>,
     exports: Vec<String>,
@@ -53,7 +53,12 @@ pub async fn run(
                 }
             });
         }
-        let listen = cfg.agent.tcp_listen.unwrap_or(addr);
+        // Documented precedence: CLI flag, then config, then the built-in
+        // default. `--tcp` used to lose to the config because clap always
+        // supplied a value, so an explicit flag was silently ignored.
+        let listen = addr
+            .or(cfg.agent.tcp_listen)
+            .unwrap_or_else(|| "127.0.0.1:7440".to_string());
         let token = cfg.agent.tcp_token.clone();
         if token.is_none() && !alloyfs_common::is_loopback_listen(&listen) {
             anyhow::bail!(

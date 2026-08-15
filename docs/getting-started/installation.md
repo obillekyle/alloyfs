@@ -1,31 +1,69 @@
 # Installation
 
-AlloyFS is a single binary. It needs a filesystem driver on the machine doing
-the *mounting*; the machine doing the *serving* needs nothing extra.
+## The one-liner
 
-## Windows
+**Windows**
 
-Install [WinFsp](https://winfsp.dev) (the standard installer is enough — the
-Developer/SDK feature is only needed to build from source), then drop
-`alloyfs.exe` somewhere on your `PATH`.
+```powershell
+irm alloy.okyle.dev/install.ps1 | iex
+```
 
-## Linux
+**Linux**
 
-FUSE is already present on any desktop distribution. If `/dev/fuse` is missing:
+```bash
+curl -fsSL https://alloy.okyle.dev/install.sh | sh
+```
+
+Both fetch the binary for your platform from the latest release, check it really
+is an executable rather than an error page, put it somewhere sensible, and add
+it to your `PATH`. Neither needs root.
+
+| Variable | Effect |
+|---|---|
+| `ALLOYFS_VERSION` | Install a specific tag (`v0.1.1`) instead of the latest |
+| `ALLOYFS_INSTALL` | Install somewhere other than the default |
+| `GITHUB_TOKEN` | Optional; raises the GitHub API rate limit |
+
+Defaults are `%LOCALAPPDATA%\Programs\alloyfs` and `~/.local/bin`.
+
+Your configuration lives in `~/.alloyfs`, deliberately somewhere else — so
+reinstalling or removing AlloyFS never touches the [overlay](#/guides/excludes)
+or your [sync baselines](#/guides/sync-mode).
+
+## Staying up to date
+
+```bash
+alloyfs update              # the latest release
+alloyfs update v0.1.1       # pin, or roll back
+alloyfs update --dry-run    # print the command, run nothing
+```
+
+`update` re-runs the installer rather than replacing the binary itself. That
+keeps one implementation of "download, verify, put on `PATH`" instead of two
+that drift — and a filesystem binary does not need a TLS stack linked into it
+for the sake of one rarely-used command.
+
+## The driver each platform needs
+
+The machine doing the **serving** needs nothing beyond the binary. The machine
+doing the **mounting** needs a filesystem driver.
+
+### Windows
+
+Install [WinFsp](https://winfsp.dev). The standard installer is enough — the
+Developer/SDK feature is only needed to build AlloyFS from source. The installer
+warns you if it is missing.
+
+### Linux
+
+FUSE is present on any desktop distribution. If `/dev/fuse` is missing:
 
 ```bash
 sudo apt install fuse3
 ```
 
-Then place `alloyfs` on your `PATH`, or use the installer:
-
-```bash
-sudo packaging/install.sh
-```
-
-See [Installing on Linux](#/deployment/linux) for what that script touches, and
-[The Linux kernel module](#/backends/kernel-module) for the optional driver that
-makes `inotify` work for remote changes.
+The optional [kernel module](#/backends/kernel-module) is separate, and only
+worth installing if you need `inotify` to fire for changes other machines make.
 
 ## Building from source
 
@@ -33,13 +71,18 @@ makes `inotify` work for remote changes.
 cargo build --release
 ```
 
-The workspace builds on Windows (MSVC or the gnullvm toolchain) and Linux.
-`scripts/verify.sh` runs formatting, clippy with warnings denied, the whole
-test suite, and a release build — the same gate CI applies.
+The workspace builds on Windows (MSVC or gnullvm) and Linux. `scripts/verify.sh`
+runs formatting, clippy with warnings denied, the full test suite and a release
+build — the same gate CI applies.
 
-## Checking it works
+For a system-wide Linux install with the service and optionally the kernel
+module, see [Installing on Linux](#/deployment/linux).
+
+## Checking it worked
 
 ```bash
 alloyfs --version
-alloyfs ping tcp://127.0.0.1:7440
+alloyfs --help
 ```
+
+Then [make your first mount](#/getting-started/first-mount).

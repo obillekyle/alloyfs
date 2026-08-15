@@ -15,6 +15,8 @@ alloyfs <COMMAND>
 | `ping` | Round-trip time to an agent |
 | `bench` | Timed pipelined read, no mount involved |
 | `stress` | Concurrent load generator |
+| `init` | Write a config for a directory, ready to serve |
+| `update` | Update in place by re-running the installer |
 
 ## serve
 
@@ -27,6 +29,10 @@ not start the HTTP API; that belongs to the long-running agent, not to a
 per-mount transport.
 
 `--export NAME=PATH` publishes a folder without a config file, for a quick test.
+
+`--tcp` overrides `agent.tcp_listen`; with neither, the default is
+`127.0.0.1:7440`. A non-loopback address requires a token — see
+[TCP authentication](#/configuration/auth).
 
 ## mount
 
@@ -51,6 +57,38 @@ alloyfs events <URL> [--since SEQ]
 ```
 
 One JSON object per line. `--since` replays from a sequence number.
+
+## init
+
+```bash
+alloyfs init                 # ./alloyfs.yml exporting the current directory
+alloyfs init /srv/data       # export somewhere else
+alloyfs init --name docs     # choose the export name
+alloyfs init --global        # write ~/.alloyfs/config.yml instead
+alloyfs init --force         # overwrite an existing file
+```
+
+The export name is derived from the directory name, lowercased and reduced to
+`[a-z0-9-_]` — names end up in URLs and in on-disk paths, so anything that
+could change how either parses becomes a dash.
+
+A config in the current directory is **not** picked up automatically. Pass
+`--config`, or move it next to the binary, or use `--global`. Auto-loading from
+the working directory would mean running `alloyfs` in a directory someone else
+controls could serve whatever a config there said to.
+
+## update
+
+```bash
+alloyfs update              # the latest release
+alloyfs update v0.1.1       # pin, or roll back
+alloyfs update --dry-run    # print the command, run nothing
+```
+
+Re-runs the installer from `alloy.okyle.dev` rather than replacing the binary
+itself — one implementation of download-verify-install instead of two. On
+Windows the installer renames the running executable aside before writing the
+new one, which is the only way to replace a binary that is currently executing.
 
 ## bench and ping
 

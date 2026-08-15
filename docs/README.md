@@ -37,6 +37,16 @@ write is on the server. If you want files on local disk instead, that is
 Not a database host. Whole-file advisory locks only; see
 [Limitations](#/reference/limitations).
 
+## Install
+
+```powershell
+irm alloy.okyle.dev/install.ps1 | iex        # Windows
+```
+
+```bash
+curl -fsSL https://alloy.okyle.dev/install.sh | sh   # Linux
+```
+
 ## Where to go next
 
 - [Installation](#/getting-started/installation) — get the binary

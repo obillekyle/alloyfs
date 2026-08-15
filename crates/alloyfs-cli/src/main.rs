@@ -20,9 +20,12 @@ struct Cli {
 enum Command {
     /// Run the agent, serving exports to clients.
     Serve {
-        /// TCP listen address, e.g. 127.0.0.1:7440
-        #[arg(long, default_value = "127.0.0.1:7440")]
-        tcp: String,
+        /// TCP listen address. Defaults to agent.tcp_listen from the config,
+        /// then 127.0.0.1:7440. No clap default, so that passing this flag can
+        /// actually override the config — with one, every run would look like
+        /// an explicit choice and the config could never win.
+        #[arg(long)]
+        tcp: Option<String>,
         /// Serve one session over stdin/stdout instead of TCP (what
         /// `mount ssh://...` runs on the remote side).
         #[arg(long)]
@@ -165,6 +168,28 @@ enum Command {
         #[arg(long)]
         token: Option<String>,
     },
+    /// Write a config for a directory, ready to serve.
+    Init {
+        /// Directory to export (default: the current one).
+        dir: Option<PathBuf>,
+        /// Export name (default: derived from the directory name).
+        #[arg(long)]
+        name: Option<String>,
+        /// Write ~/.alloyfs/config.yml instead of ./alloyfs.yml.
+        #[arg(long)]
+        global: bool,
+        /// Overwrite an existing file.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Update AlloyFS in place by re-running the official installer.
+    Update {
+        /// `stable` (the default), or a tag like `v0.1.1` to pin or roll back.
+        channel: Option<String>,
+        /// Print the command that would run, and stop.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -275,5 +300,12 @@ async fn main() -> anyhow::Result<()> {
             remote_cmd,
             token,
         } => commands::diag::bench(url, path, depth, remote_cmd, token).await,
+        Command::Init {
+            dir,
+            name,
+            global,
+            force,
+        } => commands::init::run(dir, name, global, force),
+        Command::Update { channel, dry_run } => commands::update::run(channel, dry_run),
     }
 }

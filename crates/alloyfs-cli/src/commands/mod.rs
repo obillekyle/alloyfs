@@ -1,5 +1,7 @@
 pub mod cache;
 pub mod diag;
+pub mod init;
 pub mod mount;
 pub mod serve;
 pub mod sync;
+pub mod update;
