@@ -1,0 +1,105 @@
+name: Publish
+
+# What a tag produces: the executables, attached to the GitHub release.
+#
+# It fires on a tag rather than on a push — version.yml creates the tag, and a
+# human can also create one by hand.
+#
+# **Nothing here touches a registry.** `publish` in cutver.yml does not name
+# one, so a tag builds binaries and stops. Add `registry` to that list to
+# publish as well — and read what it costs first: crates.io reserves a crate
+# name on its first publish, permanently, for every member of the workspace.
+#
+# **A tag pushed by version.yml cannot start this workflow.** GitHub refuses to
+# create runs from events made with the default GITHUB_TOKEN, to prevent
+# recursion, so `push: tags` only ever fires for a tag a human pushes.
+# `workflow_dispatch` is one of the two documented exemptions.
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to publish, e.g. v1.2.3'
+        required: true
+        type: string
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+# One name for the tag whichever trigger fired, at workflow level so every job
+# below reads the same one. On a tag push `ref_name` is the tag; on a dispatch
+# it is the branch, so the input has to win.
+env:
+  TAG: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  artifacts:
+    name: ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu }
+          - { os: macos-latest,   target: aarch64-apple-darwin }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc }
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo build --workspace --release
+
+      # Every `[[bin]]` the workspace declares, asked of cargo rather than
+      # written down. `--no-deps` keeps it to this workspace's own crates.
+      - name: Collect the binaries
+        shell: bash
+        run: |
+          mkdir -p dist
+          ext=""
+          [ "${{ runner.os }}" = "Windows" ] && ext=".exe"
+          cargo metadata --format-version 1 --no-deps \
+            | jq -r '.packages[].targets[] | select(.kind[] == "bin") | .name' \
+            | while read -r bin; do
+                cp "target/release/$bin$ext" "dist/$bin-${{ matrix.target }}$ext"
+              done
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+
+  release:
+    needs: artifacts
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: staged
+          merge-multiple: true
+
+      - name: Attach them to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          case "$TAG" in
+            *-*) pre=--prerelease ;;
+            *)   pre= ;;
+          esac
+          gh release create "$TAG" --repo "$REPO" --title "$TAG" --notes "" $pre \
+            || echo "release $TAG already exists — uploading into it"
+          gh release upload "$TAG" --repo "$REPO" --clobber staged/*
