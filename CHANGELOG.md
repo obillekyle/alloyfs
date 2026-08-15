@@ -6,6 +6,8 @@ outside the repository.
 
 ## [Unreleased]
 
+## [0.1.1] — 2026-08-15
+
 ## [0.1.0] — 2026-08-15
 
 First release. The version was computed from the commit history rather than
