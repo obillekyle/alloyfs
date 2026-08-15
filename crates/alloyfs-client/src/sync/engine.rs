@@ -67,7 +67,7 @@ pub struct SyncEngine {
     manifest_path: PathBuf,
     suppress: DashMap<String, Suppress>,
     policy: ConflictPolicy,
-    dialer: Option<crate::remote_fs::Dialer>,
+    dialer: Option<crate::options::Dialer>,
     conn_epoch: tokio::sync::watch::Sender<u64>,
     op_tx: mpsc::UnboundedSender<Op>,
     pub stats: SyncStats,
@@ -432,7 +432,7 @@ impl SyncEngine {
         }
         if stat.kind == EntryKind::Dir {
             // Suppress every child the recursive delete will touch.
-            if let Ok(snap) = snapshot_local(&full, &ExcludeSet::compile(&[], false).unwrap()) {
+            if let Ok(snap) = snapshot_local(&full, &ExcludeSet::default()) {
                 for child in snap.keys() {
                     self.expect(&format!("{rel}/{child}"), Expect::Absent);
                 }
