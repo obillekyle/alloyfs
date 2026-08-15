@@ -6,6 +6,8 @@ outside the repository.
 
 ## [Unreleased]
 
+## [0.1.0] — 2026-08-15
+
 First release. The version was computed from the commit history rather than
 chosen: five `feat` commits and eight `fix`/`perf` ones since the first commit,
 no breaking markers anywhere, so a minor from a `0.0.0` baseline.
