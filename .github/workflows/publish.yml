@@ -41,12 +41,19 @@ env:
 jobs:
   artifacts:
     name: ${{ matrix.target }}
+    # **Windows and Linux, the two platforms this actually targets.**
+    #
+    # `cutver init` scaffolds macOS too and it was left in for exactly one run,
+    # which failed: `alloyfs-cli` pulls `alloyfs-mount-fuse` under
+    # `cfg(unix)` — and `cfg(unix)` is true on macOS — so `fuser` looks for
+    # libfuse through pkg-config and a macOS runner has none. Supporting it
+    # would mean installing macFUSE in CI and meaning it as a platform; the
+    # README lists WinFsp and Linux and says nothing about macOS.
     strategy:
       fail-fast: false
       matrix:
         include:
           - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu }
-          - { os: macos-latest,   target: aarch64-apple-darwin }
           - { os: windows-latest, target: x86_64-pc-windows-msvc }
     runs-on: ${{ matrix.os }}
 
@@ -57,6 +64,23 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
+      # The same two prerequisites ci.yml installs, and for the same reasons.
+      # A release build that skipped them would fail here rather than in CI —
+      # after the tag is already public, which is the worst place to find out.
+      - name: Install WinFsp (with SDK)
+        if: runner.os == 'Windows'
+        run: |
+          Invoke-WebRequest -Uri "https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi" -OutFile winfsp.msi
+          Start-Process msiexec -ArgumentList '/i','winfsp.msi','/qn','INSTALLLEVEL=1000' -Wait
+          Remove-Item winfsp.msi
+
+      - name: Point bindgen at preinstalled LLVM
+        if: runner.os == 'Windows'
+        run: echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -Append $env:GITHUB_ENV
+
+      # `--workspace` rather than `-p alloyfs-cli`, matching ci.yml: it exercises
+      # the pinned release profile across every crate, and `lto = false` there is
+      # load-bearing (see the comment in the workspace Cargo.toml).
       - run: cargo build --workspace --release
 
       # Every `[[bin]]` the workspace declares, asked of cargo rather than
