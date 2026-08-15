@@ -9,7 +9,8 @@ use std::sync::Arc;
 
 use alloyfs_proto::{EventKind, FsEvent, Request, Response};
 
-use crate::remote_fs::{FsError, RemoteFs};
+use crate::error::FsError;
+use crate::remote_fs::RemoteFs;
 
 impl RemoteFs {
     /// Overlay filter: the server may legitimately emit events for paths this

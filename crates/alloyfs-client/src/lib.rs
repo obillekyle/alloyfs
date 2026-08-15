@@ -7,14 +7,19 @@
 //! nothing in here knows what platform it's on.
 
 mod autocache;
+mod error;
 mod events;
 mod inode;
+mod options;
 mod overlay;
 mod readahead;
 mod remote_fs;
+mod symlink;
 pub mod sync;
 mod walker;
 
+pub use error::{posix_errno, FsError};
 pub use inode::{InodeTable, ROOT_INO};
-pub use remote_fs::{posix_errno, ClientOptions, Dialer, FsError, RemoteFs};
+pub use options::{ClientOptions, Dialer};
+pub use remote_fs::RemoteFs;
 pub use sync::{ConflictPolicy, SyncEngine, SyncOptions, SyncStats};

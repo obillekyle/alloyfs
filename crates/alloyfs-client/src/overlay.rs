@@ -11,7 +11,7 @@ use std::time::SystemTime;
 use alloyfs_proto::{Attr, ErrorCode, OpenFlags, RelPath};
 use dashmap::DashMap;
 
-use crate::remote_fs::FsError;
+use crate::error::FsError;
 use alloyfs_common::ExcludeSet;
 use alloyfs_common::{attr_from_metadata, read_fully, write_fully, OrCode};
 

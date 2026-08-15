@@ -20,7 +20,7 @@ pub use engine::SyncEngine;
 
 use std::path::PathBuf;
 
-use crate::remote_fs::Dialer;
+use crate::options::Dialer;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConflictPolicy {

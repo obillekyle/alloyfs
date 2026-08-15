@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -8,178 +7,13 @@ use alloyfs_proto::{Attr, ErrorCode, OpenFlags, RelPath, Request, Response, DATA
 use alloyfs_transport::{MuxConnection, TransportError};
 use bytes::Bytes;
 use dashmap::DashMap;
-use futures::future::BoxFuture;
 
 use crate::autocache::AutoCache;
+use crate::error::FsError;
+use crate::options::{ClientOptions, Dialer};
 use crate::overlay::{Overlay, OVERLAY_FH_BIT};
 use crate::readahead::ReadAhead;
-
-#[derive(Debug, thiserror::Error)]
-pub enum FsError {
-    /// The server answered with an error — maps 1:1 onto an errno/NTSTATUS.
-    #[error(transparent)]
-    Remote(#[from] ErrorCode),
-    /// The connection itself failed — surfaces as EIO on the mount.
-    #[error("transport: {0}")]
-    Transport(#[from] TransportError),
-}
-
-/// Linux errno for a filesystem error, shared by both Linux mount backends.
-///
-/// FUSE and the kernel-module daemon are two front-ends onto one platform, and
-/// each used to carry its own copy of this table. They had already drifted:
-/// the kernel backend mapped `NoSuchExport` to ENOENT while FUSE let it fall
-/// through to EIO, and only FUSE had tests. Unified on ENOENT — "that export
-/// does not exist" is a miss, not a device failure.
-///
-/// WinFsp keeps its own mapping, and correctly so: NTSTATUS is a genuinely
-/// different target, not a second spelling of the same one.
-pub fn posix_errno(err: &FsError) -> i32 {
-    // Values rather than libc constants: this crate compiles on Windows too,
-    // and the kernel daemon's abi module already spells them out for the same
-    // reason.
-    match err {
-        FsError::Remote(code) => match code {
-            ErrorCode::NotFound | ErrorCode::NoSuchExport => 2, // ENOENT
-            ErrorCode::PermissionDenied => 13,                  // EACCES
-            ErrorCode::AlreadyExists => 17,                     // EEXIST
-            ErrorCode::NotADirectory => 20,                     // ENOTDIR
-            ErrorCode::IsADirectory => 21,                      // EISDIR
-            ErrorCode::NotEmpty => 39,                          // ENOTEMPTY
-            ErrorCode::InvalidPath => 22,                       // EINVAL
-            ErrorCode::BadHandle => 9,                          // EBADF
-            ErrorCode::ReadOnly => 30,                          // EROFS
-            ErrorCode::WouldBlock => 11,                        // EAGAIN
-            ErrorCode::CrossDevice => 18,                       // EXDEV
-            // An old server, not a broken disk.
-            ErrorCode::VersionMismatch => 95, // EOPNOTSUPP
-            _ => 5,                           // EIO
-        },
-        // The operation may or may not have happened; EIO is the honest answer.
-        FsError::Transport(_) => 5,
-    }
-}
-
-/// Rewrite `target` relative to `link_dir` when it points back into the mount
-/// rooted at `mount_root`; otherwise return it unchanged.
-///
-/// A free function so it can be tested without standing up a connection — the
-/// version this replaced lived in the WinFsp backend and had no direct tests
-/// at all.
-fn localize_symlink_target(mount_root: &str, target: &str, link_dir: &RelPath) -> String {
-    let norm = target.replace('\\', "/");
-    // Case-insensitive: Windows drive letters and paths are, and a missed
-    // match here just means no rewrite — never a wrong one.
-    let prefix = format!("{}/", mount_root.replace('\\', "/").trim_end_matches('/'));
-    if !norm.to_uppercase().starts_with(&prefix.to_uppercase()) {
-        return target.to_string();
-    }
-    let rest = norm[prefix.len()..].trim_start_matches('/');
-
-    // Walk up out of the link's directory, then back down to the target; both
-    // are export-relative, so the shared prefix cancels.
-    let from: Vec<&str> = if link_dir.is_root() {
-        Vec::new()
-    } else {
-        link_dir.0.split('/').collect()
-    };
-    let to: Vec<&str> = if rest.is_empty() {
-        Vec::new()
-    } else {
-        rest.split('/').collect()
-    };
-    let shared = from
-        .iter()
-        .zip(to.iter())
-        .take_while(|(a, b)| a.eq_ignore_ascii_case(b))
-        .count();
-    let mut out: Vec<&str> = vec![".."; from.len() - shared];
-    out.extend_from_slice(&to[shared..]);
-    if out.is_empty() {
-        return ".".to_string(); // the link points at its own directory
-    }
-    out.join("/")
-}
-
-#[cfg(test)]
-mod localize_tests {
-    use super::*;
-
-    fn dir(s: &str) -> RelPath {
-        RelPath(s.to_string())
-    }
-
-    /// The case that made this necessary: PowerShell resolves a relative
-    /// target to a drive-letter-absolute one before the syscall is made.
-    #[test]
-    fn a_target_inside_the_mount_becomes_relative() {
-        assert_eq!(
-            localize_symlink_target("Y:", "Y:\\linktest\\real.txt", &dir("linktest")),
-            "real.txt"
-        );
-        assert_eq!(
-            localize_symlink_target("Y:", "Y:\\real.txt", &dir("")),
-            "real.txt"
-        );
-        // Up and back down.
-        assert_eq!(
-            localize_symlink_target("Y:", "Y:\\real.txt", &dir("sub")),
-            "../real.txt"
-        );
-        assert_eq!(
-            localize_symlink_target("Y:", "Y:\\a\\b\\t.txt", &dir("a/c")),
-            "../b/t.txt"
-        );
-    }
-
-    /// The same problem exists on Unix — `ln -s "$(pwd)/real.txt"` — which is
-    /// why this does not live in the Windows backend.
-    #[test]
-    fn a_unix_mountpoint_works_the_same_way() {
-        assert_eq!(
-            localize_symlink_target("/mnt/alloy", "/mnt/alloy/dir/real.txt", &dir("dir")),
-            "real.txt"
-        );
-        assert_eq!(
-            localize_symlink_target("/mnt/alloy/", "/mnt/alloy/real.txt", &dir("sub")),
-            "../real.txt"
-        );
-    }
-
-    /// Absolute somewhere else is left alone — the server refuses it, which is
-    /// correct, because it genuinely does leave the export.
-    #[test]
-    fn targets_outside_the_mount_are_untouched() {
-        for t in [
-            "C:\\Windows\\system32",
-            "/etc/passwd",
-            "\\\\server\\share\\x",
-            "../already-relative.txt",
-            "plain.txt",
-        ] {
-            assert_eq!(localize_symlink_target("Y:", t, &dir("sub")), t, "{t:?}");
-        }
-    }
-
-    /// A prefix that only looks like ours must not match: "Y:" should not
-    /// swallow "Y:extra" or a different drive.
-    #[test]
-    fn a_near_miss_prefix_does_not_match() {
-        assert_eq!(
-            localize_symlink_target("Y:", "Z:/real.txt", &dir("")),
-            "Z:/real.txt"
-        );
-        assert_eq!(
-            localize_symlink_target("/mnt/alloy", "/mnt/alloys/x", &dir("")),
-            "/mnt/alloys/x"
-        );
-    }
-
-    #[test]
-    fn a_link_to_its_own_directory_is_dot() {
-        assert_eq!(localize_symlink_target("Y:", "Y:\\sub", &dir("sub")), ".");
-    }
-}
+use crate::symlink::localize_symlink_target;
 
 /// Unwrap one expected Response variant; anything else is a protocol-level
 /// surprise that logs and becomes Io. Collapses the five-line match this
@@ -200,69 +34,6 @@ macro_rules! expect_resp {
 /// Event-driven invalidation is the primary freshness mechanism; this bounds
 /// staleness if the event stream hiccups.
 const ATTR_TTL: Duration = Duration::from_secs(5);
-
-/// Re-dial an equivalent connection after the current one dies. Built by the
-/// CLI from the original mount url (tcp dial or ssh re-spawn).
-pub type Dialer = Arc<dyn Fn() -> BoxFuture<'static, anyhow::Result<Arc<MuxConnection>>> + Send + Sync>;
-
-/// Per-mount client behavior: local overlay excludes + auto-download cache +
-/// optional reconnect. Default means every feature is off and RemoteFs
-/// behaves exactly as a plain single-connection client.
-#[derive(Clone)]
-pub struct ClientOptions {
-    pub excludes: Vec<String>,
-    /// Durable per-host tree: the overlay lives here and losing it loses
-    /// files that exist on no server.
-    pub data_dir: PathBuf,
-    /// Disposable per-host tree: blobs only, safe to delete at any time.
-    /// Kept separate from `data_dir` so "clear the cache" can never reach
-    /// the overlay.
-    pub cache_dir: PathBuf,
-    /// Directory name for this export within those trees.
-    pub mount_key: String,
-    /// None = no explicit choice: a server suggestion (v2+) applies, else
-    /// the fallback below. `Some(0)` is an explicit OFF that beats both.
-    pub auto_cache_max: Option<u64>,
-    pub auto_cache_budget: Option<u64>,
-    /// Used when neither the client nor the server chose a value. The
-    /// library default is off/512M; the CLI mounts pass 2M/512M.
-    pub auto_cache_max_fallback: u64,
-    pub auto_cache_budget_fallback: u64,
-    pub pins: Vec<String>,
-    pub dialer: Option<Dialer>,
-    /// Ignore the server's suggested client settings entirely.
-    pub no_server_defaults: bool,
-    /// Refuse to write over a file another machine changed since this handle
-    /// last saw it. Off by default: it trades "your editor's save failed" for
-    /// "your colleague's edit vanished", and which of those is worse depends
-    /// entirely on what the mount is for.
-    pub detect_conflicts: bool,
-    /// Where this mount appears locally ("Y:", "/mnt/alloy"). Used only to
-    /// rewrite symlink targets that point back into the mount; `None` skips
-    /// that entirely, which is right for a client with no mountpoint (sync,
-    /// the CLI diagnostics).
-    pub mount_root: Option<String>,
-}
-
-impl Default for ClientOptions {
-    fn default() -> Self {
-        Self {
-            excludes: Vec::new(),
-            data_dir: PathBuf::new(),
-            cache_dir: PathBuf::new(),
-            mount_key: String::new(),
-            auto_cache_max: None,
-            auto_cache_budget: None,
-            auto_cache_max_fallback: 0, // library default: cache off
-            auto_cache_budget_fallback: 512 * 1024 * 1024,
-            pins: Vec::new(),
-            dialer: None,
-            no_server_defaults: false,
-            detect_conflicts: false,
-            mount_root: None,
-        }
-    }
-}
 
 /// Client-side bookkeeping for one open remote handle. Keyed by the fh the
 /// KERNEL holds (stable across reconnects); `server_fh` is what the current

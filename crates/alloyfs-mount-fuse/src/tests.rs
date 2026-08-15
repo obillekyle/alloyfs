@@ -5,6 +5,12 @@
 //! view and the wire's. That is where a mistake is quiet rather than loud: a
 //! wrong errno turns "the server said no" into a filesystem that looks broken,
 //! and a wrong open flag silently drops O_APPEND or O_EXCL.
+//!
+//! The ErrorCode → errno table itself is tested in `alloyfs_client::error`,
+//! where the function lives. It was tested here for as long as this was the
+//! only backend calling it, and that outlived its usefulness: this crate is
+//! `#![cfg(unix)]`, so a Windows `cargo test` compiled it to nothing and the
+//! table went unchecked until CI. Only the wrapping is this crate's business.
 
 use super::*;
 use alloyfs_proto::ErrorCode;
@@ -16,56 +22,20 @@ fn kinds_map_to_the_kernel_file_types() {
     assert_eq!(file_type(FileKind::Symlink), FileType::Symlink);
 }
 
-/// Every wire error must reach userspace as the errno an application expects
-/// to branch on. `EIO` for everything would compile and pass a smoke test,
-/// and would make `mkdir` on an existing directory indistinguishable from a
-/// disk failure.
+/// `Errno::from_i32` is the only thing this crate adds to the shared table, so
+/// it is the only thing worth asserting here: one mapped code and one
+/// fall-through, to catch the wrapper being wired to the wrong function or
+/// silently swallowing a value.
 #[test]
-fn wire_errors_become_the_matching_errno() {
-    let cases: &[(ErrorCode, Errno)] = &[
-        (ErrorCode::NotFound, Errno::ENOENT),
-        (ErrorCode::PermissionDenied, Errno::EACCES),
-        (ErrorCode::AlreadyExists, Errno::EEXIST),
-        (ErrorCode::NotADirectory, Errno::ENOTDIR),
-        (ErrorCode::IsADirectory, Errno::EISDIR),
-        (ErrorCode::NotEmpty, Errno::ENOTEMPTY),
-        (ErrorCode::InvalidPath, Errno::EINVAL),
-        (ErrorCode::BadHandle, Errno::EBADF),
-        (ErrorCode::ReadOnly, Errno::EROFS),
-        (ErrorCode::WouldBlock, Errno::EAGAIN),
-        (ErrorCode::CrossDevice, Errno::EXDEV),
-    ];
-    for (code, want) in cases {
-        assert_eq!(
-            errno(&FsError::Remote(*code)).code(),
-            want.code(),
-            "{code:?} mapped wrong"
-        );
-    }
-}
-
-/// Codes with no specific mapping fall through to EIO rather than to
-/// something plausible-but-wrong. The operation may or may not have happened,
-/// and EIO is the only honest answer to that.
-#[test]
-fn unmapped_codes_fall_through_to_eio() {
-    for code in [ErrorCode::Io, ErrorCode::Conflict, ErrorCode::NotAttached] {
-        assert_eq!(
-            errno(&FsError::Remote(code)).code(),
-            Errno::EIO.code(),
-            "{code:?}"
-        );
-    }
-}
-
-/// "The server is too old for this operation" is not an I/O error, and
-/// reporting it as one sends people looking at the wrong layer. It did
-/// exactly that once, during the first live symlink attempt.
-#[test]
-fn an_old_server_is_not_an_io_error() {
+fn the_shared_errno_table_reaches_fuse_intact() {
     assert_eq!(
-        errno(&FsError::Remote(ErrorCode::VersionMismatch)).code(),
-        Errno::EOPNOTSUPP.code()
+        errno(&FsError::Remote(ErrorCode::NotFound)).code(),
+        Errno::ENOENT.code()
+    );
+    assert_eq!(errno(&FsError::Remote(ErrorCode::Io)).code(), Errno::EIO.code());
+    assert_eq!(
+        errno(&FsError::Remote(ErrorCode::NotFound)).code(),
+        alloyfs_client::posix_errno(&FsError::Remote(ErrorCode::NotFound))
     );
 }
 
