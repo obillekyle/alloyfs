@@ -10,3 +10,6 @@ scripts/*.service text eol=lf
 # Installed verbatim onto Linux systems (shell, dkms.conf, udev rules,
 # systemd units): CRLF would break shebangs and udev rule parsing.
 packaging/** text eol=lf
+# Served as-is by GitHub Pages. CNAME in particular is parsed as a single
+# hostname and a trailing CR would make it a different (invalid) one.
+docs/** text eol=lf
