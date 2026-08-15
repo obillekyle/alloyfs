@@ -19,8 +19,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use alloyfs_client::{FsError, RemoteFs, ROOT_INO};
-use alloyfs_proto::{Attr, ErrorCode, EventKind, FileKind, FsEvent, OpenFlags, RelPath};
+use alloyfs_client::{RemoteFs, ROOT_INO};
+use alloyfs_proto::{Attr, EventKind, FileKind, FsEvent, OpenFlags, RelPath};
 
 use crate::abi::{self, InHeader, KernelAttr, Notification};
 
@@ -37,27 +37,10 @@ const DIR_CACHE_TTL: Duration = Duration::from_secs(5);
 /// starts at 2 and child *i* lives at position *i* + 2.
 const DOTS: u64 = 2;
 
-fn errno_of(err: &FsError) -> i32 {
-    match err {
-        FsError::Remote(code) => match code {
-            ErrorCode::NotFound | ErrorCode::NoSuchExport => abi::ENOENT,
-            ErrorCode::PermissionDenied => abi::EACCES,
-            ErrorCode::AlreadyExists => abi::EEXIST,
-            ErrorCode::NotADirectory => abi::ENOTDIR,
-            ErrorCode::IsADirectory => abi::EISDIR,
-            ErrorCode::NotEmpty => abi::ENOTEMPTY,
-            ErrorCode::InvalidPath => abi::EINVAL,
-            ErrorCode::BadHandle => abi::EBADF,
-            ErrorCode::ReadOnly => abi::EROFS,
-            ErrorCode::WouldBlock => abi::EAGAIN,
-            ErrorCode::CrossDevice => abi::EXDEV,
-            // An old server, not a broken disk.
-            ErrorCode::VersionMismatch => abi::EOPNOTSUPP,
-            _ => abi::EIO,
-        },
-        FsError::Transport(_) => abi::EIO,
-    }
-}
+/// Shared with the FUSE backend — see `alloyfs_client::posix_errno`. Both are
+/// front-ends onto Linux, so one table serves them; the copies here and in
+/// FUSE had already drifted apart on `NoSuchExport`.
+use alloyfs_client::posix_errno as errno_of;
 
 fn nanos_since_epoch(t: SystemTime) -> u64 {
     t.duration_since(UNIX_EPOCH)

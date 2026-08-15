@@ -85,6 +85,9 @@ pub async fn run(
         auto_cache_budget_fallback: 512 * 1024 * 1024,
         no_server_defaults,
         detect_conflicts: detect_conflicts || file_cfg.detect_conflicts,
+        // So the client can rewrite symlink targets that point back into
+        // this mount (see RemoteFs::localize_target).
+        mount_root: Some(mountpoint.to_string_lossy().into_owned()),
         // Survive connection loss: re-dial, re-attach, re-open handles,
         // resubscribe events. Locks do not survive (documented).
         dialer: Some(dialer_for(&url, &remote_cmd, &whoami(), token)),

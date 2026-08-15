@@ -18,33 +18,17 @@ use fuser::{
 };
 
 use alloyfs_client::{FsError, RemoteFs, ROOT_INO};
-use alloyfs_proto::{Attr, ErrorCode, FileKind, OpenFlags};
+use alloyfs_proto::{Attr, FileKind, OpenFlags};
 
 /// Kernel-side cache lifetime for attrs/entries we reply with. Short on
 /// purpose: real invalidation arrives with the event stream (the pump calls
 /// `apply_events_native` below); the TTL only bounds staleness if it hiccups.
 const KERNEL_TTL: Duration = Duration::from_secs(1);
 
+/// Shared with the kernel-module backend: one Linux errno table, not two.
+/// They had already drifted on `NoSuchExport` before this was unified.
 fn errno(e: &FsError) -> Errno {
-    match e {
-        FsError::Remote(code) => match code {
-            ErrorCode::NotFound => Errno::ENOENT,
-            ErrorCode::PermissionDenied => Errno::EACCES,
-            ErrorCode::AlreadyExists => Errno::EEXIST,
-            ErrorCode::NotADirectory => Errno::ENOTDIR,
-            ErrorCode::IsADirectory => Errno::EISDIR,
-            ErrorCode::NotEmpty => Errno::ENOTEMPTY,
-            ErrorCode::InvalidPath => Errno::EINVAL,
-            ErrorCode::BadHandle => Errno::EBADF,
-            ErrorCode::ReadOnly => Errno::EROFS,
-            ErrorCode::WouldBlock => Errno::EAGAIN,
-            ErrorCode::CrossDevice => Errno::EXDEV,
-            // An old server, not a broken disk.
-            ErrorCode::VersionMismatch => Errno::EOPNOTSUPP,
-            _ => Errno::EIO,
-        },
-        FsError::Transport(_) => Errno::EIO,
-    }
+    Errno::from_i32(alloyfs_client::posix_errno(e))
 }
 
 fn file_type(kind: FileKind) -> FileType {
@@ -219,12 +203,14 @@ impl Filesystem for DsFuse {
         reply: ReplyCreate,
     ) {
         let name = ok_name!(name, reply);
+        // Reuse the open conversion rather than re-testing the modifier bits:
+        // that copy was uncovered, since the flag tests only exercise
+        // `open_flags`. A create is always read+write regardless of the mode
+        // the caller asked for.
         let of = OpenFlags {
             read: true,
             write: true,
-            truncate: flags & libc::O_TRUNC != 0,
-            append: flags & libc::O_APPEND != 0,
-            excl: flags & libc::O_EXCL != 0,
+            ..Self::open_flags(FuseOpenFlags(flags))
         };
         match self.fs.create(parent.0, name, mode, of) {
             Ok((ino, fh, attr)) => reply.created(

@@ -7,6 +7,7 @@
 //! and a wrong open flag silently drops O_APPEND or O_EXCL.
 
 use super::*;
+use alloyfs_proto::ErrorCode;
 
 #[test]
 fn kinds_map_to_the_kernel_file_types() {

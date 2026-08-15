@@ -276,10 +276,6 @@ pub struct FileContext {
 struct WinFspFs {
     fs: Arc<RemoteFs>,
     volume_label: String,
-    /// Uppercased drive prefix this volume is mounted at ("Y:"), or empty for
-    /// a UNC mount. Used to turn volume-absolute symlink targets back into
-    /// export-relative ones.
-    mount_prefix: String,
     /// Server events waiting to be re-emitted as native change notifications
     /// (drained by the WinFsp notify timer; fed by the client event pump).
     pending_events: Arc<std::sync::Mutex<Vec<alloyfs_proto::FsEvent>>>,
@@ -288,58 +284,6 @@ struct WinFspFs {
 impl WinFspFs {
     /// Path -> (ino, Attr), allocating an inode on first sight and rolling the
     /// allocation back if the server says the path doesn't exist.
-    /// Turn a symlink target that points into THIS volume into one the server
-    /// can store.
-    ///
-    /// Windows tooling writes absolute targets by habit — PowerShell's
-    /// `New-Item -Target "real.txt"` resolves to "Y:\dir\real.txt" before the
-    /// syscall is even made. The drive letter is a local artifact: the server
-    /// has never heard of Y:, and would rightly refuse it as a path outside
-    /// the export. So a target under our own mount point is rewritten
-    /// relative to the link's directory, which is what the user meant and
-    /// what stays correct if the export is later mounted elsewhere.
-    ///
-    /// Targets that are absolute somewhere ELSE (C:\Windows, a UNC share) are
-    /// left exactly as they are, and the server refuses them. That is the
-    /// right outcome: they genuinely do point out of the export.
-    fn localize_target(&self, target: &str, link_dir: &RelPath) -> String {
-        if self.mount_prefix.is_empty() {
-            return target.to_string();
-        }
-        let norm = target.replace('\\', "/");
-        let upper = norm.to_uppercase();
-        let prefix = format!("{}/", self.mount_prefix);
-        let Some(rest) = upper.strip_prefix(&prefix).map(|_| &norm[prefix.len()..]) else {
-            return target.to_string();
-        };
-        let rest = rest.trim_start_matches('/');
-
-        // Walk up out of the link's directory, then back down to the target.
-        // Both are export-relative, so the shared prefix cancels.
-        let from: Vec<&str> = if link_dir.is_root() {
-            Vec::new()
-        } else {
-            link_dir.0.split('/').collect()
-        };
-        let to: Vec<&str> = if rest.is_empty() {
-            Vec::new()
-        } else {
-            rest.split('/').collect()
-        };
-        let shared = from
-            .iter()
-            .zip(to.iter())
-            .take_while(|(a, b)| a.eq_ignore_ascii_case(b))
-            .count();
-        let mut out: Vec<&str> = vec![".."; from.len() - shared];
-        out.extend_from_slice(&to[shared..]);
-        if out.is_empty() {
-            // The link points at its own directory.
-            return ".".to_string();
-        }
-        out.join("/")
-    }
-
     fn resolve(&self, path: &RelPath) -> Result<(u64, Attr), FsError> {
         let existing = self.fs.ino.ino_of(path);
         let ino = existing.unwrap_or_else(|| self.fs.ino.get_or_alloc(path.clone()));
@@ -837,7 +781,8 @@ impl FileSystemContext for WinFspFs {
 
         let rel = rel_path(file_name)?;
         let (parent_rel, name) = rel.split().ok_or_else(|| nt(STATUS_OBJECT_NAME_INVALID))?;
-        let target = self.localize_target(&target, &parent_rel);
+        // The drive-letter-absolute target that Windows tooling writes is
+        // rewritten by RemoteFs::symlink, which every backend goes through.
         let (parent_ino, _) = self.resolve(&parent_rel).map_err(fsp_err)?;
 
         // Replace the placeholder — but ONLY if it is one. A non-empty file
@@ -1050,11 +995,6 @@ pub fn mount(fs: Arc<RemoteFs>, mountpoint: &str, volume_label: &str) -> anyhow:
     let context = WinFspFs {
         fs,
         volume_label: volume_label.to_string(),
-        // Forward slashes, to match the form `localize_target` compares in.
-        // A drive letter has no separator so this was invisible there, but a
-        // directory mountpoint ("C:\mnt\alloy") kept its backslashes and the
-        // prefix test could never match, silently disabling the rewrite.
-        mount_prefix: mountpoint.replace('\\', "/").trim_end_matches('/').to_uppercase(),
         pending_events: pending.clone(),
     };
     // new_with_timer: a 100 ms poll drains pending_events into

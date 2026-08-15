@@ -24,6 +24,163 @@ pub enum FsError {
     Transport(#[from] TransportError),
 }
 
+/// Linux errno for a filesystem error, shared by both Linux mount backends.
+///
+/// FUSE and the kernel-module daemon are two front-ends onto one platform, and
+/// each used to carry its own copy of this table. They had already drifted:
+/// the kernel backend mapped `NoSuchExport` to ENOENT while FUSE let it fall
+/// through to EIO, and only FUSE had tests. Unified on ENOENT — "that export
+/// does not exist" is a miss, not a device failure.
+///
+/// WinFsp keeps its own mapping, and correctly so: NTSTATUS is a genuinely
+/// different target, not a second spelling of the same one.
+pub fn posix_errno(err: &FsError) -> i32 {
+    // Values rather than libc constants: this crate compiles on Windows too,
+    // and the kernel daemon's abi module already spells them out for the same
+    // reason.
+    match err {
+        FsError::Remote(code) => match code {
+            ErrorCode::NotFound | ErrorCode::NoSuchExport => 2, // ENOENT
+            ErrorCode::PermissionDenied => 13,                  // EACCES
+            ErrorCode::AlreadyExists => 17,                     // EEXIST
+            ErrorCode::NotADirectory => 20,                     // ENOTDIR
+            ErrorCode::IsADirectory => 21,                      // EISDIR
+            ErrorCode::NotEmpty => 39,                          // ENOTEMPTY
+            ErrorCode::InvalidPath => 22,                       // EINVAL
+            ErrorCode::BadHandle => 9,                          // EBADF
+            ErrorCode::ReadOnly => 30,                          // EROFS
+            ErrorCode::WouldBlock => 11,                        // EAGAIN
+            ErrorCode::CrossDevice => 18,                       // EXDEV
+            // An old server, not a broken disk.
+            ErrorCode::VersionMismatch => 95, // EOPNOTSUPP
+            _ => 5,                           // EIO
+        },
+        // The operation may or may not have happened; EIO is the honest answer.
+        FsError::Transport(_) => 5,
+    }
+}
+
+/// Rewrite `target` relative to `link_dir` when it points back into the mount
+/// rooted at `mount_root`; otherwise return it unchanged.
+///
+/// A free function so it can be tested without standing up a connection — the
+/// version this replaced lived in the WinFsp backend and had no direct tests
+/// at all.
+fn localize_symlink_target(mount_root: &str, target: &str, link_dir: &RelPath) -> String {
+    let norm = target.replace('\\', "/");
+    // Case-insensitive: Windows drive letters and paths are, and a missed
+    // match here just means no rewrite — never a wrong one.
+    let prefix = format!("{}/", mount_root.replace('\\', "/").trim_end_matches('/'));
+    if !norm.to_uppercase().starts_with(&prefix.to_uppercase()) {
+        return target.to_string();
+    }
+    let rest = norm[prefix.len()..].trim_start_matches('/');
+
+    // Walk up out of the link's directory, then back down to the target; both
+    // are export-relative, so the shared prefix cancels.
+    let from: Vec<&str> = if link_dir.is_root() {
+        Vec::new()
+    } else {
+        link_dir.0.split('/').collect()
+    };
+    let to: Vec<&str> = if rest.is_empty() {
+        Vec::new()
+    } else {
+        rest.split('/').collect()
+    };
+    let shared = from
+        .iter()
+        .zip(to.iter())
+        .take_while(|(a, b)| a.eq_ignore_ascii_case(b))
+        .count();
+    let mut out: Vec<&str> = vec![".."; from.len() - shared];
+    out.extend_from_slice(&to[shared..]);
+    if out.is_empty() {
+        return ".".to_string(); // the link points at its own directory
+    }
+    out.join("/")
+}
+
+#[cfg(test)]
+mod localize_tests {
+    use super::*;
+
+    fn dir(s: &str) -> RelPath {
+        RelPath(s.to_string())
+    }
+
+    /// The case that made this necessary: PowerShell resolves a relative
+    /// target to a drive-letter-absolute one before the syscall is made.
+    #[test]
+    fn a_target_inside_the_mount_becomes_relative() {
+        assert_eq!(
+            localize_symlink_target("Y:", "Y:\\linktest\\real.txt", &dir("linktest")),
+            "real.txt"
+        );
+        assert_eq!(
+            localize_symlink_target("Y:", "Y:\\real.txt", &dir("")),
+            "real.txt"
+        );
+        // Up and back down.
+        assert_eq!(
+            localize_symlink_target("Y:", "Y:\\real.txt", &dir("sub")),
+            "../real.txt"
+        );
+        assert_eq!(
+            localize_symlink_target("Y:", "Y:\\a\\b\\t.txt", &dir("a/c")),
+            "../b/t.txt"
+        );
+    }
+
+    /// The same problem exists on Unix — `ln -s "$(pwd)/real.txt"` — which is
+    /// why this does not live in the Windows backend.
+    #[test]
+    fn a_unix_mountpoint_works_the_same_way() {
+        assert_eq!(
+            localize_symlink_target("/mnt/alloy", "/mnt/alloy/dir/real.txt", &dir("dir")),
+            "real.txt"
+        );
+        assert_eq!(
+            localize_symlink_target("/mnt/alloy/", "/mnt/alloy/real.txt", &dir("sub")),
+            "../real.txt"
+        );
+    }
+
+    /// Absolute somewhere else is left alone — the server refuses it, which is
+    /// correct, because it genuinely does leave the export.
+    #[test]
+    fn targets_outside_the_mount_are_untouched() {
+        for t in [
+            "C:\\Windows\\system32",
+            "/etc/passwd",
+            "\\\\server\\share\\x",
+            "../already-relative.txt",
+            "plain.txt",
+        ] {
+            assert_eq!(localize_symlink_target("Y:", t, &dir("sub")), t, "{t:?}");
+        }
+    }
+
+    /// A prefix that only looks like ours must not match: "Y:" should not
+    /// swallow "Y:extra" or a different drive.
+    #[test]
+    fn a_near_miss_prefix_does_not_match() {
+        assert_eq!(
+            localize_symlink_target("Y:", "Z:/real.txt", &dir("")),
+            "Z:/real.txt"
+        );
+        assert_eq!(
+            localize_symlink_target("/mnt/alloy", "/mnt/alloys/x", &dir("")),
+            "/mnt/alloys/x"
+        );
+    }
+
+    #[test]
+    fn a_link_to_its_own_directory_is_dot() {
+        assert_eq!(localize_symlink_target("Y:", "Y:\\sub", &dir("sub")), ".");
+    }
+}
+
 /// Unwrap one expected Response variant; anything else is a protocol-level
 /// surprise that logs and becomes Io. Collapses the five-line match this
 /// crate used to repeat at every RPC call site.
@@ -80,6 +237,11 @@ pub struct ClientOptions {
     /// "your colleague's edit vanished", and which of those is worse depends
     /// entirely on what the mount is for.
     pub detect_conflicts: bool,
+    /// Where this mount appears locally ("Y:", "/mnt/alloy"). Used only to
+    /// rewrite symlink targets that point back into the mount; `None` skips
+    /// that entirely, which is right for a client with no mountpoint (sync,
+    /// the CLI diagnostics).
+    pub mount_root: Option<String>,
 }
 
 impl Default for ClientOptions {
@@ -97,6 +259,7 @@ impl Default for ClientOptions {
             dialer: None,
             no_server_defaults: false,
             detect_conflicts: false,
+            mount_root: None,
         }
     }
 }
@@ -146,6 +309,8 @@ pub struct RemoteFs {
     pub(crate) last_event_seq: AtomicU64,
     /// Send `expect_version` with writes and refuse to clobber (opt-in).
     detect_conflicts: bool,
+    /// Local mountpoint, for symlink target rewriting. See `localize_target`.
+    mount_root: Option<String>,
 }
 
 impl RemoteFs {
@@ -264,6 +429,7 @@ impl RemoteFs {
             conn_epoch: epoch_tx,
             last_event_seq: AtomicU64::new(0),
             detect_conflicts: opts.detect_conflicts,
+            mount_root: opts.mount_root.clone(),
         });
 
         if let (Some(cache), Some(rx)) = (fs.cache.clone(), fetch_rx) {
@@ -923,6 +1089,31 @@ impl RemoteFs {
         }
     }
 
+    /// Rewrite a symlink target that points back into this mount so the
+    /// server can store it, leaving anything else untouched.
+    ///
+    /// Tooling writes absolute targets by habit, and the absolute form is
+    /// always local: PowerShell's `New-Item -Target "real.txt"` resolves to
+    /// `Y:\dir\real.txt` before the syscall is made, and `ln -s "$(pwd)/x"`
+    /// produces `/mnt/alloy/dir/x`. Neither means anything to the server,
+    /// which would refuse both as paths outside the export — a correct check
+    /// with a useless outcome, since the user meant a path inside it.
+    ///
+    /// So a target under this mount's own root becomes one relative to the
+    /// link's directory, which is what was meant and what stays correct if
+    /// the export is later mounted somewhere else. A target absolute
+    /// SOMEWHERE ELSE (`C:\Windows`, `/etc`, a UNC share) is passed through
+    /// and the server refuses it — those genuinely do leave the export.
+    ///
+    /// This lives here rather than in a backend because every backend has the
+    /// problem; it was found on Windows only because that is where symlinks
+    /// were tested first.
+    fn localize_target(&self, target: &str, link_dir: &RelPath) -> String {
+        match &self.mount_root {
+            Some(root) => localize_symlink_target(root, target, link_dir),
+            None => target.to_string(),
+        }
+    }
     /// Create a symlink at `parent/name` pointing at `target`.
     ///
     /// Unlike `link`, only the LINK's location decides where this goes: the
@@ -933,15 +1124,19 @@ impl RemoteFs {
     pub fn symlink(&self, parent: u64, name: &str, target: &str) -> Result<(u64, Attr), FsError> {
         let dir = self.path_of(parent)?;
         let link = dir.join(name);
+        // Before anything else: a target pointing back into this mount is
+        // written as an absolute local path by most tooling, and means
+        // nothing to the server.
+        let target = self.localize_target(target, &dir);
         if self.is_overlay(&link) {
-            let attr = self.overlay_ref().symlink(target, &link)?;
+            let attr = self.overlay_ref().symlink(&target, &link)?;
             let ino = self.ino.get_or_alloc(link);
             return Ok((ino, attr));
         }
         self.require_proto(4, "symlink")?;
         let attr = expect_resp!(
             self.call(Request::Symlink {
-                target: target.to_string(),
+                target,
                 link: link.clone(),
             })?,
             Response::Attr(attr) => attr
