@@ -368,13 +368,19 @@ pub fn deadline_after(secs: u64) -> std::time::Instant {
 /// (× ALLOYFS_TEST_DEADLINE_MULT) naming `what`.
 pub async fn wait_until<T>(what: &str, secs: u64, mut probe: impl FnMut() -> Option<T>) -> T {
     let deadline = deadline_after(secs);
+    // The message reports the WAITED time, not the base. It used to print
+    // `secs`, so a CI failure under ALLOYFS_TEST_DEADLINE_MULT=3 read as "timed
+    // out after 15s" when it had in fact waited 45 — which is the difference
+    // between "the runner was slow" and "this never happened", and sends the
+    // next person reading the log down the wrong path.
+    let waited = secs * deadline_mult();
     loop {
         if let Some(v) = probe() {
             return v;
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "wait_until timed out after {secs}s: {what}"
+            "wait_until timed out after {waited}s: {what}"
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }

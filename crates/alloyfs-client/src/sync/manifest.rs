@@ -67,7 +67,12 @@ impl SyncManifest {
 
     /// Move every entry under `from` (inclusive) to the same suffix under
     /// `to` — directory renames move whole subtrees.
-    pub fn rename_prefix(&mut self, from: &str, to: &str) {
+    /// Returns whether anything moved. Callers must handle `false`: it means
+    /// the manifest has no baseline for `to` even though the rename itself
+    /// happened, and `push_local`'s `Removed` arm silently skips paths with no
+    /// baseline — so an unhandled miss strands the file permanently.
+    #[must_use = "a rename that moved nothing leaves the target with no baseline"]
+    pub fn rename_prefix(&mut self, from: &str, to: &str) -> bool {
         let mut moved = Vec::new();
         let dir_prefix = format!("{from}/");
         self.entries.retain(|path, entry| {
@@ -81,9 +86,11 @@ impl SyncManifest {
                 true
             }
         });
+        let any = !moved.is_empty();
         for (path, entry) in moved {
             self.entries.insert(path, entry);
         }
+        any
     }
 }
 
@@ -125,12 +132,37 @@ mod tests {
         assert_eq!(loaded.entries.len(), 3);
 
         let mut m = loaded;
-        m.rename_prefix("a", "z");
+        assert!(m.rename_prefix("a", "z"), "a known source moves");
         assert!(m.entries.contains_key("z"), "dir entry moves");
         assert!(m.entries.contains_key("z/b.txt"), "children move");
         assert!(
             m.entries.contains_key("ax.txt"),
             "prefix match must be component-wise, not string-wise"
         );
+    }
+
+    /// Renaming a source the manifest never knew records NOTHING for the
+    /// target — this only moves keys that already exist.
+    ///
+    /// Left alone, that is a silent hole rather than a missing optimization.
+    /// The manifest is the baseline `push_local` consults, and its `Removed`
+    /// arm returns `Ok(())` without contacting the server when there is no
+    /// baseline ("never synced — nothing to delete remotely"). So a rename
+    /// whose source was absent leaves the server holding a file that no
+    /// subsequent local delete can ever remove.
+    ///
+    /// The engine is what has to close this, since only it can stat the target
+    /// to build an entry; this test exists so the gap is a documented property
+    /// of `rename_prefix` and not a surprise found twice.
+    #[test]
+    fn renaming_an_unknown_source_records_nothing() {
+        let mut m = SyncManifest::default();
+        m.entries.insert("other.txt".into(), entry(EntryKind::File));
+
+        assert!(!m.rename_prefix("ghost.txt", "landed.txt"), "nothing to move");
+
+        assert!(!m.entries.contains_key("landed.txt"));
+        assert!(!m.entries.contains_key("ghost.txt"));
+        assert_eq!(m.entries.len(), 1, "unrelated entries untouched");
     }
 }

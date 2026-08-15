@@ -317,8 +317,14 @@ impl SyncEngine {
                                 },
                             );
                         }
-                        self.manifest.lock().unwrap().rename_prefix(rel, &to_rel);
-                        return Ok(());
+                        // A miss here means the local rename succeeded but the
+                        // manifest gained no baseline for the target. Falling
+                        // through to the pull below rebuilds one from the
+                        // server, which is exactly the recovery this arm
+                        // already has for the other ways it can lose track.
+                        if self.manifest.lock().unwrap().rename_prefix(rel, &to_rel) {
+                            return Ok(());
+                        }
                     }
                 }
                 // Source missing or rename failed: converge by pulling `to`.
@@ -579,7 +585,24 @@ impl SyncEngine {
                     .await?
                 {
                     Ok(_) => {
-                        self.manifest.lock().unwrap().rename_prefix(rel, &to.0);
+                        let known = self.manifest.lock().unwrap().rename_prefix(rel, &to.0);
+                        // `rename_prefix` only MOVES keys, so a source the
+                        // manifest never held leaves the target unrecorded —
+                        // while the server has just performed the rename. That
+                        // combination is unrecoverable rather than merely
+                        // stale: `EventKind::Removed` treats "no baseline" as
+                        // "never synced, nothing to delete remotely" and
+                        // returns without asking the server, so the renamed
+                        // file could never be deleted again from this side.
+                        if !known {
+                            if let Some(s) = self.local_stat(&to.0) {
+                                self.record(&to.0, s.kind, s.size, s.mtime_ns, 0);
+                                tracing::debug!(
+                                    path = %to.0,
+                                    "rename target adopted into the manifest (source was unknown)"
+                                );
+                            }
+                        }
                         self.stats.pushes.fetch_add(1, Relaxed);
                         Ok(())
                     }
