@@ -2,18 +2,40 @@
 
 One file describes what a machine serves and how its mounts behave.
 
+## Getting one
+
+```bash
+alloyfs init            # ./alloyfs.yml, exporting the current directory
+alloyfs init --global   # ~/.alloyfs/config.yml instead
+```
+
+[`alloyfs init`](#/reference/cli) fills in the export for you rather than
+leaving you to write one. See [Your first mount](#/getting-started/first-mount).
+
 ## Where it is found
 
-In order:
+`alloyfs serve` looks, in order:
 
 1. **`alloyfs.yml` beside the executable** — a portable install (binary plus
    config in one folder, or on a stick) works without touching the home
    directory, and wins over everything else.
 2. **`~/.alloyfs/config.yml`** (`%USERPROFILE%\.alloyfs\config.yml`) — the
-   normal location. Created from a commented template on first run, so a first
-   run leaves you a file to edit rather than an error telling you to invent one.
+   normal location. If nothing exists anywhere, `serve` writes a commented
+   template here, so a first run leaves you a file to edit rather than an error
+   telling you to invent one.
 
-`--config <PATH>` overrides both.
+`--config <PATH>` overrides both, and is how you use a config that `init` wrote
+into a project directory.
+
+**The working directory is not searched.** A config sitting in whatever folder
+you happen to be in could otherwise decide what a `serve` publishes, which is
+not something the current directory should get a vote on. That is why
+`init` prints the `--config` line rather than assuming.
+
+**Mounting needs no config at all.** `alloyfs mount` takes everything from
+flags; a mount config (a different, smaller schema — see below) is optional and
+only ever loaded via `--config`. A first mount creates `~/.alloyfs/` for the
+[overlay and cache](#/configuration/where-things-live), and nothing else.
 
 ## Serving
 

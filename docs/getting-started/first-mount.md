@@ -5,8 +5,17 @@ fine on `127.0.0.1`.
 
 ## 1. Serve a folder
 
-On the machine with the files, create `~/.alloyfs/config.yml` — running any
-command once will write a commented starter for you:
+On the machine with the files, in the folder you want to share:
+
+```bash
+cd ~/projects
+alloyfs init
+alloyfs serve --config alloyfs.yml
+```
+
+`alloyfs init` writes an `alloyfs.yml` describing that directory — export name
+derived from the folder, sensible excludes, loopback listener — so there is
+nothing to hand-write:
 
 ```yaml
 agent:
@@ -14,14 +23,18 @@ agent:
 
 exports:
   projects:
-    path: /home/you/projects
+    path: "/home/you/projects"
+    read_only: false
+    exclude:
+      - "**/.git"
 ```
 
-Then:
+Prefer it in your home config instead of per-directory? `alloyfs init --global`
+writes `~/.alloyfs/config.yml`, which `alloyfs serve` finds on its own with no
+`--config`.
 
-```bash
-alloyfs serve
-```
+Either way, edit the file and re-run — it is a plain YAML file, and
+[config.yml](#/configuration/config-file) explains every key.
 
 ## 2. Mount it
 
