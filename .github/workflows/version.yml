@@ -49,10 +49,13 @@ jobs:
           # *stable* tag; a shallow clone has neither.
           fetch-depth: 0
 
+      # Pinned to a tag, not `releases/latest`: this workflow is the thing that
+      # decides version numbers, and it should not change what it does because
+      # someone else shipped a release. Moving the pin is a commit here.
       - name: Fetch cutver
         run: |
           curl -fsSL -o /usr/local/bin/cutver \
-            https://github.com/obillekyle/cutver/releases/download/v1.1.0/cutver-linux-x64
+            https://github.com/obillekyle/cutver/releases/download/v2.0.2/cutver-linux-x64
           chmod +x /usr/local/bin/cutver
           cutver --version
 
@@ -87,8 +90,12 @@ jobs:
       #
       # `--branch` because CI checks out a detached HEAD, where git answers
       # the literal string 'HEAD' and the real branch is only in the payload.
+      # **`stage` is the verb since cutver 2.0.** A bare `cutver` is the help
+      # now, and outside a terminal it exits 1 — so the old shape would not
+      # have quietly released nothing, but it would have gone red on the first
+      # push after the pin moved. Pin and invocation change together.
       - name: Compute the version and bump Cargo.toml
-        run: cutver --if-needed --branch '${{ github.ref_name }}'
+        run: cutver stage --if-needed --branch '${{ github.ref_name }}'
 
       # **Whether the version moved is the signal — not whether the tree is
       # dirty.** `git status` reports an unrelated formatter edit as "a
