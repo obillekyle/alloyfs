@@ -123,15 +123,42 @@ jobs:
           path: staged
           merge-multiple: true
 
+      # **The release body comes from the changelog, not from `--notes ""`.**
+      # Every release page here was empty because this job never had the
+      # repository to read one from. The tag, not the branch: notes for version
+      # X belong to X's commits.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+          fetch-depth: 0
+
+      - name: Fetch cutver
+        run: |
+          curl -fsSL --retry 3 --retry-connrefused --retry-delay 2 \
+            -o /usr/local/bin/cutver \
+            https://github.com/obillekyle/cutver/releases/download/v2.0.3/cutver-linux-x64
+          chmod +x /usr/local/bin/cutver
+
+      # `cutver notes` prints the section for this tag, rewritten by the
+      # summariser named in cutver.yml. An unset key is not a failure — cutver
+      # says so on stderr and prints the compiled section — so a missing secret
+      # costs readability, never a release.
+      - name: Release notes
+        continue-on-error: true
+        env:
+          CUTVER_SUMMARIZE_KEY: ${{ secrets.CUTVER_SUMMARIZE_KEY }}
+        run: cutver notes "$TAG" > notes.md || true
+
       - name: Attach them to the release
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
         run: |
+          [ -s notes.md ] || echo "_No release notes._" > notes.md
           case "$TAG" in
             *-*) pre=--prerelease ;;
             *)   pre= ;;
           esac
-          gh release create "$TAG" --repo "$REPO" --title "$TAG" --notes "" $pre \
-            || echo "release $TAG already exists — uploading into it"
+          gh release create "$TAG" --repo "$REPO" --title "$TAG" --notes-file notes.md $pre \
+            || gh release edit "$TAG" --repo "$REPO" --notes-file notes.md
           gh release upload "$TAG" --repo "$REPO" --clobber staged/*
