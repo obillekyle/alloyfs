@@ -15,3 +15,9 @@ kernel/test/out/
 
 # Agent worktrees and session scratch — never part of the tree
 /.claude/
+
+# **Every .env, not just `.env`.** The bare name is a literal: it does not
+# match `.env.local`, which is where a summariser key actually lands. An
+# example file stays committable.
+.env*
+!.env.example
