@@ -52,9 +52,15 @@ jobs:
       # Pinned to a tag, not `releases/latest`: this workflow is the thing that
       # decides version numbers, and it should not change what it does because
       # someone else shipped a release. Moving the pin is a commit here.
+      #
+      # `--retry`, because this step failed a release once on `curl: (35) Recv
+      # failure: Connection reset by peer` — the URL was fine and the asset was
+      # a 200 thirty seconds later. One blip reaching GitHub should not be the
+      # thing that stops a version being cut.
       - name: Fetch cutver
         run: |
-          curl -fsSL -o /usr/local/bin/cutver \
+          curl -fsSL --retry 3 --retry-connrefused --retry-delay 2 \
+            -o /usr/local/bin/cutver \
             https://github.com/obillekyle/cutver/releases/download/v2.0.3/cutver-linux-x64
           chmod +x /usr/local/bin/cutver
           cutver --version
