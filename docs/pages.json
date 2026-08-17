@@ -1,0 +1,54 @@
+[
+  {
+    "title": "Getting started",
+    "items": [
+      ["getting-started/installation", "Installation"],
+      ["getting-started/first-mount", "Your first mount"],
+      ["getting-started/how-it-works", "How it works"]
+    ]
+  },
+  {
+    "title": "Guides",
+    "items": [
+      ["guides/mounting", "Mounting a drive"],
+      ["guides/sync-mode", "Sync mode"],
+      ["guides/excludes", "Excludes and the overlay"],
+      ["guides/cache", "Offline cache"],
+      ["guides/events", "Change events"],
+      ["guides/locking", "Locking"],
+      ["guides/conflicts", "Write conflicts"]
+    ]
+  },
+  {
+    "title": "Configuration",
+    "items": [
+      ["configuration/config-file", "config.yml"],
+      ["configuration/where-things-live", "Where things live"],
+      ["configuration/auth", "TCP authentication"]
+    ]
+  },
+  {
+    "title": "Backends",
+    "items": [
+      ["backends/choosing", "Choosing a backend"],
+      ["backends/kernel-module", "The Linux kernel module"]
+    ]
+  },
+  {
+    "title": "Deployment",
+    "items": [
+      ["deployment/linux", "Installing on Linux"],
+      ["deployment/service", "Running as a service"],
+      ["deployment/security", "Security"]
+    ]
+  },
+  {
+    "title": "Reference",
+    "items": [
+      ["reference/cli", "CLI"],
+      ["reference/http-api", "HTTP API"],
+      ["reference/architecture", "Architecture"],
+      ["reference/limitations", "Limitations"]
+    ]
+  }
+]
