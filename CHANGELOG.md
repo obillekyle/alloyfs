@@ -8,9 +8,19 @@ is only ever as good as the commits — which is the point.
 explanation in the commit body, where it is also visible in `git log`, in a
 pull request, and on the release page.
 
+## [0.4.0] — 2026-08-17
+
+<sub>diff: [17926b6...4997c9f](https://github.com/obillekyle/alloyfs/compare/17926b6...4997c9f)</sub>
+
+### New Features
+
+- **changelog:** compile it from the commits, and summarise the release body ([cdd0d2d](https://github.com/obillekyle/alloyfs/commit/cdd0d2d))
+
+    The file said notes were written by hand and then five releases in a row went out with nothing under their headings — and every release page was empty, because publish.yml created them with `--notes ""` and had no checkout to read a changelog from. Hand-written notes only beat compiled ones when they get written.
+
 ## [0.3.1] — 2026-08-15
 
-diff: [7376f6a...17926b6](https://github.com/obillekyle/alloyfs/compare/7376f6a...17926b6)
+<sub>diff: [7376f6a...17926b6](https://github.com/obillekyle/alloyfs/compare/7376f6a...17926b6)</sub>
 
 ### Fixes
 
@@ -34,7 +44,7 @@ diff: [7376f6a...17926b6](https://github.com/obillekyle/alloyfs/compare/7376f6a.
 
 ## [0.3.0] — 2026-08-15
 
-diff: [5dfc1af...7376f6a](https://github.com/obillekyle/alloyfs/compare/5dfc1af...7376f6a)
+<sub>diff: [5dfc1af...7376f6a](https://github.com/obillekyle/alloyfs/compare/5dfc1af...7376f6a)</sub>
 
 ### New Features
 
@@ -58,7 +68,7 @@ diff: [5dfc1af...7376f6a](https://github.com/obillekyle/alloyfs/compare/5dfc1af.
 
 ## [0.2.0] — 2026-08-15
 
-diff: [81db420...5dfc1af](https://github.com/obillekyle/alloyfs/compare/81db420...5dfc1af)
+<sub>diff: [81db420...5dfc1af](https://github.com/obillekyle/alloyfs/compare/81db420...5dfc1af)</sub>
 
 ### New Features
 
@@ -81,7 +91,7 @@ diff: [81db420...5dfc1af](https://github.com/obillekyle/alloyfs/compare/81db420.
 
 ## [0.1.1] — 2026-08-15
 
-diff: [fedde5a...81db420](https://github.com/obillekyle/alloyfs/compare/fedde5a...81db420)
+<sub>diff: [fedde5a...81db420](https://github.com/obillekyle/alloyfs/compare/fedde5a...81db420)</sub>
 
 ### Fixes
 
@@ -93,7 +103,7 @@ diff: [fedde5a...81db420](https://github.com/obillekyle/alloyfs/compare/fedde5a.
 
 ## [0.1.0] — 2026-08-15
 
-diff: [3e918d8...fedde5a](https://github.com/obillekyle/alloyfs/compare/3e918d8...fedde5a)
+<sub>diff: [3e918d8...fedde5a](https://github.com/obillekyle/alloyfs/compare/3e918d8...fedde5a)</sub>
 
 ### New Features
 
