@@ -1,4 +1,22 @@
+<div align="center">
+
+<a href="https://alloy.okyle.dev"><img src="https://raw.githubusercontent.com/obillekyle/alloyfs/main/assets/logo.svg" alt="AlloyFS" title="Read the docs" width="96"></a>
+
 # AlloyFS
+
+### Someone else's folder, as a real drive letter.
+
+<!--
+  One line each. GitHub renders a single newline inside a centred block as a
+  `<br>`, so a wrapped paragraph breaks mid-sentence and each badge on its own
+  source line becomes its own row.
+-->
+
+Not SMB, not WebDAV, not a sync folder — a mount, with the events and the locking that implies.
+
+[![release](https://img.shields.io/github/v/release/obillekyle/alloyfs?color=2c6e8f&label=release)](https://github.com/obillekyle/alloyfs/releases/latest) [![license](https://img.shields.io/badge/license-MIT-2c6e8f)](LICENSE) ![stars](https://img.shields.io/github/stars/obillekyle/alloyfs?color=2c6e8f)
+
+</div>
 
 **AlloyFS** is a cross-platform virtual drive service: any host runs an **agent** that exports
 folders; any other host **mounts** an export as a *real local drive* — a drive
