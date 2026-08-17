@@ -8,9 +8,19 @@ is only ever as good as the commits — which is the point.
 explanation in the commit body, where it is also visible in `git log`, in a
 pull request, and on the release page.
 
+## [0.5.0] — 2026-08-17
+
+<sub>diff: [3171187...6e421bd](https://github.com/obillekyle/alloyfs/compare/3171187...6e421bd)</sub>
+
+### New Features
+
+- **exclude:** hide OS bookkeeping from every export by default ([6e421bd](https://github.com/obillekyle/alloyfs/commit/6e421bd))
+
+    Mounting a Linux export as a Windows drive letter made the MOUNTING machine's volume service create `System Volume Information` inside the served folder, and a recycle bin would have followed the first delete. Found in a first-run walkthrough: a `~/webdav` grew one the moment it appeared as S:, and that folder is also served over WebDAV to things that then have to explain it.
+
 ## [0.4.1] — 2026-08-17
 
-<sub>diff: [a828432...094a918](https://github.com/obillekyle/alloyfs/compare/a828432...094a918)</sub>
+<sub>diff: [a828432...3171187](https://github.com/obillekyle/alloyfs/compare/a828432...3171187)</sub>
 
 ### Fixes
 
