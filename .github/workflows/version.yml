@@ -61,7 +61,7 @@ jobs:
         run: |
           curl -fsSL --retry 3 --retry-connrefused --retry-delay 2 \
             -o /usr/local/bin/cutver \
-            https://github.com/obillekyle/cutver/releases/download/v2.0.3/cutver-linux-x64
+            https://github.com/obillekyle/cutver/releases/download/v2.1.2/cutver-linux-x64
           chmod +x /usr/local/bin/cutver
           cutver --version
 
