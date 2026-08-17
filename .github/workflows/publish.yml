@@ -118,19 +118,24 @@ jobs:
       contents: write
 
     steps:
-      - uses: actions/download-artifact@v4
-        with:
-          path: staged
-          merge-multiple: true
-
-      # **The release body comes from the changelog, not from `--notes ""`.**
-      # Every release page here was empty because this job never had the
-      # repository to read one from. The tag, not the branch: notes for version
-      # X belong to X's commits.
+      # **Checkout first, and that ordering is load-bearing.** `actions/checkout`
+      # cleans the workspace by default, so running it *after* the download
+      # deletes `staged/` — the release is created with its notes and then the
+      # upload fails with `no matches found for staged/*`. Measured here, on
+      # v0.4.0.
+      #
+      # The body comes from the changelog rather than `--notes ""`, which is why
+      # this job needs the repository at all. The tag, not the branch: notes for
+      # version X belong to X's commits.
       - uses: actions/checkout@v4
         with:
           ref: ${{ env.TAG }}
           fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: staged
+          merge-multiple: true
 
       - name: Fetch cutver
         run: |
