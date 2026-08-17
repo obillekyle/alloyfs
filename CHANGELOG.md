@@ -8,9 +8,19 @@ is only ever as good as the commits — which is the point.
 explanation in the commit body, where it is also visible in `git log`, in a
 pull request, and on the release page.
 
+## [0.4.1] — 2026-08-17
+
+<sub>diff: [a828432...094a918](https://github.com/obillekyle/alloyfs/compare/a828432...094a918)</sub>
+
+### Fixes
+
+- **ci:** check out before downloading the artifacts ([094a918](https://github.com/obillekyle/alloyfs/commit/094a918))
+
+    `actions/checkout` cleans the workspace by default, so running it after `download-artifact` deleted `staged/` — v0.4.0's release page was created with its notes and the upload then failed with `no matches found for staged/*`, leaving a release with no binaries.
+
 ## [0.4.0] — 2026-08-17
 
-<sub>diff: [17926b6...4997c9f](https://github.com/obillekyle/alloyfs/compare/17926b6...4997c9f)</sub>
+<sub>diff: [17926b6...a828432](https://github.com/obillekyle/alloyfs/compare/17926b6...a828432)</sub>
 
 ### New Features
 
