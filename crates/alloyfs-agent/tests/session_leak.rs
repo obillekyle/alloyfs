@@ -18,7 +18,7 @@ async fn serve_connection_returns_after_the_peer_disconnects() {
             path: dir.path().to_path_buf(),
             read_only: false,
             exclude: Vec::new(),
-            client: None,
+            ..Default::default()
         },
     );
     let registry = Arc::new(ExportRegistry::from_config(&cfg).unwrap());

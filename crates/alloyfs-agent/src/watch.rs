@@ -232,7 +232,7 @@ mod tests {
                 path: dir.path().to_path_buf(),
                 read_only: false,
                 exclude: vec![],
-                client: None,
+                ..Default::default()
             },
         );
         let registry = crate::ExportRegistry::from_config(&cfg).unwrap();

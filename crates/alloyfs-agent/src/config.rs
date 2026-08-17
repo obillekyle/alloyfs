@@ -48,11 +48,39 @@ pub struct ExportConfig {
     /// never listed, resolvable, or event-broadcast to any client.
     #[serde(default)]
     pub exclude: Vec<String>,
+    /// Also hide the OS bookkeeping in `alloyfs_common::LOCAL_ARTIFACTS`
+    /// (`System Volume Information`, recycle bins, `.DS_Store`, …). On by
+    /// default: a client mounting this export would otherwise create its own
+    /// machine's volume-service directories inside someone else's folder.
+    ///
+    /// Set false only when the export IS a whole volume being backed up and
+    /// those directories are part of what you meant to copy.
+    #[serde(default = "default_true")]
+    pub default_excludes: bool,
     /// Suggested CLIENT settings, sent to v2+ mounts at attach time. The
     /// client unions the lists with its own and uses the sizes only where it
     /// has no explicit value; `--no-server-defaults` opts out entirely.
     #[serde(default)]
     pub client: Option<ClientDefaults>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Hand-written rather than derived so `default_excludes` defaults to TRUE in
+/// both directions — a derive would make it false and quietly disagree with
+/// what the config file does when the key is omitted.
+impl Default for ExportConfig {
+    fn default() -> Self {
+        Self {
+            path: PathBuf::new(),
+            read_only: false,
+            exclude: Vec::new(),
+            default_excludes: true,
+            client: None,
+        }
+    }
 }
 
 /// The `client:` section of an export: what this server recommends mounts

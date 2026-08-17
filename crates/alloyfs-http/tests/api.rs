@@ -36,7 +36,7 @@ fn api(token: Option<&str>) -> Api {
             path: dir.path().to_path_buf(),
             read_only: false,
             exclude: vec!["*.key".to_string()],
-            client: None,
+            ..Default::default()
         },
     );
     let registry = Arc::new(ExportRegistry::from_config(&cfg).expect("registry"));
@@ -277,7 +277,7 @@ async fn a_read_only_export_refuses_writes() {
             path: dir.path().to_path_buf(),
             read_only: true,
             exclude: Vec::new(),
-            client: None,
+            ..Default::default()
         },
     );
     let registry = Arc::new(ExportRegistry::from_config(&cfg).unwrap());

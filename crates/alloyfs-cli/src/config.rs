@@ -295,11 +295,11 @@ pub fn load_agent_config(config: Option<PathBuf>, inline_exports: &[String]) -> 
         Some(path) => AgentConfig::from_path(&path)?,
         // No explicit config: a default file (if present) supplies exports —
         // essential for `serve --stdio`, which is spawned with no arguments.
+        // `default_config_path` already logs which location won, and says
+        // which one; logging again here printed two lines for one file and
+        // read as though two configs had been considered.
         None if inline_exports.is_empty() => match default_config_path() {
-            Some(path) => {
-                tracing::info!(path = %path.display(), "using default config");
-                AgentConfig::from_path(&path)?
-            }
+            Some(path) => AgentConfig::from_path(&path)?,
             None => AgentConfig::default(),
         },
         None => AgentConfig::default(),
@@ -314,7 +314,9 @@ pub fn load_agent_config(config: Option<PathBuf>, inline_exports: &[String]) -> 
                 path: PathBuf::from(path),
                 read_only: false,
                 exclude: vec![],
-                client: None,
+                // A throwaway `--export` gets the same OS-artifact hiding as a
+                // configured one; opting out is a config-file decision.
+                ..Default::default()
             },
         );
     }

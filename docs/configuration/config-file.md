@@ -74,6 +74,32 @@ client and report "not found" rather than "forbidden", so their existence does
 not leak. **`client.exclude` is a suggestion**, merged into what the client
 already wanted.
 
+### OS bookkeeping is hidden by default
+
+`System Volume Information`, `$RECYCLE.BIN`, `Thumbs.db`, `desktop.ini`,
+`.DS_Store`, `.Spotlight-V100`, `.Trashes`, `lost+found`, `.Trash-*` and
+friends are excluded in both directions without being listed.
+
+This is not tidiness. Mounting an export on Windows makes the *mounting*
+machine's volume service create `System Volume Information` inside the served
+folder — a Linux `~/webdav` grows one the moment it appears as a drive letter,
+and a recycle bin follows the first delete. There is no arrangement of two
+machines where one's recycle bin is the other's business.
+
+They are matched case-insensitively even on a case-sensitive server, because
+the casing is Windows's choice rather than yours and it varies between versions
+(`$RECYCLE.BIN` and `$Recycle.Bin` both occur in the wild).
+
+Turn them off per export when the export genuinely *is* a whole volume you are
+backing up:
+
+```yaml
+exports:
+  wholedisk:
+    path: /mnt/backup-source
+    default_excludes: false
+```
+
 Sizes accept `2M`, `512K`, or plain bytes.
 
 ## Mount config

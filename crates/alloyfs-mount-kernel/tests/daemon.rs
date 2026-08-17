@@ -35,7 +35,7 @@ async fn fixture() -> Fixture {
             path: dir.path().to_path_buf(),
             read_only: false,
             exclude: Vec::new(),
-            client: None,
+            ..Default::default()
         },
     );
     let registry = Arc::new(ExportRegistry::from_config(&cfg).expect("registry"));
@@ -808,7 +808,7 @@ async fn two_clients() -> (tempfile::TempDir, Arc<Server>, Arc<Server>) {
             path: dir.path().to_path_buf(),
             read_only: false,
             exclude: Vec::new(),
-            client: None,
+            ..Default::default()
         },
     );
     let registry = Arc::new(ExportRegistry::from_config(&cfg).expect("registry"));

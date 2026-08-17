@@ -64,6 +64,7 @@ pub fn start_agent(mut opts: AgentOpts) -> TestAgent {
             read_only: opts.read_only,
             exclude: opts.excludes.clone(),
             client: opts.client_defaults.take(),
+            ..Default::default()
         },
     );
     let registry = Arc::new(ExportRegistry::from_config(&cfg).expect("export registry"));

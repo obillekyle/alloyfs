@@ -72,10 +72,18 @@ The export name is derived from the directory name, lowercased and reduced to
 `[a-z0-9-_]` — names end up in URLs and in on-disk paths, so anything that
 could change how either parses becomes a dash.
 
-A config in the current directory is **not** picked up automatically. Pass
-`--config`, or move it next to the binary, or use `--global`. Auto-loading from
-the working directory would mean running `alloyfs` in a directory someone else
-controls could serve whatever a config there said to.
+`alloyfs serve` picks up `./alloyfs.yml` from the directory it is run in, so
+`alloyfs init && alloyfs serve` works with no `--config`. The full search order
+is in [config.yml](#/configuration/config-file).
+
+That does mean running `alloyfs serve` inside a directory someone else controls
+will serve whatever a config there says to. Treat an `alloyfs.yml` you did not
+write the way you would treat a `Makefile` you did not write.
+
+`init` writes a config; it does not merge into one. Pointing it at a path that
+already exists fails unless `--force` is passed, and `--force` overwrites rather
+than appends — so adding a second export to an existing config is a text edit,
+not a command.
 
 ## update
 

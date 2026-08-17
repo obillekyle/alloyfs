@@ -100,8 +100,8 @@ impl SyncEngine {
             Response::AttachOk { .. } => {}
             _ => return Err(ErrorCode::Io.into()),
         }
-        let exclude =
-            ExcludeSet::compile(&opts.excludes, cfg!(windows)).map_err(|_| ErrorCode::InvalidPath)?;
+        let exclude = ExcludeSet::compile_with_defaults(&opts.excludes, cfg!(windows))
+            .map_err(|_| ErrorCode::InvalidPath)?;
         let manifest_path = opts
             .data_dir
             .join("sync")

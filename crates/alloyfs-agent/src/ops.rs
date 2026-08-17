@@ -138,9 +138,16 @@ impl ExportRegistry {
             let root = std::fs::canonicalize(&ec.path)
                 .map_err(|e| anyhow::anyhow!("export {name}: cannot resolve {:?}: {e}", ec.path))?;
             anyhow::ensure!(root.is_dir(), "export {name}: {root:?} is not a directory");
-            // Server matching is always case-sensitive (documented).
-            let exclude =
-                ExcludeSet::compile(&ec.exclude, false).map_err(|e| anyhow::anyhow!("export {name}: {e}"))?;
+            // Server matching is always case-sensitive (documented) for the
+            // user's own patterns; the built-in local artifacts are matched
+            // case-insensitively regardless, since their casing is the OS's
+            // choice rather than anybody's configuration.
+            let exclude = if ec.default_excludes {
+                ExcludeSet::compile_with_defaults(&ec.exclude, false)
+            } else {
+                ExcludeSet::compile(&ec.exclude, false)
+            }
+            .map_err(|e| anyhow::anyhow!("export {name}: {e}"))?;
             // Resolve the suggested-client-config sizes at startup so a bad
             // value fails the boot, not a mount.
             let mount_defaults = match &ec.client {

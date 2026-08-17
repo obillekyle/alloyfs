@@ -34,7 +34,7 @@ impl Overlay {
     pub fn new(root: PathBuf, patterns: &[String]) -> anyhow::Result<Self> {
         // The mounted volume presents case-insensitively on Windows, so the
         // matcher must too — "Node_Modules" still routes local there.
-        let matcher = ExcludeSet::compile(patterns, cfg!(windows))?;
+        let matcher = ExcludeSet::compile_with_defaults(patterns, cfg!(windows))?;
         std::fs::create_dir_all(&root)?;
         Ok(Self {
             matcher,
