@@ -215,6 +215,79 @@ async fn remote_changes_applied_live() {
 
 // ---------------------------------------------------------------------- 4
 
+/// After a rename, the baseline must describe the file under its NEW name.
+///
+/// This is the deterministic half of a failure that was only ever seen on a
+/// contended CI runner. `local_changes_pushed_live` timed out waiting for a
+/// delete to reach the server, and the diagnostics showed the file present in
+/// both trees with `deletes_remote=0` — the delete had been converted into a
+/// pull, which is the one path that puts a deleted local file back.
+///
+/// The cause is not a race at all; the race only decided whether it surfaced.
+/// `rename_prefix` MOVES a baseline entry unchanged, while the server's
+/// `rename_version` does `versions.remove(from)` then `bump(to)` — so after
+/// every rename the recorded version describes the source and the server's
+/// target has a strictly newer one. `EventKind::Removed` reads that mismatch
+/// as "somebody else edited it" and pulls instead of deleting. The size+mtime
+/// fallback is the only thing that ever masked it, and it compares a LOCAL
+/// mtime against the SERVER's.
+///
+/// So this asserts the property rather than reproducing the timing: the
+/// version the baseline holds for the renamed path is the one the server
+/// actually has. It fails without the fix regardless of load.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rename_leaves_the_baseline_describing_the_new_name() {
+    let agent = start_agent(AgentOpts::default());
+    let s = start_sync(&agent, |_| {}).await;
+    wait_quiescent(&s).await;
+
+    std::fs::create_dir_all(s.local.path().join("proj")).unwrap();
+    std::fs::write(s.local.path().join("proj/code.rs"), b"contents").unwrap();
+    {
+        let remote = agent.dir.path().join("proj/code.rs");
+        wait_until("create pushed", 15, move || remote.exists().then_some(())).await;
+    }
+    wait_quiescent(&s).await;
+
+    let before = s
+        .engine
+        .baseline_version("proj/code.rs")
+        .expect("the created file has a baseline");
+
+    std::fs::rename(
+        s.local.path().join("proj/code.rs"),
+        s.local.path().join("proj/renamed.rs"),
+    )
+    .unwrap();
+    {
+        let new = agent.dir.path().join("proj/renamed.rs");
+        wait_until("rename pushed", 15, move || new.exists().then_some(())).await;
+    }
+    wait_quiescent(&s).await;
+
+    let recorded = s
+        .engine
+        .baseline_version("proj/renamed.rs")
+        .expect("the renamed file must still have a baseline");
+    let on_server = agent
+        .export
+        .version_of(&alloyfs_proto::RelPath("proj/renamed.rs".into()));
+
+    assert_eq!(
+        recorded, on_server,
+        "the baseline must record the version the server has for the NEW name \
+         (recorded {recorded}, server {on_server}, pre-rename {before}). \
+         A stale version here makes the next delete of this path pull the file \
+         back instead of removing it."
+    );
+
+    // And the consequence, end to end: the delete has to actually land.
+    std::fs::remove_file(s.local.path().join("proj/renamed.rs")).unwrap();
+    {
+        let gone = agent.dir.path().join("proj/renamed.rs");
+        wait_until("delete pushed", 15, move || (!gone.exists()).then_some(())).await;
+    }
+}
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn local_changes_pushed_live() {
     let agent = start_agent(AgentOpts::default());

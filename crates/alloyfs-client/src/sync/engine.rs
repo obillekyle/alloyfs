@@ -173,6 +173,21 @@ impl SyncEngine {
         Ok(engine)
     }
 
+    /// The server version this baseline recorded for `path`, if any.
+    ///
+    /// Narrower than `baseline_debug` and meant for assertions rather than
+    /// eyeballing: the version is what decides whether a delete is sent or
+    /// turned into a pull, so a test can check it directly instead of
+    /// reproducing the race that made it matter.
+    pub fn baseline_version(&self, path: &str) -> Option<u64> {
+        self.manifest
+            .lock()
+            .unwrap()
+            .entries
+            .get(path)
+            .map(|e| e.remote_version)
+    }
+
     /// The sync baseline as text, one path per line, sorted.
     ///
     /// The baseline decides whether a local delete is pushed at all:
