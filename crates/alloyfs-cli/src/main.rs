@@ -116,6 +116,19 @@ enum Command {
         #[arg(long)]
         one_shot: bool,
     },
+    /// Start everything this machine's config describes: the agent from
+    /// `server:`, plus every mount under `client.mounts:`. Runs until Ctrl-C.
+    Start {
+        /// Config file. Defaults to the discovered one.
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Only the agent, no mounts.
+        #[arg(long, conflicts_with = "mounts_only")]
+        server_only: bool,
+        /// Only the mounts, no agent.
+        #[arg(long)]
+        mounts_only: bool,
+    },
     /// Mounts and agents that start on their own, with no terminal window.
     /// Every subcommand except `list` needs an ELEVATED shell.
     Service {
@@ -352,6 +365,11 @@ async fn main() -> anyhow::Result<()> {
             )
             .await
         }
+        Command::Start {
+            config,
+            server_only,
+            mounts_only,
+        } => commands::start::run(config, server_only, mounts_only).await,
         Command::Service { cmd } => match cmd {
             ServiceCmd::Setup => commands::service::setup(),
             ServiceCmd::Add(args) => {

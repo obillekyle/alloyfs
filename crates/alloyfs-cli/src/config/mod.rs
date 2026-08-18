@@ -15,7 +15,7 @@ use alloyfs_agent::AgentConfig;
 
 pub use detect::{to_agent_config, Shape};
 
-pub use schema::{ClientSection, Config, CURRENT_VERSION};
+pub use schema::{ClientSection, Config, ResolvedMount, CURRENT_VERSION};
 
 // Size parsing lives in alloyfs-common (the agent's `client:` section uses the
 // same forms); re-exported so callers keep one import path.
@@ -91,6 +91,19 @@ const UPGRADE_HEADER: &str = "\
 # The previous file is beside this one with a .bak extension — including any
 # comments, which a rewrite cannot preserve.
 ";
+
+/// The config to use, honouring `--config` and otherwise discovering one.
+/// An absent config is an empty one: a machine with nothing set up yet is not
+/// an error, it is a machine with nothing to start.
+pub fn load_or_default(explicit: Option<PathBuf>) -> anyhow::Result<Config> {
+    match explicit {
+        Some(path) => load(&path),
+        None => match default_config_path() {
+            Some(path) => load(&path),
+            None => Ok(Config::default()),
+        },
+    }
+}
 
 // ## Where things live
 //

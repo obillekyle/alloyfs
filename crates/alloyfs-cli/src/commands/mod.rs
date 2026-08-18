@@ -4,5 +4,6 @@ pub mod init;
 pub mod mount;
 pub mod serve;
 pub mod service;
+pub mod start;
 pub mod sync;
 pub mod update;
