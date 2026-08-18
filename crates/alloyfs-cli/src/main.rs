@@ -38,11 +38,27 @@ enum Command {
         exports: Vec<String>,
     },
     /// Mount an export as a local drive.
+    ///
+    /// Two positionals mount a url somewhere:
+    ///     alloyfs mount tcp://host:7440/projects P:
+    /// One mounts a name from `client.mounts` in the config, which brings its
+    /// own url, mountpoint and settings:
+    ///     alloyfs mount work
+    ///
     /// URL: tcp://host:port/export or ssh://host/export
+    // `verbatim_doc_comment` so the two example lines survive as lines instead
+    // of being rewrapped into one paragraph; `about` spelled out because that
+    // setting would otherwise carry the trailing full stop into the subcommand
+    // list, where no other entry has one.
+    #[command(verbatim_doc_comment, about = "Mount an export as a local drive")]
     Mount {
-        url: String,
+        /// A mount url when a MOUNTPOINT follows it; the name of a mount under
+        /// `client.mounts` in the config when nothing does.
+        #[arg(value_name = "URL|NAME")]
+        target: String,
         /// Mountpoint: a directory on Linux, a drive letter (X:) on Windows.
-        mountpoint: PathBuf,
+        /// Left out, the first positional is read as a configured mount name.
+        mountpoint: Option<PathBuf>,
         /// Remote alloyfs command for ssh:// urls.
         #[arg(long, default_value = "alloyfs")]
         remote_cmd: String,
@@ -310,7 +326,7 @@ async fn main() -> anyhow::Result<()> {
             exports,
         } => commands::serve::run(tcp, stdio, config, exports).await,
         Command::Mount {
-            url,
+            target,
             mountpoint,
             remote_cmd,
             config,
@@ -324,8 +340,8 @@ async fn main() -> anyhow::Result<()> {
             token,
             backend,
         } => {
-            commands::mount::run(
-                url,
+            commands::mount::run_cli(
+                target,
                 mountpoint,
                 remote_cmd,
                 config,

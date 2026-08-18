@@ -125,10 +125,6 @@ pub struct MountEntry {
 /// there is no way to say it — and `exclude: []` has to be able to mean
 /// nothing. Scalars override the same way, which is the rule nobody is
 /// surprised by.
-// Consumed by `alloyfs mount <name>` and `alloyfs start`, which land next on
-// this branch. Kept rather than deleted because the merge rule it implements
-// is the subtle part of v3 and is already covered by tests.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ResolvedMount {
     pub url: String,
@@ -143,7 +139,6 @@ pub struct ResolvedMount {
     pub token: Option<String>,
 }
 
-#[allow(dead_code)]
 impl ClientSection {
     /// Collapse `client:` defaults and one named mount into what that mount
     /// actually wants. CLI flags are applied by the caller, above this.
@@ -188,7 +183,6 @@ impl ClientSection {
     }
 }
 
-#[allow(dead_code)]
 impl Config {
     /// Named mount, or `None`. The caller decides whether a miss is an error.
     pub fn mount(&self, name: &str) -> Option<ResolvedMount> {

@@ -1,7 +1,9 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::config::{cache_root, data_root, migrate_legacy_mount, parse_size};
+use alloyfs_common::SizeField;
+
+use crate::config::{cache_root, data_root, migrate_legacy_mount, parse_size, Config, ResolvedMount};
 use crate::urls::{
     connect_target, dialer_for, export_key, host_key, legacy_mount_key, require_export, whoami,
 };
@@ -16,6 +18,140 @@ pub enum Backend {
     /// Linux only: the alloyfs kernel module, which can deliver remote changes
     /// as genuine inotify events.
     Kernel,
+}
+
+/// `alloyfs mount` as the command line spells it: a url plus a mountpoint, or
+/// the name of a mount the config already describes.
+///
+/// Which form it is comes from how many positionals arrived, never from how the
+/// first one looks. Sniffing for `://` would make `alloyfs mount work` depend on
+/// whether the name happened to resemble a url, and every misjudgement would
+/// surface as a connection failure naming a host nobody typed.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_cli(
+    target: String,
+    mountpoint: Option<PathBuf>,
+    remote_cmd: String,
+    config: Option<PathBuf>,
+    excludes: Vec<String>,
+    pins: Vec<String>,
+    auto_cache_max: Option<String>,
+    auto_cache_budget: Option<String>,
+    data_dir: Option<PathBuf>,
+    no_server_defaults: bool,
+    detect_conflicts: bool,
+    token: Option<String>,
+    backend: Backend,
+) -> anyhow::Result<()> {
+    if let Some(mountpoint) = mountpoint {
+        return run(
+            target,
+            mountpoint,
+            remote_cmd,
+            config,
+            excludes,
+            pins,
+            auto_cache_max,
+            auto_cache_budget,
+            data_dir,
+            no_server_defaults,
+            detect_conflicts,
+            token,
+            backend,
+        )
+        .await;
+    }
+
+    // One positional: a name. `--config` still decides WHICH file the name is
+    // looked up in; without it, the usual discovery order applies.
+    let cfg = crate::config::load_or_default(config)?;
+    let mount = resolve_named(&cfg, &target)?;
+    tracing::info!(
+        mount = %target,
+        url = %mount.url,
+        at = %mount.at.display(),
+        "mounting a configured mount"
+    );
+
+    // The file is deliberately not passed on to `run`: `mount` is already the
+    // collapsed form of the `client:` defaults plus this entry, and reading it
+    // a second time down there would put `client.exclude` back over a mount
+    // that said `exclude: []` precisely to inherit nothing. What is left to
+    // apply is the flags, and flags win.
+    let excludes = if excludes.is_empty() {
+        mount.exclude
+    } else {
+        excludes
+    };
+    let pins = if pins.is_empty() { mount.pin } else { pins };
+    let auto_cache_max = resolve_size(auto_cache_max, mount.auto_cache_max, "auto_cache_max")?;
+    let auto_cache_budget = resolve_size(auto_cache_budget, mount.auto_cache_budget, "auto_cache_budget")?;
+    run(
+        mount.url,
+        mount.at,
+        remote_cmd,
+        None,
+        excludes,
+        pins,
+        auto_cache_max,
+        auto_cache_budget,
+        data_dir.or(mount.data_dir),
+        no_server_defaults || mount.no_server_defaults,
+        detect_conflicts || mount.detect_conflicts,
+        token.or(mount.token),
+        backend,
+    )
+    .await
+}
+
+/// The mount `name` stands for, or an error that names the mounts which DO
+/// exist.
+///
+/// A miss must not fall through to url parsing. `alloyfs mount wrok` would then
+/// fail as an unknown scheme, or as a DNS lookup for a typo — an error about the
+/// network, when the actual problem is a name that is not in the file.
+fn resolve_named(cfg: &Config, name: &str) -> anyhow::Result<ResolvedMount> {
+    if let Some(mount) = cfg.mount(name) {
+        return Ok(mount);
+    }
+    let known = cfg.mount_names();
+    if known.is_empty() {
+        anyhow::bail!(
+            "no mount named `{name}`: this config defines no mounts.\n\n\
+             \x20 Add one under `client.mounts:`, or give a url and a mountpoint:\n\
+             \x20   alloyfs mount tcp://host:7440/export <mountpoint>"
+        );
+    }
+    anyhow::bail!(
+        "no mount named `{name}`.\n\n\
+         \x20 configured mounts: {}\n\n\
+         \x20 alloyfs mount <name>              mounts one of those\n\
+         \x20 alloyfs mount <url> <mountpoint>  mounts something the config does not describe",
+        known.join(", ")
+    )
+}
+
+/// One cache size as the command line finally means it: the flag when one was
+/// given, otherwise whatever the config resolved to.
+///
+/// The configured value becomes a plain byte count rather than its original
+/// spelling, because `run` parses whatever string it is handed and a resolved
+/// `2M` and a resolved `2097152` have to reach it as the same number.
+fn resolve_size(
+    flag: Option<String>,
+    configured: Option<SizeField>,
+    key: &str,
+) -> anyhow::Result<Option<String>> {
+    match flag {
+        Some(flag) => Ok(Some(flag)),
+        None => match configured {
+            Some(size) => {
+                let bytes = size.to_bytes().map_err(|e| anyhow::anyhow!("{key}: {e}"))?;
+                Ok(Some(bytes.to_string()))
+            }
+            None => Ok(None),
+        },
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -228,4 +364,80 @@ async fn mount_platform(
     drive.unmount();
     fs.shutdown(); // persist the auto-cache manifest
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(text: &str) -> Config {
+        serde_yaml::from_str(text).expect("should load")
+    }
+
+    /// Two mounts and a client-level default, which is the shape the name
+    /// lookup has to cope with: `work` inherits the exclude it never states.
+    const CONFIG: &str = "client:\n  exclude: [node_modules]\n  mounts:\n\
+         \x20   docs: { url: 'tcp://h/docs', at: 'D:' }\n\
+         \x20   work: { url: 'ssh://azure/projects', at: 'P:' }\n";
+
+    #[test]
+    fn a_configured_name_arrives_with_the_client_defaults_folded_in() {
+        let mount = resolve_named(&parse(CONFIG), "work").expect("work is configured");
+        assert_eq!(mount.url, "ssh://azure/projects");
+        assert_eq!(mount.at, PathBuf::from("P:"));
+        assert_eq!(mount.exclude, ["node_modules"]);
+    }
+
+    /// The reason the two forms are told apart by positional COUNT: a name
+    /// that is not in the file has to fail as a name, listing what is, rather
+    /// than being handed to the url parser and failing as a hostname.
+    #[test]
+    fn an_unknown_name_lists_the_configured_ones() {
+        let err = resolve_named(&parse(CONFIG), "wrok")
+            .expect_err("wrok is not configured")
+            .to_string();
+        assert!(err.contains("wrok"), "{err}");
+        assert!(err.contains("docs") && err.contains("work"), "{err}");
+    }
+
+    /// A config with no mounts at all cannot list alternatives, so it says
+    /// where mounts go instead of printing an empty list.
+    #[test]
+    fn an_unknown_name_with_nothing_configured_says_where_mounts_go() {
+        let err = resolve_named(&parse("version: 3\n"), "work")
+            .expect_err("nothing is configured")
+            .to_string();
+        assert!(err.contains("work"), "{err}");
+        assert!(err.contains("client.mounts"), "{err}");
+    }
+
+    #[test]
+    fn a_size_flag_beats_the_configured_size() {
+        let configured = Some(SizeField::Human("2M".into()));
+        assert_eq!(
+            resolve_size(Some("8M".into()), configured.clone(), "auto_cache_max").unwrap(),
+            Some("8M".to_string())
+        );
+    }
+
+    /// Both spellings of a configured size reach `run` as the same number.
+    #[test]
+    fn a_configured_size_travels_as_bytes() {
+        let two_meg = (2 * 1024 * 1024).to_string();
+        for configured in [SizeField::Human("2M".into()), SizeField::Bytes(2 * 1024 * 1024)] {
+            assert_eq!(
+                resolve_size(None, Some(configured), "auto_cache_max").unwrap(),
+                Some(two_meg.clone())
+            );
+        }
+        assert_eq!(resolve_size(None, None, "auto_cache_max").unwrap(), None);
+    }
+
+    #[test]
+    fn an_unparseable_configured_size_names_the_key() {
+        let err = resolve_size(None, Some(SizeField::Human("2X".into())), "auto_cache_budget")
+            .expect_err("2X is not a size")
+            .to_string();
+        assert!(err.contains("auto_cache_budget"), "{err}");
+    }
 }

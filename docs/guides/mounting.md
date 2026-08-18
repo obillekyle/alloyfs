@@ -2,10 +2,12 @@
 
 ```bash
 alloyfs mount <URL> <MOUNTPOINT> [options]
+alloyfs mount <NAME> [options]
 ```
 
 The URL is `tcp://host:port/export` or `ssh://host/export`. The mountpoint is a
-directory on Linux, a drive letter (`X:`) on Windows.
+directory on Linux, a drive letter (`X:`) on Windows. A NAME is a mount the
+config already describes, covered below.
 
 ## TCP or SSH
 
@@ -16,6 +18,33 @@ jump hosts. The remote needs `alloyfs` on `PATH` and a config naming the export.
 **TCP** is lower overhead on a LAN. A non-loopback listener **requires** a token;
 the agent refuses to start otherwise, because anyone who can reach the port
 could otherwise mount every export. See [TCP authentication](#/configuration/auth).
+
+## Mounting by name
+
+Mounts listed in a config have names, and one positional mounts one of them:
+
+```yaml
+client:
+  exclude: [node_modules]
+  mounts:
+    work: { url: ssh://azure/projects, at: "P:" }
+```
+
+```bash
+alloyfs mount work
+```
+
+The entry supplies the url, the mountpoint and its own settings, including
+whatever it inherits from the `client:` defaults above it. Flags still win:
+`alloyfs mount work --exclude target` mounts that same `work` excluding
+`target` rather than `node_modules`.
+
+Which form runs is decided by how many positionals there are, not by how the
+first one looks — so a name is never dialled as a host, and a name that is not
+in the file says so and lists the ones that are.
+
+`--config <PATH>` chooses which file the name is looked up in; without it, the
+usual [search order](#/configuration/config-file) applies.
 
 ## Options worth knowing
 

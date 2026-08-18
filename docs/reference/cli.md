@@ -38,7 +38,13 @@ per-mount transport.
 
 ```bash
 alloyfs mount <URL> <MOUNTPOINT> [options]
+alloyfs mount <NAME> [options]
 ```
+
+Two positionals mount a url at a mountpoint. One names a mount under
+`client.mounts:` in the config, which supplies the url, the mountpoint and that
+entry's settings; flags still override them. Which form runs is decided by how
+many positionals there are, never by how the first one looks.
 
 See [Mounting a drive](#/guides/mounting) for the full option list.
 
