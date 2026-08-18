@@ -23,25 +23,35 @@ JOBS="${ALLOYFS_KBUILD_JOBS:-$(nproc)}"
 mkdir -p "$ROOT"
 cd "$ROOT"
 
-# Build dependencies (idempotent).
+# Build dependencies (idempotent). sudo -n throughout: this script is driven
+# over ssh and from WSL, where a password prompt is a hang nobody can answer.
+# Print the command instead and let the operator run it once.
 need=""
 for p in flex bison libssl-dev libelf-dev bc; do
 	dpkg -s "$p" >/dev/null 2>&1 || need="$need $p"
 done
 if [ -n "$need" ]; then
 	echo "==> installing build deps:$need"
-	sudo apt-get update -qq
-	sudo apt-get install -y -qq $need
+	if ! { sudo -n apt-get update -qq && sudo -n apt-get install -y -qq $need; }; then
+		echo "sudo could not install them. Run this once, by hand:" >&2
+		echo "  sudo apt-get install -y$need" >&2
+		exit 1
+	fi
 fi
 
-# 843 MB of RAM is not enough headroom for two gcc processes on the big
-# translation units; a swapfile turns a possible OOM into merely slower.
-if [ "$(swapon --show --noheadings | wc -l)" -eq 0 ]; then
-	echo "==> adding a 2G swapfile (build headroom)"
-	sudo fallocate -l 2G /swapfile
-	sudo chmod 600 /swapfile
-	sudo mkswap -q /swapfile
-	sudo swapon /swapfile
+# Two gcc processes on the big translation units want more headroom than a
+# small box has; a swapfile turns a possible OOM into merely slower. Only worth
+# it on a box that is actually short — the remote builder has 843 MB, a laptop
+# running this under WSL has several gigabytes and its own swap already.
+mem_mb=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)
+if [ "$mem_mb" -lt 2048 ] && [ "$(swapon --show --noheadings | wc -l)" -eq 0 ]; then
+	echo "==> adding a 2G swapfile (${mem_mb}M of RAM is not enough headroom)"
+	if ! { sudo -n fallocate -l 2G /swapfile && sudo -n chmod 600 /swapfile &&
+	       sudo -n mkswap -q /swapfile && sudo -n swapon /swapfile; }; then
+		echo "sudo could not add swap; the build may OOM. To add it by hand:" >&2
+		echo "  sudo fallocate -l 2G /swapfile && sudo chmod 600 /swapfile &&" >&2
+		echo "  sudo mkswap /swapfile && sudo swapon /swapfile" >&2
+	fi
 fi
 
 if [ ! -d "$SRC" ]; then
