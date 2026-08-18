@@ -104,7 +104,9 @@ pub(crate) async fn upload(conn: &MuxConnection, rel: &str, full: &Path) -> Resu
             })
             .await;
         match resp {
-            Ok(Ok(Response::Written { .. })) => {}
+            // v5+ servers answer with the attributes attached; the uploader
+            // reads neither field, only "it landed".
+            Ok(Ok(Response::Written { .. } | Response::WrittenAttr { .. })) => {}
             _ => {
                 result = Err(alloyfs_proto::ErrorCode::Io.into());
                 break;

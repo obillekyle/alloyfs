@@ -21,8 +21,21 @@ use crate::error::ErrorCode;
 /// Symlinks could previously be read (resolved server-side) but never
 /// created through a mount. Gated the same way: a v3 peer cannot decode
 /// these variants, so they are sent only when the negotiated version is >= 4.
+///
+/// v5: `Response::WrittenAttr` — a write reply that carries the file's
+/// post-write attributes. The gate is on the SERVER here rather than the
+/// client, because it is the server that chooses the reply shape: it answers
+/// with `Written` below v5 and `WrittenAttr` at v5+, and a v5 client accepts
+/// either.
 pub const PROTO_VERSION_MIN: u16 = 1;
-pub const PROTO_VERSION_MAX: u16 = 4;
+pub const PROTO_VERSION_MAX: u16 = 5;
+
+/// The protocol range this build speaks, for `--version` and diagnostics —
+/// "which wire version does this release talk" should not require reading
+/// source. A literal rather than a formatted string because clap's version
+/// output needs a `&'static str`; `proto_range_matches_the_constants` is what
+/// keeps it from drifting away from the two constants above.
+pub const PROTO_RANGE: &str = "1-5";
 
 /// Read/write payloads are capped to this many bytes per request so one huge
 /// file operation can never monopolize the connection (head-of-line blocking).
@@ -287,6 +300,8 @@ pub enum Response {
         attr: Attr,
     },
     Data(Bytes),
+    /// Pre-v5 write reply: byte count and new version, no attributes. Still
+    /// the only reply a v4-or-older peer can decode, so it stays.
     Written {
         n: u32,
         new_version: u64,
@@ -313,6 +328,23 @@ pub enum Response {
     /// v4+: a symlink's target, exactly as stored on the server. Appended
     /// last (see `Request::ReadLink`).
     Target(String),
+    /// v5+: `Written` plus the file's attributes as they stand after the
+    /// write. Every mount backend followed a write with a Getattr to learn
+    /// exactly these three fields (size, mtime, version), so carrying them
+    /// here removes a network round-trip per write.
+    ///
+    /// A NEW variant rather than fields on `Written`, and not only because
+    /// variants are append-only: postcard is not self-describing, so one
+    /// variant index cannot decode to two different shapes. Changing
+    /// `Written` would mean a v4 peer misreading the trailing attribute bytes
+    /// as whatever came next in the stream. `attr.version` carries what
+    /// `Written::new_version` did; `conflict` is not repeated (it has been
+    /// permanently false since a version mismatch started refusing the write
+    /// outright, and no client reads it).
+    WrittenAttr {
+        n: u32,
+        attr: Attr,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -350,4 +382,21 @@ pub enum Frame {
     /// prepended uncompressed size). Senders use it for large compressible
     /// frames when the negotiated version is >= 3; nesting is forbidden.
     Compressed(Bytes),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `PROTO_RANGE` is printed by `--version` and `alloyfs ping`, where a
+    /// wrong answer is worse than none: it is what a bug report quotes when
+    /// two peers refuse to talk.
+    #[test]
+    fn proto_range_matches_the_constants() {
+        assert_eq!(
+            PROTO_RANGE,
+            format!("{PROTO_VERSION_MIN}-{PROTO_VERSION_MAX}"),
+            "PROTO_RANGE must be regenerated when either constant moves"
+        );
+    }
 }

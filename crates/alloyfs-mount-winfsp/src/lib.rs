@@ -581,13 +581,22 @@ impl FileSystemContext for WinFspFs {
             (offset, buffer)
         };
 
-        let n = self.fs.write(fh, offset, data).map_err(fsp_err)?;
+        let (n, written_attr) = self.fs.write_at(fh, offset, data).map_err(fsp_err)?;
 
-        // Chunking happens inside RemoteFs; compute the resulting size locally
-        // instead of paying another round-trip, then drop the stale cache entry.
-        let mut new_attr = attr;
-        new_attr.size = attr.size.max(offset + u64::from(n));
-        self.fs.invalidate_attr(context.ino);
+        // Windows wants the file's post-write state in the reply to the write
+        // itself, which is why this used to be the point where a Getattr was
+        // unavoidable — and why it was skipped, by extrapolating the size and
+        // leaving the mtime at its pre-write value.
+        //
+        // Protocol v5 sends the real attributes back with the write, so there
+        // is nothing left to guess. Against an older agent the extrapolation
+        // stands, and the cache entry has already been dropped by `write_at`
+        // — the next stat pays for the truth.
+        let new_attr = written_attr.unwrap_or_else(|| {
+            let mut guessed = attr;
+            guessed.size = attr.size.max(offset + u64::from(n));
+            guessed
+        });
         fill_file_info(file_info, context.ino, &new_attr);
         Ok(n)
     }

@@ -529,9 +529,25 @@ impl RemoteFs {
 
     // --------------------------------------------------------------- writes
 
+    /// Write, discarding the server's post-write attributes. `write_at` is
+    /// the same call for backends that can use them.
     pub fn write(&self, fh: u64, offset: u64, data: &[u8]) -> Result<u32, FsError> {
+        self.write_at(fh, offset, data).map(|(n, _)| n)
+    }
+
+    /// Write, handing back the file's attributes as the server saw them
+    /// immediately afterwards — when the negotiated protocol carried them.
+    ///
+    /// `None` means "they did not come with the reply": a v4-or-older server,
+    /// or a write routed to the local overlay. Callers that fill a kernel
+    /// stat structure right after a write want the `Some` case; that is the
+    /// Getattr round-trip which used to follow every write.
+    ///
+    /// Either way the attribute cache is left CORRECT for this path — either
+    /// refreshed from the reply or, with nothing to refresh it with, dropped.
+    pub fn write_at(&self, fh: u64, offset: u64, data: &[u8]) -> Result<(u32, Option<Attr>), FsError> {
         if fh & OVERLAY_FH_BIT != 0 {
-            return self.overlay_ref().write(fh, offset, data);
+            return self.overlay_ref().write(fh, offset, data).map(|n| (n, None));
         }
         self.check_poisoned(fh)?;
         let server_fh = self.server_fh(fh);
@@ -550,6 +566,9 @@ impl RemoteFs {
         } else {
             None
         };
+        // The last chunk's reply describes the file as it now stands; earlier
+        // chunks' attributes are already superseded by the time the loop ends.
+        let mut fresh: Option<Attr> = None;
         let mut pos = 0usize;
         while pos < data.len() {
             let chunk = &data[pos..(pos + DATA_CHUNK as usize).min(data.len())];
@@ -576,10 +595,25 @@ impl RemoteFs {
                 }
                 Err(e) => return Err(e),
             };
-            let (n, new_version) = expect_resp!(
-                written,
-                Response::Written { n, new_version, .. } => (n, new_version)
-            );
+            // Both shapes are legal: v5+ servers answer with the attributes,
+            // everything older with the byte count and version alone. The
+            // version means the same thing in both — `Attr::version` IS what
+            // `Written::new_version` carried.
+            let (n, new_version) = match written {
+                Response::Written { n, new_version, .. } => {
+                    fresh = None;
+                    (n, new_version)
+                }
+                Response::WrittenAttr { n, attr } => {
+                    let version = attr.version;
+                    fresh = Some(attr);
+                    (n, version)
+                }
+                other => {
+                    tracing::error!(?other, "unexpected response variant");
+                    return Err(ErrorCode::Io.into());
+                }
+            };
             if let Some(state) = self.open_files.get(&fh) {
                 state.version.store(new_version, Ordering::Relaxed);
             }
@@ -596,8 +630,19 @@ impl RemoteFs {
         if let Some(state) = self.open_files.get(&fh) {
             state.wrote.store(true, Ordering::Relaxed);
             self.mark_path_written(&state.path);
+            // Size, mtime and version all just changed. With the reply
+            // carrying them the cached attr is REPLACED rather than dropped,
+            // and the next stat of this file — which every mount does
+            // immediately, to fill the write's own reply — is a memory hit
+            // instead of a Getattr. Without them the entry has to go: serving
+            // a pre-write size would be worse than paying for the round-trip.
+            match (fresh, self.ino.ino_of(&state.path)) {
+                (Some(attr), Some(ino)) => self.cache_attr(ino, attr),
+                (None, Some(ino)) => self.invalidate_attr(ino),
+                (_, None) => {} // never stat'ed through this mount: nothing cached
+            }
         }
-        Ok(data.len() as u32)
+        Ok((data.len() as u32, fresh))
     }
 
     /// Invalidate the cache entry, readahead windows, and every open fh's

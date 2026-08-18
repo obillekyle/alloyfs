@@ -1,12 +1,13 @@
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use alloyfs_common::{attr_from_metadata, read_fully, set_mode, write_fully, ExcludeSet, OrCode};
 use alloyfs_proto::{
     DirEntry, ErrorCode, EventKind, FsEvent, OpenFlags, RelPath, Request, Response, DATA_CHUNK,
+    PROTO_VERSION_MIN,
 };
 use alloyfs_transport::{EventPusher, RequestHandler};
 use dashmap::DashMap;
@@ -280,6 +281,10 @@ struct SessionInner {
     required_token: Option<String>,
     /// Starts true when no token is required; flipped by `Request::Auth`.
     authed: AtomicBool,
+    /// The version the handshake settled on, set by `negotiated()` before the
+    /// first request. Starts at the floor so a session served by something
+    /// that never reports one still answers in the shape every peer decodes.
+    proto: AtomicU16,
 }
 
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
@@ -303,6 +308,7 @@ impl AgentSession {
             last_seen: std::sync::Mutex::new(std::time::Instant::now()),
             authed: AtomicBool::new(token.is_none()),
             required_token: token,
+            proto: AtomicU16::new(PROTO_VERSION_MIN),
         });
         registry.sessions.insert(inner.id, Arc::downgrade(&inner));
         Self { inner }
@@ -580,8 +586,31 @@ impl SessionInner {
         write_fully(&of.file, &data, offset).or_code()?;
         export.events.note_local_write(&of.path, self.id);
         let new_version = export.bump(&of.path);
+        let n = data.len() as u32;
+
+        // v5+: answer with the attributes the client would otherwise come
+        // back for. One fstat on a handle already open costs microseconds
+        // here and saves a full round-trip there.
+        //
+        // The mtime is the one field this can report slightly early: Windows
+        // does not necessarily flush a file's timestamp to the FCB until the
+        // handle is closed, so a rapid rewrite may report the previous one.
+        // Freshness is decided by `version` (bumped above, always exact) and
+        // never by mtime, and the alternative every backend used until now —
+        // keeping the PRE-write attr and patching its size — was strictly
+        // more stale. A failed stat simply falls back to the old shape, which
+        // a v5 client also accepts.
+        if self.proto.load(Ordering::Relaxed) >= 5 {
+            if let Ok(md) = of.file.metadata() {
+                return Ok(Response::WrittenAttr {
+                    n,
+                    attr: attr_from_metadata(&md, new_version),
+                });
+            }
+            tracing::debug!(path = %of.path, "post-write stat failed; replying without attributes");
+        }
         Ok(Response::Written {
-            n: data.len() as u32,
+            n,
             new_version,
             // Always false now: a conflict returns above rather than writing
             // and flagging. The field is frozen by the append-only wire rule
@@ -871,6 +900,10 @@ impl RequestHandler for AgentSession {
                     .map_err(|_| ErrorCode::Io)?
             }
         }
+    }
+
+    async fn negotiated(&self, proto: u16) {
+        self.inner.proto.store(proto, Ordering::Relaxed);
     }
 
     async fn connected(&self, push: EventPusher) {

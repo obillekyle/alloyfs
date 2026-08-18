@@ -37,6 +37,16 @@ impl EventPusher {
 pub trait RequestHandler: Send + Sync + 'static {
     async fn handle(&self, req: Request) -> Result<Response, ErrorCode>;
 
+    /// Called once with the version the handshake settled on, before any
+    /// request is dispatched. Default: ignore it.
+    ///
+    /// Handlers that pick a REPLY shape by version need this — the client's
+    /// own gating (send the new variant only when the peer can decode it)
+    /// has no server-side equivalent, since the server never announces what
+    /// it is about to answer with. A handler that ignores this must behave as
+    /// `PROTO_VERSION_MIN`: the oldest shape is the one every peer decodes.
+    async fn negotiated(&self, _proto: u16) {}
+
     /// Called once after the handshake with a handle for server-push frames.
     /// Default: ignore it (handlers that never push need nothing).
     async fn connected(&self, _push: EventPusher) {}
@@ -79,7 +89,7 @@ where
     let mut reader = FramedRead::new(r, FrameCodec::default());
     let mut writer = FramedWrite::new(w, FrameCodec::default());
 
-    match reader.next().await {
+    let proto = match reader.next().await {
         Some(Ok(Frame::Hello {
             proto_min,
             proto_max,
@@ -107,6 +117,7 @@ where
                 .await?;
             // v3+: both sides may compress large frames from here on.
             writer.encoder_mut().compress = hi >= 3;
+            hi
         }
         Some(Ok(other)) => {
             return Err(TransportError::Handshake(format!(
@@ -115,7 +126,12 @@ where
         }
         Some(Err(e)) => return Err(e.into()),
         None => return Err(TransportError::Closed),
-    }
+    };
+
+    // Before `connected`, and before any request can be dispatched: a handler
+    // that learned the version late would already have answered its first
+    // request with the wrong shape.
+    handler.negotiated(proto).await;
 
     let (out_tx, mut out_rx) = mpsc::channel::<Frame>(256);
     handler.connected(EventPusher { tx: out_tx.clone() }).await;

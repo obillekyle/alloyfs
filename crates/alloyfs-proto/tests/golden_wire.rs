@@ -262,6 +262,10 @@ fn canonical() -> Vec<(&'static str, Frame)> {
             "resp_target",
             ok(Response::Target("../elsewhere/file.txt".into())),
         ),
+        (
+            "resp_written_attr",
+            ok(Response::WrittenAttr { n: 42, attr: attr() }),
+        ),
         // --- every ErrorCode (as Err) ---
         ("err_not_found", err(ErrorCode::NotFound)),
         ("err_permission_denied", err(ErrorCode::PermissionDenied)),
@@ -356,6 +360,7 @@ fn _variant_tripwire(
         Response::Ok => {}
         Response::MountDefaults { .. } => {} // v2: golden added, PROTO_VERSION_MAX bumped
         Response::Target(..) => {}           // v4: golden added, PROTO_VERSION_MAX bumped
+        Response::WrittenAttr { .. } => {}   // v5: golden added, PROTO_VERSION_MAX bumped
     }
     match code {
         ErrorCode::NotFound => {}
@@ -402,9 +407,12 @@ fn _variant_tripwire(
 #[rustfmt::skip]
 const GOLDEN: &[(&str, &str)] = &[
     // hello/hello_ack embed PROTO_VERSION_MAX — they legitimately move when
-    // the protocol version bumps (v3: auth + compression).
-    ("hello", "00010406676f6c64656e"),
-    ("hello_ack", "010406676f6c64656e"),
+    // the protocol version bumps (v5: attributes on the write reply). They
+    // are also the ONLY existing entries allowed to move for that reason: a
+    // bump that disturbs any other line has changed a variant's index or
+    // shape, which is the failure this table exists to catch.
+    ("hello", "00010506676f6c64656e"),
+    ("hello_ack", "010506676f6c64656e"),
     ("ping", "0507"),
     ("pong", "0607"),
     ("compressed", "0706676f6c64656e"),
@@ -442,6 +450,10 @@ const GOLDEN: &[(&str, &str)] = &[
     ("req_symlink", "020715152e2e2f656c736577686572652f66696c652e7478740c6469722f66696c652e747874"),
     ("req_read_link", "0207160c6469722f66696c652e747874"),
     ("resp_target", "0307000a152e2e2f656c736577686572652f66696c652e747874"),
+    // Variant index 0b, appended after Target. Its tail is byte-for-byte the
+    // Attr encoding in resp_attr — proof the shared type did not shift while
+    // a variant carrying it was added.
+    ("resp_written_attr", "0307000b2a002a80e2cfaa06bc99ef3a80e2cfaa06bc99ef3aa40308"),
     ("err_not_found", "03070100"),
     ("err_permission_denied", "03070101"),
     ("err_already_exists", "03070102"),

@@ -13,6 +13,7 @@ use std::time::Duration;
 use alloyfs_client::{ClientOptions, ROOT_INO};
 use alloyfs_proto::{
     ErrorCode, EventKind, FileKind, FsEvent, LockKind, OpenFlags, RelPath, Request, Response,
+    PROTO_VERSION_MAX,
 };
 use alloyfs_transport::TransportError;
 use bytes::Bytes;
@@ -459,7 +460,15 @@ async fn write_conflict_last_writer_wins() {
         .await
         .expect("transport")
         .expect("an unpinned write still wins");
-    assert!(matches!(resp, Response::Written { n: 6, .. }));
+    // Either write reply shape is fine here — what matters is that the write
+    // was accepted and 6 bytes landed, not which protocol version answered.
+    assert!(
+        matches!(
+            resp,
+            Response::Written { n: 6, .. } | Response::WrittenAttr { n: 6, .. }
+        ),
+        "got {resp:?}"
+    );
     assert_eq!(std::fs::read(agent.dir.path().join("w.txt")).unwrap(), b"FINAL!");
 }
 
@@ -1528,4 +1537,47 @@ async fn readlink_on_a_regular_file_is_refused() {
 
     let err = on_fs(&s.fs, move |fs| fs.readlink(ino)).await.unwrap_err();
     assert_eq!(remote_code(err), ErrorCode::InvalidPath);
+}
+
+// --------------------------------------------------------------------- 33
+
+/// A write's reply carries the file's new attributes (protocol v5), so the
+/// stat every backend does straight after a write is served from memory
+/// instead of costing a second round-trip.
+///
+/// Proved by severing the link before asking: `getattr` consults the cache
+/// before it touches the connection, so getting an answer at all means it
+/// never went to the wire — and that answer has to be the POST-write one.
+/// Both older behaviours fail here: dropping the entry leaves nothing to
+/// answer from, and keeping it unchanged answers with the pre-write size.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_write_reply_refreshes_the_attr_cache_instead_of_costing_a_getattr() {
+    let agent = start_agent(AgentOpts::default());
+    let s = connect(&agent, ClientOptions::default()).await;
+    assert_eq!(
+        s.conn().proto,
+        PROTO_VERSION_MAX,
+        "two peers from one build negotiate the newest version"
+    );
+
+    let (ino, fh) = on_fs(&s.fs, |fs| {
+        let (ino, fh, attr) = fs.create(ROOT_INO, "w.txt", 0o644, rw()).expect("create");
+        assert_eq!(attr.size, 0, "the cached attr starts at the empty file");
+        (ino, fh)
+    })
+    .await;
+
+    let (n, written) = on_fs(&s.fs, move |fs| fs.write_at(fh, 0, b"golden"))
+        .await
+        .expect("write");
+    assert_eq!(n, 6);
+    let written = written.expect("a v5 peer must carry the attributes on the write reply");
+    assert_eq!(written.size, 6);
+
+    s.sever();
+    let cached = on_fs(&s.fs, move |fs| fs.getattr(ino))
+        .await
+        .expect("the post-write attr must be cached, with no server left to ask");
+    assert_eq!(cached.size, 6, "the cached attr must be the post-write one");
+    assert_eq!(cached.version, written.version);
 }

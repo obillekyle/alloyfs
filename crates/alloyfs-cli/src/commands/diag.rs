@@ -2,13 +2,20 @@
 
 use std::time::Instant;
 
-use alloyfs_proto::{Request, Response};
+use alloyfs_proto::{Request, Response, PROTO_RANGE};
 
 use crate::urls::{connect_target, require_export, whoami};
 
 pub async fn ping(url: String, count: u32, token: Option<String>) -> anyhow::Result<()> {
     let (conn, _) = connect_target(&url, "alloyfs", "ping", token.as_deref()).await?;
-    println!("connected to {} (proto v{})", conn.server_name, conn.proto);
+    println!("connected to {}", conn.server_name);
+    // Both halves of the compatibility question in one quotable line: what
+    // this pair settled on, and what this build was willing to speak. A peer
+    // that refuses to connect at all is diagnosed by comparing two of these.
+    println!(
+        "protocol v{} negotiated (this build speaks {PROTO_RANGE})",
+        conn.proto
+    );
     for i in 1..=count {
         let rtt = conn.ping().await?;
         println!("ping {i}: {:.3} ms", rtt.as_secs_f64() * 1000.0);
