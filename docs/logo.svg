@@ -1,0 +1,71 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="664" height="664" viewBox="68 68 664 664" fill="none" role="img" aria-label="AlloyFS">
+  <title>AlloyFS</title>
+  <!--
+    The docs copy. Same drawing as assets/logo.svg, cropped to the mark.
+    
+    The published logo carries space around it on purpose — an avatar gets
+    cropped to a circle and a mark touching the edge loses its outline. A
+    header slot is the opposite case: the box is already small, so that same
+    space renders the mark smaller than the wordmark beside it. Measured, the
+    original left 68px at the sides and 132px top and bottom of empty box.
+    
+    Square and centred on the ink, since this file is the favicon as well.
+  -->
+    <desc>An open folder, lit from the top left, the front panel casting a shadow up onto the tab.</desc>
+
+  <!--
+    Paths, gradients, blend modes and layer order are the export's own.
+    One thing is not: the grain.
+
+    The export carries it as two 1024x1024 base64 bitmaps and weighs 4.2 MB — an
+    SVG wrapping rasters, which is larger than a PNG of the same picture and
+    stops scaling cleanly, in a file whose whole job is to be a logo at 80px and
+    a hero at 800. `feTurbulence` generates the same texture procedurally in a
+    few hundred bytes and stays sharp at any size.
+
+    Its noise is finer than a downscaled 1024px bitmap's, so `color-dodge` on
+    the tab bit harder than intended and read as speckle rather than texture.
+    The frequency is raised and that layer's opacity dropped to match what the
+    export looks like, not what it says.
+  -->
+  <defs>
+    <filter id="noise" x="0" y="0" width="100%" height="100%">
+      <feTurbulence type="fractalNoise" baseFrequency="1.6" numOctaves="3" stitchTiles="stitch"/>
+      <feColorMatrix type="saturate" values="0"/>
+    </filter>
+    <pattern id="grain" width="200" height="200" patternUnits="userSpaceOnUse">
+      <rect width="200" height="200" filter="url(#noise)"/>
+    </pattern>
+
+    <linearGradient id="front" x1="346.806" y1="280.155" x2="691.623" y2="666.667" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#A7D7FF"/>
+      <stop offset="1" stop-color="#051933"/>
+    </linearGradient>
+    <linearGradient id="back" x1="346.806" y1="280.155" x2="691.623" y2="666.667" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#163C5B"/>
+      <stop offset="1" stop-color="#6686AF"/>
+    </linearGradient>
+    <!-- The shadow the front panel throws up onto the tab: clear at the top
+         fold, solid by roughly three quarters down. -->
+    <linearGradient id="shadow" x1="400" y1="133.333" x2="400" y2="666.667" gradientUnits="userSpaceOnUse">
+      <stop stop-opacity="0"/>
+      <stop offset="0.730769"/>
+    </linearGradient>
+    <linearGradient id="edge" x1="559.213" y1="584.514" x2="177.616" y2="261.765" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#3D688F" stop-opacity="0.44"/>
+      <stop offset="1" stop-color="#5C94B3" stop-opacity="0.72"/>
+    </linearGradient>
+
+    <path id="body" d="M130.44 666.667H669.56C686.8 666.667 701.196 653.52 702.756 636.35L730.03 336.35C731.803 316.831 716.433 300 696.833 300H103.167C83.5665 300 68.1965 316.831 69.9712 336.35L97.2438 636.35C98.8048 653.52 113.2 666.667 130.44 666.667Z"/>
+    <path id="tab" d="M700 300.148V233.333C700 214.924 685.076 200 666.666 200H333.333L300 133.333H133.333L107.038 185.924C102.409 195.181 99.9998 205.388 99.9998 215.738V300.148C101.042 300.05 102.098 300 103.167 300H696.833C697.902 300 698.958 300.05 700 300.148Z"/>
+  </defs>
+
+  <use href="#body" fill="url(#front)"/>
+  <use href="#body" fill="url(#grain)" fill-opacity="0.24" style="mix-blend-mode:soft-light"/>
+
+  <use href="#tab" fill="url(#back)"/>
+  <use href="#tab" fill="url(#grain)" fill-opacity="0.10" style="mix-blend-mode:color-dodge"/>
+  <use href="#tab" fill="url(#shadow)"/>
+
+  <path d="M696.833 300C716.433 300 731.803 316.831 730.03 336.35L702.756 636.35C701.196 653.52 686.8 666.667 669.56 666.667H130.44C113.2 666.667 98.8048 653.52 97.2438 636.35L69.9712 336.35C68.1965 316.831 83.5665 300 103.167 300M696.833 300H103.167M696.833 300C697.902 300 698.958 300.05 700 300.148V233.333C700 214.924 685.076 200 666.666 200H333.333L300 133.333H133.333L107.038 185.924C102.409 195.181 99.9998 205.388 99.9998 215.738V300.148C101.042 300.05 102.098 300 103.167 300" stroke="url(#edge)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
