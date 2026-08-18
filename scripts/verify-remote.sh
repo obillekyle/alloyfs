@@ -25,10 +25,23 @@ echo "==> shipping the workspace to $host:$dest"
 # so cargo cannot even load the manifest without it — Windows-only in effect,
 # mandatory for resolution everywhere.
 tar czf - Cargo.toml Cargo.lock rust-toolchain.toml rustfmt.toml crates scripts kernel vendor |
-  ssh "$host" "mkdir -p $dest && cd $dest && tar xzf -"
+# The shipped directories go first: tar unpacks OVER a tree and never deletes,
+# so a renamed file lingers there and fails the build with an error that has
+# nothing to do with the change under test.
+  ssh "$host" "mkdir -p $dest && cd $dest && rm -rf crates kernel vendor && tar xzf -"
 
-echo "==> cargo test --workspace on $host"
-ssh "$host" "cd $dest && . ~/.cargo/env 2>/dev/null; cargo test --workspace"
+# The SAME gate as scripts/verify.sh, not a weaker one.
+#
+# This ran only `cargo test` until CI failed on a commit it had passed: the
+# dead-code errors that broke the Linux build come from `clippy -D warnings`,
+# and `cargo test` reports them as warnings it prints and ignores. A remote
+# check that is easier to satisfy than CI is worse than no remote check,
+# because it is believed.
+echo "==> fmt + clippy + test on $host"
+ssh "$host" "cd $dest && . ~/.cargo/env 2>/dev/null; \
+  cargo fmt --all --check && \
+  cargo clippy --workspace --all-targets -- -D warnings && \
+  cargo test --workspace"
 
 echo
 echo "remote verify OK ($host)"

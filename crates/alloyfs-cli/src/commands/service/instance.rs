@@ -1,5 +1,12 @@
 //! What one managed instance is, and where its definition lives.
 
+// Windows-only in practice: every command in the parent module returns the
+// "use service.sh" error on other platforms, so nothing here is reached and
+// `-D warnings` turns each unused item into a build failure. Allowed rather
+// than cfg-gated because the module is not Windows-specific in principle —
+// systemd units will consume exactly these definitions.
+#![cfg_attr(not(windows), allow(dead_code))]
+
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};

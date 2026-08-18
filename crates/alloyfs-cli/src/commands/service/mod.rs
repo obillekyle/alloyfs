@@ -14,6 +14,11 @@
 //! breaks `GetFinalPathNameByHandle` round-trips — the reason bun reports
 //! spurious ENOENT on this class of drive.
 
+// On non-Windows every command below is `#[cfg(not(windows))] return
+// unsupported();` followed by a cfg'd-out block. The `return` is load-bearing
+// there — without it the function would fall through to nothing — but clippy
+// only sees the last statement in a function and calls it needless.
+#![cfg_attr(not(windows), allow(clippy::needless_return))]
 pub mod instance;
 
 #[cfg(windows)]
@@ -72,6 +77,9 @@ pub fn require_elevation() -> anyhow::Result<()> {
     Ok(())
 }
 
+// Never reached on this platform — every command bails with `unsupported()`
+// first — but kept so the call site does not need a cfg of its own.
+#[cfg_attr(not(windows), allow(dead_code))]
 #[cfg(not(windows))]
 pub fn require_elevation() -> anyhow::Result<()> {
     Ok(())
