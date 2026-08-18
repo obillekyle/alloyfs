@@ -18,6 +18,22 @@ Not SMB, not WebDAV, not a sync folder — a mount, with the events and the lock
 
 </div>
 
+<!--
+  Wider than the shot in the other two READMEs, and not by choice: the agent
+  logs through `tracing_subscriber::fmt()` with its default formatter, which
+  spends about forty columns on an RFC3339 timestamp and a module path before
+  the message starts. 880 keeps it inside the content column; capping it
+  further makes the line unreadable rather than merely small.
+-->
+
+<div align="center">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/obillekyle/alloyfs/main/assets/terminal-dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/obillekyle/alloyfs/main/assets/terminal-light.svg">
+  <img alt="the alloyfs agent starting: an export opened and watched, a TCP socket listening, then a client session attaching to it" src="https://raw.githubusercontent.com/obillekyle/alloyfs/main/assets/terminal-light.svg" width="880">
+</picture>
+</div>
+
 **AlloyFS** is a cross-platform virtual drive service: any host runs an **agent** that exports
 folders; any other host **mounts** an export as a *real local drive* — a drive
 letter on Windows (via [WinFsp](https://winfsp.dev)), a mountpoint on Linux

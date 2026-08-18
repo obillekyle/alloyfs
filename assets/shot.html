@@ -1,0 +1,53 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>alloyfs — terminal</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<style>
+  body { margin: 0; padding: 40px; background: #8b8b8b; display: flex; flex-direction: column; gap: 40px; align-items: flex-start; }
+  .win {
+    background: var(--bg); border: 1px solid var(--border); border-radius: 10px;
+    overflow: hidden; width: max-content; box-shadow: 0 8px 30px rgba(0,0,0,.18);
+  }
+  .bar {
+    height: 34px; background: var(--chrome); border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; gap: 8px; padding: 0 13px;
+  }
+  .d { width: 11px; height: 11px; border-radius: 50%; display: inline-block; }
+  .r { background: #ff5f57 } .y { background: #febc2e } .g { background: #28c840 }
+  .t {
+    margin-left: 10px; font-size: 12px; color: var(--title);
+    /* Google Sans if this machine has it, and the usual UI stack if not. */
+    font-family: "Google Sans", "Google Sans Text", ui-sans-serif, system-ui, "Segoe UI", Roboto, sans-serif;
+  }
+  pre {
+    margin: 0; padding: 18px 22px 20px;
+    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 13px; line-height: 1.62; letter-spacing: 0;
+    white-space: pre; tab-size: 2;
+    /* Ligatures off, and this is not taste. JetBrains Mono draws two dashes as
+       one long dash, so a flag in this window would render differently from how
+       it has to be typed. */
+    font-variant-ligatures: none;
+    font-feature-settings: "liga" 0, "calt" 0;
+  }
+</style>
+<div class="win" id="dark" style="--bg:#0d1117;--chrome:#161b22;--border:#30363d;--title:#8b949e">
+  <div class="bar"><i class="d r"></i><i class="d y"></i><i class="d g"></i><span class="t">projects — alloyfs</span></div>
+  <pre><span style="color:#c9d1d9;opacity:.65">2026-08-18T01:41:35.172991Z</span><span style="color:#c9d1d9"> </span><span style="color:#7ee787"> INFO</span><span style="color:#c9d1d9"> </span><span style="color:#c9d1d9;opacity:.65">alloyfs_agent::ops</span><span style="color:#c9d1d9;opacity:.65">:</span><span style="color:#c9d1d9"> export ready </span><span style="color:#c9d1d9;font-style:italic">name</span><span style="color:#c9d1d9;opacity:.65">=</span><span style="color:#c9d1d9">"projects" </span><span style="color:#c9d1d9;font-style:italic">root</span><span style="color:#c9d1d9;opacity:.65">=</span><span style="color:#c9d1d9">/home/you/projects </span><span style="color:#c9d1d9;font-style:italic">read_only</span><span style="color:#c9d1d9;opacity:.65">=</span><span style="color:#c9d1d9">false </span><span style="color:#c9d1d9;font-style:italic">excludes</span><span style="color:#c9d1d9;opacity:.65">=</span><span style="color:#c9d1d9">0</span>
+<span style="color:#c9d1d9;opacity:.65">2026-08-18T01:41:35.173791Z</span><span style="color:#c9d1d9"> </span><span style="color:#7ee787"> INFO</span><span style="color:#c9d1d9"> </span><span style="color:#c9d1d9;opacity:.65">alloyfs_agent::watch</span><span style="color:#c9d1d9;opacity:.65">:</span><span style="color:#c9d1d9"> watching for changes </span><span style="color:#c9d1d9;font-style:italic">export</span><span style="color:#c9d1d9;opacity:.65">=</span><span style="color:#c9d1d9">"projects"</span>
+<span style="color:#c9d1d9;opacity:.65">2026-08-18T01:41:35.178712Z</span><span style="color:#c9d1d9"> </span><span style="color:#7ee787"> INFO</span><span style="color:#c9d1d9"> </span><span style="color:#c9d1d9;opacity:.65">alloyfs_transport::tcp</span><span style="color:#c9d1d9;opacity:.65">:</span><span style="color:#c9d1d9"> listening (tcp) </span><span style="color:#c9d1d9;font-style:italic">addr</span><span style="color:#c9d1d9;opacity:.65">=</span><span style="color:#c9d1d9">127.0.0.1:7440</span>
+<span style="color:#c9d1d9;opacity:.65">2026-08-18T01:41:35.201701Z</span><span style="color:#c9d1d9"> </span><span style="color:#7ee787"> INFO</span><span style="color:#c9d1d9"> </span><span style="color:#c9d1d9;opacity:.65">alloyfs_transport::tcp</span><span style="color:#c9d1d9;opacity:.65">:</span><span style="color:#c9d1d9"> connection accepted </span><span style="color:#c9d1d9;font-style:italic">peer</span><span style="color:#c9d1d9;opacity:.65">=</span><span style="color:#c9d1d9">127.0.0.1:62497</span>
+<span style="color:#c9d1d9;opacity:.65">2026-08-18T01:41:35.201778Z</span><span style="color:#c9d1d9"> </span><span style="color:#7ee787"> INFO</span><span style="color:#c9d1d9"> </span><span style="color:#c9d1d9;opacity:.65">alloyfs_transport::server</span><span style="color:#c9d1d9;opacity:.65">:</span><span style="color:#c9d1d9"> session connected </span><span style="color:#c9d1d9;font-style:italic">client</span><span style="color:#c9d1d9;opacity:.65">=</span><span style="color:#c9d1d9">"you@desktop" </span><span style="color:#c9d1d9;font-style:italic">proto</span><span style="color:#c9d1d9;opacity:.65">=</span><span style="color:#c9d1d9">4</span>
+<span style="color:#c9d1d9;opacity:.65">2026-08-18T01:41:35.202487Z</span><span style="color:#c9d1d9"> </span><span style="color:#7ee787"> INFO</span><span style="color:#c9d1d9"> </span><span style="color:#c9d1d9;opacity:.65">alloyfs_agent::ops</span><span style="color:#c9d1d9;opacity:.65">:</span><span style="color:#c9d1d9"> client attached </span><span style="color:#c9d1d9;font-style:italic">export</span><span style="color:#c9d1d9;opacity:.65">=</span><span style="color:#c9d1d9">"projects"</span></pre>
+</div>
+<div class="win" id="light" style="--bg:#ffffff;--chrome:#f6f8fa;--border:#d0d7de;--title:#6e7781">
+  <div class="bar"><i class="d r"></i><i class="d y"></i><i class="d g"></i><span class="t">projects — alloyfs</span></div>
+  <pre><span style="color:#24292f;opacity:.65">2026-08-18T01:41:35.172991Z</span><span style="color:#24292f"> </span><span style="color:#1a7f37"> INFO</span><span style="color:#24292f"> </span><span style="color:#24292f;opacity:.65">alloyfs_agent::ops</span><span style="color:#24292f;opacity:.65">:</span><span style="color:#24292f"> export ready </span><span style="color:#24292f;font-style:italic">name</span><span style="color:#24292f;opacity:.65">=</span><span style="color:#24292f">"projects" </span><span style="color:#24292f;font-style:italic">root</span><span style="color:#24292f;opacity:.65">=</span><span style="color:#24292f">/home/you/projects </span><span style="color:#24292f;font-style:italic">read_only</span><span style="color:#24292f;opacity:.65">=</span><span style="color:#24292f">false </span><span style="color:#24292f;font-style:italic">excludes</span><span style="color:#24292f;opacity:.65">=</span><span style="color:#24292f">0</span>
+<span style="color:#24292f;opacity:.65">2026-08-18T01:41:35.173791Z</span><span style="color:#24292f"> </span><span style="color:#1a7f37"> INFO</span><span style="color:#24292f"> </span><span style="color:#24292f;opacity:.65">alloyfs_agent::watch</span><span style="color:#24292f;opacity:.65">:</span><span style="color:#24292f"> watching for changes </span><span style="color:#24292f;font-style:italic">export</span><span style="color:#24292f;opacity:.65">=</span><span style="color:#24292f">"projects"</span>
+<span style="color:#24292f;opacity:.65">2026-08-18T01:41:35.178712Z</span><span style="color:#24292f"> </span><span style="color:#1a7f37"> INFO</span><span style="color:#24292f"> </span><span style="color:#24292f;opacity:.65">alloyfs_transport::tcp</span><span style="color:#24292f;opacity:.65">:</span><span style="color:#24292f"> listening (tcp) </span><span style="color:#24292f;font-style:italic">addr</span><span style="color:#24292f;opacity:.65">=</span><span style="color:#24292f">127.0.0.1:7440</span>
+<span style="color:#24292f;opacity:.65">2026-08-18T01:41:35.201701Z</span><span style="color:#24292f"> </span><span style="color:#1a7f37"> INFO</span><span style="color:#24292f"> </span><span style="color:#24292f;opacity:.65">alloyfs_transport::tcp</span><span style="color:#24292f;opacity:.65">:</span><span style="color:#24292f"> connection accepted </span><span style="color:#24292f;font-style:italic">peer</span><span style="color:#24292f;opacity:.65">=</span><span style="color:#24292f">127.0.0.1:62497</span>
+<span style="color:#24292f;opacity:.65">2026-08-18T01:41:35.201778Z</span><span style="color:#24292f"> </span><span style="color:#1a7f37"> INFO</span><span style="color:#24292f"> </span><span style="color:#24292f;opacity:.65">alloyfs_transport::server</span><span style="color:#24292f;opacity:.65">:</span><span style="color:#24292f"> session connected </span><span style="color:#24292f;font-style:italic">client</span><span style="color:#24292f;opacity:.65">=</span><span style="color:#24292f">"you@desktop" </span><span style="color:#24292f;font-style:italic">proto</span><span style="color:#24292f;opacity:.65">=</span><span style="color:#24292f">4</span>
+<span style="color:#24292f;opacity:.65">2026-08-18T01:41:35.202487Z</span><span style="color:#24292f"> </span><span style="color:#1a7f37"> INFO</span><span style="color:#24292f"> </span><span style="color:#24292f;opacity:.65">alloyfs_agent::ops</span><span style="color:#24292f;opacity:.65">:</span><span style="color:#24292f"> client attached </span><span style="color:#24292f;font-style:italic">export</span><span style="color:#24292f;opacity:.65">=</span><span style="color:#24292f">"projects"</span></pre>
+</div>
