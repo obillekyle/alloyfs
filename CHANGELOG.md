@@ -8,9 +8,29 @@ is only ever as good as the commits — which is the point.
 explanation in the commit body, where it is also visible in `git log`, in a
 pull request, and on the release page.
 
+## [0.6.0] — 2026-08-18
+
+<sub>diff: [456a69a...827c012](https://github.com/obillekyle/alloyfs/compare/456a69a...827c012)</sub>
+
+### New Features
+
+- **docs:** versioned docs, with the sidebar and version list as data ([1dbcbd6](https://github.com/obillekyle/alloyfs/commit/1dbcbd6))
+
+    The sidebar was a `const NAV` literal in `index.html`, and the version badge was an element nothing ever filled — this project publishes to no registry, so there was nothing for it to ask. Both become files the site reads: `docs/pages.json` and `docs/versions.json`.
+
+### Docs
+
+- the agent serving, as a picture ([827c012](https://github.com/obillekyle/alloyfs/commit/827c012))
+
+    The README described an agent that opens an export, watches it with the OS-native watcher and accepts client sessions. That reads better as the agent saying it. `scripts/terminal-shot.ts` builds an export in a temp directory, starts the agent on a spare port, attaches a real client so the session rows are not staged, captures the log and tears both processes down.
+
+- a header, and the logo as vectors rather than bitmaps ([fd18a7b](https://github.com/obillekyle/alloyfs/commit/fd18a7b))
+
+    The export carried its grain as two 1024x1024 base64 images and weighed 4.2 MB — an SVG wrapping rasters, which is larger than a PNG of the same picture and no longer scales, in a file whose whole job is to be 96px in a README and 800 in a hero. `feTurbulence` generates the same texture procedurally: 3.3 KB, sharp at any size.
+
 ## [0.5.0] — 2026-08-17
 
-<sub>diff: [3171187...6e421bd](https://github.com/obillekyle/alloyfs/compare/3171187...6e421bd)</sub>
+<sub>diff: [3171187...456a69a](https://github.com/obillekyle/alloyfs/compare/3171187...456a69a)</sub>
 
 ### New Features
 
