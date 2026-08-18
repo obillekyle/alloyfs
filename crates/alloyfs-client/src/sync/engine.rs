@@ -173,6 +173,33 @@ impl SyncEngine {
         Ok(engine)
     }
 
+    /// The sync baseline as text, one path per line, sorted.
+    ///
+    /// The baseline decides whether a local delete is pushed at all:
+    /// `push_local`'s `Removed` arm treats a path with no entry as "never
+    /// synced, nothing to delete remotely" and returns without asking the
+    /// server. So when a delete appears to do nothing, this is the first
+    /// thing worth looking at — and it is otherwise invisible from outside
+    /// the engine, which is what made an intermittent CI failure cost a
+    /// whole investigation with nothing to show for it.
+    ///
+    /// A snapshot for diagnostics, not a handle for control.
+    pub fn baseline_debug(&self) -> String {
+        let m = self.manifest.lock().unwrap();
+        let mut out = format!(
+            "baseline: {} entries (last_seq {})\n",
+            m.entries.len(),
+            m.last_seq
+        );
+        for (path, entry) in &m.entries {
+            out.push_str(&format!(
+                "    {path}  kind={:?} size={} mtime={} ver={}\n",
+                entry.kind, entry.size, entry.mtime_ns, entry.remote_version
+            ));
+        }
+        out
+    }
+
     /// True once every accepted op has been fully processed.
     pub fn is_quiescent(&self) -> bool {
         self.stats.pending.load(Relaxed) == 0

@@ -364,6 +364,58 @@ fn deadline_mult() -> u64 {
 pub fn deadline_after(secs: u64) -> std::time::Instant {
     std::time::Instant::now() + Duration::from_secs(secs * deadline_mult())
 }
+/// Like `wait_until`, but a timeout also prints `ctx()` — whatever state
+/// makes the failure diagnosable.
+///
+/// An intermittent timeout that only reports which condition failed is close
+/// to useless: it says a delete never reached the server, and nothing about
+/// whether the engine skipped it, never saw it, or tried and failed. `ctx`
+/// runs once, at the moment of failure, so it costs nothing on the passing
+/// path and answers the question on the failing one.
+pub async fn wait_until_ctx<T>(
+    what: &str,
+    secs: u64,
+    mut probe: impl FnMut() -> Option<T>,
+    ctx: impl Fn() -> String,
+) -> T {
+    let deadline = deadline_after(secs);
+    let waited = secs * deadline_mult();
+    loop {
+        if let Some(v) = probe() {
+            return v;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("wait_until timed out after {waited}s: {what}\n{}", ctx());
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// A directory listing, relative and sorted, for timeout diagnostics.
+pub fn tree_debug(label: &str, root: &std::path::Path) -> String {
+    fn walk(dir: &std::path::Path, base: &std::path::Path, out: &mut Vec<String>) {
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        for item in rd.flatten() {
+            let path = item.path();
+            let rel = path.strip_prefix(base).unwrap_or(&path).display().to_string();
+            let rel = rel.replace(std::path::MAIN_SEPARATOR, "/");
+            if path.is_dir() {
+                out.push(format!("{rel}/"));
+                walk(&path, base, out);
+            } else {
+                let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                out.push(format!("{rel} ({size}b)"));
+            }
+        }
+    }
+    let mut entries = Vec::new();
+    walk(root, root, &mut entries);
+    entries.sort();
+    if entries.is_empty() {
+        return format!("{label}: (empty)\n");
+    }
+    format!("{label}:\n    {}\n", entries.join("\n    "))
+}
 
 /// Poll `probe` every 25 ms until it yields, or panic after `secs`
 /// (× ALLOYFS_TEST_DEADLINE_MULT) naming `what`.

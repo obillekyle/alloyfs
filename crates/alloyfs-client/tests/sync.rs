@@ -254,7 +254,35 @@ async fn local_changes_pushed_live() {
     std::fs::remove_file(s.local.path().join("proj/renamed.rs")).unwrap();
     {
         let gone = agent.dir.path().join("proj/renamed.rs");
-        wait_until("delete pushed", 15, move || (!gone.exists()).then_some(())).await;
+        // The one step of this test that has failed intermittently in CI, and
+        // the failure said only that the file was still there. A delete that
+        // never reaches the server is either a watcher event that never
+        // arrived or a push that decided there was nothing to do — and the
+        // baseline is what tells those apart, since `push_local` skips a
+        // Removed with no baseline entry without asking the server.
+        let engine = s.engine.clone();
+        let local_root = s.local.path().to_path_buf();
+        let remote_root = agent.dir.path().to_path_buf();
+        harness::wait_until_ctx(
+            "delete pushed",
+            15,
+            move || (!gone.exists()).then_some(()),
+            move || {
+                format!(
+                    "{}{}{}  stats: pushes={} deletes_remote={} pending={}\n",
+                    engine.baseline_debug(),
+                    harness::tree_debug("  local", &local_root),
+                    harness::tree_debug("  remote", &remote_root),
+                    engine.stats.pushes.load(std::sync::atomic::Ordering::Relaxed),
+                    engine
+                        .stats
+                        .deletes_remote
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    engine.stats.pending.load(std::sync::atomic::Ordering::Relaxed),
+                )
+            },
+        )
+        .await;
     }
     wait_quiescent(&s).await;
     assert_trees_equal(s.local.path(), agent.dir.path());
