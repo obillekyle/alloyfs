@@ -1,6 +1,6 @@
-# Stage 2: the filesystem served by a real daemon over /dev/alloyfs, with no
-# in-memory tree behind it. Everything here crosses the kernel<->userspace
-# ABI: lookup, getattr, readdir and read.
+# Stage 2: the filesystem served by a real daemon over /dev/alloyfs. Every
+# name, size and byte in this case crossed the kernel<->userspace ABI to get
+# here: lookup, getattr, readdir and read.
 . /tests/lib.sh
 
 MNT=/mnt/alloyfs

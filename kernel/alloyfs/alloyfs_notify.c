@@ -23,21 +23,17 @@
  * dentry cache with d_hash_and_lookup(). An uncached path is skipped —
  * nothing has walked that subtree, so nothing can be watching it.
  *
- * Layout: the primitives in the middle of this file are the shared core.
- * Two front-ends drive them — /proc/alloyfs-inject for the in-memory tree, and
- * daemon notifications addressed by nodeid for real mounts.
+ * Layout: the primitives in the middle of this file are the shared core, and
+ * the daemon front-end below them addresses events by nodeid, the same way it
+ * addresses everything else.
  */
 #define pr_fmt(fmt) "alloyfs: " fmt
 
 #include <linux/dcache.h>
 #include <linux/fs.h>
 #include <linux/fsnotify.h>
-#include <linux/namei.h>
 #include <linux/pagemap.h>	/* invalidate_inode_pages2 */
-#include <linux/proc_fs.h>
-#include <linux/slab.h>
 #include <linux/string.h>
-#include <linux/uaccess.h>
 
 #include "alloyfs.h"
 
@@ -84,33 +80,30 @@ static struct dentry *alloyfs_cached_child(struct dentry *dir, const struct qstr
  */
 
 /*
- * A name appeared. `inode` is the new child's inode when the caller has one
- * (the in-memory tree can make one); NULL is fine.
+ * A name appeared on the server.
  *
- * CONSUMES the reference on `inode`: it is either handed to a cached
- * negative dentry or released here. Hoisting the iget out of the branch
- * that instantiates leaks it, which surfaces at umount as
- * "VFS: Busy inodes after unmount" — caught by the stage-1 regression.
+ * A negative dentry may be cached from a lookup that ran before the name
+ * existed, and nothing here revalidates one: this filesystem has no
+ * ->d_revalidate, so the VFS would go on answering ENOENT for a file that is
+ * now really there. Unhashing it forces the next lookup to ask the daemon.
+ *
+ * The notification cannot instantiate the name itself — a CREATE carries the
+ * parent's nodeid and a name, not the child's attributes — so dropping is the
+ * whole of the fix, and it has to happen before the watchers are woken or a
+ * watcher that reacts by opening the file races the stale answer.
  */
 static void alloyfs_ev_created(struct dentry *dir_dentry, const struct qstr *q,
-			    bool isdir, struct inode *inode)
+			    bool isdir)
 {
 	struct inode *dir = d_inode(dir_dentry);
 	struct dentry *child = alloyfs_cached_child(dir_dentry, q);
 
-	/* A negative dentry may be cached from an earlier failed lookup; the
-	 * VFS would keep answering ENOENT for a file that now exists.
-	 */
-	if (child && d_really_is_negative(child) && inode) {
-		d_instantiate(child, inode);
-		inode = NULL;	/* the dentry owns it now */
-	}
+	if (child && d_really_is_negative(child))
+		d_drop(child);
 
 	alloyfs_notify_dirent(dir, child, q, FS_CREATE | (isdir ? FS_ISDIR : 0), 0);
 	if (child)
 		dput(child);
-	if (inode)
-		iput(inode);
 }
 
 /* Contents or metadata changed. `newsize` >= 0 updates i_size first. */
@@ -289,7 +282,7 @@ int alloyfs_notify_from_daemon(int code, const void *payload, u32 len)
 
 	switch (code) {
 	case ALLOYFS_NOTIFY_CREATE:
-		alloyfs_ev_created(dir, &q, isdir, NULL);
+		alloyfs_ev_created(dir, &q, isdir);
 		break;
 	case ALLOYFS_NOTIFY_DELETE:
 		alloyfs_ev_removed(dir, &q, isdir);
@@ -315,280 +308,4 @@ int alloyfs_notify_from_daemon(int code, const void *payload, u32 len)
 	dput(dir);
 	mutex_unlock(&alloyfs_lock);
 	return ret;
-}
-
-/* --------------------------------------------- front-end: /proc (in-memory)
- *
- * Stage-1 trigger for the fd-less demo tree, kept because its assertions are
- * the project's inotify regression test. It mutates the in-memory tree and
- * then calls the same primitives above.
- */
-
-/* Resolve a mount-relative directory path in our own dcache. "" or "/" is
- * the root. NULL when any component is not cached.
- */
-static struct dentry *alloyfs_resolve_dir(const char *path)
-{
-	struct dentry *cur, *next;
-	char *buf, *p, *comp;
-
-	if (!alloyfs_sb || !alloyfs_sb->s_root)
-		return NULL;
-
-	cur = dget(alloyfs_sb->s_root);
-	if (!path || !*path || !strcmp(path, "/"))
-		return cur;
-
-	buf = kstrdup(path, GFP_KERNEL);
-	if (!buf) {
-		dput(cur);
-		return NULL;
-	}
-	p = buf;
-	while ((comp = strsep(&p, "/"))) {
-		struct qstr q;
-
-		if (!*comp)
-			continue;	/* tolerate "a//b" and trailing slashes */
-		q.name = comp;
-		q.len = strlen(comp);
-		next = d_hash_and_lookup(cur, &q);
-		dput(cur);
-		if (IS_ERR_OR_NULL(next) || d_really_is_negative(next)) {
-			if (!IS_ERR_OR_NULL(next))
-				dput(next);
-			kfree(buf);
-			return NULL;
-		}
-		cur = next;
-	}
-	kfree(buf);
-	return cur;
-}
-
-static int alloyfs_do_create(const char *dirpath, const char *name, bool isdir)
-{
-	struct dentry *dir_dentry;
-	struct alloyfs_node *dnode, *node;
-	struct inode *inode = NULL;
-	struct qstr q = QSTR_INIT(name, strlen(name));
-
-	dir_dentry = alloyfs_resolve_dir(dirpath);
-	if (!dir_dentry)
-		return -ENOENT;
-	dnode = d_inode(dir_dentry)->i_private;
-
-	mutex_lock(&alloyfs_lock);
-	if (alloyfs_child(dnode, name)) {
-		mutex_unlock(&alloyfs_lock);
-		dput(dir_dentry);
-		return -EEXIST;
-	}
-	node = alloyfs_node_new(dnode, name, isdir ? (S_IFDIR | 0755) : (S_IFREG | 0644));
-	mutex_unlock(&alloyfs_lock);
-	if (!node) {
-		dput(dir_dentry);
-		return -ENOMEM;
-	}
-	inode = alloyfs_iget_node(alloyfs_sb, node);
-	if (IS_ERR(inode))
-		inode = NULL;
-
-	alloyfs_ev_created(dir_dentry, &q, isdir, inode);
-	dput(dir_dentry);
-	return 0;
-}
-
-static int alloyfs_do_modify(const char *dirpath, const char *name, loff_t newsize,
-			  __u32 mask)
-{
-	struct dentry *dir_dentry;
-	struct alloyfs_node *dnode, *node;
-	struct qstr q = QSTR_INIT(name, strlen(name));
-
-	dir_dentry = alloyfs_resolve_dir(dirpath);
-	if (!dir_dentry)
-		return -ENOENT;
-	dnode = d_inode(dir_dentry)->i_private;
-
-	mutex_lock(&alloyfs_lock);
-	node = alloyfs_child(dnode, name);
-	if (!node) {
-		mutex_unlock(&alloyfs_lock);
-		dput(dir_dentry);
-		return -ENOENT;
-	}
-	if (mask & FS_MODIFY) {
-		kfree(node->data);
-		node->data = NULL;	/* size-only change; reads return zeroes */
-		node->size = newsize;
-	}
-	mutex_unlock(&alloyfs_lock);
-
-	alloyfs_ev_changed(dir_dentry, &q, mask, (mask & FS_MODIFY) ? newsize : -1);
-	dput(dir_dentry);
-	return 0;
-}
-
-static int alloyfs_do_delete(const char *dirpath, const char *name)
-{
-	struct dentry *dir_dentry;
-	struct alloyfs_node *dnode, *node;
-	struct qstr q = QSTR_INIT(name, strlen(name));
-	bool isdir;
-
-	dir_dentry = alloyfs_resolve_dir(dirpath);
-	if (!dir_dentry)
-		return -ENOENT;
-	dnode = d_inode(dir_dentry)->i_private;
-
-	mutex_lock(&alloyfs_lock);
-	node = alloyfs_child(dnode, name);
-	if (!node) {
-		mutex_unlock(&alloyfs_lock);
-		dput(dir_dentry);
-		return -ENOENT;
-	}
-	isdir = S_ISDIR(node->mode);
-	alloyfs_node_free(node);
-	mutex_unlock(&alloyfs_lock);
-
-	alloyfs_ev_removed(dir_dentry, &q, isdir);
-	dput(dir_dentry);
-	return 0;
-}
-
-static int alloyfs_do_rename(const char *fromdir, const char *fromname,
-			  const char *todir, const char *toname)
-{
-	struct dentry *from_dentry, *to_dentry;
-	struct alloyfs_node *fnode, *tnode, *node;
-	struct qstr fq = QSTR_INIT(fromname, strlen(fromname));
-	struct qstr tq = QSTR_INIT(toname, strlen(toname));
-	bool isdir;
-
-	from_dentry = alloyfs_resolve_dir(fromdir);
-	if (!from_dentry)
-		return -ENOENT;
-	to_dentry = alloyfs_resolve_dir(todir);
-	if (!to_dentry) {
-		dput(from_dentry);
-		return -ENOENT;
-	}
-	fnode = d_inode(from_dentry)->i_private;
-	tnode = d_inode(to_dentry)->i_private;
-
-	mutex_lock(&alloyfs_lock);
-	node = alloyfs_child(fnode, fromname);
-	if (!node) {
-		mutex_unlock(&alloyfs_lock);
-		dput(to_dentry);
-		dput(from_dentry);
-		return -ENOENT;
-	}
-	isdir = S_ISDIR(node->mode);
-	list_del(&node->sibling);
-	strscpy(node->name, toname, sizeof(node->name));
-	node->parent = tnode;
-	list_add_tail(&node->sibling, &tnode->children);
-	mutex_unlock(&alloyfs_lock);
-
-	alloyfs_ev_moved(from_dentry, &fq, to_dentry, &tq, isdir);
-	dput(to_dentry);
-	dput(from_dentry);
-	return 0;
-}
-
-/*
- *   create <dir> <name>          mkdir  <dir> <name>
- *   modify <dir> <name> <size>   attrib <dir> <name>
- *   delete <dir> <name>          rename <dir> <name> <dir2> <name2>
- *
- * <dir> is mount-relative; "/" is the root.
- */
-int alloyfs_inject(const char *line)
-{
-	char *buf, *p, *cmd, *a1, *a2, *a3, *a4;
-	int ret;
-
-	/* This trigger mutates the in-memory tree, which a daemon-backed mount
-	 * does not have — there the daemon drives injection over the device.
-	 */
-	if (alloyfs_sb && ALLOYFS_SB(alloyfs_sb) && ALLOYFS_SB(alloyfs_sb)->conn)
-		return -EOPNOTSUPP;
-
-	buf = kstrdup(line, GFP_KERNEL);
-	if (!buf)
-		return -ENOMEM;
-	p = strim(buf);
-
-	cmd = strsep(&p, " ");
-	a1 = strsep(&p, " ");
-	a2 = strsep(&p, " ");
-	a3 = strsep(&p, " ");
-	a4 = strsep(&p, " ");
-
-	if (!cmd || !a1 || !a2) {
-		ret = -EINVAL;
-	} else if (!strcmp(cmd, "create")) {
-		ret = alloyfs_do_create(a1, a2, false);
-	} else if (!strcmp(cmd, "mkdir")) {
-		ret = alloyfs_do_create(a1, a2, true);
-	} else if (!strcmp(cmd, "attrib")) {
-		ret = alloyfs_do_modify(a1, a2, 0, FS_ATTRIB);
-	} else if (!strcmp(cmd, "delete")) {
-		ret = alloyfs_do_delete(a1, a2);
-	} else if (!strcmp(cmd, "modify")) {
-		long long size = 0;
-
-		if (!a3 || kstrtoll(a3, 10, &size))
-			ret = -EINVAL;
-		else
-			ret = alloyfs_do_modify(a1, a2, size, FS_MODIFY);
-	} else if (!strcmp(cmd, "rename")) {
-		ret = (a3 && a4) ? alloyfs_do_rename(a1, a2, a3, a4) : -EINVAL;
-	} else {
-		ret = -EINVAL;
-	}
-
-	kfree(buf);
-	return ret;
-}
-
-static ssize_t alloyfs_inject_write(struct file *file, const char __user *ubuf,
-				 size_t count, loff_t *ppos)
-{
-	char buf[512];
-	int ret;
-
-	if (count == 0 || count >= sizeof(buf))
-		return -EINVAL;
-	if (copy_from_user(buf, ubuf, count))
-		return -EFAULT;
-	buf[count] = '\0';
-
-	ret = alloyfs_inject(buf);
-	if (ret)
-		return ret;
-	return count;
-}
-
-static const struct proc_ops alloyfs_inject_proc_ops = {
-	.proc_write = alloyfs_inject_write,
-	.proc_lseek = noop_llseek,
-};
-
-static struct proc_dir_entry *alloyfs_inject_entry;
-
-int alloyfs_notify_init(void)
-{
-	alloyfs_inject_entry = proc_create("alloyfs-inject", 0200, NULL,
-					&alloyfs_inject_proc_ops);
-	return alloyfs_inject_entry ? 0 : -ENOMEM;
-}
-
-void alloyfs_notify_exit(void)
-{
-	if (alloyfs_inject_entry)
-		proc_remove(alloyfs_inject_entry);
 }

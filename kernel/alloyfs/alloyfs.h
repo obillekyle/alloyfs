@@ -2,14 +2,14 @@
 /*
  * AlloyFS — a filesystem that can report changes it did not make.
  *
- * Two mount modes share one implementation:
- *   - `mount -t alloyfs none /mnt`         a hardcoded in-memory tree. This is
- *                                       the stage-1 spike, kept because its
- *                                       32 inotify assertions are the
- *                                       project's regression test.
- *   - `mount -t alloyfs -o fd=N none /mnt` backed by a daemon on /dev/alloyfs.
+ * One mount mode: `mount -t alloyfs -o fd=N none /mnt`, where N is a
+ * descriptor for an open /dev/alloyfs shared with the daemon serving the
+ * export. The tree, the file contents and the change notifications all arrive
+ * over that connection; a mount without one is refused rather than served
+ * from anything local.
  *
- * The fsnotify injection path (alloyfs_notify.c) is identical in both.
+ * The fsnotify injection path — the reason the module exists — is in
+ * alloyfs_notify.c.
  */
 #ifndef _ALLOYFS_H
 #define _ALLOYFS_H
@@ -28,33 +28,17 @@
 					 * baked into every mounted superblock and
 					 * changing it would strand existing mounts. */
 
-/* ------------------------------------------------------- in-memory tree */
+/* --------------------------------------------------------------- the mount */
 
-/*
- * One entry of the stage-1 tree. Guarded by alloyfs_lock (a single global mutex
- * is right for a demo tree; daemon-backed mounts never touch these).
+/* The mounted superblock. One mount at a time, which is all the harness needs
+ * and all stage 2 promises.
+ *
+ * alloyfs_lock guards that pointer: notifications arrive on the daemon's own
+ * thread and must not reach a superblock that put_super is halfway through
+ * tearing down.
  */
-struct alloyfs_node {
-	struct list_head sibling;
-	struct list_head children;
-	struct alloyfs_node *parent;
-	char name[NAME_MAX + 1];
-	umode_t mode;
-	unsigned long ino;
-	loff_t size;
-	char *data;		/* file contents; NULL means zero-filled */
-};
-
 extern struct mutex alloyfs_lock;
-
-/* The mounted superblock. One mount at a time, which is all the harness
- * needs and all stage 2 promises.
- */
 extern struct super_block *alloyfs_sb;
-
-struct alloyfs_node *alloyfs_node_new(struct alloyfs_node *parent, const char *name, umode_t mode);
-void alloyfs_node_free(struct alloyfs_node *node);
-struct alloyfs_node *alloyfs_child(struct alloyfs_node *dir, const char *name);
 
 /* --------------------------------------------------------- daemon transport */
 
@@ -91,10 +75,11 @@ struct alloyfs_conn {
 	refcount_t refs;
 };
 
-/* Per-superblock state; NULL conn means the in-memory mode. */
+/* Per-superblock state. A live mount always has its connection; NULL means
+ * the superblock is on its way out.
+ */
 struct alloyfs_sb_info {
 	struct alloyfs_conn *conn;
-	struct alloyfs_node *root_node;
 };
 
 static inline struct alloyfs_sb_info *ALLOYFS_SB(struct super_block *sb)
@@ -114,16 +99,12 @@ int alloyfs_request(struct alloyfs_conn *conn, u32 opcode, u64 nodeid, u64 offse
 
 /* ------------------------------------------------------------------ inodes */
 
-struct inode *alloyfs_iget_node(struct super_block *sb, struct alloyfs_node *node);
 struct inode *alloyfs_iget_attr(struct super_block *sb, const struct alloyfs_attr *attr);
 
 /* Upper bound on a notification payload: the fixed entry plus two names. */
 #define ALLOYFS_NOTIFY_MAX (sizeof(struct alloyfs_notify_entry) + 2 * ALLOYFS_MAX_NAME)
 
 /* alloyfs_notify.c — the point of the whole exercise. */
-int alloyfs_inject(const char *line);
 int alloyfs_notify_from_daemon(int code, const void *payload, u32 len);
-int alloyfs_notify_init(void);
-void alloyfs_notify_exit(void);
 
 #endif /* _ALLOYFS_H */

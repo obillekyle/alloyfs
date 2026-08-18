@@ -2,9 +2,11 @@
 /*
  * Filesystem registration, inodes, and the VFS operations.
  *
- * Every operation has two implementations behind one entry point: the
- * in-memory stage-1 tree, and a round-trip to the daemon. Which one runs is
- * decided by whether the superblock has a connection.
+ * Every operation is a round trip to the daemon: nothing is served from
+ * kernel memory, and nothing is cached beyond what the VFS keeps for us. A
+ * superblock without a connection is one that is being torn down, and the
+ * operations below answer such a mount with EIO rather than an invented
+ * result.
  */
 #define pr_fmt(fmt) "alloyfs: " fmt
 
@@ -24,54 +26,11 @@
 DEFINE_MUTEX(alloyfs_lock);
 struct super_block *alloyfs_sb;
 
-static atomic_long_t alloyfs_next_ino = ATOMIC_LONG_INIT(2);	/* 1 is the root */
-
 static const struct inode_operations alloyfs_dir_inode_operations;
 static const struct inode_operations alloyfs_file_inode_operations;
 static const struct inode_operations alloyfs_symlink_inode_operations;
 static const struct file_operations alloyfs_dir_operations;
 static const struct file_operations alloyfs_file_operations;
-
-/* ------------------------------------------------------------------ tree */
-
-struct alloyfs_node *alloyfs_node_new(struct alloyfs_node *parent, const char *name, umode_t mode)
-{
-	struct alloyfs_node *node = kzalloc(sizeof(*node), GFP_KERNEL);
-
-	if (!node)
-		return NULL;
-	INIT_LIST_HEAD(&node->children);
-	INIT_LIST_HEAD(&node->sibling);
-	strscpy(node->name, name, sizeof(node->name));
-	node->mode = mode;
-	node->ino = atomic_long_inc_return(&alloyfs_next_ino);
-	node->parent = parent;
-	if (parent)
-		list_add_tail(&node->sibling, &parent->children);
-	return node;
-}
-
-void alloyfs_node_free(struct alloyfs_node *node)
-{
-	struct alloyfs_node *child, *tmp;
-
-	list_for_each_entry_safe(child, tmp, &node->children, sibling)
-		alloyfs_node_free(child);
-	list_del(&node->sibling);
-	kfree(node->data);
-	kfree(node);
-}
-
-struct alloyfs_node *alloyfs_child(struct alloyfs_node *dir, const char *name)
-{
-	struct alloyfs_node *child;
-
-	list_for_each_entry(child, &dir->children, sibling) {
-		if (!strcmp(child->name, name))
-			return child;
-	}
-	return NULL;
-}
 
 /* ----------------------------------------------------------------- inodes */
 
@@ -102,24 +61,10 @@ static void alloyfs_init_inode(struct inode *inode, umode_t mode, loff_t size)
 }
 
 /*
- * One inode per node/nodeid. Reusing the same inode across lookups is not an
+ * One inode per nodeid. Reusing the same inode across lookups is not an
  * optimisation but a correctness requirement: an inotify mark pins an inode,
  * and handing out a fresh one per lookup would silently drop watches.
  */
-struct inode *alloyfs_iget_node(struct super_block *sb, struct alloyfs_node *node)
-{
-	struct inode *inode = iget_locked(sb, node->ino);
-
-	if (!inode)
-		return ERR_PTR(-ENOMEM);
-	if (!(inode->i_state & I_NEW))
-		return inode;
-	inode->i_private = node;
-	alloyfs_init_inode(inode, node->mode, node->size);
-	unlock_new_inode(inode);
-	return inode;
-}
-
 struct inode *alloyfs_iget_attr(struct super_block *sb, const struct alloyfs_attr *attr)
 {
 	struct inode *inode = iget_locked(sb, (unsigned long)attr->nodeid);
@@ -131,7 +76,6 @@ struct inode *alloyfs_iget_attr(struct super_block *sb, const struct alloyfs_att
 		i_size_write(inode, attr->size);
 		return inode;
 	}
-	inode->i_private = NULL;
 	alloyfs_init_inode(inode, attr->mode, attr->size);
 	if (attr->nlink)
 		set_nlink(inode, attr->nlink);
@@ -152,56 +96,49 @@ static struct dentry *alloyfs_lookup(struct inode *dir, struct dentry *dentry,
 				  unsigned int flags)
 {
 	struct alloyfs_conn *conn = alloyfs_conn_of(dir);
-	struct inode *inode = NULL;
+	struct alloyfs_attr attr;
+	struct inode *inode;
+	int ret;
 
 	if (dentry->d_name.len > ALLOYFS_MAX_NAME)
 		return ERR_PTR(-ENAMETOOLONG);
+	if (!conn)
+		return ERR_PTR(-EIO);
 
-	if (conn) {
-		struct alloyfs_attr attr;
-		int ret = alloyfs_request(conn, ALLOYFS_OP_LOOKUP, dir->i_ino, 0, 0,
-				       dentry->d_name.name, dentry->d_name.len,
-				       &attr, sizeof(attr));
+	ret = alloyfs_request(conn, ALLOYFS_OP_LOOKUP, dir->i_ino, 0, 0,
+			   dentry->d_name.name, dentry->d_name.len,
+			   &attr, sizeof(attr));
 
-		if (ret == -ENOENT)
-			return d_splice_alias(NULL, dentry);	/* negative */
-		if (ret < 0)
-			return ERR_PTR(ret);
-		if (ret < (int)sizeof(attr))
-			return ERR_PTR(-EIO);
-		inode = alloyfs_iget_attr(dir->i_sb, &attr);
-		if (IS_ERR(inode))
-			return ERR_CAST(inode);
-		return d_splice_alias(inode, dentry);
-	}
-
-	mutex_lock(&alloyfs_lock);
-	{
-		struct alloyfs_node *child = alloyfs_child(dir->i_private, dentry->d_name.name);
-
-		if (child) {
-			inode = alloyfs_iget_node(dir->i_sb, child);
-			if (IS_ERR(inode)) {
-				mutex_unlock(&alloyfs_lock);
-				return ERR_CAST(inode);
-			}
-		}
-	}
-	mutex_unlock(&alloyfs_lock);
-
-	/* A negative dentry is cached too: it is what lets a later injected
-	 * create find something to instantiate.
+	/* A miss is cached as a negative dentry, and nothing here revalidates
+	 * one — which is why a create reported by the daemon has to drop it
+	 * (alloyfs_ev_created). Without that, this cache would keep answering
+	 * ENOENT for a name that now exists on the server.
 	 */
+	if (ret == -ENOENT)
+		return d_splice_alias(NULL, dentry);
+	if (ret < 0)
+		return ERR_PTR(ret);
+	if (ret < (int)sizeof(attr))
+		return ERR_PTR(-EIO);
+	inode = alloyfs_iget_attr(dir->i_sb, &attr);
+	if (IS_ERR(inode))
+		return ERR_CAST(inode);
 	return d_splice_alias(inode, dentry);
 }
 
-static int alloyfs_readdir_remote(struct file *file, struct dir_context *ctx,
-			       struct alloyfs_conn *conn)
+static int alloyfs_readdir(struct file *file, struct dir_context *ctx)
 {
 	struct inode *inode = file_inode(file);
-	void *buf = kmalloc(ALLOYFS_MAX_PAYLOAD, GFP_KERNEL);
+	struct alloyfs_conn *conn = alloyfs_conn_of(inode);
+	void *buf;
 	int ret = 0;
 
+	if (!conn)
+		return -EIO;
+	if (!dir_emit_dots(file, ctx))
+		return 0;
+
+	buf = kmalloc(ALLOYFS_MAX_PAYLOAD, GFP_KERNEL);
 	if (!buf)
 		return -ENOMEM;
 
@@ -239,75 +176,34 @@ out:
 	return ret;
 }
 
-static int alloyfs_readdir(struct file *file, struct dir_context *ctx)
-{
-	struct inode *inode = file_inode(file);
-	struct alloyfs_conn *conn = alloyfs_conn_of(inode);
-	struct alloyfs_node *child;
-	loff_t i = 2;
-
-	if (!dir_emit_dots(file, ctx))
-		return 0;
-	if (conn)
-		return alloyfs_readdir_remote(file, ctx, conn);
-
-	mutex_lock(&alloyfs_lock);
-	list_for_each_entry(child, &((struct alloyfs_node *)inode->i_private)->children, sibling) {
-		if (i++ < ctx->pos)
-			continue;
-		if (!dir_emit(ctx, child->name, strlen(child->name), child->ino,
-			      S_ISDIR(child->mode) ? DT_DIR : DT_REG)) {
-			break;
-		}
-		ctx->pos++;
-	}
-	mutex_unlock(&alloyfs_lock);
-	return 0;
-}
-
 static ssize_t alloyfs_read_iter(struct kiocb *iocb, struct iov_iter *to)
 {
 	struct inode *inode = file_inode(iocb->ki_filp);
 	struct alloyfs_conn *conn = alloyfs_conn_of(inode);
-	struct alloyfs_node *node;
-	ssize_t ret = 0;
 	loff_t pos = iocb->ki_pos;
 	size_t want = iov_iter_count(to);
-	size_t avail;
+	ssize_t ret;
+	void *buf;
+	int len;
 
-	if (conn) {
-		void *buf;
-		int len;
+	if (!conn)
+		return -EIO;
 
-		want = min_t(size_t, want, ALLOYFS_MAX_PAYLOAD);
-		if (!want)
-			return 0;
-		buf = kmalloc(want, GFP_KERNEL);
-		if (!buf)
-			return -ENOMEM;
-		len = alloyfs_request(conn, ALLOYFS_OP_READ, inode->i_ino, pos, want,
-				   NULL, 0, buf, want);
-		if (len < 0) {
-			kfree(buf);
-			return len;
-		}
-		ret = copy_to_iter(buf, len, to);
-		iocb->ki_pos = pos + ret;
+	want = min_t(size_t, want, ALLOYFS_MAX_PAYLOAD);
+	if (!want)
+		return 0;
+	buf = kmalloc(want, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+	len = alloyfs_request(conn, ALLOYFS_OP_READ, inode->i_ino, pos, want,
+			   NULL, 0, buf, want);
+	if (len < 0) {
 		kfree(buf);
-		return ret;
+		return len;
 	}
-
-	mutex_lock(&alloyfs_lock);
-	node = inode->i_private;
-	if (node && pos < node->size) {
-		avail = node->size - pos;
-		if (node->data)
-			ret = copy_to_iter(node->data + pos, min(avail, want), to);
-		else
-			ret = iov_iter_zero(min(avail, want), to);
-		iocb->ki_pos = pos + ret;
-	}
-	mutex_unlock(&alloyfs_lock);
+	ret = copy_to_iter(buf, len, to);
+	iocb->ki_pos = pos + ret;
+	kfree(buf);
 	return ret;
 }
 
@@ -323,6 +219,10 @@ static ssize_t alloyfs_read_iter(struct kiocb *iocb, struct iov_iter *to)
  * that for us (vfs_create -> fsnotify_create, vfs_unlink -> fsnotify_unlink,
  * and so on). Only remote changes need the injection path — that asymmetry
  * is the whole design.
+ *
+ * A NULL connection can only be a superblock on its way out; there is no
+ * local mode left to fall back on, so every mutation below answers EIO
+ * rather than inventing a result the daemon never agreed to.
  */
 
 /* Shared by create() and mkdir(): both send mode + name and get an attr. */
@@ -337,7 +237,7 @@ static int alloyfs_do_mknod(struct inode *dir, struct dentry *dentry, umode_t mo
 	int ret;
 
 	if (!conn)
-		return -EROFS;	/* the in-memory demo tree is read-only */
+		return -EIO;
 	if (dentry->d_name.len > ALLOYFS_MAX_NAME)
 		return -ENAMETOOLONG;
 
@@ -390,7 +290,7 @@ static int alloyfs_symlink(struct mnt_idmap *idmap, struct inode *dir,
 	int ret;
 
 	if (!conn)
-		return -EROFS;
+		return -EIO;
 	if (dentry->d_name.len > ALLOYFS_MAX_NAME)
 		return -ENAMETOOLONG;
 	/* PATH_MAX is the kernel's own ceiling for a symlink body; anything
@@ -482,7 +382,7 @@ static int alloyfs_link(struct dentry *old_dentry, struct inode *dir,
 	int ret;
 
 	if (!conn)
-		return -EROFS;
+		return -EIO;
 	if (dentry->d_name.len > ALLOYFS_MAX_NAME)
 		return -ENAMETOOLONG;
 
@@ -513,7 +413,7 @@ static int alloyfs_do_remove(struct inode *dir, struct dentry *dentry, u32 opcod
 	int ret;
 
 	if (!conn)
-		return -EROFS;
+		return -EIO;
 	ret = alloyfs_request(conn, opcode, dir->i_ino, 0, 0,
 			   dentry->d_name.name, dentry->d_name.len, NULL, 0);
 	if (ret < 0)
@@ -555,7 +455,7 @@ static int alloyfs_rename(struct mnt_idmap *idmap, struct inode *old_dir,
 	int ret;
 
 	if (!conn)
-		return -EROFS;
+		return -EIO;
 	/* EXCHANGE and WHITEOUT have no wire representation; refusing them is
 	 * correct and the VFS falls back for callers that can.
 	 */
@@ -611,7 +511,7 @@ static ssize_t alloyfs_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	int err;
 
 	if (!conn)
-		return -EROFS;
+		return -EIO;
 
 	inode_lock(inode);
 	err = generic_write_checks(iocb, from) <= 0 ? -EINVAL : 0;
@@ -683,7 +583,7 @@ static int alloyfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 	if (ret)
 		return ret;
 	if (!conn)
-		return -EROFS;
+		return -EIO;
 
 	if (attr->ia_valid & ATTR_MODE) {
 		in.valid |= ALLOYFS_SETATTR_MODE;
@@ -887,13 +787,9 @@ static void alloyfs_put_super(struct super_block *sb)
 
 	mutex_lock(&alloyfs_lock);
 	if (sbi) {
-		if (sbi->root_node)
-			alloyfs_node_free(sbi->root_node);
-		if (sbi->conn) {
-			/* Release sleepers before the mount disappears. */
-			alloyfs_conn_shutdown(sbi->conn);
-			alloyfs_conn_put(sbi->conn);
-		}
+		/* Release sleepers before the mount disappears. */
+		alloyfs_conn_shutdown(sbi->conn);
+		alloyfs_conn_put(sbi->conn);
 		kfree(sbi);
 	}
 	sb->s_fs_info = NULL;
@@ -940,33 +836,6 @@ static const struct super_operations alloyfs_super_operations = {
 	.put_super = alloyfs_put_super,
 };
 
-/* The hardcoded tree the stage-1 assertions are written against. */
-static int alloyfs_build_tree(struct alloyfs_node *root)
-{
-	struct alloyfs_node *a, *sub, *b;
-
-	a = alloyfs_node_new(root, "a.txt", S_IFREG | 0644);
-	if (!a)
-		return -ENOMEM;
-	a->data = kstrdup("hello world", GFP_KERNEL);
-	if (!a->data)
-		return -ENOMEM;
-	a->size = strlen(a->data);
-
-	sub = alloyfs_node_new(root, "sub", S_IFDIR | 0755);
-	if (!sub)
-		return -ENOMEM;
-
-	b = alloyfs_node_new(sub, "b.txt", S_IFREG | 0644);
-	if (!b)
-		return -ENOMEM;
-	b->data = kstrdup("bee", GFP_KERNEL);
-	if (!b->data)
-		return -ENOMEM;
-	b->size = strlen(b->data);
-	return 0;
-}
-
 /* ------------------------------------------------------------ mount options */
 
 enum alloyfs_param { Opt_fd };
@@ -1002,8 +871,18 @@ static int alloyfs_fill_super(struct super_block *sb, struct fs_context *fc)
 {
 	struct alloyfs_fc *ctx = fc->fs_private;
 	struct alloyfs_sb_info *sbi;
+	struct alloyfs_attr attr;
 	struct inode *root_inode;
-	int err;
+	int ret;
+
+	/* Everything this filesystem shows comes from the daemon, so a mount
+	 * with no connection has nothing to show. Refusing here is the honest
+	 * answer; presenting an empty tree would look like a working mount.
+	 */
+	if (!ctx->have_fd) {
+		pr_err("mount needs fd=N naming an open /dev/alloyfs\n");
+		return -EINVAL;
+	}
 
 	sb->s_magic = ALLOYFS_MAGIC;
 	sb->s_op = &alloyfs_super_operations;
@@ -1017,54 +896,50 @@ static int alloyfs_fill_super(struct super_block *sb, struct fs_context *fc)
 		return -ENOMEM;
 	sb->s_fs_info = sbi;
 
-	if (ctx->have_fd) {
-		struct alloyfs_attr attr;
-		int ret;
-
-		sbi->conn = alloyfs_conn_from_fd(ctx->fd);
-		if (!sbi->conn) {
-			pr_err("fd=%u is not an open /dev/alloyfs\n", ctx->fd);
-			return -EINVAL;
-		}
-		ret = alloyfs_request(sbi->conn, ALLOYFS_OP_GETATTR, ALLOYFS_ROOT_NODEID,
-				   0, 0, NULL, 0, &attr, sizeof(attr));
-		if (ret < (int)sizeof(attr)) {
-			pr_err("daemon did not describe the root (%d)\n", ret);
-			return ret < 0 ? ret : -EIO;
-		}
-		if (!S_ISDIR(attr.mode)) {
-			pr_err("daemon root is not a directory\n");
-			return -ENOTDIR;
-		}
-		attr.nodeid = ALLOYFS_ROOT_NODEID;
-		root_inode = alloyfs_iget_attr(sb, &attr);
-	} else {
-		struct alloyfs_node *root_node = kzalloc(sizeof(*root_node), GFP_KERNEL);
-
-		if (!root_node)
-			return -ENOMEM;
-		INIT_LIST_HEAD(&root_node->children);
-		INIT_LIST_HEAD(&root_node->sibling);
-		strscpy(root_node->name, "/", sizeof(root_node->name));
-		root_node->mode = S_IFDIR | 0755;
-		root_node->ino = 1;
-		sbi->root_node = root_node;
-
-		err = alloyfs_build_tree(root_node);
-		if (err)
-			return err;
-		root_inode = alloyfs_iget_node(sb, root_node);
+	sbi->conn = alloyfs_conn_from_fd(ctx->fd);
+	if (!sbi->conn) {
+		pr_err("fd=%u is not an open /dev/alloyfs\n", ctx->fd);
+		ret = -EINVAL;
+		goto err_free;
+	}
+	ret = alloyfs_request(sbi->conn, ALLOYFS_OP_GETATTR, ALLOYFS_ROOT_NODEID,
+			   0, 0, NULL, 0, &attr, sizeof(attr));
+	if (ret < (int)sizeof(attr)) {
+		pr_err("daemon did not describe the root (%d)\n", ret);
+		ret = ret < 0 ? ret : -EIO;
+		goto err_put;
+	}
+	if (!S_ISDIR(attr.mode)) {
+		pr_err("daemon root is not a directory\n");
+		ret = -ENOTDIR;
+		goto err_put;
+	}
+	attr.nodeid = ALLOYFS_ROOT_NODEID;
+	root_inode = alloyfs_iget_attr(sb, &attr);
+	if (IS_ERR(root_inode)) {
+		ret = PTR_ERR(root_inode);
+		goto err_put;
+	}
+	sb->s_root = d_make_root(root_inode);	/* iputs the inode if it fails */
+	if (!sb->s_root) {
+		ret = -ENOMEM;
+		goto err_put;
 	}
 
-	if (IS_ERR(root_inode))
-		return PTR_ERR(root_inode);
-	sb->s_root = d_make_root(root_inode);
-	if (!sb->s_root)
-		return -ENOMEM;
-
 	alloyfs_sb = sb;
-	pr_info("mounted (%s)\n", sbi->conn ? "daemon-backed" : "in-memory stage-1 tree");
+	pr_info("mounted (daemon-backed)\n");
 	return 0;
+
+err_put:
+	alloyfs_conn_put(sbi->conn);
+err_free:
+	/* put_super() runs only for a superblock that got as far as a root
+	 * dentry, so a mount that fails here has to release its own state or
+	 * leak it once per attempt.
+	 */
+	kfree(sbi);
+	sb->s_fs_info = NULL;
+	return ret;
 }
 
 static int alloyfs_get_tree(struct fs_context *fc)
@@ -1110,24 +985,16 @@ static int __init alloyfs_module_init(void)
 	if (err)
 		return err;
 	err = register_filesystem(&alloyfs_type);
-	if (err)
-		goto err_conn;
-	err = alloyfs_notify_init();
-	if (err)
-		goto err_fs;
+	if (err) {
+		alloyfs_conn_exit();
+		return err;
+	}
 	pr_info("loaded (abi %d)\n", ALLOYFS_ABI_VERSION);
 	return 0;
-
-err_fs:
-	unregister_filesystem(&alloyfs_type);
-err_conn:
-	alloyfs_conn_exit();
-	return err;
 }
 
 static void __exit alloyfs_module_exit(void)
 {
-	alloyfs_notify_exit();
 	unregister_filesystem(&alloyfs_type);
 	alloyfs_conn_exit();
 	pr_info("unloaded\n");

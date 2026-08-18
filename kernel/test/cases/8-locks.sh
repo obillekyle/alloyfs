@@ -131,8 +131,18 @@ while grep -q ' alloyfs ' /proc/mounts; do
 done
 check "both unmounted" sh -c '! grep -q " alloyfs " /proc/mounts'
 kill -9 $AGENT_PID 2>/dev/null
-sleep 0.3
-rmmod alloyfs
+
+# Both clients unmount lazily (MNT_DETACH), so an empty /proc/mounts proves
+# nothing about what still pins the module: the superblocks are freed
+# asynchronously, and each client holds /dev/alloyfs open until its serving
+# thread has wound down. A fixed sleep turns that into a coin toss decided by
+# how fast the machine is — retry instead, as stage 6 already does.
+n=0
+while lsmod | grep -q alloyfs; do
+	rmmod alloyfs 2>/dev/null && break
+	n=$((n + 1)); [ $n -gt 50 ] && break
+	sleep 0.1
+done
 check "rmmod clean" sh -c '! lsmod | grep -q alloyfs'
 
 summary
