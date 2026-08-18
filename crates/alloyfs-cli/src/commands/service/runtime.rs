@@ -1,10 +1,14 @@
 //! The service side: what runs under the SCM, and what it supervises.
 //!
 //! This process does nothing useful itself. It waits for an interactive
-//! session, launches a plain `alloyfs mount …` (or `serve`) into it via
-//! [`super::spawn`], and keeps it alive. The child is an ordinary CLI
+//! session, launches a plain `alloyfs start` (or `alloyfs mount <name>`) into
+//! it via [`super::spawn`], and keeps it alive. The child is an ordinary CLI
 //! invocation — the same one `alloyfs service list` prints — so anything that
 //! goes wrong can be reproduced by hand without the service in the way.
+//!
+//! It never reads the config. The instance file says which command to run, and
+//! the child — running as the logged-in user — is the one that opens the
+//! config that command names.
 
 use std::ffi::OsString;
 use std::sync::mpsc;

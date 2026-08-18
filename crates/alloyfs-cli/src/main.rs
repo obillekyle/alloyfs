@@ -232,11 +232,15 @@ enum ServiceCmd {
     /// One-time preparation: check WinFsp, create and lock down the instance
     /// directory. Safe to re-run.
     Setup,
-    /// Define an instance and register it to start at boot.
+    /// Register a service that runs part of this machine's config at boot.
     ///
-    /// Boxed because clap gives every field of every variant to the enum, and
-    /// this one dwarfs `Remove { id }` — the whole `ServiceCmd` would be sized
-    /// by its largest arm otherwise.
+    /// With no flags it runs `alloyfs start`: the agent, then every mount. The
+    /// mounts themselves stay in the config — a service records WHICH part to
+    /// run, never a copy of the settings.
+    // Boxed because clap gives every field of every variant to the enum, and
+    // this one dwarfs `Remove { id }` — the whole `ServiceCmd` would be sized
+    // by its largest arm otherwise. Not a doc comment: clap prints those, and
+    // a layout note is not something `service add --help` should explain.
     Add(Box<AddArgs>),
     /// Stop, unregister, and forget an instance.
     Remove { id: String },
@@ -264,36 +268,106 @@ enum ServiceCmd {
 struct AddArgs {
     /// Name for this instance (letters, digits, dashes, underscores).
     id: String,
-    /// Mount url: tcp://host:port/export or ssh://host/export.
-    #[arg(long, conflicts_with = "config")]
-    url: Option<String>,
-    /// Where to mount it: a drive letter (P:) on Windows.
-    #[arg(long, requires = "url")]
-    mount: Option<PathBuf>,
-    /// Run an AGENT with this config instead of mounting.
-    #[arg(long, conflicts_with_all = ["url", "mount"])]
+    /// Run ONE mount from `client.mounts` instead of the whole config,
+    /// named the way `alloyfs mount <NAME>` names it.
+    #[arg(long, value_name = "NAME")]
+    mount: Option<String>,
+    /// Only the agent from `server:`, no mounts.
+    #[arg(long, conflicts_with_all = ["mount", "mounts_only"])]
+    server_only: bool,
+    /// Only the mounts under `client.mounts:`, no agent — for a machine where
+    /// something else already serves.
+    #[arg(long, conflicts_with = "mount")]
+    mounts_only: bool,
+    /// Config to run from. Default: whichever one the logged-in user
+    /// discovers at launch. The file is opened by THEM, not by the service,
+    /// so it has to be a path they can read.
+    #[arg(long, value_name = "PATH")]
     config: Option<PathBuf>,
-    /// Agent TCP listen address (with --config, or alone).
-    #[arg(long, conflicts_with = "url")]
-    tcp: Option<String>,
-    /// Local-only paths, never sent to the server (repeatable).
-    #[arg(long = "exclude", value_name = "GLOB", requires = "url")]
-    excludes: Vec<String>,
-    /// Always fully cache matching files (repeatable).
-    #[arg(long = "pin", value_name = "GLOB", requires = "url")]
-    pins: Vec<String>,
-    /// Auto-download files up to this size ("2M", 0 = off).
-    #[arg(long, requires = "url")]
-    auto_cache_max: Option<String>,
-    /// Total local cache budget.
-    #[arg(long, requires = "url")]
-    auto_cache_budget: Option<String>,
-    /// Refuse to overwrite a file another machine changed.
-    #[arg(long, requires = "url")]
-    detect_conflicts: bool,
     /// Start it now as well as at boot.
     #[arg(long)]
     start: bool,
+    #[command(flatten)]
+    copied: CopiedArgs,
+}
+
+/// The flags a service definition used to copy into a file of its own.
+///
+/// Hidden, and accepted only to answer an old command line with a sentence
+/// instead of `unexpected argument '--url' found`. Every one of them now
+/// belongs in the config, and the published examples used them.
+#[derive(clap::Args)]
+struct CopiedArgs {
+    #[arg(long, hide = true)]
+    url: Option<String>,
+    #[arg(long = "exclude", hide = true)]
+    excludes: Vec<String>,
+    #[arg(long = "pin", hide = true)]
+    pins: Vec<String>,
+    #[arg(long, hide = true)]
+    auto_cache_max: Option<String>,
+    #[arg(long, hide = true)]
+    auto_cache_budget: Option<String>,
+    #[arg(long, hide = true)]
+    detect_conflicts: bool,
+    #[arg(long, hide = true)]
+    tcp: Option<String>,
+}
+
+impl CopiedArgs {
+    /// Which of these were given, and where each one lives now.
+    fn moved(&self) -> Vec<(&'static str, &'static str)> {
+        let mut out = Vec::new();
+        if self.url.is_some() {
+            out.push(("--url", "client.mounts.<name>.url"));
+        }
+        if !self.excludes.is_empty() {
+            out.push(("--exclude", "client.mounts.<name>.exclude, or client.exclude"));
+        }
+        if !self.pins.is_empty() {
+            out.push(("--pin", "client.mounts.<name>.pin, or client.pin"));
+        }
+        if self.auto_cache_max.is_some() {
+            out.push(("--auto-cache-max", "client.auto_cache_max"));
+        }
+        if self.auto_cache_budget.is_some() {
+            out.push(("--auto-cache-budget", "client.auto_cache_budget"));
+        }
+        if self.detect_conflicts {
+            out.push(("--detect-conflicts", "client.detect_conflicts"));
+        }
+        if self.tcp.is_some() {
+            out.push(("--tcp", "server.tcp_listen"));
+        }
+        out
+    }
+
+    /// The error an old command line earns, naming every flag it used.
+    fn migration_error(&self) -> Option<anyhow::Error> {
+        let moved = self.moved();
+        if moved.is_empty() {
+            return None;
+        }
+        let mut lines = String::new();
+        for (flag, home) in &moved {
+            lines.push_str(&format!("\n\x20   {flag:<20} -> {home}"));
+        }
+        Some(anyhow::anyhow!(
+            "a service no longer keeps its own copy of a mount. These moved into the config:\
+             {lines}\n\
+             \n\
+             \x20 client:\n\
+             \x20   mounts:\n\
+             \x20     work:\n\
+             \x20       url: ssh://azure/projects\n\
+             \x20       at: \"P:\"\n\
+             \n\
+             \x20 Then register a service that points at it:\n\
+             \x20   alloyfs service add work --mount work\n\
+             \x20 or one that runs everything the config describes:\n\
+             \x20   alloyfs service add alloyfs"
+        ))
+    }
 }
 #[derive(Subcommand)]
 enum CacheCmd {
@@ -389,38 +463,32 @@ async fn main() -> anyhow::Result<()> {
         Command::Service { cmd } => match cmd {
             ServiceCmd::Setup => commands::service::setup(),
             ServiceCmd::Add(args) => {
-                use commands::service::Instance;
+                use commands::service::{Instance, Scope};
                 let AddArgs {
                     id,
-                    url,
                     mount,
+                    server_only,
+                    mounts_only,
                     config,
-                    tcp,
-                    excludes,
-                    pins,
-                    auto_cache_max,
-                    auto_cache_budget,
-                    detect_conflicts,
                     start,
+                    copied,
                 } = *args;
-                // clap enforces that --mount accompanies --url and that the
-                // agent flags do not mix with them; what it cannot express is
-                // "one of the two shapes must be chosen".
-                let instance = match (url, config, tcp) {
-                    (Some(url), _, _) => Instance::Mount {
-                        url,
-                        mountpoint: mount.ok_or_else(|| anyhow::anyhow!("--url needs --mount"))?,
-                        exclude: excludes,
-                        pin: pins,
-                        auto_cache_max,
-                        auto_cache_budget,
-                        detect_conflicts,
+                if let Some(e) = copied.migration_error() {
+                    return Err(e);
+                }
+                // No flags at all is the whole config, which is the shape
+                // worth defaulting to: one service, one definition, and
+                // nothing to keep in step.
+                let instance = match mount {
+                    Some(name) => Instance::Mount { name, config },
+                    None => Instance::Start {
+                        config,
+                        scope: match (server_only, mounts_only) {
+                            (true, _) => Scope::Server,
+                            (_, true) => Scope::Mounts,
+                            _ => Scope::All,
+                        },
                     },
-                    (None, config @ Some(_), tcp) => Instance::Agent { config, tcp },
-                    (None, None, tcp @ Some(_)) => Instance::Agent { config: None, tcp },
-                    (None, None, None) => anyhow::bail!(
-                        "say what to run: --url URL --mount P: for a drive, or --config PATH for an agent"
-                    ),
                 };
                 commands::service::add(id, instance, start)
             }

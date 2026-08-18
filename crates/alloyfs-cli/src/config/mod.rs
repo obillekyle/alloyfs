@@ -96,11 +96,27 @@ const UPGRADE_HEADER: &str = "\
 /// An absent config is an empty one: a machine with nothing set up yet is not
 /// an error, it is a machine with nothing to start.
 pub fn load_or_default(explicit: Option<PathBuf>) -> anyhow::Result<Config> {
+    Ok(load_with_path(explicit)?.1)
+}
+
+/// The same, and WHICH file it came from.
+///
+/// The path matters wherever an answer is only as good as its source: a
+/// service registered against a mount name has to be able to say which config
+/// was consulted, because the process that resolves it later may not be
+/// reading the same one.
+pub fn load_with_path(explicit: Option<PathBuf>) -> anyhow::Result<(Option<PathBuf>, Config)> {
     match explicit {
-        Some(path) => load(&path),
+        Some(path) => {
+            let config = load(&path)?;
+            Ok((Some(path), config))
+        }
         None => match default_config_path() {
-            Some(path) => load(&path),
-            None => Ok(Config::default()),
+            Some(path) => {
+                let config = load(&path)?;
+                Ok((Some(path), config))
+            }
+            None => Ok((None, Config::default())),
         },
     }
 }

@@ -84,9 +84,10 @@ error.
 
 ```bash
 alloyfs service setup                 # one-time: check WinFsp, lock down the store
-alloyfs service add <ID> --url <URL> --mount <MOUNTPOINT> [--start]
-alloyfs service add <ID> --config <PATH> [--tcp ADDR]   # an agent instead
-alloyfs service list                  # what is defined, and what it is doing
+alloyfs service add <ID> [--config PATH] [--start]      # runs `alloyfs start`
+alloyfs service add <ID> --mount <NAME>                 # one mount from client.mounts
+alloyfs service add <ID> --mounts-only | --server-only  # one half of the config
+alloyfs service list                  # what is defined, and the command it runs
 alloyfs service start|stop|restart [ID]     # one, or every one
 alloyfs service remove <ID>
 alloyfs service reset --confirm       # remove every instance
@@ -96,8 +97,16 @@ Windows only, for now. Mounts and agents that come back at boot with no terminal
 window. **Every subcommand except `list` needs an elevated shell**, and none of
 them will raise their own privileges.
 
+A service records **which part of the config to run**, not a copy of it. With no
+flags it runs `alloyfs start`, so one service brings back the agent and every
+drive; `--mount NAME` runs a single entry from `client.mounts:`, named the same
+way `alloyfs mount <NAME>` names it. The url, mountpoint, excludes and cache
+sizes stay in the config and are read at launch, by the logged-in user, whose
+config it is.
+
 See [Running as a service](#/deployment/service) for what a registered service
-actually does, why it needs Administrator, and the Linux equivalent.
+actually does, which process reads the config, why it needs Administrator, and
+the Linux equivalent.
 
 ## sync
 
