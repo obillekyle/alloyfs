@@ -33,7 +33,9 @@ pub fn parse_size(s: &str) -> Result<u64, String> {
 }
 
 /// Config-file size value: `2M` (string) or `2097152` (integer bytes).
-#[derive(Debug, Clone, serde::Deserialize)]
+// Serialize + PartialEq because `alloyfs init --migrate` WRITES configs, not
+// just reads them, and the resolver compares merged values.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(untagged)]
 pub enum SizeField {
     Bytes(u64),

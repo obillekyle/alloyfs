@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Agent configuration, usually from a TOML file:
 ///
@@ -13,7 +13,7 @@ use serde::Deserialize;
 /// path = "/home/kyle/projects"
 /// read_only = false
 /// ```
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentConfig {
     #[serde(default)]
@@ -22,7 +22,7 @@ pub struct AgentConfig {
     pub exports: BTreeMap<String, ExportConfig>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentSection {
     pub tcp_listen: Option<String>,
@@ -38,7 +38,7 @@ pub struct AgentSection {
     pub http_token: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExportConfig {
     pub path: PathBuf,
@@ -60,7 +60,7 @@ pub struct ExportConfig {
     /// Suggested CLIENT settings, sent to v2+ mounts at attach time. The
     /// client unions the lists with its own and uses the sizes only where it
     /// has no explicit value; `--no-server-defaults` opts out entirely.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client: Option<ClientDefaults>,
 }
 
@@ -85,7 +85,7 @@ impl Default for ExportConfig {
 
 /// The `client:` section of an export: what this server recommends mounts
 /// configure locally (overlay excludes, pins, cache sizing).
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientDefaults {
     #[serde(default)]

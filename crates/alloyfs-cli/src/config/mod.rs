@@ -1,41 +1,96 @@
-//! Client/agent configuration: YAML mount config, size parsing, default
-//! paths. CLI flags always override file values.
+//! Finding and loading the config, and where this machine keeps its data.
+//!
+//! One file describes both halves of a machine — what it serves and what it
+//! mounts — and three shapes of that file have existed. `detect` works out
+//! which one is in front of it and converts; everything above this module sees
+//! only [`schema::Config`].
+
+mod detect;
+mod legacy;
+mod schema;
 
 use std::path::{Path, PathBuf};
 
 use alloyfs_agent::AgentConfig;
 
-/// Per-mount client config file (YAML). All keys optional; CLI flags win.
-#[derive(Default, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MountConfig {
-    #[serde(default)]
-    pub exclude: Vec<String>,
-    #[serde(default)]
-    pub pin: Vec<String>,
-    pub auto_cache_max: Option<SizeField>,
-    pub auto_cache_budget: Option<SizeField>,
-    pub data_dir: Option<PathBuf>,
-    /// Ignore the server's suggested client settings for this mount.
-    #[serde(default)]
-    pub no_server_defaults: bool,
-    /// Refuse writes over concurrently-modified files (CLI: --detect-conflicts).
-    #[serde(default)]
-    pub detect_conflicts: bool,
-    /// Shared secret for token-protected TCP servers (agent.tcp_token).
-    pub token: Option<String>,
-}
+pub use detect::{to_agent_config, Shape};
 
-impl MountConfig {
-    pub fn load(path: &std::path::Path) -> anyhow::Result<Self> {
-        serde_yaml::from_str(&std::fs::read_to_string(path)?)
-            .map_err(|e| anyhow::anyhow!("mount config {}: {e}", path.display()))
-    }
-}
+pub use schema::{ClientSection, Config, CURRENT_VERSION};
 
 // Size parsing lives in alloyfs-common (the agent's `client:` section uses the
 // same forms); re-exported so callers keep one import path.
-pub use alloyfs_common::{parse_size, SizeField};
+pub use alloyfs_common::parse_size;
+
+/// Load a config file, upgrading it in place if it is an older shape.
+///
+/// There is no permanent legacy mode. An old file is recognised, converted,
+/// and **rewritten as v{CURRENT_VERSION}** — so the old layouts are a one-time
+/// reader rather than a second code path to keep working forever. A carried
+/// compatibility mode is the thing that quietly becomes permanent, and then
+/// every later change has to be made twice.
+///
+/// The original is kept beside it as `.bak` because the rewrite cannot
+/// preserve comments: serde round-trips values, not the prose around them.
+/// Losing somebody's annotated config without a copy would be unforgivable for
+/// a convenience feature.
+///
+/// A file that cannot be rewritten — read-only, or a directory this process
+/// cannot write — still loads. It converts in memory and says why it could not
+/// be upgraded. Refusing to start because a *cosmetic* upgrade failed would be
+/// the wrong trade entirely.
+pub fn load(path: &Path) -> anyhow::Result<Config> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("reading config {}: {e}", path.display()))?;
+    let value: serde_yaml::Value = serde_yaml::from_str(&text)
+        .map_err(|e| anyhow::anyhow!("config {} is not valid YAML: {e}", path.display()))?;
+    let (mut config, shape) =
+        detect::from_value(value).map_err(|e| anyhow::anyhow!("config {}: {e}", path.display()))?;
+
+    if shape != Shape::V3 {
+        config.version = Some(CURRENT_VERSION);
+        match upgrade_in_place(path, &config) {
+            Ok(backup) => tracing::info!(
+                path = %path.display(),
+                backup = %backup.display(),
+                "upgraded this config to version {CURRENT_VERSION}; the original is kept as .bak \
+                 (comments do not survive the rewrite)"
+            ),
+            Err(e) => tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "could not upgrade this config to version {CURRENT_VERSION} on disk; \
+                 running from the converted form in memory"
+            ),
+        }
+    }
+    Ok(config)
+}
+
+/// Write `config` over `path`, keeping the original as `<path>.bak`.
+///
+/// Staged through a temporary file and renamed, so an interrupted upgrade
+/// leaves either the old config or the new one and never half of either.
+fn upgrade_in_place(path: &Path, config: &Config) -> anyhow::Result<PathBuf> {
+    let backup = path.with_extension(format!(
+        "{}.bak",
+        path.extension().and_then(|e| e.to_str()).unwrap_or("yml")
+    ));
+    std::fs::copy(path, &backup)?;
+
+    let yaml = serde_yaml::to_string(config)?;
+    let staged = path.with_extension("alloyfs-upgrade");
+    std::fs::write(&staged, format!("{UPGRADE_HEADER}{yaml}"))?;
+    std::fs::rename(&staged, path)?;
+    Ok(backup)
+}
+
+/// Prepended to an auto-upgraded file, because a config that silently changed
+/// shape under someone is alarming to find and the note costs four lines.
+const UPGRADE_HEADER: &str = "\
+# Upgraded automatically to the version 3 layout by alloyfs.
+# The previous file is beside this one with a .bak extension — including any
+# comments, which a rewrite cannot preserve.
+";
 
 // ## Where things live
 //
@@ -291,15 +346,18 @@ pub fn default_config_path() -> Option<PathBuf> {
 }
 
 pub fn load_agent_config(config: Option<PathBuf>, inline_exports: &[String]) -> anyhow::Result<AgentConfig> {
+    // A thin adapter over the unified loader: the agent still takes the shape
+    // it always did, so nothing in `alloyfs-agent` had to learn about v3.
+    //
+    // `default_config_path` already logs which location won, and says which
+    // one; logging again here printed two lines for one file and read as
+    // though two configs had been considered.
     let mut cfg = match config {
-        Some(path) => AgentConfig::from_path(&path)?,
+        Some(path) => to_agent_config(&load(&path)?),
         // No explicit config: a default file (if present) supplies exports —
         // essential for `serve --stdio`, which is spawned with no arguments.
-        // `default_config_path` already logs which location won, and says
-        // which one; logging again here printed two lines for one file and
-        // read as though two configs had been considered.
         None if inline_exports.is_empty() => match default_config_path() {
-            Some(path) => AgentConfig::from_path(&path)?,
+            Some(path) => to_agent_config(&load(&path)?),
             None => AgentConfig::default(),
         },
         None => AgentConfig::default(),

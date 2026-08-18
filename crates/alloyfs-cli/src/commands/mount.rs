@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::config::{cache_root, data_root, migrate_legacy_mount, parse_size, MountConfig};
+use crate::config::{cache_root, data_root, migrate_legacy_mount, parse_size};
 use crate::urls::{
     connect_target, dialer_for, export_key, host_key, legacy_mount_key, require_export, whoami,
 };
@@ -36,16 +36,26 @@ pub async fn run(
 ) -> anyhow::Result<()> {
     // File values first, CLI flags override. Sizes stay None when neither
     // set one, so a server suggestion (proto v2+) can fill them in.
+    //
+    // The file may be a v3 config carrying a whole `client:` section, or one
+    // of the flat pre-v3 mount configs; `crate::config::load` normalises both
+    // (and upgrades the old shape on disk). What lands here is the `client:`
+    // defaults, since a `--config` given to `mount` is asking for exactly
+    // that: how this mount should behave.
     let file_cfg = match &config {
-        Some(path) => MountConfig::load(path)?,
-        None => MountConfig::default(),
+        Some(path) => crate::config::load(path)?.client.unwrap_or_default(),
+        None => crate::config::ClientSection::default(),
     };
     let excludes = if excludes.is_empty() {
-        file_cfg.exclude
+        file_cfg.exclude.unwrap_or_default()
     } else {
         excludes
     };
-    let pins = if pins.is_empty() { file_cfg.pin } else { pins };
+    let pins = if pins.is_empty() {
+        file_cfg.pin.unwrap_or_default()
+    } else {
+        pins
+    };
     let auto_cache_max = match (auto_cache_max, &file_cfg.auto_cache_max) {
         (Some(flag), _) => Some(parse_size(&flag).map_err(|e| anyhow::anyhow!(e))?),
         (None, Some(f)) => Some(f.to_bytes().map_err(|e| anyhow::anyhow!(e))?),
@@ -56,7 +66,7 @@ pub async fn run(
         (None, Some(f)) => Some(f.to_bytes().map_err(|e| anyhow::anyhow!(e))?),
         (None, None) => None,
     };
-    let no_server_defaults = no_server_defaults || file_cfg.no_server_defaults;
+    let no_server_defaults = no_server_defaults || file_cfg.no_server_defaults.unwrap_or(false);
     let token = token.or(file_cfg.token);
 
     let (conn, export) = connect_target(&url, &remote_cmd, &whoami(), token.as_deref()).await?;
@@ -84,7 +94,7 @@ pub async fn run(
         auto_cache_max_fallback: 2 * 1024 * 1024,
         auto_cache_budget_fallback: 512 * 1024 * 1024,
         no_server_defaults,
-        detect_conflicts: detect_conflicts || file_cfg.detect_conflicts,
+        detect_conflicts: detect_conflicts || file_cfg.detect_conflicts.unwrap_or(false),
         // So the client can rewrite symlink targets that point back into
         // this mount (see RemoteFs::localize_target).
         mount_root: Some(mountpoint.to_string_lossy().into_owned()),
