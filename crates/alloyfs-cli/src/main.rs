@@ -116,6 +116,12 @@ enum Command {
         #[arg(long)]
         one_shot: bool,
     },
+    /// Mounts and agents that start on their own, with no terminal window.
+    /// Every subcommand except `list` needs an ELEVATED shell.
+    Service {
+        #[command(subcommand)]
+        cmd: ServiceCmd,
+    },
     /// Manage the local auto-download cache.
     Cache {
         #[command(subcommand)]
@@ -192,6 +198,74 @@ enum Command {
     },
 }
 
+#[derive(Subcommand)]
+enum ServiceCmd {
+    /// One-time preparation: check WinFsp, create and lock down the instance
+    /// directory. Safe to re-run.
+    Setup,
+    /// Define an instance and register it to start at boot.
+    ///
+    /// Boxed because clap gives every field of every variant to the enum, and
+    /// this one dwarfs `Remove { id }` — the whole `ServiceCmd` would be sized
+    /// by its largest arm otherwise.
+    Add(Box<AddArgs>),
+    /// Stop, unregister, and forget an instance.
+    Remove { id: String },
+    /// Start one instance, or every instance.
+    Start { id: Option<String> },
+    /// Stop one instance, or every instance.
+    Stop { id: Option<String> },
+    /// Restart one instance, or every instance.
+    Restart { id: Option<String> },
+    /// What is defined, and what each one is doing.
+    List,
+    /// Remove EVERY instance and its definition.
+    Reset {
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Internal: the entry point the Windows service manager invokes.
+    #[command(hide = true)]
+    Run { id: String },
+}
+
+/// The arguments of `service add`, in their own struct so the variant that
+/// carries them can be boxed.
+#[derive(clap::Args)]
+struct AddArgs {
+    /// Name for this instance (letters, digits, dashes, underscores).
+    id: String,
+    /// Mount url: tcp://host:port/export or ssh://host/export.
+    #[arg(long, conflicts_with = "config")]
+    url: Option<String>,
+    /// Where to mount it: a drive letter (P:) on Windows.
+    #[arg(long, requires = "url")]
+    mount: Option<PathBuf>,
+    /// Run an AGENT with this config instead of mounting.
+    #[arg(long, conflicts_with_all = ["url", "mount"])]
+    config: Option<PathBuf>,
+    /// Agent TCP listen address (with --config, or alone).
+    #[arg(long, conflicts_with = "url")]
+    tcp: Option<String>,
+    /// Local-only paths, never sent to the server (repeatable).
+    #[arg(long = "exclude", value_name = "GLOB", requires = "url")]
+    excludes: Vec<String>,
+    /// Always fully cache matching files (repeatable).
+    #[arg(long = "pin", value_name = "GLOB", requires = "url")]
+    pins: Vec<String>,
+    /// Auto-download files up to this size ("2M", 0 = off).
+    #[arg(long, requires = "url")]
+    auto_cache_max: Option<String>,
+    /// Total local cache budget.
+    #[arg(long, requires = "url")]
+    auto_cache_budget: Option<String>,
+    /// Refuse to overwrite a file another machine changed.
+    #[arg(long, requires = "url")]
+    detect_conflicts: bool,
+    /// Start it now as well as at boot.
+    #[arg(long)]
+    start: bool,
+}
 #[derive(Subcommand)]
 enum CacheCmd {
     /// Delete cached blobs for one mount url (SAFE while unmounted; never
@@ -278,6 +352,58 @@ async fn main() -> anyhow::Result<()> {
             )
             .await
         }
+        Command::Service { cmd } => match cmd {
+            ServiceCmd::Setup => commands::service::setup(),
+            ServiceCmd::Add(args) => {
+                use commands::service::Instance;
+                let AddArgs {
+                    id,
+                    url,
+                    mount,
+                    config,
+                    tcp,
+                    excludes,
+                    pins,
+                    auto_cache_max,
+                    auto_cache_budget,
+                    detect_conflicts,
+                    start,
+                } = *args;
+                // clap enforces that --mount accompanies --url and that the
+                // agent flags do not mix with them; what it cannot express is
+                // "one of the two shapes must be chosen".
+                let instance = match (url, config, tcp) {
+                    (Some(url), _, _) => Instance::Mount {
+                        url,
+                        mountpoint: mount.ok_or_else(|| anyhow::anyhow!("--url needs --mount"))?,
+                        exclude: excludes,
+                        pin: pins,
+                        auto_cache_max,
+                        auto_cache_budget,
+                        detect_conflicts,
+                    },
+                    (None, config @ Some(_), tcp) => Instance::Agent { config, tcp },
+                    (None, None, tcp @ Some(_)) => Instance::Agent { config: None, tcp },
+                    (None, None, None) => anyhow::bail!(
+                        "say what to run: --url URL --mount P: for a drive, or --config PATH for an agent"
+                    ),
+                };
+                commands::service::add(id, instance, start)
+            }
+            ServiceCmd::Remove { id } => commands::service::remove(id),
+            ServiceCmd::Start { id } => commands::service::control("start", id),
+            ServiceCmd::Stop { id } => commands::service::control("stop", id),
+            ServiceCmd::Restart { id } => commands::service::control("restart", id),
+            ServiceCmd::List => commands::service::list(),
+            ServiceCmd::Reset { confirm } => commands::service::reset(confirm),
+            #[cfg(windows)]
+            ServiceCmd::Run { id } => commands::service::runtime::run(&id),
+            #[cfg(not(windows))]
+            ServiceCmd::Run { id } => {
+                let _ = id;
+                anyhow::bail!("`service run` is Windows-only")
+            }
+        },
         Command::Cache { cmd } => match cmd {
             CacheCmd::Clear {
                 target,

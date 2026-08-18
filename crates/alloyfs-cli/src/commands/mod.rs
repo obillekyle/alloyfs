@@ -3,5 +3,6 @@ pub mod diag;
 pub mod init;
 pub mod mount;
 pub mod serve;
+pub mod service;
 pub mod sync;
 pub mod update;

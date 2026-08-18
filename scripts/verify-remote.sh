@@ -21,7 +21,10 @@ dest="${ALLOYFS_REMOTE_DIR:-~/alloyfs}"
 echo "==> shipping the workspace to $host:$dest"
 # kernel/ rides along so the module sources stay in step with the daemon that
 # speaks to them; the ABI is shared and drifts silently otherwise.
-tar czf - Cargo.toml Cargo.lock rust-toolchain.toml rustfmt.toml crates scripts kernel |
+# vendor/ has to travel too: winfsp-sys is a path dependency of the workspace,
+# so cargo cannot even load the manifest without it — Windows-only in effect,
+# mandatory for resolution everywhere.
+tar czf - Cargo.toml Cargo.lock rust-toolchain.toml rustfmt.toml crates scripts kernel vendor |
   ssh "$host" "mkdir -p $dest && cd $dest && tar xzf -"
 
 echo "==> cargo test --workspace on $host"

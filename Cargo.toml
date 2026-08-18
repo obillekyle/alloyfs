@@ -56,7 +56,21 @@ tower = { version = "0.5", features = ["util"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 fuser = "0.17"
 libc = "0.2"
-windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.60", features = [
+  "Win32_Foundation",
+  "Win32_Storage_FileSystem",
+  # `alloyfs service` launches the mount into the interactive session: query
+  # the console session and its user token, unwrap the UAC-filtered token to
+  # the elevated one behind it, and CreateProcessAsUser with the user's own
+  # environment (so their SSH keys and agent are the ones in scope).
+  "Win32_Security",
+  "Win32_Security_Authorization",
+  "Win32_System_RemoteDesktop",
+  "Win32_System_Threading",
+  "Win32_System_Environment",
+  "Win32_System_SystemServices",
+] }
+windows-service = "0.8"
 winfsp = { version = "0.13.0", default-features = false, features = ["system", "delayload", "notify"] }
 
 # The upstream winfsp-sys build script needs our llvm-mingw/bindgen fixes; the

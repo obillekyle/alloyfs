@@ -35,6 +35,8 @@ alloyfs-mount-kernel.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 alloyfs-mount-winfsp.workspace = true
+windows-sys.workspace = true
+windows-service.workspace = true
 
 # build.rs emits the DELAYLOAD link flags for winfsp-x64.dll (the helper is
 # gnullvm-aware). Target-gated so non-Windows builds never compile winfsp.
