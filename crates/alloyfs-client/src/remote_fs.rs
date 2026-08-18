@@ -102,88 +102,17 @@ impl RemoteFs {
             Response::AttachOk { root_attr, .. } => root_attr
         );
 
-        // Config negotiation (protocol v2+): merge the server's suggested
-        // client settings under the client's own. Precedence: explicit client
-        // value > server suggestion > fallback. Lists are unioned (client
-        // entries first); `no_server_defaults` skips the exchange entirely.
-        let mut opts = opts;
-        if !opts.no_server_defaults && conn.proto >= 2 {
-            if let Ok(Ok(Response::MountDefaults {
-                exclude,
-                pin,
-                auto_cache_max,
-                auto_cache_budget,
-            })) = conn.request(Request::MountDefaults).await
-            {
-                let suggested = exclude.len() + pin.len();
-                for e in exclude {
-                    if !opts.excludes.contains(&e) {
-                        opts.excludes.push(e);
-                    }
-                }
-                for p in pin {
-                    if !opts.pins.contains(&p) {
-                        opts.pins.push(p);
-                    }
-                }
-                if opts.auto_cache_max.is_none() {
-                    opts.auto_cache_max = auto_cache_max;
-                }
-                if opts.auto_cache_budget.is_none() {
-                    opts.auto_cache_budget = auto_cache_budget;
-                }
-                if suggested > 0 || auto_cache_max.is_some() || auto_cache_budget.is_some() {
-                    tracing::info!(
-                        excludes = opts.excludes.len(),
-                        pins = opts.pins.len(),
-                        "applied server-suggested mount defaults (--no-server-defaults to opt out)"
-                    );
-                }
-            }
-        }
-        let auto_cache_max = opts.auto_cache_max.unwrap_or(opts.auto_cache_max_fallback);
-        let auto_cache_budget = opts.auto_cache_budget.unwrap_or(opts.auto_cache_budget_fallback);
+        let Negotiated {
+            opts,
+            auto_cache_max,
+            auto_cache_budget,
+        } = negotiate_defaults(opts, conn.proto, || async {
+            conn.request(Request::MountDefaults).await.ok()?.ok()
+        })
+        .await;
 
-        let overlay = if opts.excludes.is_empty() {
-            None
-        } else {
-            let root = opts.data_dir.join("overlay").join(&opts.mount_key);
-            let ov = Overlay::new(root, &opts.excludes).map_err(|e| {
-                tracing::error!(error = %e, "overlay init failed");
-                ErrorCode::Io
-            })?;
-            let orphans = ov.orphans();
-            if !orphans.is_empty() {
-                tracing::warn!(
-                    ?orphans,
-                    "overlay contains entries that no longer match any --exclude \
-                     pattern; they are invisible until the pattern returns"
-                );
-            }
-            Some(ov)
-        };
-
-        let cache_enabled = auto_cache_max > 0 || !opts.pins.is_empty();
-        let mut fetch_rx = None;
-        let cache = if cache_enabled {
-            let root = opts.cache_dir.join(&opts.mount_key);
-            let manifest = opts.cache_dir.join(format!("{}.manifest.json", opts.mount_key));
-            let (cache, rx) = AutoCache::load(crate::autocache::AutoCacheConfig {
-                max_file_size: auto_cache_max,
-                budget: auto_cache_budget.max(1),
-                pins: opts.pins.clone(),
-                root,
-                manifest,
-            })
-            .map_err(|e| {
-                tracing::error!(error = %e, "auto-cache init failed");
-                ErrorCode::Io
-            })?;
-            fetch_rx = Some(rx);
-            Some(Arc::new(cache))
-        } else {
-            None
-        };
+        let overlay = build_overlay(&opts)?;
+        let (cache, fetch_rx) = build_auto_cache(&opts, auto_cache_max, auto_cache_budget)?;
 
         let (epoch_tx, _) = tokio::sync::watch::channel(0u64);
         let fs = Arc::new(Self {
@@ -202,23 +131,7 @@ impl RemoteFs {
             detect_conflicts: opts.detect_conflicts,
             mount_root: opts.mount_root.clone(),
         });
-
-        if let (Some(cache), Some(rx)) = (fs.cache.clone(), fetch_rx) {
-            crate::walker::spawn(fs.clone(), cache.clone(), rx);
-            // Manifest flusher: every 30 s when dirty.
-            let flusher = cache;
-            tokio::spawn(async move {
-                let mut tick = tokio::time::interval(Duration::from_secs(30));
-                loop {
-                    tick.tick().await;
-                    let c = flusher.clone();
-                    let _ = tokio::task::spawn_blocking(move || c.flush_manifest()).await;
-                }
-            });
-        }
-        if fs.dialer.is_some() {
-            tokio::spawn(reconnect_supervisor(fs.clone()));
-        }
+        spawn_background_tasks(&fs, fetch_rx);
         Ok(fs)
     }
 
@@ -1043,6 +956,154 @@ impl RemoteFs {
     }
 }
 
+/// A mount's settled configuration: the merged options, plus the two cache
+/// sizes with their fallbacks already resolved.
+struct Negotiated {
+    opts: ClientOptions,
+    auto_cache_max: u64,
+    auto_cache_budget: u64,
+}
+
+/// Fold the server's suggested client settings (protocol v2+) in underneath
+/// the client's own.
+///
+/// Precedence is `explicit client value > server suggestion > fallback`, but
+/// what "underneath" means differs per setting:
+///
+/// * Lists (`excludes`, `pins`) are UNIONED, the client's own entries first.
+///   Both sides' patterns name something somebody wanted excluded or pinned,
+///   so letting either side replace the other loses a stated intent. This is
+///   deliberately unlike the config file's client-defaults merge, where a
+///   per-mount list REPLACES the global one — there, both lists were written
+///   by the same person, and replacing is how they say "not that, this".
+/// * Sizes apply only where the client made no explicit choice, which is why
+///   `auto_cache_max: Some(0)` is an OFF switch a server cannot override
+///   while `None` is an invitation for it to suggest one.
+/// * `no_server_defaults` skips the exchange entirely: `ask` is never
+///   invoked, so nothing is sent. Same for a v1 peer, which cannot decode the
+///   request variant at all.
+///
+/// `ask` yielding `None` — a server that refused, a connection that dropped —
+/// leaves the client's own configuration exactly as it was.
+async fn negotiate_defaults<F, Fut>(mut opts: ClientOptions, proto: u16, ask: F) -> Negotiated
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Option<Response>>,
+{
+    if !opts.no_server_defaults && proto >= 2 {
+        if let Some(Response::MountDefaults {
+            exclude,
+            pin,
+            auto_cache_max,
+            auto_cache_budget,
+        }) = ask().await
+        {
+            let suggested = exclude.len() + pin.len();
+            for e in exclude {
+                if !opts.excludes.contains(&e) {
+                    opts.excludes.push(e);
+                }
+            }
+            for p in pin {
+                if !opts.pins.contains(&p) {
+                    opts.pins.push(p);
+                }
+            }
+            if opts.auto_cache_max.is_none() {
+                opts.auto_cache_max = auto_cache_max;
+            }
+            if opts.auto_cache_budget.is_none() {
+                opts.auto_cache_budget = auto_cache_budget;
+            }
+            if suggested > 0 || auto_cache_max.is_some() || auto_cache_budget.is_some() {
+                tracing::info!(
+                    excludes = opts.excludes.len(),
+                    pins = opts.pins.len(),
+                    "applied server-suggested mount defaults (--no-server-defaults to opt out)"
+                );
+            }
+        }
+    }
+    Negotiated {
+        auto_cache_max: opts.auto_cache_max.unwrap_or(opts.auto_cache_max_fallback),
+        auto_cache_budget: opts.auto_cache_budget.unwrap_or(opts.auto_cache_budget_fallback),
+        opts,
+    }
+}
+
+/// The local overlay backing the `--exclude`d paths, or `None` when nothing
+/// is excluded and every path routes to the server.
+fn build_overlay(opts: &ClientOptions) -> Result<Option<Overlay>, FsError> {
+    if opts.excludes.is_empty() {
+        return Ok(None);
+    }
+    let root = opts.data_dir.join("overlay").join(&opts.mount_key);
+    let ov = Overlay::new(root, &opts.excludes).map_err(|e| {
+        tracing::error!(error = %e, "overlay init failed");
+        ErrorCode::Io
+    })?;
+    let orphans = ov.orphans();
+    if !orphans.is_empty() {
+        tracing::warn!(
+            ?orphans,
+            "overlay contains entries that no longer match any --exclude \
+             pattern; they are invisible until the pattern returns"
+        );
+    }
+    Ok(Some(ov))
+}
+
+/// Paths the auto-cache has decided to download, drained by the walker.
+type FetchQueue = tokio::sync::mpsc::UnboundedReceiver<RelPath>;
+
+/// The auto-download cache and the walker's fetch queue. Both are `None`
+/// unless something asks for a cache: a nonzero size limit, or a pin (which
+/// must be held locally whatever the limit says).
+fn build_auto_cache(
+    opts: &ClientOptions,
+    auto_cache_max: u64,
+    auto_cache_budget: u64,
+) -> Result<(Option<Arc<AutoCache>>, Option<FetchQueue>), FsError> {
+    if auto_cache_max == 0 && opts.pins.is_empty() {
+        return Ok((None, None));
+    }
+    let root = opts.cache_dir.join(&opts.mount_key);
+    let manifest = opts.cache_dir.join(format!("{}.manifest.json", opts.mount_key));
+    let (cache, rx) = AutoCache::load(crate::autocache::AutoCacheConfig {
+        max_file_size: auto_cache_max,
+        budget: auto_cache_budget.max(1),
+        pins: opts.pins.clone(),
+        root,
+        manifest,
+    })
+    .map_err(|e| {
+        tracing::error!(error = %e, "auto-cache init failed");
+        ErrorCode::Io
+    })?;
+    Ok((Some(Arc::new(cache)), Some(rx)))
+}
+
+/// Start the long-lived tasks, each only when its feature is configured: the
+/// cache walker with its manifest flusher, and the reconnect supervisor.
+fn spawn_background_tasks(fs: &Arc<RemoteFs>, fetch_rx: Option<FetchQueue>) {
+    if let (Some(cache), Some(rx)) = (fs.cache.clone(), fetch_rx) {
+        crate::walker::spawn(fs.clone(), cache.clone(), rx);
+        // Manifest flusher: every 30 s when dirty.
+        let flusher = cache;
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(30));
+            loop {
+                tick.tick().await;
+                let c = flusher.clone();
+                let _ = tokio::task::spawn_blocking(move || c.flush_manifest()).await;
+            }
+        });
+    }
+    if fs.dialer.is_some() {
+        tokio::spawn(reconnect_supervisor(fs.clone()));
+    }
+}
+
 /// Reconnect supervisor: when the connection dies, dial a replacement with
 /// exponential backoff, re-attach, re-open every live handle on the new
 /// session, replay each handle's advisory lock, then swap it in and bump
@@ -1167,4 +1228,148 @@ async fn replay_lock(conn: &Arc<MuxConnection>, fh: u64, kind: alloyfs_proto::Lo
         }
     }
     false
+}
+
+/// Mount-defaults negotiation. Every rule here decides what a mount is
+/// actually configured with, and each one has a plausible-looking wrong
+/// answer — a suggestion that overrides an explicit `0`, a list that replaces
+/// instead of unions, an opt-out that still sends the request — so they are
+/// pinned individually rather than left to an end-to-end mount test.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    fn suggests(
+        exclude: &[&str],
+        pin: &[&str],
+        auto_cache_max: Option<u64>,
+        auto_cache_budget: Option<u64>,
+    ) -> Response {
+        Response::MountDefaults {
+            exclude: exclude.iter().map(|s| (*s).to_string()).collect(),
+            pin: pin.iter().map(|s| (*s).to_string()).collect(),
+            auto_cache_max,
+            auto_cache_budget,
+        }
+    }
+
+    /// Negotiate against a v2 server that answers with `resp`.
+    async fn against(opts: ClientOptions, resp: Response) -> Negotiated {
+        negotiate_defaults(opts, 2, move || async move { Some(resp) }).await
+    }
+
+    /// An explicit client value wins, including the explicit OFF: `Some(0)`
+    /// means "no auto-cache on this mount" and an eager server must not talk
+    /// the client back into one.
+    #[tokio::test]
+    async fn explicit_client_values_beat_the_server_suggestion() {
+        let opts = ClientOptions {
+            auto_cache_max: Some(0),
+            auto_cache_budget: Some(4096),
+            auto_cache_max_fallback: 111,
+            auto_cache_budget_fallback: 222,
+            ..ClientOptions::default()
+        };
+        let out = against(opts, suggests(&[], &[], Some(9_999_999), Some(8_888_888))).await;
+        assert_eq!(out.auto_cache_max, 0);
+        assert_eq!(out.auto_cache_budget, 4096);
+    }
+
+    /// No explicit choice: the server's suggestion outranks the fallback.
+    #[tokio::test]
+    async fn the_server_suggestion_beats_the_fallback() {
+        let opts = ClientOptions {
+            auto_cache_max_fallback: 111,
+            auto_cache_budget_fallback: 222,
+            ..ClientOptions::default()
+        };
+        let out = against(opts, suggests(&[], &[], Some(4096), Some(8192))).await;
+        assert_eq!(out.auto_cache_max, 4096);
+        assert_eq!(out.auto_cache_budget, 8192);
+    }
+
+    /// Neither side chose: the fallback applies. Suggesting one size and not
+    /// the other must not drag the unsuggested one along.
+    #[tokio::test]
+    async fn the_fallback_applies_where_neither_side_chose() {
+        let opts = ClientOptions {
+            auto_cache_max_fallback: 111,
+            auto_cache_budget_fallback: 222,
+            ..ClientOptions::default()
+        };
+        let out = against(opts, suggests(&[], &[], Some(4096), None)).await;
+        assert_eq!(out.auto_cache_max, 4096);
+        assert_eq!(out.auto_cache_budget, 222);
+    }
+
+    /// Lists are UNIONED, not replaced, with the client's own entries first —
+    /// a server suggestion never costs the client a pattern it asked for, and
+    /// never silently drops one the server asked for either. Duplicates
+    /// collapse rather than accumulating on every mount.
+    #[tokio::test]
+    async fn lists_are_unioned_with_the_clients_entries_first() {
+        let opts = ClientOptions {
+            excludes: vec!["mine/**".into(), "shared/**".into()],
+            pins: vec!["*.mine".into()],
+            ..ClientOptions::default()
+        };
+        let out = against(
+            opts,
+            suggests(&["shared/**", "theirs/**"], &["*.mine", "*.theirs"], None, None),
+        )
+        .await;
+        assert_eq!(out.opts.excludes, ["mine/**", "shared/**", "theirs/**"]);
+        assert_eq!(out.opts.pins, ["*.mine", "*.theirs"]);
+    }
+
+    /// `no_server_defaults` opts out of ASKING, not merely of applying the
+    /// answer: the request must never be sent.
+    #[tokio::test]
+    async fn no_server_defaults_skips_the_exchange_entirely() {
+        let asked = Cell::new(false);
+        let opts = ClientOptions {
+            excludes: vec!["mine/**".into()],
+            no_server_defaults: true,
+            auto_cache_max_fallback: 111,
+            ..ClientOptions::default()
+        };
+        let out = negotiate_defaults(opts, 2, || async {
+            asked.set(true);
+            Some(suggests(&["theirs/**"], &[], Some(9_999_999), None))
+        })
+        .await;
+        assert!(!asked.get(), "the request must not be sent at all");
+        assert_eq!(out.opts.excludes, ["mine/**"]);
+        assert_eq!(out.auto_cache_max, 111);
+    }
+
+    /// A v1 peer cannot decode the request variant, so it is never sent one.
+    #[tokio::test]
+    async fn a_v1_server_is_never_asked() {
+        let asked = Cell::new(false);
+        let out = negotiate_defaults(ClientOptions::default(), 1, || async {
+            asked.set(true);
+            Some(suggests(&["theirs/**"], &[], Some(9_999_999), None))
+        })
+        .await;
+        assert!(!asked.get(), "the request must not be sent at all");
+        assert!(out.opts.excludes.is_empty());
+    }
+
+    /// A refused or dropped exchange is not a configuration change: the
+    /// client keeps its own values and its own fallbacks.
+    #[tokio::test]
+    async fn an_unanswered_exchange_leaves_the_client_configuration_alone() {
+        let opts = ClientOptions {
+            excludes: vec!["mine/**".into()],
+            auto_cache_max_fallback: 111,
+            auto_cache_budget_fallback: 222,
+            ..ClientOptions::default()
+        };
+        let out = negotiate_defaults(opts, 2, || async { None }).await;
+        assert_eq!(out.opts.excludes, ["mine/**"]);
+        assert_eq!(out.auto_cache_max, 111);
+        assert_eq!(out.auto_cache_budget, 222);
+    }
 }

@@ -191,12 +191,12 @@ impl SyncEngine {
     /// The sync baseline as text, one path per line, sorted.
     ///
     /// The baseline decides whether a local delete is pushed at all:
-    /// `push_local`'s `Removed` arm treats a path with no entry as "never
-    /// synced, nothing to delete remotely" and returns without asking the
-    /// server. So when a delete appears to do nothing, this is the first
-    /// thing worth looking at — and it is otherwise invisible from outside
-    /// the engine, which is what made an intermittent CI failure cost a
-    /// whole investigation with nothing to show for it.
+    /// `push_removal` treats a path with no entry as "never synced, nothing
+    /// to delete remotely" and returns without asking the server. So when a
+    /// delete appears to do nothing, this is the first thing worth looking
+    /// at — and it is otherwise invisible from outside the engine, which is
+    /// what made an intermittent CI failure cost a whole investigation with
+    /// nothing to show for it.
     ///
     /// A snapshot for diagnostics, not a handle for control.
     pub fn baseline_debug(&self) -> String {
@@ -501,6 +501,8 @@ impl SyncEngine {
 
     // ------------------------------------------------------ local → remote
 
+    /// Local change → server: a dispatch table over the event kinds, one arm
+    /// per method. Echo suppression is common to all of them and stays here.
     async fn push_local(&self, rel: &str, kind: &EventKind) -> Result<(), FsError> {
         if self.is_own_echo(rel) {
             return Ok(());
@@ -508,206 +510,218 @@ impl SyncEngine {
         let conn = self.conn();
         match kind {
             EventKind::Created | EventKind::Modified | EventKind::AttrChanged => {
-                let Some(local) = self.local_stat(rel) else {
-                    return Ok(()); // vanished before we got to it
-                };
-                if local.kind == EntryKind::Dir {
-                    match conn
-                        .request(Request::Mkdir {
-                            path: RelPath(rel.to_string()),
-                            mode: 0o755,
-                        })
-                        .await?
-                    {
-                        Ok(_) | Err(ErrorCode::AlreadyExists) => {}
-                        Err(e) => return Err(e.into()),
-                    }
-                    self.record(rel, EntryKind::Dir, 0, 0, 0);
-                    // inotify races adding watches on brand-new directories:
-                    // children created before the watch attached were never
-                    // reported. Scan the subtree and push whatever the
-                    // manifest doesn't know about yet.
-                    self.push_new_dir_contents(rel).await;
+                self.push_upsert(&conn, rel).await
+            }
+            EventKind::Removed => self.push_removal(&conn, rel).await,
+            EventKind::RenamedFrom { to } => self.push_rename(&conn, rel, to).await,
+            // Remote-side instruction; nothing to send back.
+            EventKind::ResyncRequired => Ok(()),
+        }
+    }
+
+    /// A created, modified or attribute-changed local path: mkdir it or
+    /// upload it — unless the remote moved since our baseline, which is a
+    /// conflict rather than something to clobber.
+    async fn push_upsert(&self, conn: &MuxConnection, rel: &str) -> Result<(), FsError> {
+        let Some(local) = self.local_stat(rel) else {
+            return Ok(()); // vanished before we got to it
+        };
+        if local.kind == EntryKind::Dir {
+            match conn
+                .request(Request::Mkdir {
+                    path: RelPath(rel.to_string()),
+                    mode: 0o755,
+                })
+                .await?
+            {
+                Ok(_) | Err(ErrorCode::AlreadyExists) => {}
+                Err(e) => return Err(e.into()),
+            }
+            self.record(rel, EntryKind::Dir, 0, 0, 0);
+            // inotify races adding watches on brand-new directories: children
+            // created before the watch attached were never reported. Scan the
+            // subtree and push whatever the manifest doesn't know about yet.
+            self.push_new_dir_contents(rel).await;
+            return Ok(());
+        }
+        // Remote moved since our baseline? Conflict — never clobber.
+        let remote = match conn
+            .request(Request::Getattr {
+                path: RelPath(rel.to_string()),
+            })
+            .await?
+        {
+            Ok(Response::Attr(a)) => Some(a),
+            Err(ErrorCode::NotFound) => None,
+            Ok(_) => return Err(ErrorCode::Io.into()),
+            Err(e) => return Err(e.into()),
+        };
+        if let Some(r) = &remote {
+            let r_stat = Stat {
+                kind: EntryKind::File,
+                size: r.size,
+                mtime_ns: mtime_ns_of(r.mtime),
+                version: r.version,
+            };
+            let baseline = self.manifest.lock().unwrap().entries.get(rel).cloned();
+            let remote_dirty = match &baseline {
+                Some(b) => {
+                    !(b.remote_version != 0 && b.remote_version == r.version)
+                        && !(b.size == r_stat.size && b.mtime_ns == r_stat.mtime_ns)
+                }
+                None => true, // remote exists and we never synced it
+            };
+            if remote_dirty {
+                if local.size == r_stat.size && local.mtime_ns == r_stat.mtime_ns {
+                    self.record(rel, local.kind, local.size, local.mtime_ns, r.version);
                     return Ok(());
                 }
-                // Remote moved since our baseline? Conflict — never clobber.
-                let remote = match conn
-                    .request(Request::Getattr {
-                        path: RelPath(rel.to_string()),
-                    })
-                    .await?
-                {
-                    Ok(Response::Attr(a)) => Some(a),
-                    Err(ErrorCode::NotFound) => None,
-                    Ok(_) => return Err(ErrorCode::Io.into()),
-                    Err(e) => return Err(e.into()),
-                };
-                if let Some(r) = &remote {
-                    let r_stat = Stat {
-                        kind: EntryKind::File,
-                        size: r.size,
-                        mtime_ns: mtime_ns_of(r.mtime),
-                        version: r.version,
-                    };
-                    let baseline = self.manifest.lock().unwrap().entries.get(rel).cloned();
-                    let remote_dirty = match &baseline {
-                        Some(b) => {
-                            !(b.remote_version != 0 && b.remote_version == r.version)
-                                && !(b.size == r_stat.size && b.mtime_ns == r_stat.mtime_ns)
-                        }
-                        None => true, // remote exists and we never synced it
-                    };
-                    if remote_dirty {
-                        if local.size == r_stat.size && local.mtime_ns == r_stat.mtime_ns {
-                            self.record(rel, local.kind, local.size, local.mtime_ns, r.version);
-                            return Ok(());
-                        }
-                        return self.resolve_conflict(rel, local, r_stat).await;
-                    }
-                }
-                self.push(rel).await
+                return self.resolve_conflict(rel, local, r_stat).await;
             }
-            EventKind::Removed => {
-                // Remote changed since baseline? Edit wins: pull instead.
-                let baseline = self.manifest.lock().unwrap().entries.get(rel).cloned();
-                let Some(b) = baseline else {
-                    return Ok(()); // never synced — nothing to delete remotely
-                };
-                let remote = conn
-                    .request(Request::Getattr {
-                        path: RelPath(rel.to_string()),
-                    })
-                    .await?;
-                match remote {
-                    Err(ErrorCode::NotFound) => {
-                        self.manifest.lock().unwrap().entries.remove(rel);
-                        Ok(())
-                    }
-                    Ok(Response::Attr(a)) => {
-                        let fresh = (b.remote_version != 0 && b.remote_version == a.version)
-                            || (b.size == a.size && b.mtime_ns == mtime_ns_of(a.mtime));
-                        if !fresh && a.kind != alloyfs_proto::FileKind::Dir {
-                            tracing::info!(path = rel, "local delete skipped: remote edit wins");
-                            return self.pull(rel).await;
-                        }
-                        let req = if a.kind == alloyfs_proto::FileKind::Dir {
-                            Request::Rmdir {
-                                path: RelPath(rel.to_string()),
-                            }
-                        } else {
-                            Request::Unlink {
-                                path: RelPath(rel.to_string()),
-                            }
-                        };
-                        match conn.request(req).await? {
-                            Ok(_) | Err(ErrorCode::NotFound) => {}
-                            Err(ErrorCode::NotEmpty) => {
-                                tracing::warn!(path = rel, "remote rmdir skipped (not empty yet)");
-                                return Ok(());
-                            }
-                            Err(e) => return Err(e.into()),
-                        }
-                        let mut m = self.manifest.lock().unwrap();
-                        let prefix = format!("{rel}/");
-                        m.entries.retain(|p, _| p != rel && !p.starts_with(&prefix));
-                        self.stats.deletes_remote.fetch_add(1, Relaxed);
-                        Ok(())
-                    }
-                    Ok(_) => Err(ErrorCode::Io.into()),
-                    Err(e) => Err(e.into()),
-                }
-            }
-            EventKind::RenamedFrom { to } => {
-                match conn
-                    .request(Request::Rename {
-                        from: RelPath(rel.to_string()),
-                        to: to.clone(),
-                        replace: true,
-                    })
-                    .await?
-                {
-                    Ok(_) => {
-                        let known = self.manifest.lock().unwrap().rename_prefix(rel, &to.0);
-                        // `rename_prefix` only MOVES keys, so a source the
-                        // manifest never held leaves the target unrecorded —
-                        // while the server has just performed the rename. That
-                        // combination is unrecoverable rather than merely
-                        // stale: `EventKind::Removed` treats "no baseline" as
-                        // "never synced, nothing to delete remotely" and
-                        // returns without asking the server, so the renamed
-                        // file could never be deleted again from this side.
-                        if !known {
-                            if let Some(s) = self.local_stat(&to.0) {
-                                self.record(&to.0, s.kind, s.size, s.mtime_ns, 0);
-                                tracing::debug!(
-                                    path = %to.0,
-                                    "rename target adopted into the manifest (source was unknown)"
-                                );
-                            }
-                        }
+        }
+        self.push(rel).await
+    }
 
-                        // Re-stat the server and adopt what it now reports.
-                        //
-                        // A moved entry still describes the file under its OLD
-                        // name: the server bumps the version when it performs
-                        // the rename, and the recorded mtime is the local one,
-                        // which need not match what the server stored. So both
-                        // legs of the freshness test in `EventKind::Removed`
-                        // fail — version differs, size+mtime differs — and a
-                        // later delete of this path is read as "somebody else
-                        // edited it", converted into a pull, and the file comes
-                        // back instead of going away.
-                        //
-                        // That is not hypothetical: it is what
-                        // `local_changes_pushed_live` caught in CI, with
-                        // deletes_remote=0 and the file present in both trees.
-                        if let Ok(Ok(Response::Attr(a))) =
-                            conn.request(Request::Getattr { path: to.clone() }).await
+    /// A locally deleted path: delete it on the server too, unless the remote
+    /// changed since our baseline — a remote edit outranks a local delete and
+    /// is pulled back instead.
+    async fn push_removal(&self, conn: &MuxConnection, rel: &str) -> Result<(), FsError> {
+        // Remote changed since baseline? Edit wins: pull instead.
+        let baseline = self.manifest.lock().unwrap().entries.get(rel).cloned();
+        let Some(b) = baseline else {
+            return Ok(()); // never synced — nothing to delete remotely
+        };
+        let remote = conn
+            .request(Request::Getattr {
+                path: RelPath(rel.to_string()),
+            })
+            .await?;
+        match remote {
+            Err(ErrorCode::NotFound) => {
+                self.manifest.lock().unwrap().entries.remove(rel);
+                Ok(())
+            }
+            Ok(Response::Attr(a)) => {
+                let fresh = (b.remote_version != 0 && b.remote_version == a.version)
+                    || (b.size == a.size && b.mtime_ns == mtime_ns_of(a.mtime));
+                if !fresh && a.kind != alloyfs_proto::FileKind::Dir {
+                    tracing::info!(path = rel, "local delete skipped: remote edit wins");
+                    return self.pull(rel).await;
+                }
+                let req = if a.kind == alloyfs_proto::FileKind::Dir {
+                    Request::Rmdir {
+                        path: RelPath(rel.to_string()),
+                    }
+                } else {
+                    Request::Unlink {
+                        path: RelPath(rel.to_string()),
+                    }
+                };
+                match conn.request(req).await? {
+                    Ok(_) | Err(ErrorCode::NotFound) => {}
+                    Err(ErrorCode::NotEmpty) => {
+                        tracing::warn!(path = rel, "remote rmdir skipped (not empty yet)");
+                        return Ok(());
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+                let mut m = self.manifest.lock().unwrap();
+                let prefix = format!("{rel}/");
+                m.entries.retain(|p, _| p != rel && !p.starts_with(&prefix));
+                self.stats.deletes_remote.fetch_add(1, Relaxed);
+                Ok(())
+            }
+            Ok(_) => Err(ErrorCode::Io.into()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// A local rename: replay it on the server, then re-baseline the target
+    /// from what the server now reports.
+    async fn push_rename(&self, conn: &MuxConnection, rel: &str, to: &RelPath) -> Result<(), FsError> {
+        match conn
+            .request(Request::Rename {
+                from: RelPath(rel.to_string()),
+                to: to.clone(),
+                replace: true,
+            })
+            .await?
+        {
+            Ok(_) => {
+                let known = self.manifest.lock().unwrap().rename_prefix(rel, &to.0);
+                // `rename_prefix` only MOVES keys, so a source the manifest
+                // never held leaves the target unrecorded — while the server
+                // has just performed the rename. That combination is
+                // unrecoverable rather than merely stale: `push_removal`
+                // treats "no baseline" as "never synced, nothing to delete
+                // remotely" and returns without asking the server, so the
+                // renamed file could never be deleted again from this side.
+                if !known {
+                    if let Some(s) = self.local_stat(&to.0) {
+                        self.record(&to.0, s.kind, s.size, s.mtime_ns, 0);
+                        tracing::debug!(
+                            path = %to.0,
+                            "rename target adopted into the manifest (source was unknown)"
+                        );
+                    }
+                }
+
+                // Re-stat the server and adopt what it now reports.
+                //
+                // A moved entry still describes the file under its OLD name:
+                // the server bumps the version when it performs the rename,
+                // and the recorded mtime is the local one, which need not
+                // match what the server stored. So both legs of the freshness
+                // test in `push_removal` fail — version differs, size+mtime
+                // differs — and a later delete of this path is read as
+                // "somebody else edited it", converted into a pull, and the
+                // file comes back instead of going away.
+                //
+                // That is not hypothetical: it is what
+                // `local_changes_pushed_live` caught in CI, with
+                // deletes_remote=0 and the file present in both trees.
+                if let Ok(Ok(Response::Attr(a))) = conn.request(Request::Getattr { path: to.clone() }).await {
+                    self.record(
+                        &to.0,
+                        if a.kind == alloyfs_proto::FileKind::Dir {
+                            EntryKind::Dir
+                        } else {
+                            EntryKind::File
+                        },
+                        a.size,
+                        mtime_ns_of(a.mtime),
+                        a.version,
+                    );
+                }
+                self.stats.pushes.fetch_add(1, Relaxed);
+                Ok(())
+            }
+            Err(ErrorCode::NotFound) => {
+                // Source never made it remotely: push the target fresh
+                // (direct upload — no async recursion).
+                self.manifest.lock().unwrap().entries.remove(rel);
+                match self.local_stat(&to.0) {
+                    Some(s) if s.kind == EntryKind::Dir => {
+                        match self
+                            .conn()
+                            .request(Request::Mkdir {
+                                path: to.clone(),
+                                mode: 0o755,
+                            })
+                            .await?
                         {
-                            self.record(
-                                &to.0,
-                                if a.kind == alloyfs_proto::FileKind::Dir {
-                                    EntryKind::Dir
-                                } else {
-                                    EntryKind::File
-                                },
-                                a.size,
-                                mtime_ns_of(a.mtime),
-                                a.version,
-                            );
-                        }
-                        self.stats.pushes.fetch_add(1, Relaxed);
-                        Ok(())
-                    }
-                    Err(ErrorCode::NotFound) => {
-                        // Source never made it remotely: push the target
-                        // fresh (direct upload — no async recursion).
-                        self.manifest.lock().unwrap().entries.remove(rel);
-                        match self.local_stat(&to.0) {
-                            Some(s) if s.kind == EntryKind::Dir => {
-                                match self
-                                    .conn()
-                                    .request(Request::Mkdir {
-                                        path: to.clone(),
-                                        mode: 0o755,
-                                    })
-                                    .await?
-                                {
-                                    Ok(_) | Err(ErrorCode::AlreadyExists) => {
-                                        self.record(&to.0, EntryKind::Dir, 0, 0, 0);
-                                        Ok(())
-                                    }
-                                    Err(e) => Err(e.into()),
-                                }
+                            Ok(_) | Err(ErrorCode::AlreadyExists) => {
+                                self.record(&to.0, EntryKind::Dir, 0, 0, 0);
+                                Ok(())
                             }
-                            Some(_) => self.push(&to.0).await,
-                            None => Ok(()),
+                            Err(e) => Err(e.into()),
                         }
                     }
-                    Err(e) => Err(e.into()),
+                    Some(_) => self.push(&to.0).await,
+                    None => Ok(()),
                 }
             }
-            EventKind::ResyncRequired => Ok(()),
+            Err(e) => Err(e.into()),
         }
     }
 
