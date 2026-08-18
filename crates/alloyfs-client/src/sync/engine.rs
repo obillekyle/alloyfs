@@ -630,6 +630,37 @@ impl SyncEngine {
                                 );
                             }
                         }
+
+                        // Re-stat the server and adopt what it now reports.
+                        //
+                        // A moved entry still describes the file under its OLD
+                        // name: the server bumps the version when it performs
+                        // the rename, and the recorded mtime is the local one,
+                        // which need not match what the server stored. So both
+                        // legs of the freshness test in `EventKind::Removed`
+                        // fail — version differs, size+mtime differs — and a
+                        // later delete of this path is read as "somebody else
+                        // edited it", converted into a pull, and the file comes
+                        // back instead of going away.
+                        //
+                        // That is not hypothetical: it is what
+                        // `local_changes_pushed_live` caught in CI, with
+                        // deletes_remote=0 and the file present in both trees.
+                        if let Ok(Ok(Response::Attr(a))) =
+                            conn.request(Request::Getattr { path: to.clone() }).await
+                        {
+                            self.record(
+                                &to.0,
+                                if a.kind == alloyfs_proto::FileKind::Dir {
+                                    EntryKind::Dir
+                                } else {
+                                    EntryKind::File
+                                },
+                                a.size,
+                                mtime_ns_of(a.mtime),
+                                a.version,
+                            );
+                        }
                         self.stats.pushes.fetch_add(1, Relaxed);
                         Ok(())
                     }
