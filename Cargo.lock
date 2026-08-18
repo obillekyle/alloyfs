@@ -152,6 +152,7 @@ dependencies = [
  "alloyfs-proto",
  "anyhow",
  "tracing",
+ "windows-sys 0.60.2",
  "winfsp",
 ]
 

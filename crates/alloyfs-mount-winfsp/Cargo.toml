@@ -12,5 +12,6 @@ repository.workspace = true
 alloyfs-proto.workspace = true
 alloyfs-client.workspace = true
 winfsp.workspace = true
+windows-sys.workspace = true
 tracing.workspace = true
 anyhow.workspace = true

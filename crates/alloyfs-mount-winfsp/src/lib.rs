@@ -330,19 +330,33 @@ impl FileSystemContext for WinFspFs {
     fn get_security_by_name(
         &self,
         file_name: &U16CStr,
-        _security_descriptor: Option<&mut [std::ffi::c_void]>,
+        security_descriptor: Option<&mut [std::ffi::c_void]>,
         _reparse_point_resolver: impl FnOnce(&U16CStr) -> Option<FileSecurity>,
     ) -> winfsp::Result<FileSecurity> {
         let path = rel_path(file_name)?;
         tracing::trace!(path = %path, "get_security_by_name");
         let (_ino, attr) = self.resolve(&path).map_err(fsp_err)?;
-        // TODO(M4+): no ACL support yet — we report no security descriptor and
-        // let WinFsp synthesize a default one from the mounting user.
         Ok(FileSecurity {
             reparse: false,
-            sz_security_descriptor: 0,
+            sz_security_descriptor: write_security_descriptor(security_descriptor)?,
             attributes: attributes(&attr),
         })
+    }
+
+    /// The descriptor for an OPEN file — what `icacls` and `Get-Acl` ask.
+    ///
+    /// Separate from `get_security_by_name`, which answers the access check at
+    /// open time. Left unimplemented this returns STATUS_INVALID_DEVICE_REQUEST
+    /// and Windows reports "no permissions are set, all users have full
+    /// control" — accidentally true here, and misleading everywhere it is
+    /// read, since it describes a NULL DACL rather than the one actually
+    /// enforced. Answering with the same descriptor keeps the two consistent.
+    fn get_security(
+        &self,
+        _context: &Self::FileContext,
+        security_descriptor: Option<&mut [std::ffi::c_void]>,
+    ) -> winfsp::Result<u64> {
+        write_security_descriptor(security_descriptor)
     }
 
     fn open(
@@ -859,7 +873,95 @@ impl EventSink {
     }
 }
 
-/// Volume-rooted wide path ("\dir\file.txt"), no NUL terminator.
+// ------------------------------------------------------- security descriptors
+
+/// The descriptor every file and directory on the mount reports.
+///
+/// SYSTEM, Administrators and Everyone, full access, protected (`P`) so
+/// nothing is inherited from wherever the drive letter hangs.
+///
+/// This is deliberate rather than lax. **The server is the access boundary**:
+/// an export's `read_only` flag and the serving machine's own filesystem
+/// permissions decide what a client may do, and they are enforced on the far
+/// side of the wire where the files actually live. Windows-side ACLs on top of
+/// that would protect nothing — anyone who can read this drive can equally run
+/// `alloyfs mount` themselves and get their own copy of it.
+///
+/// It also has to be explicit rather than absent. Returning no descriptor
+/// makes WinFsp synthesize one from whoever mounted, which is fine when that
+/// is the user at the keyboard and wrong the moment anything else does the
+/// mounting — the reason `alloyfs service` goes to the trouble of launching
+/// into the interactive session instead of mounting from the service.
+const MOUNT_SDDL: &str = "O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;WD)";
+
+/// The parsed descriptor and its length, built once.
+struct MountSecurity {
+    descriptor: Vec<u8>,
+}
+
+// The pointer from ConvertStringSecurityDescriptorToSecurityDescriptorW is
+// copied into an owned Vec immediately, so what is cached is plain bytes.
+static MOUNT_SECURITY: std::sync::OnceLock<MountSecurity> = std::sync::OnceLock::new();
+
+fn mount_security() -> &'static MountSecurity {
+    MOUNT_SECURITY.get_or_init(|| {
+        use windows_sys::Win32::Foundation::LocalFree;
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+        };
+        use windows_sys::Win32::Security::{GetSecurityDescriptorLength, PSECURITY_DESCRIPTOR};
+
+        let wide: Vec<u16> = MOUNT_SDDL.encode_utf16().chain(Some(0)).collect();
+        let mut psd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        let ok = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                wide.as_ptr(),
+                SDDL_REVISION_1,
+                &mut psd,
+                std::ptr::null_mut(),
+            )
+        };
+        // A compile-time constant SDDL either parses on every machine or on
+        // none, so a failure here is a bug in this file rather than something
+        // to degrade around.
+        assert!(
+            ok != 0 && !psd.is_null(),
+            "the built-in mount SDDL failed to parse: {}",
+            std::io::Error::last_os_error()
+        );
+        let len = unsafe { GetSecurityDescriptorLength(psd) } as usize;
+        let descriptor = unsafe { std::slice::from_raw_parts(psd as *const u8, len) }.to_vec();
+        unsafe { LocalFree(psd as *mut _) };
+        MountSecurity { descriptor }
+    })
+}
+
+/// Copy the mount descriptor into WinFsp's buffer, returning its length.
+///
+/// WinFsp asks twice: once with no buffer to learn the size, then again with
+/// one big enough. A buffer that is too small is not an error either — it is
+/// the same "here is the size you need" answer, so this reports the length in
+/// every case and only copies when there is room.
+fn write_security_descriptor(buffer: Option<&mut [std::ffi::c_void]>) -> winfsp::Result<u64> {
+    let security = mount_security();
+    let len = security.descriptor.len();
+    if let Some(buffer) = buffer {
+        if buffer.len() >= len {
+            // SAFETY: the destination is at least `len` bytes, and a security
+            // descriptor is a plain byte blob to everyone but the SRM.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    security.descriptor.as_ptr(),
+                    buffer.as_mut_ptr() as *mut u8,
+                    len,
+                );
+            }
+        }
+    }
+    Ok(len as u64)
+}
+
+/// Volume-rooted wide path (`\dir\file.txt`), no NUL terminator.
 fn notify_name(rel: &alloyfs_proto::RelPath) -> Vec<u16> {
     let mut s = String::with_capacity(rel.0.len() + 1);
     s.push('\\');
