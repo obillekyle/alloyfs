@@ -228,27 +228,54 @@ pub fn migrate_legacy_mount(old_key: &str, host: &str, export: &str) {
 const CONFIG_TEMPLATE: &str = "\
 # AlloyFS configuration.
 #
+# One file, both halves of this machine: `server:` is what it offers to
+# others, `client:` is what it mounts from them. Neither is required. A
+# machine that only mounts writes no `server:` at all, and a section whose
+# contents are all commented out reads as empty rather than as an error.
+#
+# `alloyfs start` runs everything below at once: the agent, then every mount.
+#
 # An alloyfs.yml placed NEXT TO THE EXECUTABLE overrides this file, which
 # makes a portable install (binary + config on a stick or in one folder)
 # work without touching the home directory.
 
-agent:
-  # Serve mounts over TCP. A non-loopback address REQUIRES tcp_token.
+version: 3
+
+# What this machine serves.
+server:
+  # Listen for mounts over TCP. A non-loopback address REQUIRES tcp_token.
   tcp_listen: \"127.0.0.1:7440\"
   # tcp_token: \"change-me\"
   # http_listen: \"127.0.0.1:7441\"
   # http_token: \"change-me\"
 
-# Folders this machine offers to others. Add one block per export.
-exports: {}
-#  projects:
-#    path: /home/you/projects
-#    read_only: false
-#    exclude:
-#      - \"**/.git\"
-#    client:            # settings suggested to anyone who mounts this
-#      exclude: [node_modules]
-#      auto_cache_max: 2M
+  # Folders offered to others. One block per export.
+  # exports:
+  #   projects:
+  #     path: /home/you/projects
+  #     read_only: false
+  #     exclude:
+  #       - \"**/.git\"
+  #     client:          # settings SUGGESTED to whoever mounts this export,
+  #       exclude: [node_modules]   # merged into what they already asked for
+  #       auto_cache_max: 2M
+
+# What this machine mounts. Keys directly under `client:` are defaults for
+# every mount below; a mount that states the same key wins outright, and a
+# list REPLACES the one above it instead of adding to it — which is what
+# makes `exclude: []` mean \"inherit nothing\".
+client:
+  # exclude: [node_modules]
+  # pin: [\"*.lock\"]
+  # auto_cache_max: 2M
+  # auto_cache_budget: 512M
+  # detect_conflicts: false
+
+  # Named mounts: `alloyfs mount work` mounts one, `alloyfs start` mounts all.
+  # mounts:
+  #   work:
+  #     url: ssh://host/projects
+  #     at: \"P:\"        # a drive letter on Windows, a directory on Linux
 ";
 
 /// Names an auto-discovered config may have, most preferred first. JSON is

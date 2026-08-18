@@ -42,13 +42,20 @@ An export can publish suggested settings, so every client mounting it starts
 with sensible excludes without being told:
 
 ```yaml
-exports:
-  projects:
-    path: /home/you/projects
-    client:
-      exclude: ["node_modules", "target"]
-      auto_cache_max: 2M
+server:
+  exports:
+    projects:
+      path: /home/you/projects
+      client:
+        exclude: ["node_modules", "target"]
+        auto_cache_max: 2M
 ```
 
-Your own flags are unioned with the suggestion. `--no-server-defaults` ignores
-it entirely.
+Your own flags are **unioned** with the suggestion. `--no-server-defaults`
+ignores it entirely — and skips asking, rather than asking and discarding the
+answer.
+
+That union is specific to server suggestions, where two machines each stated an
+intent and dropping either would lose one. Inside a single config file the rule
+is the opposite: a mount's `exclude` **replaces** the `client:` default above
+it. See [config.yml](#/configuration/config-file).

@@ -6,7 +6,7 @@ login. A TCP listener is not, so it has rules.
 ## The loopback rule
 
 ```yaml
-agent:
+server:
   tcp_listen: "0.0.0.0:7440"
   tcp_token: "a-long-random-secret"
 ```
@@ -25,7 +25,8 @@ you are already on the machine.
 alloyfs mount tcp://host:7440/projects /mnt/p --token a-long-random-secret
 ```
 
-or `token:` in the mount config, which keeps it out of your shell history.
+or `token:` in the config — under `client:` for every mount, or on the one
+mount entry that needs it — which keeps it out of your shell history.
 
 ## How it works
 
@@ -41,7 +42,7 @@ takes exactly as long to reject as one that shares nothing.
 Same shape, separately configured:
 
 ```yaml
-agent:
+server:
   http_listen: "127.0.0.1:7441"
   http_token: "another-secret"
 ```

@@ -3,7 +3,7 @@
 A small read/write API on the agent, off unless configured:
 
 ```yaml
-agent:
+server:
   http_listen: "127.0.0.1:7441"
   http_token: "a-secret"
 ```

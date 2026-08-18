@@ -26,6 +26,11 @@ it to your `PATH`. Neither needs root.
 
 Defaults are `%LOCALAPPDATA%\Programs\alloyfs` and `~/.local/bin`.
 
+`~/.local/bin` reaches your `PATH` through a login shell's profile, which
+`ssh host <command>` never starts — so a machine that will be mounted **from**
+elsewhere over `ssh://` usually wants `ALLOYFS_INSTALL=/usr/local/bin` instead.
+See [Your first mount](#/getting-started/first-mount).
+
 Your configuration lives in `~/.alloyfs`, deliberately somewhere else — so
 reinstalling or removing AlloyFS never touches the [overlay](#/guides/excludes)
 or your [sync baselines](#/guides/sync-mode).

@@ -39,10 +39,11 @@ It is the lowest-exposure option and costs nothing extra.
 ## Read-only exports
 
 ```yaml
-exports:
-  reference:
-    path: /srv/reference
-    read_only: true
+server:
+  exports:
+    reference:
+      path: /srv/reference
+      read_only: true
 ```
 
 Enforced at the agent, on every mutating operation — over the wire and through

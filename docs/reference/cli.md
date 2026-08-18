@@ -8,6 +8,8 @@ alloyfs <COMMAND>
 |---|---|
 | `serve` | Publish the exports named in the config |
 | `mount` | Mount an export as a drive |
+| `start` | Run the whole config: the agent, plus every configured mount |
+| `service` | Register mounts and agents to start on their own (Windows) |
 | `sync` | Keep a local directory in step with an export |
 | `cache` | Show what is cached |
 | `clear` | Drop the cache |
@@ -30,7 +32,7 @@ per-mount transport.
 
 `--export NAME=PATH` publishes a folder without a config file, for a quick test.
 
-`--tcp` overrides `agent.tcp_listen`; with neither, the default is
+`--tcp` overrides `server.tcp_listen`; with neither, the default is
 `127.0.0.1:7440`. A non-loopback address requires a token — see
 [TCP authentication](#/configuration/auth).
 
@@ -47,6 +49,55 @@ entry's settings; flags still override them. Which form runs is decided by how
 many positionals there are, never by how the first one looks.
 
 See [Mounting a drive](#/guides/mounting) for the full option list.
+
+## start
+
+```bash
+alloyfs start [--config PATH] [--server-only] [--mounts-only]
+```
+
+Everything one config describes, in one command: the agent from `server:`, then
+every mount under `client.mounts:`, running together until Ctrl-C. A v3 config
+describes both halves of a machine, and starting them separately means two
+terminals and a remembered order.
+
+The agent is started when the config defines at least one export — a `server:`
+holding only a listen address has nothing to serve, so nothing is run for it.
+
+The agent starts first and the mounts **wait for it to accept connections**
+before dialling (up to ten seconds). A config whose own `client.mounts` point
+back at its own `server:` — a loopback mount of a local export — is an ordinary
+thing to write, and without the wait the mount races the listener and loses. A
+`0.0.0.0` listener is dialled on loopback, since a wildcard is what to bind, not
+an address to connect to.
+
+**One failure does not take the rest down.** An unreachable host must not stop
+the agent, and a broken mount must not unmount the working ones. Whatever failed
+is named at exit, rather than a single "start failed" about a five-mount config.
+
+`--server-only` skips the mounts; `--mounts-only` skips the agent. Neither is
+needed for a config that only has one half. A config with nothing in it prints
+what to add and exits cleanly — a machine that has not been set up yet is not an
+error.
+
+## service
+
+```bash
+alloyfs service setup                 # one-time: check WinFsp, lock down the store
+alloyfs service add <ID> --url <URL> --mount <MOUNTPOINT> [--start]
+alloyfs service add <ID> --config <PATH> [--tcp ADDR]   # an agent instead
+alloyfs service list                  # what is defined, and what it is doing
+alloyfs service start|stop|restart [ID]     # one, or every one
+alloyfs service remove <ID>
+alloyfs service reset --confirm       # remove every instance
+```
+
+Windows only, for now. Mounts and agents that come back at boot with no terminal
+window. **Every subcommand except `list` needs an elevated shell**, and none of
+them will raise their own privileges.
+
+See [Running as a service](#/deployment/service) for what a registered service
+actually does, why it needs Administrator, and the Linux equivalent.
 
 ## sync
 
