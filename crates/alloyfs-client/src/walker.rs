@@ -179,7 +179,17 @@ async fn fetch_one(fs: &Arc<RemoteFs>, cache: &Arc<AutoCache>, path: &RelPath) -
             return false;
         }
         // Chunk list, fetched CHUNK_CONCURRENCY at a time in order windows.
-        let mut data = Vec::with_capacity(attr.size as usize);
+        // `attr.size` is whatever the SERVER said it was. Pre-allocating it
+        // outright turns a corrupt or hostile value into an abort — capacity
+        // overflow, or the OOM killer — rather than an error, and a pinned
+        // path bypasses the size ceiling that would otherwise bound it. Ask
+        // for a sane amount and let the Vec grow if the file really is large.
+        //
+        // This bounds the ALLOCATION, not the buffering: a genuinely huge
+        // pinned file is still assembled whole in memory. Streaming it to the
+        // cache file instead is the real fix and is its own change.
+        const MAX_PREALLOC: u64 = 8 * 1024 * 1024;
+        let mut data = Vec::with_capacity(attr.size.min(MAX_PREALLOC) as usize);
         let mut pos = 0u64;
         while pos < attr.size {
             let mut batch = Vec::new();
