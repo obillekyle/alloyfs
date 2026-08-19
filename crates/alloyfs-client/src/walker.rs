@@ -58,10 +58,64 @@ pub(crate) fn spawn(
         let mut pending: Vec<RelPath> = Vec::new();
         let mut pending_bytes = 0u64;
 
+        // Before anything else: has the export changed at all since this
+        // cache was last complete?
+        //
+        // One `TreeToken` answers that in a single exchange, and a match means
+        // every blob on disk is still current — no tree to fetch, no files to
+        // compare, nothing to walk. This is the difference between a warm
+        // remount costing one round trip and costing a full discovery pass.
+        //
+        // The token is usable for this precisely because it is derived from
+        // the export's CONTENT rather than from a session counter: an
+        // `ssh://` agent is spawned fresh per mount, so anything session-shaped
+        // (`seq`) restarts and cannot speak for a cache written by an earlier
+        // mount. See the `Manifest` field comment.
+        let saved_token = cache.saved_tree_token();
+        if saved_token != 0 {
+            match fs.conn().request(Request::TreeToken).await {
+                Ok(Ok(Response::TreeToken { token })) if token == saved_token => {
+                    cache.note_walk_skipped();
+                    tracing::info!(
+                        token,
+                        entries = cache.stats().0,
+                        elapsed_s = started.elapsed().as_secs_f32(),
+                        "auto-cache is current for this export; skipping the walk"
+                    );
+                    // Straight to serving the re-fetch queue: events and our
+                    // own writes still keep the cache honest from here.
+                    while let Some(path) = fetch_rx.recv().await {
+                        if fs.is_overlay(&path) {
+                            continue;
+                        }
+                        let permit = sem.clone().acquire_owned().await.unwrap();
+                        let fs = fs.clone();
+                        let cache = cache.clone();
+                        tokio::spawn(async move {
+                            let _ = fetch_one(&fs, &cache, &path).await;
+                            drop(permit);
+                        });
+                    }
+                    return;
+                }
+                // Changed, unindexed (token 0), or an agent that cannot
+                // answer: fall through and do the work.
+                _ => {}
+            }
+        }
+
         // One exchange instead of one per directory, where the agent can. The
         // BFS below stays as the fallback and is still what runs against a
         // pre-v6 agent or an unindexed export.
         let indexed = discover_by_tree(&fs).await;
+        // Kept only when the tree served the whole discovery: a BFS walk has
+        // no token to speak for, and recording one from a fallback pass would
+        // be claiming knowledge the pass never had.
+        let complete_at_token = if indexed.is_some() {
+            current_tree_token(&fs).await
+        } else {
+            0
+        };
         if let Some(entries) = indexed {
             walked_dirs = entries
                 .iter()
@@ -195,6 +249,16 @@ pub(crate) fn spawn(
         while let Some(done) = tasks.join_next().await {
             ok += done.unwrap_or(0);
         }
+        // Record the token ONLY if the pass actually finished the job: the
+        // tree served discovery, and everything it queued was fetched. A token
+        // beside an incomplete cache is worse than no token, because the next
+        // mount would trust it and skip the walk that would have finished the
+        // work — the token would be telling the truth about the export while
+        // saying nothing about the cache.
+        let complete = complete_at_token != 0 && ok == fetched;
+        if complete {
+            cache.record_tree_token(complete_at_token);
+        }
         let (entries, bytes) = cache.stats();
         tracing::info!(
             walked_dirs,
@@ -202,6 +266,8 @@ pub(crate) fn spawn(
             fetched = ok,
             cached_entries = entries,
             cached_bytes = bytes,
+            tree_token = complete_at_token,
+            complete,
             elapsed_s = started.elapsed().as_secs_f32(),
             "auto-cache walk complete"
         );
@@ -464,4 +530,22 @@ async fn discover_by_tree(fs: &Arc<RemoteFs>) -> Option<Vec<(RelPath, Attr)>> {
     }
     tracing::debug!(requests, entries = out.len(), "export tree fetched");
     Some(out)
+}
+
+/// The export's current tree token, or 0 when there is not one to have —
+/// a pre-v6 agent, an unindexed export, or a request that failed.
+///
+/// Asked separately from the tree itself rather than reusing the token the
+/// `Tree` pages carried: this is taken AFTER discovery finished, so it
+/// describes the export as of the end of the pass. A token from the start
+/// would claim the cache is current as of a moment before the fetches ran,
+/// and anything changed in between would be invisible to the next mount.
+async fn current_tree_token(fs: &Arc<RemoteFs>) -> u64 {
+    if fs.conn().proto < 6 {
+        return 0;
+    }
+    match fs.conn().request(Request::TreeToken).await {
+        Ok(Ok(Response::TreeToken { token })) => token,
+        _ => 0,
+    }
 }

@@ -394,6 +394,13 @@ impl RemoteFs {
         }
     }
 
+    /// True when the auto-cache walk was skipped this mount because the
+    /// export tree token still matched what the cache was last complete at.
+    /// A mount with no auto-cache never walks, and reports false.
+    pub fn auto_cache_walk_skipped(&self) -> bool {
+        self.cache.as_ref().is_some_and(|c| c.walk_skipped())
+    }
+
     /// Is this path routed to the local overlay?
     pub(crate) fn is_overlay(&self, path: &RelPath) -> bool {
         self.overlay.as_ref().is_some_and(|o| o.excluded(path))

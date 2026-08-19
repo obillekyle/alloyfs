@@ -2355,3 +2355,88 @@ async fn the_walker_falls_back_to_readdir_when_the_export_is_not_indexed() {
     let _s = connect(&agent, cache_opts(&data_dir)).await;
     expect_all_cached(&data_dir, &names, "readdir fallback cached every file").await;
 }
+
+// ------------------------------------------- the tree token across remounts
+
+/// A remount whose token still matches does no discovery at all.
+///
+/// This is what makes a warm cold-start one round trip instead of a full pass:
+/// the token is derived from the export's CONTENT, so it survives the agent
+/// being respawned — which an `ssh://` mount does on every connection, and
+/// which is exactly why the event `seq` could never answer this question.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_matching_tree_token_skips_the_walk_on_remount() {
+    let agent = start_agent(AgentOpts::default());
+    let names = nested_export(&agent);
+    let data_dir = tempfile::TempDir::new().unwrap();
+
+    // First mount: full discovery, everything cached, token recorded.
+    {
+        let s = connect(&agent, cache_opts(&data_dir)).await;
+        expect_all_cached(&data_dir, &names, "first mount cached every file").await;
+        assert!(
+            !s.fs.auto_cache_walk_skipped(),
+            "the first mount has no token to match and must walk"
+        );
+        on_fs(&s.fs, |fs| fs.shutdown()).await;
+    }
+
+    // Second mount against the same cache, export untouched.
+    let s2 = connect(&agent, cache_opts(&data_dir)).await;
+    wait_until("remount settles", 15, {
+        let fs = s2.fs.clone();
+        move || fs.auto_cache_walk_skipped().then_some(())
+    })
+    .await;
+
+    // ...and the cache it skipped past is still the right cache.
+    let blob = data_dir.path().join("cache").join("t").join("a/deep/three.txt");
+    assert_eq!(std::fs::read(&blob).unwrap(), b"content-3");
+}
+
+/// ...and a remount whose token has moved walks, and picks up what changed.
+///
+/// The agent runs with NO watcher, so the change reaches this mount through
+/// nothing but the token comparison — which is the point. If the token were
+/// session-shaped, or compared only after a walk, this file would not arrive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_changed_export_still_walks_on_remount() {
+    // watch: true is REQUIRED, not incidental. The token is only as good as
+    // the server index behind it, and that index is maintained by the
+    // watcher — with no watcher the export can change without the token
+    // moving, and a client would skip a walk it needed. See the note in the
+    // backlog: this is the same dependency that makes watcher OVERFLOW
+    // dangerous now that clients skip on the token.
+    let agent = start_agent(AgentOpts {
+        watch: true,
+        ..AgentOpts::default()
+    });
+    let names = nested_export(&agent);
+    let data_dir = tempfile::TempDir::new().unwrap();
+
+    {
+        let s = connect(&agent, cache_opts(&data_dir)).await;
+        expect_all_cached(&data_dir, &names, "first mount cached every file").await;
+        on_fs(&s.fs, |fs| fs.shutdown()).await;
+    }
+
+    // Change the export while nothing is mounted and no watcher is running.
+    std::fs::write(agent.dir.path().join("a/deep/four.txt"), b"content-4").unwrap();
+    // Let the watcher reach the index before remounting. The skip decision is
+    // made at mount from the token as it stands THEN, so a remount that races
+    // the watcher can legitimately skip on a token that has not caught up —
+    // narrow, but real, and the reason this wait is here rather than the test
+    // being flaky.
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+
+    let s2 = connect(&agent, cache_opts(&data_dir)).await;
+    let blob = data_dir.path().join("cache").join("t").join("a/deep/four.txt");
+    wait_until("remount cached the new file", 15, move || {
+        (std::fs::read(&blob).ok()? == b"content-4").then_some(())
+    })
+    .await;
+    assert!(
+        !s2.fs.auto_cache_walk_skipped(),
+        "a moved token must not skip the walk"
+    );
+}

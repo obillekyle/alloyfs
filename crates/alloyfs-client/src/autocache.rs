@@ -60,6 +60,20 @@ struct Manifest {
     /// which subscribes live and re-verifies, exactly as before.
     #[serde(default)]
     seq: u64,
+    /// The export's tree token when this cache was last known complete.
+    ///
+    /// `seq` cannot answer the question this does. It is a per-SESSION event
+    /// counter, and an `ssh://` agent is spawned fresh for every mount, so its
+    /// numbering restarts and a cursor from a previous mount means nothing.
+    /// The tree token is derived from the export's CONTENT, so it is the same
+    /// value across agent restarts — which makes it the one thing that can
+    /// say "nothing has changed since this cache was written" in a single
+    /// exchange, without re-proving a single file.
+    ///
+    /// 0 means unknown: no token recorded, an unindexed export, or a
+    /// format < 3 manifest. All of them mean "walk and find out".
+    #[serde(default)]
+    tree_token: u64,
 }
 
 pub(crate) struct CacheState {
@@ -77,6 +91,12 @@ pub(crate) struct AutoCache {
     /// Event sequence the cache is current at. Loaded from the manifest and
     /// written back on every flush, so the cursor outlives the process.
     seq: std::sync::atomic::AtomicU64,
+    /// Tree token the cache was last known COMPLETE at; see `Manifest`.
+    tree_token: std::sync::atomic::AtomicU64,
+    /// Set when this mount skipped discovery because the token still matched.
+    /// "Did this mount do any discovery at all" is otherwise invisible from
+    /// outside, which makes both the log line and the test unfalsifiable.
+    walk_skipped: std::sync::atomic::AtomicBool,
 }
 
 pub(crate) fn mtime_ns(t: SystemTime) -> u128 {
@@ -94,9 +114,11 @@ impl AutoCache {
         let mut entries = BTreeMap::new();
         let mut total = 0u64;
         let mut loaded_seq = 0u64;
+        let mut loaded_token = 0u64;
         if let Ok(text) = std::fs::read_to_string(&cfg.manifest) {
             if let Ok(m) = serde_json::from_str::<Manifest>(&text) {
                 loaded_seq = m.seq;
+                loaded_token = m.tree_token;
                 for (path, entry) in m.entries {
                     let rel = RelPath(path);
                     // Crash tolerance: blob must exist with the recorded size.
@@ -108,6 +130,13 @@ impl AutoCache {
                         }
                         _ => {
                             let _ = std::fs::remove_file(&blob);
+                            // The cache is no longer what the token says it
+                            // is. The token describes the EXPORT and is still
+                            // perfectly true; it just no longer speaks for
+                            // this cache, and leaving it set would let the
+                            // next mount skip the walk that would refill what
+                            // was just discarded.
+                            loaded_token = 0;
                         }
                     }
                 }
@@ -135,6 +164,9 @@ impl AutoCache {
                 evicted += 1;
             }
             if evicted > 0 {
+                // Same reasoning as a dropped blob above: evicting for budget
+                // leaves a cache the token can no longer vouch for.
+                loaded_token = 0;
                 tracing::info!(evicted, bytes = total, "auto-cache shrank to fit budget at load");
             }
             if total > cfg.budget {
@@ -166,6 +198,8 @@ impl AutoCache {
                 }),
                 fetch_tx,
                 seq: std::sync::atomic::AtomicU64::new(loaded_seq),
+                tree_token: std::sync::atomic::AtomicU64::new(loaded_token),
+                walk_skipped: std::sync::atomic::AtomicBool::new(false),
             },
             fetch_rx,
         ))
@@ -174,6 +208,34 @@ impl AutoCache {
     /// The event sequence this cache was last current at, 0 when unknown.
     pub fn saved_seq(&self) -> u64 {
         self.seq.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// The tree token this cache was last known COMPLETE at, 0 when unknown.
+    pub fn saved_tree_token(&self) -> u64 {
+        self.tree_token.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// True when this mount skipped discovery because the token matched.
+    pub fn walk_skipped(&self) -> bool {
+        self.walk_skipped.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Note that discovery was skipped for this mount.
+    pub fn note_walk_skipped(&self) {
+        self.walk_skipped
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Record the token the cache is now complete at.
+    ///
+    /// "Complete" is the whole contract, and it is why this is only ever
+    /// called after a walk that finished having fetched everything it wanted.
+    /// Recording a token beside a half-populated cache would let the next
+    /// mount skip a walk it needed — the token would say "nothing changed",
+    /// which is true, while the cache was never finished in the first place.
+    pub fn record_tree_token(&self, token: u64) {
+        self.tree_token.store(token, std::sync::atomic::Ordering::Release);
+        self.st().dirty = true;
     }
 
     /// Advance the recorded cursor. Monotonic — a late writer must never move
@@ -370,11 +432,13 @@ impl AutoCache {
             }
             st.dirty = false;
             Manifest {
-                // 2 adds `seq`. Not a breaking bump: `seq` defaults to 0 on
-                // read, and a format-1 file loads as a cache of unknown age,
-                // which is what it is.
-                format: 2,
+                // 2 added `seq`, 3 adds `tree_token`. Neither is a breaking
+                // bump: both default to 0 on read, and an older file loads as
+                // a cache of unknown age with no known token — which is what
+                // it is, and which means "walk and find out".
+                format: 3,
                 seq: self.seq.load(std::sync::atomic::Ordering::Acquire),
+                tree_token: self.tree_token.load(std::sync::atomic::Ordering::Acquire),
                 entries: st.entries.iter().map(|(p, e)| (p.0.clone(), e.clone())).collect(),
             }
         };
