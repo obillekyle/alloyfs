@@ -3,3 +3,37 @@ obj-m := alloyfs.o
 alloyfs-y := alloyfs_main.o alloyfs_notify.o alloyfs_conn.o
 ccflags-y += -I$(src)
 ccflags-y += -Wall -Wextra -Wno-unused-parameter
+
+# VFS API probes.
+#
+# Three things this module touches moved between 6.14 (what it was written
+# against) and 7.0 (what Ubuntu 26.04 ships). Probing the header the build is
+# actually running against beats `LINUX_VERSION_CODE >= KERNEL_VERSION(x,y,0)`,
+# because it needs no guess about which release each landed in — and a wrong
+# guess there fails at a version nobody has to hand to test with. Distro
+# backports, which move APIs without moving the version number, are wrong for
+# the same reason and are the case version checks get wrong most often.
+#
+# Each probe defines a macro only when the NEW form is present, so the absence
+# of a probe (an unreadable header, say) leaves the 6.14 spelling — the one
+# this module has always compiled with.
+ALLOYFS_FS_H := $(srctree)/include/linux/fs.h
+
+# `i_state` became `struct inode_state_flags`, read through accessors.
+ccflags-y += $(shell grep -q 'inode_state_read' $(ALLOYFS_FS_H) 2>/dev/null && \
+	echo -DALLOYFS_HAVE_INODE_STATE_ACCESSORS)
+
+# `generic_delete_inode` was renamed `inode_just_drop`.
+ccflags-y += $(shell grep -q 'inode_just_drop' $(ALLOYFS_FS_H) 2>/dev/null && \
+	echo -DALLOYFS_HAVE_INODE_JUST_DROP)
+
+# `->mkdir` returns the resulting dentry instead of an int.
+ccflags-y += $(shell grep -q 'struct dentry \*(\*mkdir)' $(ALLOYFS_FS_H) 2>/dev/null && \
+	echo -DALLOYFS_MKDIR_RETURNS_DENTRY)
+
+# `d_hash_and_lookup` is no longer declared for modules. This probe is the
+# other way round from the three above — it defines a macro when the OLD form
+# is still there, because what replaces it is spelling out what it always did
+# internally rather than a renamed equivalent.
+ccflags-y += $(shell grep -q 'd_hash_and_lookup' $(srctree)/include/linux/dcache.h 2>/dev/null && \
+	echo -DALLOYFS_HAVE_D_HASH_AND_LOOKUP)

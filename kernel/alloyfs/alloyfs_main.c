@@ -71,7 +71,7 @@ struct inode *alloyfs_iget_attr(struct super_block *sb, const struct alloyfs_att
 
 	if (!inode)
 		return ERR_PTR(-ENOMEM);
-	if (!(inode->i_state & I_NEW)) {
+	if (!(alloyfs_inode_state(inode) & I_NEW)) {
 		/* Refresh: the daemon is authoritative about size/mtime. */
 		i_size_write(inode, attr->size);
 		return inode;
@@ -310,11 +310,26 @@ static int alloyfs_create(struct mnt_idmap *idmap, struct inode *dir,
 	return alloyfs_do_mknod(dir, dentry, mode | S_IFREG, ALLOYFS_OP_CREATE);
 }
 
+/* `->mkdir` returns the resulting dentry from 7.0 and an int before it. The
+ * body is identical either way: NULL means "use the dentry that was passed
+ * in", which is exactly what the old int form implied, so the two spellings
+ * differ only in how success is written down.
+ */
+#ifdef ALLOYFS_MKDIR_RETURNS_DENTRY
+static struct dentry *alloyfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
+		      struct dentry *dentry, umode_t mode)
+{
+	int ret = alloyfs_do_mknod(dir, dentry, mode | S_IFDIR, ALLOYFS_OP_MKDIR);
+
+	return ret ? ERR_PTR(ret) : NULL;
+}
+#else
 static int alloyfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 		      struct dentry *dentry, umode_t mode)
 {
 	return alloyfs_do_mknod(dir, dentry, mode | S_IFDIR, ALLOYFS_OP_MKDIR);
 }
+#endif
 
 /* ---------------------------------------------------------------- links */
 
@@ -872,7 +887,7 @@ static int alloyfs_statfs(struct dentry *dentry, struct kstatfs *buf)
 
 static const struct super_operations alloyfs_super_operations = {
 	.statfs = alloyfs_statfs,
-	.drop_inode = generic_delete_inode,
+	.drop_inode = ALLOYFS_DROP_INODE,
 	.put_super = alloyfs_put_super,
 };
 

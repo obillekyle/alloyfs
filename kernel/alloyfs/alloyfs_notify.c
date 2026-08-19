@@ -62,13 +62,24 @@ static void alloyfs_notify_dirent(struct inode *dir, struct dentry *child,
 }
 
 /* The cached child dentry, positive or negative, or NULL. Caller dputs.
- * (d_hash_and_lookup takes a non-const qstr; it does not modify it.)
+ * (the lookup takes a non-const qstr; it does not modify it.)
+ *
+ * `d_hash_and_lookup` stopped being declared for modules after 6.14. With no
+ * custom `->d_hash` — and this filesystem installs no dentry_operations at
+ * all — it was exactly "hash the name, then d_lookup", so the replacement
+ * spells out what it had been doing rather than substituting something else.
  */
 static struct dentry *alloyfs_cached_child(struct dentry *dir, const struct qstr *name)
 {
 	struct qstr q = *name;
-	struct dentry *child = d_hash_and_lookup(dir, &q);
+	struct dentry *child;
 
+#ifdef ALLOYFS_HAVE_D_HASH_AND_LOOKUP
+	child = d_hash_and_lookup(dir, &q);
+#else
+	q.hash = full_name_hash(dir, q.name, q.len);
+	child = d_lookup(dir, &q);
+#endif
 	return IS_ERR(child) ? NULL : child;
 }
 

@@ -24,6 +24,33 @@
 
 #include "uapi/alloyfs.h"
 
+/* ------------------------------------------------------- VFS API shims
+ *
+ * Three things this module uses moved between 6.14, which it was written
+ * against, and 7.0, which Ubuntu 26.04 ships. Kbuild probes the header the
+ * build is actually running against and defines the macros below; see the
+ * reasoning there for why that beats a LINUX_VERSION_CODE comparison.
+ *
+ * Each shim spells the OLD form by default, so a build whose probe did not
+ * run still compiles exactly as it always did.
+ */
+
+/* `i_state` became `struct inode_state_flags`, read through accessors. */
+#ifdef ALLOYFS_HAVE_INODE_STATE_ACCESSORS
+#define alloyfs_inode_state(inode) inode_state_read(inode)
+#else
+#define alloyfs_inode_state(inode) ((inode)->i_state)
+#endif
+
+/* `generic_delete_inode` was renamed `inode_just_drop`. Same behaviour: drop
+ * the inode on last put rather than keeping it cached, which is what a
+ * filesystem with no local backing store wants. */
+#ifdef ALLOYFS_HAVE_INODE_JUST_DROP
+#define ALLOYFS_DROP_INODE inode_just_drop
+#else
+#define ALLOYFS_DROP_INODE generic_delete_inode
+#endif
+
 #define ALLOYFS_MAGIC 0x64736673	/* "dsfs" — the pre-rename value, frozen: it is
 					 * baked into every mounted superblock and
 					 * changing it would strand existing mounts. */
