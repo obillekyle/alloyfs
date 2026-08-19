@@ -225,3 +225,221 @@ pub async fn tree(url: String, remote_cmd: String, token: Option<String>) -> any
     println!("  readdir would have needed ~{dirs} round trips for the same listing");
     Ok(())
 }
+
+/// Small-file fetch, both strategies, alternating in ONE process.
+///
+/// The question this answers is what `ReadMany` bought, and the honest way to
+/// ask it is to run both against the same files over the same connection in
+/// the same minute. Stat latency on the machine this was written for drifts
+/// ~50% intraday, so a number from a previous build is not comparable to one
+/// from this build — but two numbers taken seconds apart are, and alternating
+/// them means neither strategy gets the good half of a drift.
+///
+/// A CPU-bound control runs alongside for the same reason: if it moves between
+/// rounds, the machine moved and the round is suspect.
+pub async fn bulk(
+    url: String,
+    dir: String,
+    rounds: usize,
+    remote_cmd: String,
+    token: Option<String>,
+) -> anyhow::Result<()> {
+    use alloyfs_proto::{ManyEntry, OpenFlags, RelPath, DATA_CHUNK};
+
+    let (conn, export) = connect_target(&url, &remote_cmd, "bulk", token.as_deref()).await?;
+    let export = require_export(export, &url)?;
+    match conn.request(Request::Attach { export }).await?? {
+        Response::AttachOk { .. } => {}
+        other => anyhow::bail!("unexpected attach reply: {other:?}"),
+    }
+
+    // The file list, and the sizes, come from one listing — the same thing the
+    // walker has in hand when it decides what to fetch.
+    let mut files: Vec<(RelPath, u64)> = Vec::new();
+    let mut cursor = 0u64;
+    loop {
+        match conn
+            .request(Request::Readdir {
+                path: RelPath(dir.clone()),
+                cursor,
+            })
+            .await??
+        {
+            Response::Dir { entries, next_cursor } => {
+                for e in entries {
+                    if e.attr.kind == alloyfs_proto::FileKind::File {
+                        let p = if dir.is_empty() {
+                            RelPath(e.name.clone())
+                        } else {
+                            RelPath(format!("{dir}/{}", e.name))
+                        };
+                        files.push((p, e.attr.size));
+                    }
+                }
+                match next_cursor {
+                    Some(c) => cursor = c,
+                    None => break,
+                }
+            }
+            other => anyhow::bail!("unexpected readdir reply: {other:?}"),
+        }
+    }
+    anyhow::ensure!(!files.is_empty(), "{dir} has no files to measure");
+    let total_bytes: u64 = files.iter().map(|(_, s)| s).sum();
+    println!(
+        "{} files, {total_bytes} bytes total, {rounds} round(s) of each strategy\n",
+        files.len()
+    );
+
+    // Per-file: Open, Read the whole thing, Release. What the walker did before
+    // v8, and what any consumer without ReadMany still does.
+    let per_file = |conn: std::sync::Arc<alloyfs_transport::MuxConnection>, files: Vec<(RelPath, u64)>| async move {
+        let mut bytes = 0u64;
+        for (path, size) in files {
+            let flags = OpenFlags {
+                read: true,
+                ..OpenFlags::default()
+            };
+            let fh = match conn.request(Request::Open { path, flags }).await {
+                Ok(Ok(Response::Opened { fh, .. })) => fh,
+                _ => continue,
+            };
+            let mut off = 0u64;
+            while off < size {
+                let len = ((size - off).min(DATA_CHUNK as u64)) as u32;
+                match conn.request(Request::Read { fh, offset: off, len }).await {
+                    Ok(Ok(Response::Data(d))) => {
+                        bytes += d.len() as u64;
+                        off += d.len().max(1) as u64;
+                    }
+                    _ => break,
+                }
+            }
+            let _ = conn.request(Request::Release { fh }).await;
+        }
+        bytes
+    };
+
+    // ReadMany: as many whole files per exchange as the budget allows, the
+    // reply a prefix of the request.
+    let bulk_fetch = |conn: std::sync::Arc<alloyfs_transport::MuxConnection>, files: Vec<(RelPath, u64)>| async move {
+        const BUDGET: u32 = 768 * 1024;
+        let mut bytes = 0u64;
+        let mut remaining: Vec<RelPath> = files.into_iter().map(|(p, _)| p).collect();
+        while !remaining.is_empty() {
+            let entries = match conn
+                .request(Request::ReadMany {
+                    paths: remaining.clone(),
+                    budget: BUDGET,
+                })
+                .await
+            {
+                Ok(Ok(Response::Many(e))) if !e.is_empty() => e,
+                _ => break,
+            };
+            let served = entries.len().min(remaining.len());
+            for entry in entries {
+                if let ManyEntry::File { data, .. } = entry {
+                    bytes += data.len() as u64;
+                }
+            }
+            remaining.drain(..served);
+        }
+        bytes
+    };
+
+    // Per-file again, but four at a time — what the walker ACTUALLY did before
+    // v8 (FILE_CONCURRENCY = 4). Without this the comparison flatters
+    // ReadMany, because a serial loop is not the thing it replaced.
+    let per_file_conc = |conn: std::sync::Arc<alloyfs_transport::MuxConnection>,
+                         files: Vec<(RelPath, u64)>| async move {
+        use futures::StreamExt;
+        let bytes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        futures::stream::iter(files.into_iter().map(|(path, size)| {
+            let conn = conn.clone();
+            let bytes = bytes.clone();
+            async move {
+                let flags = OpenFlags {
+                    read: true,
+                    ..OpenFlags::default()
+                };
+                let fh = match conn.request(Request::Open { path, flags }).await {
+                    Ok(Ok(Response::Opened { fh, .. })) => fh,
+                    _ => return,
+                };
+                let mut off = 0u64;
+                while off < size {
+                    let len = ((size - off).min(DATA_CHUNK as u64)) as u32;
+                    match conn.request(Request::Read { fh, offset: off, len }).await {
+                        Ok(Ok(Response::Data(d))) => {
+                            bytes.fetch_add(d.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                            off += d.len().max(1) as u64;
+                        }
+                        _ => break,
+                    }
+                }
+                let _ = conn.request(Request::Release { fh }).await;
+            }
+        }))
+        .buffer_unordered(4)
+        .collect::<Vec<_>>()
+        .await;
+        bytes.load(std::sync::atomic::Ordering::Relaxed)
+    };
+
+    // A fixed amount of arithmetic, timed each round. It has nothing to do
+    // with the filesystem, so if it moves, the machine did.
+    let control = || {
+        let start = Instant::now();
+        let mut acc = 0u64;
+        for i in 0..40_000_000u64 {
+            acc = acc.wrapping_add(i ^ (acc >> 7));
+        }
+        std::hint::black_box(acc);
+        start.elapsed().as_secs_f64() * 1000.0
+    };
+
+    let mut serial_ms = Vec::new();
+    let mut conc_ms = Vec::new();
+    let mut bulk_ms = Vec::new();
+    for round in 1..=rounds {
+        let ctl_a = control();
+
+        let start = Instant::now();
+        let a_bytes = per_file(conn.clone(), files.clone()).await;
+        let a = start.elapsed().as_secs_f64() * 1000.0;
+        serial_ms.push(a);
+
+        let start = Instant::now();
+        let c_bytes = per_file_conc(conn.clone(), files.clone()).await;
+        let c = start.elapsed().as_secs_f64() * 1000.0;
+        conc_ms.push(c);
+
+        let start = Instant::now();
+        let b_bytes = bulk_fetch(conn.clone(), files.clone()).await;
+        let b = start.elapsed().as_secs_f64() * 1000.0;
+        bulk_ms.push(b);
+
+        let ctl_b = control();
+        println!(
+            "round {round}: serial {a:9.1} ms ({a_bytes} B) | 4-way {c:8.1} ms ({c_bytes} B) \
+             | ReadMany {b:7.1} ms ({b_bytes} B) | control {ctl_a:.0}/{ctl_b:.0} ms"
+        );
+    }
+
+    let median = |mut v: Vec<f64>| {
+        v.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        v[v.len() / 2]
+    };
+    let a = median(serial_ms);
+    let c = median(conc_ms);
+    let b = median(bulk_ms);
+    println!("\nmedians over {rounds} round(s):");
+    println!("  per-file, serial     {a:9.1} ms   ({:.1}x)", a / b.max(0.001));
+    println!(
+        "  per-file, 4 at a time{c:9.1} ms   ({:.1}x)  <- what the walker actually did",
+        c / b.max(0.001)
+    );
+    println!("  ReadMany             {b:9.1} ms   (1.0x)");
+    Ok(())
+}

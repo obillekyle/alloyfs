@@ -91,7 +91,16 @@ async fn fetch_body(conn: &MuxConnection, fh: u64, size: u64, staging: &Path) ->
 /// then mirror its mtime server-side. Returns the server's final Attr —
 /// the version to record in the manifest.
 pub(crate) async fn upload(conn: &MuxConnection, rel: &str, full: &Path) -> Result<Attr, FsError> {
-    let data = std::fs::read(full).map_err(|_| alloyfs_proto::ErrorCode::Io)?;
+    // A LOCAL read, and its failure is reported as `ErrorCode::Io` — which
+    // prints as "server I/O error" and has sent at least one investigation to
+    // the wrong machine. The usual cause is benign and local: the file was
+    // renamed or removed between the watcher noticing it and this running, so
+    // there is nothing at `full` any more. Log what actually happened before
+    // flattening it into a wire code.
+    let data = std::fs::read(full).map_err(|e| {
+        tracing::debug!(path = %full.display(), error = %e, "local read failed before upload");
+        alloyfs_proto::ErrorCode::Io
+    })?;
     let mtime = std::fs::metadata(full)
         .and_then(|m| m.modified())
         .map_err(|_| alloyfs_proto::ErrorCode::Io)?;

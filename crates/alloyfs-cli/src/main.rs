@@ -214,6 +214,22 @@ enum Command {
         #[arg(long)]
         token: Option<String>,
     },
+    /// Small-file fetch, per-file against ReadMany, alternating in one process.
+    /// url: tcp://host:port/export or ssh://host/export.
+    Bulk {
+        url: String,
+        /// Directory inside the export whose files are fetched.
+        #[arg(default_value = "")]
+        dir: String,
+        /// Rounds of each strategy; the median is reported.
+        #[arg(long, default_value_t = 3)]
+        rounds: usize,
+        #[arg(long, default_value = "alloyfs")]
+        remote_cmd: String,
+        /// Shared secret for token-protected TCP servers.
+        #[arg(long)]
+        token: Option<String>,
+    },
     /// Write a config for a directory, ready to serve.
     Init {
         /// Directory to export (default: the current one).
@@ -547,6 +563,13 @@ async fn main() -> anyhow::Result<()> {
         } => commands::diag::tree(url, remote_cmd, token).await,
         Command::Ping { url, count, token } => commands::diag::ping(url, count, token).await,
         Command::Stress { url, count, token } => commands::diag::stress(url, count, token).await,
+        Command::Bulk {
+            url,
+            dir,
+            rounds,
+            remote_cmd,
+            token,
+        } => commands::diag::bulk(url, dir, rounds, remote_cmd, token).await,
         Command::Bench {
             url,
             path,
