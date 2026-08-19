@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use alloyfs_proto::{OpenFlags, RelPath, Request, Response, DATA_CHUNK};
+use alloyfs_proto::{ManyEntry, OpenFlags, RelPath, Request, Response, DATA_CHUNK};
 use tokio::sync::{mpsc, Semaphore};
 
 use crate::autocache::{stage_write, AutoCache};
@@ -23,6 +23,15 @@ const FILE_CONCURRENCY: usize = 4;
 /// parallelism than content fetches do.
 const DIR_CONCURRENCY: usize = 16;
 const CHUNK_CONCURRENCY: usize = 8;
+
+/// Bytes asked of one `ReadMany`. The agent clamps this to what a frame can
+/// hold; asking for its ceiling means a full batch per round trip.
+const READ_MANY_BUDGET: u32 = 768 * 1024;
+
+/// Files batched into one `ReadMany` before it is sent. Bounded by size as
+/// well as count — the point is to fill a frame, and a batch of large files
+/// fills one long before 256 of them accumulate.
+const BATCH_FILES: usize = 256;
 
 pub(crate) fn spawn(
     fs: Arc<RemoteFs>,
@@ -43,6 +52,11 @@ pub(crate) fn spawn(
         let mut level: Vec<RelPath> = vec![RelPath(String::new())];
         let mut tasks = tokio::task::JoinSet::new();
         let mut ok = 0usize;
+        // Files discovered but not yet asked for, and the bytes they add up
+        // to. Accumulating them is what turns one request per file into one
+        // request per frame.
+        let mut pending: Vec<RelPath> = Vec::new();
+        let mut pending_bytes = 0u64;
 
         while !level.is_empty() {
             walked_dirs += level.len();
@@ -91,18 +105,31 @@ pub(crate) fn spawn(
                             alloyfs_proto::FileKind::Dir => next_level.push(child),
                             alloyfs_proto::FileKind::File => {
                                 if cache.wants(&child, e.attr.size) && cache.needs_fetch(&child, &e.attr) {
-                                    // The permit is taken INSIDE the task, so a
-                                    // full fetch pipeline never stalls the walk
-                                    // — discovery and download overlap instead
-                                    // of strangling each other.
-                                    let sem = sem.clone();
-                                    let fs = fs.clone();
-                                    let cache = cache.clone();
                                     fetched += 1;
-                                    tasks.spawn(async move {
-                                        let _permit = sem.acquire_owned().await.unwrap();
-                                        fetch_one(&fs, &cache, &child).await
-                                    });
+                                    pending_bytes += e.attr.size;
+                                    pending.push(child);
+                                    // Send once a frame's worth has gathered.
+                                    // Batching by BOTH count and bytes matters:
+                                    // 256 tiny files fill no frame, and a
+                                    // handful of large ones overfill it.
+                                    if pending.len() >= BATCH_FILES
+                                        || pending_bytes >= READ_MANY_BUDGET as u64
+                                    {
+                                        // The permit is taken INSIDE the task,
+                                        // so a full fetch pipeline never stalls
+                                        // the walk — discovery and download
+                                        // overlap instead of strangling each
+                                        // other.
+                                        let sem = sem.clone();
+                                        let fs = fs.clone();
+                                        let cache = cache.clone();
+                                        let batch = std::mem::take(&mut pending);
+                                        pending_bytes = 0;
+                                        tasks.spawn(async move {
+                                            let _permit = sem.acquire_owned().await.unwrap();
+                                            fetch_many(&fs, &cache, batch).await
+                                        });
+                                    }
                                 }
                             }
                             alloyfs_proto::FileKind::Symlink => {}
@@ -112,17 +139,23 @@ pub(crate) fn spawn(
                 // Reap finished fetches as we go, so the set never grows to
                 // "every file in the export" on a big tree.
                 while let Some(done) = tasks.try_join_next() {
-                    if matches!(done, Ok(true)) {
-                        ok += 1;
-                    }
+                    ok += done.unwrap_or(0);
                 }
             }
             level = next_level;
         }
+        // Whatever never reached a full batch still has to be fetched.
+        if !pending.is_empty() {
+            let sem = sem.clone();
+            let fs = fs.clone();
+            let cache = cache.clone();
+            tasks.spawn(async move {
+                let _permit = sem.acquire_owned().await.unwrap();
+                fetch_many(&fs, &cache, pending).await
+            });
+        }
         while let Some(done) = tasks.join_next().await {
-            if matches!(done, Ok(true)) {
-                ok += 1;
-            }
+            ok += done.unwrap_or(0);
         }
         let (entries, bytes) = cache.stats();
         tracing::info!(
@@ -243,4 +276,96 @@ async fn fetch_one(fs: &Arc<RemoteFs>, cache: &Arc<AutoCache>, path: &RelPath) -
     // small file cost.
     let _ = fs.conn().send_oneway(Request::Release { fh }).await;
     result
+}
+
+/// Stage a fetched body and commit it to the cache. Shared by the one-file and
+/// the bulk paths, which differ only in how the bytes arrived.
+async fn commit_blob(
+    cache: &Arc<AutoCache>,
+    path: &RelPath,
+    attr: &alloyfs_proto::Attr,
+    data: Vec<u8>,
+) -> bool {
+    let stage = cache.blob_stage_path(path);
+    let final_path = cache.blob_final_path(path);
+    let commit_path = path.clone();
+    let cache2 = cache.clone();
+    let pinned = cache.pin_match(path);
+    let attr = *attr;
+    tokio::task::spawn_blocking(move || {
+        if stage_write(&stage, &data).is_err() {
+            return false;
+        }
+        if std::fs::rename(&stage, &final_path).is_err() {
+            let _ = std::fs::remove_file(&stage);
+            return false;
+        }
+        cache2.commit(&commit_path, &attr, pinned);
+        true
+    })
+    .await
+    .unwrap_or(false)
+}
+
+/// Fetch a batch of files in one exchange and commit each. Returns how many
+/// landed.
+///
+/// This is where the walk stops being latency-bound. Per file the old path
+/// costs an Open, one or more Reads and a Release; measured over 200 small
+/// files that was 179 ms each against ~4 ms of actual transfer. One `ReadMany`
+/// carries as many whole files as fit in a frame.
+///
+/// The reply is always a PREFIX of the request — the server stops when its
+/// budget is spent — so what is outstanding is simply what was not answered,
+/// and the loop re-asks for it. Two fallbacks keep this from ever losing a
+/// file: a pre-v8 agent (or any failed request) reverts to the per-file path,
+/// and so does a single file the server declines as too large for a bulk
+/// reply, which is exactly the case the chunked reader exists for.
+async fn fetch_many(fs: &Arc<RemoteFs>, cache: &Arc<AutoCache>, batch: Vec<RelPath>) -> usize {
+    let mut ok = 0usize;
+    let mut remaining = batch;
+
+    while !remaining.is_empty() {
+        let resp = fs
+            .conn()
+            .request(Request::ReadMany {
+                paths: remaining.clone(),
+                budget: READ_MANY_BUDGET,
+            })
+            .await;
+        let entries = match resp {
+            Ok(Ok(Response::Many(entries))) if !entries.is_empty() => entries,
+            // An older agent, a refusal, or a reply that served nothing —
+            // which would spin here. Read them the ordinary way instead of
+            // dropping them on the floor.
+            _ => {
+                for path in &remaining {
+                    if fetch_one(fs, cache, path).await {
+                        ok += 1;
+                    }
+                }
+                return ok;
+            }
+        };
+        let served = entries.len().min(remaining.len());
+        for (path, entry) in remaining.iter().zip(entries) {
+            match entry {
+                ManyEntry::File { attr, data } => {
+                    if cache.wants(path, attr.size) && commit_blob(cache, path, &attr, data.into()).await {
+                        ok += 1;
+                    }
+                }
+                ManyEntry::Skipped(alloyfs_proto::ErrorCode::TooLarge) => {
+                    if fetch_one(fs, cache, path).await {
+                        ok += 1;
+                    }
+                }
+                // Gone, excluded server-side, or not a regular file. All fine:
+                // an event requeues anything that comes back.
+                ManyEntry::Skipped(_) => {}
+            }
+        }
+        remaining.drain(..served);
+    }
+    ok
 }

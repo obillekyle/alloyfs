@@ -45,6 +45,11 @@ pub enum ErrorCode {
     /// before anything else. Appended last (postcard append-only rule).
     #[error("authentication required")]
     AuthRequired,
+    /// v8+: too big to serve this way — a file that does not fit a `ReadMany`
+    /// reply. Not a failure: the caller reads it the ordinary chunked way.
+    /// Appended last (postcard append-only rule).
+    #[error("too large for a bulk reply")]
+    TooLarge,
 }
 
 /// Errors in the codec itself (framing/serialization) — these are fatal to a

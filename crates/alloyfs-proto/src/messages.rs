@@ -42,15 +42,21 @@ use crate::error::ErrorCode;
 /// not merely imprecise: it applied to release as well as to acquire, so a
 /// partial unlock dropped every lock the handle held, and SQLite performs
 /// exactly that sequence on every read transaction.
+///
+/// v8: `Request::ReadMany` / `Response::Many` — the contents of many files in
+/// one exchange, which is the tree's idea applied to bytes. Gated on the
+/// client, which falls back to open+read per file against an older peer.
+/// Measured before it was proposed: 200 files totalling 8 KB cost 35.9 s
+/// against ~4 ms of actual transfer.
 pub const PROTO_VERSION_MIN: u16 = 1;
-pub const PROTO_VERSION_MAX: u16 = 7;
+pub const PROTO_VERSION_MAX: u16 = 8;
 
 /// The protocol range this build speaks, for `--version` and diagnostics —
 /// "which wire version does this release talk" should not require reading
 /// source. A literal rather than a formatted string because clap's version
 /// output needs a `&'static str`; `proto_range_matches_the_constants` is what
 /// keeps it from drifting away from the two constants above.
-pub const PROTO_RANGE: &str = "1-7";
+pub const PROTO_RANGE: &str = "1-8";
 
 /// Read/write payloads are capped to this many bytes per request so one huge
 /// file operation can never monopolize the connection (head-of-line blocking).
@@ -448,6 +454,31 @@ pub enum Request {
         start: u64,
         len: u64,
     },
+    /// v8+: the whole contents of several files in ONE exchange.
+    ///
+    /// The tree collapsed per-directory round trips; this does the same for
+    /// bytes, and the numbers say it is the larger of the two. Measured:
+    /// copying 200 files totalling 8 KB off a mount took **35.9 s** — 179 ms
+    /// per file, about three round trips each — while the bytes themselves are
+    /// roughly 4 ms of transfer at the link's rate. 99.99% of that was waiting.
+    ///
+    /// Deliberately by PATH, not by handle. Going through `Open` would put
+    /// back one of the round trips this exists to remove, and a bulk consumer
+    /// reads each file exactly once, so a handle buys it nothing.
+    ///
+    /// `budget` caps the bytes the reply may carry. The server stops once it
+    /// is spent and answers with FEWER entries than were asked for; the client
+    /// sees the short reply and asks for the remainder. No cursor is needed,
+    /// because entries come back in request order — the reply is a prefix.
+    ///
+    /// Where this does NOT help: one large file is already at transport
+    /// capacity, since readahead detects sequential access and keeps 32 blocks
+    /// in flight (measured 415 MB/s loopback against a 479 ceiling). The whole
+    /// gap is per-file fixed cost, which is why the unit here is the file.
+    ReadMany {
+        paths: Vec<RelPath>,
+        budget: u32,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -532,6 +563,24 @@ pub enum Response {
     /// v7+: the answer to `TestLock`. `None` means the range is free for the
     /// requested kind — i.e. `F_GETLK` reports `F_UNLCK`.
     LockStatus(Option<LockConflict>),
+    /// v8+: files served by `ReadMany`, in request order.
+    ///
+    /// SHORTER than the request when the budget ran out. That is the whole
+    /// paging mechanism: a reply is always a PREFIX of what was asked for, so
+    /// the client knows exactly which paths are outstanding without a cursor.
+    Many(Vec<ManyEntry>),
+}
+
+/// One file in a `ReadMany` reply.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ManyEntry {
+    /// The file, whole, with the attributes it had when read.
+    File { attr: Attr, data: Bytes },
+    /// Not served, and why. `TooLarge` means it did not fit a bulk reply and
+    /// should be read the ordinary chunked way; the rest (gone, excluded, not
+    /// a regular file) mean skip it. A per-entry error rather than a failed
+    /// request, because one unreadable file must not cost the whole batch.
+    Skipped(ErrorCode),
 }
 
 /// v7+: the lock that would block a `TestLock`, in `fcntl(F_GETLK)`'s terms.

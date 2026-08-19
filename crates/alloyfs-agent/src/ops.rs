@@ -6,14 +6,24 @@ use std::sync::Arc;
 
 use alloyfs_common::{attr_from_metadata, read_fully, set_mode, write_fully, ExcludeSet, OrCode};
 use alloyfs_proto::{
-    Attr, DirEntry, ErrorCode, EventKind, FsEvent, OpenFlags, RelPath, Request, Response, DATA_CHUNK,
-    PROTO_VERSION_MIN,
+    Attr, DirEntry, ErrorCode, EventKind, FsEvent, ManyEntry, OpenFlags, RelPath, Request, Response,
+    DATA_CHUNK, PROTO_VERSION_MIN,
 };
 use alloyfs_transport::{EventPusher, RequestHandler};
 use dashmap::DashMap;
 
 /// Max directory entries per Readdir response; clients page with the cursor.
 const READDIR_PAGE: usize = 1024;
+
+/// Byte ceiling for one `ReadMany` reply. Well under `MAX_FRAME_LEN` (1 MiB)
+/// so the entries, their paths and their attributes all still fit alongside
+/// the file contents.
+const READ_MANY_BUDGET: u32 = 768 * 1024;
+
+/// Entry ceiling for one `ReadMany` reply, independent of the byte budget: a
+/// request naming a million empty files would otherwise cost a million stats
+/// in a single blocking call.
+const READ_MANY_ENTRIES: usize = 4096;
 
 /// Entries per `Tree` page. Larger than a readdir page because the whole
 /// point is fewer round trips, and bounded because `MAX_FRAME_LEN` is 1 MiB —
@@ -722,6 +732,72 @@ impl SessionInner {
         Ok(Response::Opened { fh, attr })
     }
 
+    /// v8+: several whole files in one reply.
+    ///
+    /// Fills up to `budget` bytes and stops, so the reply is always a PREFIX
+    /// of the request and the client can work out what is outstanding without
+    /// a cursor. One awkward case decides the shape: a single file bigger than
+    /// the whole budget would otherwise serve zero entries and leave the
+    /// client asking for the same thing forever, so it is answered
+    /// `TooLarge` — a per-entry outcome, not a failed request, which also
+    /// keeps one unreadable file from costing the whole batch.
+    fn read_many(&self, paths: Vec<RelPath>, budget: u32) -> Result<Response, ErrorCode> {
+        let export = self.export()?;
+        // The client's budget is a request, not an instruction: the reply has
+        // to fit MAX_FRAME_LEN whatever it asks for.
+        let budget = budget.min(READ_MANY_BUDGET) as u64;
+        let mut spent = 0u64;
+        let mut entries = Vec::with_capacity(paths.len().min(READ_MANY_ENTRIES));
+
+        for path in paths.into_iter().take(READ_MANY_ENTRIES) {
+            let full = match export.resolve(&path) {
+                Ok(f) => f,
+                Err(e) => {
+                    entries.push(ManyEntry::Skipped(e));
+                    continue;
+                }
+            };
+            let md = match std::fs::metadata(&full) {
+                Ok(md) if md.is_file() => md,
+                Ok(_) => {
+                    entries.push(ManyEntry::Skipped(ErrorCode::IsADirectory));
+                    continue;
+                }
+                Err(e) => {
+                    entries.push(ManyEntry::Skipped(alloyfs_common::io_to_code(&e)));
+                    continue;
+                }
+            };
+            let size = md.len();
+            if size > budget {
+                // Never fits, whatever we do: say so and let the client read
+                // it the chunked way rather than retry a request that cannot
+                // succeed.
+                entries.push(ManyEntry::Skipped(ErrorCode::TooLarge));
+                continue;
+            }
+            if spent + size > budget && !entries.is_empty() {
+                break; // out of room; the client asks for the rest
+            }
+            let mut buf = vec![0u8; size as usize];
+            let n = match read_fully(&File::open(&full).or_code()?, &mut buf, 0) {
+                Ok(n) => n,
+                Err(e) => {
+                    entries.push(ManyEntry::Skipped(alloyfs_common::io_to_code(&e)));
+                    continue;
+                }
+            };
+            buf.truncate(n);
+            spent += n as u64;
+            let version = export.version_of(&path);
+            entries.push(ManyEntry::File {
+                attr: attr_from_metadata(&md, version),
+                data: buf.into(),
+            });
+        }
+        Ok(Response::Many(entries))
+    }
+
     fn read(&self, fh: u64, offset: u64, len: u32) -> Result<Response, ErrorCode> {
         if len > DATA_CHUNK {
             return Err(ErrorCode::Io);
@@ -1002,6 +1078,7 @@ impl SessionInner {
             Request::Open { path, flags } => self.open(path, flags),
             Request::Create { path, flags, mode } => self.create(path, flags, mode),
             Request::Read { fh, offset, len } => self.read(fh, offset, len),
+            Request::ReadMany { paths, budget } => self.read_many(paths, budget),
             Request::Write {
                 fh,
                 offset,

@@ -332,6 +332,25 @@ fn canonical() -> Vec<(&'static str, Frame)> {
                 pid: 0,
             }))),
         ),
+        // --- v8: bulk content fetch ---
+        (
+            "req_read_many",
+            req(Request::ReadMany {
+                paths: vec![path(), RelPath("dir/other.txt".into())],
+                budget: 768 * 1024,
+            }),
+        ),
+        (
+            "resp_many",
+            ok(Response::Many(vec![
+                alloyfs_proto::ManyEntry::File {
+                    attr: attr(),
+                    data: bytes::Bytes::from_static(b"hi"),
+                },
+                alloyfs_proto::ManyEntry::Skipped(ErrorCode::TooLarge),
+            ])),
+        ),
+        ("err_too_large", err(ErrorCode::TooLarge)),
         // --- every ErrorCode (as Err) ---
         ("err_not_found", err(ErrorCode::NotFound)),
         ("err_permission_denied", err(ErrorCode::PermissionDenied)),
@@ -418,6 +437,7 @@ fn _variant_tripwire(
         Request::LockRange { .. } => {} // v7: golden added, PROTO_VERSION_MAX bumped
         Request::UnlockRange { .. } => {} // v7: golden added, PROTO_VERSION_MAX bumped
         Request::TestLock { .. } => {} // v7: golden added, PROTO_VERSION_MAX bumped
+        Request::ReadMany { .. } => {} // v8: golden added, PROTO_VERSION_MAX bumped
     }
     match response {
         Response::AttachOk { .. } => {}
@@ -435,6 +455,7 @@ fn _variant_tripwire(
         Response::Tree { .. } => {}          // v6: golden added, PROTO_VERSION_MAX bumped
         Response::TreeToken { .. } => {}     // v6: golden added, PROTO_VERSION_MAX bumped
         Response::LockStatus(..) => {}       // v7: golden added, PROTO_VERSION_MAX bumped
+        Response::Many(..) => {}             // v8: golden added, PROTO_VERSION_MAX bumped
     }
     match code {
         ErrorCode::NotFound => {}
@@ -455,6 +476,7 @@ fn _variant_tripwire(
         ErrorCode::Io => {}
         ErrorCode::CrossDevice => {}
         ErrorCode::AuthRequired => {} // v3: golden added, PROTO_VERSION_MAX bumped
+        ErrorCode::TooLarge => {}     // v8: golden added, PROTO_VERSION_MAX bumped
     }
     match event {
         EventKind::Created => {}
@@ -480,8 +502,8 @@ fn _variant_tripwire(
 /// `cargo test -p alloyfs-proto print_goldens -- --ignored --nocapture`
 #[rustfmt::skip]
 const GOLDEN: &[(&str, &str)] = &[
-    ("hello", "00010706676f6c64656e"),
-    ("hello_ack", "010706676f6c64656e"),
+    ("hello", "00010806676f6c64656e"),
+    ("hello_ack", "010806676f6c64656e"),
     ("ping", "0507"),
     ("pong", "0607"),
     ("compressed", "0706676f6c64656e"),
@@ -529,6 +551,9 @@ const GOLDEN: &[(&str, &str)] = &[
     ("req_test_lock", "02071b09edfd0300818080800401"),
     ("resp_lock_status_free", "0307000e00"),
     ("resp_lock_status_held", "0307000e010181808080040100"),
+    ("req_read_many", "02071c020c6469722f66696c652e7478740d6469722f6f746865722e747874808030"),
+    ("resp_many", "0307000f0200002a80e2cfaa06bc99ef3a80e2cfaa06bc99ef3aa403080268690112"),
+    ("err_too_large", "03070112"),
     ("err_not_found", "03070100"),
     ("err_permission_denied", "03070101"),
     ("err_already_exists", "03070102"),
