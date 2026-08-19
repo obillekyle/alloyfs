@@ -48,6 +48,7 @@
       ["reference/cli", "CLI"],
       ["reference/http-api", "HTTP API"],
       ["reference/architecture", "Architecture"],
+      ["reference/design", "Design and performance"],
       ["reference/limitations", "Limitations"]
     ]
   }

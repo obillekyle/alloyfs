@@ -1,5 +1,9 @@
 # Architecture
 
+The map of which crate holds what. For why the pieces are shaped this way, and
+what the performance work measured, see
+[Design and performance](#/reference/design).
+
 Bottom to top:
 
 ```
@@ -40,6 +44,7 @@ version:
 | v2 | Server-suggested mount defaults |
 | v3 | TCP token auth, transparent frame compression |
 | v4 | Symlink creation and readlink |
+| v5 | `WrittenAttr` — the write reply carries the file's new attributes |
 
 A client that would send a v4 request to a v3 peer refuses with a clear error
 naming which side is too old, rather than sending bytes the peer would decode as
