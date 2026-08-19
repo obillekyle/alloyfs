@@ -49,23 +49,81 @@ pub const PROTO_RANGE: &str = "1-6";
 pub const DATA_CHUNK: u32 = 128 * 1024;
 
 /// A path relative to an export root: UTF-8, `/`-separated, no leading `/`,
-/// never containing `.` or `..` components. The *server* is the enforcement
-/// point (`validate`) — clients are untrusted by definition.
-#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
+/// never containing `.` or `..` components, and never containing `\` or `:`.
+///
+/// Enforced in BOTH directions. The server validates what clients send, and
+/// the `Deserialize` impl below validates every `RelPath` that arrives off the
+/// wire — including the ones a *server* sends a client in events, listings and
+/// tree entries. A client that trusts a path from its peer builds a local path
+/// out of it (the sync engine joins components onto the sync root), so an
+/// unvalidated `..` from a hostile or compromised agent walks straight out of
+/// the tree it was supposed to stay in.
+#[derive(Clone, PartialEq, Eq, Hash, Serialize, PartialOrd, Ord)]
 pub struct RelPath(pub String);
 
+/// Validated on the way in, so no consumer has to remember to ask. postcard is
+/// not self-describing and a malformed frame already drops the connection, so
+/// failing here is consistent with how every other decode error is handled.
+impl<'de> serde::Deserialize<'de> for RelPath {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let p = RelPath(String::deserialize(d)?);
+        p.validate_wire()
+            .map_err(|_| serde::de::Error::custom("path is not a valid RelPath"))?;
+        Ok(p)
+    }
+}
+
 impl RelPath {
-    pub fn validate(&self) -> Result<(), ErrorCode> {
+    /// The rules that hold on EVERY platform, checked on every `RelPath` that
+    /// arrives off the wire — in both directions.
+    ///
+    /// Deliberately narrow: it rejects only what no legitimate path can
+    /// contain, because a rule that fires on a legal filename is not a
+    /// safety check, it is an outage. A server watching a Linux export emits
+    /// events naming whatever files exist there, so a decode rule that
+    /// rejected, say, every colon would drop the client's connection every
+    /// time anyone touched `log-10:30:00.txt`, forever. Two things qualify:
+    ///
+    /// - **Traversal** — a leading `/`, an empty component, `.` or `..`. None
+    ///   can appear in a filename on any supported platform, and `..` is what
+    ///   walks a peer-supplied path out of the root it was meant to stay in.
+    /// - **A Windows drive reference** — a component beginning `X:`.
+    ///   `PathBuf::join` REPLACES its buffer when the argument carries a drive
+    ///   prefix rather than appending under it, so `C:evil.txt` spliced onto a
+    ///   checked parent resolves against drive C's working directory, outside
+    ///   the export — while still reporting `is_absolute() == false`, so a
+    ///   guard looking for absolute paths never sees it. Measured, not assumed.
+    ///   Only a single ASCII letter before the colon forms a prefix (Rust's
+    ///   own parser reads `a:b:c` that way too, and `log-10:30:00.txt` not at
+    ///   all), which is why this rejects far less than "contains a colon".
+    pub fn validate_wire(&self) -> Result<(), ErrorCode> {
         let s = &self.0;
-        if s.starts_with('/') || s.contains('\\') {
+        if s.starts_with('/') {
             return Err(ErrorCode::InvalidPath);
         }
-        if s.split('/')
-            .any(|c| c.is_empty() && !s.is_empty() || c == "." || c == "..")
-        {
-            return Err(ErrorCode::InvalidPath);
+        for c in s.split('/') {
+            if (c.is_empty() && !s.is_empty()) || c == "." || c == ".." {
+                return Err(ErrorCode::InvalidPath);
+            }
+            let b = c.as_bytes();
+            if b.len() >= 2 && b[1] == b':' && b[0].is_ascii_alphabetic() {
+                return Err(ErrorCode::InvalidPath);
+            }
         }
         Ok(())
+    }
+
+    /// What a SERVER additionally requires of a path a client sent it:
+    /// `validate_wire`, plus no `\`. That extra rule keeps one spelling per
+    /// path on a Windows server, where `\` is a separator; it costs a Linux
+    /// export the ability to name a file with a backslash in it, which is the
+    /// trade this has always made. It is not applied at decode, because the
+    /// cost of being wrong there is a reconnect loop rather than an error.
+    pub fn validate(&self) -> Result<(), ErrorCode> {
+        if self.0.contains('\\') {
+            return Err(ErrorCode::InvalidPath);
+        }
+        self.validate_wire()
     }
 
     pub fn is_root(&self) -> bool {

@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -54,6 +54,23 @@ pub struct MountDefaults {
 }
 
 impl Export {
+    /// True when `full` — a real, canonicalized on-disk path under the root —
+    /// names something the export excludes. Split out because BOTH resolvers
+    /// need it: a case-insensitive volume resolves `CREDENTIALS.JSON` to an
+    /// excluded `credentials.json`, and only the on-disk spelling reveals that.
+    fn excluded_on_disk(&self, full: &Path) -> bool {
+        if self.exclude.is_empty() {
+            return false;
+        }
+        let Ok(stripped) = full.strip_prefix(&self.root) else {
+            return false;
+        };
+        let Some(s) = stripped.to_str() else {
+            return false;
+        };
+        self.exclude.is_excluded(&RelPath(s.replace('\\', "/")))
+    }
+
     /// Path resolution with exclusion enforced BEFORE touching the disk and
     /// re-checked against the canonicalized result (so a case-insensitive
     /// volume can't sidestep a literal-case pattern). Excluded → NotFound —
@@ -63,27 +80,56 @@ impl Export {
             return Err(ErrorCode::NotFound);
         }
         let full = crate::fsutil::resolve_unchecked(&self.root, rel)?;
-        if !self.exclude.is_empty() {
-            if let Ok(stripped) = full.strip_prefix(&self.root) {
-                if let Some(s) = stripped.to_str() {
-                    if self.exclude.is_excluded(&RelPath(s.replace('\\', "/"))) {
-                        return Err(ErrorCode::NotFound);
-                    }
-                }
-            }
+        if self.excluded_on_disk(&full) {
+            return Err(ErrorCode::NotFound);
         }
         Ok(full)
     }
 
     /// resolve() for paths that may not exist yet (create/mkdir/rename-to).
+    ///
+    /// `resolve` draws its safety from canonicalizing the result and checking
+    /// the prefix afterwards. A path that does not exist yet cannot be
+    /// canonicalized, so every check here has to stand on its own:
+    ///
+    /// - **The leaf must be exactly one ordinary component.** `Path::join`
+    ///   REPLACES its buffer when the argument carries a prefix or a root
+    ///   rather than appending under it, so a leaf that parses as anything
+    ///   but a single plain name must never reach the join. `validate` already
+    ///   rejects the characters that make that possible; this asserts the OS
+    ///   agrees, on the platform actually running.
+    /// - **The join must still land under the root** — cheap, and it catches
+    ///   any splice the component check did not anticipate.
+    /// - **An existing target is re-checked by its on-disk name**, which is
+    ///   what closes the case-insensitive exclude bypass: without it,
+    ///   `create("CREDENTIALS.JSON")` opens an excluded `credentials.json`
+    ///   read-write on Windows or macOS, because the raw check above compares
+    ///   case-sensitively and the filesystem does not.
     pub fn resolve_new(&self, rel: &RelPath) -> Result<PathBuf, ErrorCode> {
         if self.exclude.is_excluded(rel) {
             return Err(ErrorCode::NotFound);
         }
         rel.validate()?;
         let (parent, leaf) = rel.split().ok_or(ErrorCode::InvalidPath)?;
+        let mut comps = Path::new(leaf).components();
+        let one_plain_name = matches!(
+            (comps.next(), comps.next()),
+            (Some(std::path::Component::Normal(c)), None) if c.to_str() == Some(leaf)
+        );
+        if !one_plain_name {
+            return Err(ErrorCode::InvalidPath);
+        }
         let parent_full = self.resolve(&parent)?;
-        Ok(parent_full.join(leaf))
+        let full = parent_full.join(leaf);
+        if !full.starts_with(&self.root) {
+            return Err(ErrorCode::InvalidPath);
+        }
+        if let Ok(canon) = std::fs::canonicalize(&full) {
+            if self.excluded_on_disk(&canon) {
+                return Err(ErrorCode::NotFound);
+            }
+        }
+        Ok(full)
     }
 
     pub fn version_of(&self, path: &RelPath) -> u64 {

@@ -313,5 +313,47 @@ mod tests {
         assert!(RelPath("a\\b".into()).validate().is_err());
         assert!(RelPath("a//b".into()).validate().is_err());
         assert!(RelPath(".".into()).validate().is_err());
+
+        // A Windows drive reference in any component. `C:evil.txt` is the one
+        // that mattered: `PathBuf::join` REPLACES its buffer when the argument
+        // carries a drive prefix, so a leaf spliced onto an already-checked
+        // parent resolves against drive C's working directory instead of the
+        // export — while still reporting `is_absolute() == false`.
+        assert!(RelPath("C:evil.txt".into()).validate().is_err());
+        assert!(RelPath("sub/C:evil.txt".into()).validate().is_err());
+        assert!(RelPath("C:".into()).validate().is_err());
+        assert!(RelPath("a:b:c".into()).validate().is_err());
+
+        // ...and NOT an ordinary colon, which is legal in a POSIX filename and
+        // is not a drive prefix unless a single letter precedes it. Rejecting
+        // these would take out every ISO-timestamped log on a Linux export.
+        assert!(RelPath("log-10:30:00.txt".into()).validate().is_ok());
+        assert!(RelPath("foo:bar".into()).validate().is_ok());
+    }
+
+    /// Decode rejects what a peer must never be able to say, so a path
+    /// arriving FROM a server — an event, a listing, a tree entry — cannot
+    /// carry traversal into whatever the receiver builds out of it.
+    #[test]
+    fn decode_rejects_a_traversing_relpath() {
+        for bad in ["../../etc/passwd", "a/../b", "C:evil.txt", "/abs", "."] {
+            let bytes = postcard::to_stdvec(&bad.to_string()).unwrap();
+            assert!(
+                postcard::from_bytes::<RelPath>(&bytes).is_err(),
+                "decode accepted {bad:?}"
+            );
+        }
+        // A backslash is NOT rejected here, only by the server's stricter
+        // `validate`. It is a legal character in a POSIX filename, and a
+        // decode rule that fired on one would drop the connection every time
+        // an event mentioned that file — a reconnect loop, not a safety net.
+        for ok in ["a/b/c.txt", "log-10:30:00.txt", "a\\b", ""] {
+            let bytes = postcard::to_stdvec(&ok.to_string()).unwrap();
+            assert_eq!(
+                postcard::from_bytes::<RelPath>(&bytes).unwrap(),
+                RelPath(ok.into()),
+                "decode rejected {ok:?}"
+            );
+        }
     }
 }
