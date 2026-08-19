@@ -254,10 +254,17 @@ impl ExportTree {
         } else {
             format!("{}/", path.0)
         };
+        // Seek, don't scan. The map is a BTreeMap ordered by path, so the
+        // subtree under `prefix` is one contiguous range — `range(prefix..)`
+        // jumps straight to it instead of testing every entry in the export
+        // against the prefix on every page. `skip(offset)` still walks within
+        // the subtree; an offset cursor is what the v6 wire shape gives us,
+        // and the token already forces a restart if the map changed between
+        // pages, which is the only case an offset could lie in.
         let mut hit = idx
             .entries
-            .iter()
-            .filter(|(p, _)| prefix.is_empty() || p.0.starts_with(&prefix))
+            .range(RelPath(prefix.clone())..)
+            .take_while(|(p, _)| prefix.is_empty() || p.0.starts_with(&prefix))
             .skip(offset);
         let mut page = Vec::with_capacity(limit.min(1024));
         for (p, a) in hit.by_ref().take(limit) {

@@ -18,6 +18,10 @@ use crate::autocache::{stage_write, AutoCache};
 use crate::remote_fs::RemoteFs;
 
 const FILE_CONCURRENCY: usize = 4;
+/// Directories listed concurrently per BFS level. Discovery is pure metadata
+/// — small frames, no disk pressure server-side — so it tolerates far more
+/// parallelism than content fetches do.
+const DIR_CONCURRENCY: usize = 16;
 const CHUNK_CONCURRENCY: usize = 8;
 
 pub(crate) fn spawn(
@@ -30,56 +34,93 @@ pub(crate) fn spawn(
         let sem = Arc::new(Semaphore::new(FILE_CONCURRENCY));
         let mut walked_dirs = 0usize;
         let mut fetched = 0usize;
-        let mut queue: std::collections::VecDeque<RelPath> = [RelPath(String::new())].into();
-        let mut tasks = Vec::new();
+        // BFS by LEVELS, every directory of a level listed concurrently. The
+        // old walk awaited one Readdir at a time, which priced discovery at
+        // one round trip per directory — 535 directories measured 35.8 s, and
+        // nearly all of it was the network sitting idle between questions.
+        // Depth is what bounds it now: a level of W directories costs
+        // ceil(W / DIR_CONCURRENCY) round trips instead of W.
+        let mut level: Vec<RelPath> = vec![RelPath(String::new())];
+        let mut tasks = tokio::task::JoinSet::new();
+        let mut ok = 0usize;
 
-        while let Some(dir) = queue.pop_front() {
-            walked_dirs += 1;
-            let mut cursor = 0u64;
-            loop {
-                let resp = fs
-                    .conn()
-                    .request(Request::Readdir {
-                        path: dir.clone(),
-                        cursor,
-                    })
-                    .await;
-                let (entries, next) = match resp {
-                    Ok(Ok(Response::Dir { entries, next_cursor })) => (entries, next_cursor),
-                    _ => break, // transient failure: skip this dir, keep walking
-                };
-                for e in entries {
-                    let child = dir.join(&e.name);
-                    if fs.is_overlay(&child) {
-                        continue; // overlay paths are already local
-                    }
-                    match e.attr.kind {
-                        alloyfs_proto::FileKind::Dir => queue.push_back(child),
-                        alloyfs_proto::FileKind::File => {
-                            if cache.wants(&child, e.attr.size) && cache.needs_fetch(&child, &e.attr) {
-                                let permit = sem.clone().acquire_owned().await.unwrap();
-                                let fs = fs.clone();
-                                let cache = cache.clone();
-                                fetched += 1;
-                                tasks.push(tokio::spawn(async move {
-                                    let ok = fetch_one(&fs, &cache, &child).await;
-                                    drop(permit);
-                                    ok
-                                }));
+        while !level.is_empty() {
+            walked_dirs += level.len();
+            let mut next_level = Vec::new();
+            for window in level.chunks(DIR_CONCURRENCY) {
+                let listings = futures::future::join_all(window.iter().map(|dir| {
+                    let fs = fs.clone();
+                    let dir = dir.clone();
+                    async move {
+                        // Follow this one directory's cursor pages serially —
+                        // pages of one listing are dependent; directories are
+                        // not, and they are the parallelism that matters.
+                        let mut all = Vec::new();
+                        let mut cursor = 0u64;
+                        loop {
+                            let resp = fs
+                                .conn()
+                                .request(Request::Readdir {
+                                    path: dir.clone(),
+                                    cursor,
+                                })
+                                .await;
+                            match resp {
+                                Ok(Ok(Response::Dir { entries, next_cursor })) => {
+                                    all.extend(entries);
+                                    match next_cursor {
+                                        Some(c) => cursor = c,
+                                        None => break,
+                                    }
+                                }
+                                _ => break, // transient: skip dir, keep walking
                             }
                         }
-                        alloyfs_proto::FileKind::Symlink => {}
+                        (dir, all)
+                    }
+                }))
+                .await;
+
+                for (dir, entries) in listings {
+                    for e in entries {
+                        let child = dir.join(&e.name);
+                        if fs.is_overlay(&child) {
+                            continue; // overlay paths are already local
+                        }
+                        match e.attr.kind {
+                            alloyfs_proto::FileKind::Dir => next_level.push(child),
+                            alloyfs_proto::FileKind::File => {
+                                if cache.wants(&child, e.attr.size) && cache.needs_fetch(&child, &e.attr) {
+                                    // The permit is taken INSIDE the task, so a
+                                    // full fetch pipeline never stalls the walk
+                                    // — discovery and download overlap instead
+                                    // of strangling each other.
+                                    let sem = sem.clone();
+                                    let fs = fs.clone();
+                                    let cache = cache.clone();
+                                    fetched += 1;
+                                    tasks.spawn(async move {
+                                        let _permit = sem.acquire_owned().await.unwrap();
+                                        fetch_one(&fs, &cache, &child).await
+                                    });
+                                }
+                            }
+                            alloyfs_proto::FileKind::Symlink => {}
+                        }
                     }
                 }
-                match next {
-                    Some(c) => cursor = c,
-                    None => break,
+                // Reap finished fetches as we go, so the set never grows to
+                // "every file in the export" on a big tree.
+                while let Some(done) = tasks.try_join_next() {
+                    if matches!(done, Ok(true)) {
+                        ok += 1;
+                    }
                 }
             }
+            level = next_level;
         }
-        let mut ok = 0usize;
-        for t in tasks {
-            if matches!(t.await, Ok(true)) {
+        while let Some(done) = tasks.join_next().await {
+            if matches!(done, Ok(true)) {
                 ok += 1;
             }
         }
@@ -186,6 +227,10 @@ async fn fetch_one(fs: &Arc<RemoteFs>, cache: &Arc<AutoCache>, path: &RelPath) -
         .unwrap_or(false)
     }
     .await;
-    let _ = fs.conn().request(Request::Release { fh }).await;
+    // Fire-and-forget, for the reason `RemoteFs::release` gives: the reply was
+    // discarded anyway, and awaiting it held one of the FILE_CONCURRENCY slots
+    // for a full round trip per file. That wait was one of the three RTTs every
+    // small file cost.
+    let _ = fs.conn().send_oneway(Request::Release { fh }).await;
     result
 }
