@@ -1,7 +1,19 @@
 name: CI
 on:
   push:
-    branches: [main]
+    # EVERY branch a release can be cut from, not just main. version.yml's
+    # gate is ubuntu-only by design, so if a release branch does not run this
+    # matrix, a Windows-only regression reaches a tag having been compiled but
+    # never tested. Keep this list in step with version.yml's triggers.
+    branches:
+      - main
+      - alpha
+      - beta
+      - rc
+      - prerelease
+      - '*-alpha'
+      - '*-beta'
+      - '*-rc'
   pull_request:
 
 env:
