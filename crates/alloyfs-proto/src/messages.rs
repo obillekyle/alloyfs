@@ -34,15 +34,23 @@ use crate::error::ErrorCode;
 /// changed at all". Gated on the client, which simply keeps using `Readdir`
 /// against an older peer; an indexed export is an optimisation, never a
 /// requirement.
+///
+/// v7: `Request::LockRange` / `UnlockRange` / `TestLock` +
+/// `Response::LockStatus` — real POSIX byte-range advisory locks, replacing
+/// the whole-file coarsening of `Lock`/`Unlock`. Gated on the client, which
+/// falls back to the coarse pair against an older peer. The coarsening was
+/// not merely imprecise: it applied to release as well as to acquire, so a
+/// partial unlock dropped every lock the handle held, and SQLite performs
+/// exactly that sequence on every read transaction.
 pub const PROTO_VERSION_MIN: u16 = 1;
-pub const PROTO_VERSION_MAX: u16 = 6;
+pub const PROTO_VERSION_MAX: u16 = 7;
 
 /// The protocol range this build speaks, for `--version` and diagnostics —
 /// "which wire version does this release talk" should not require reading
 /// source. A literal rather than a formatted string because clap's version
 /// output needs a `&'static str`; `proto_range_matches_the_constants` is what
 /// keeps it from drifting away from the two constants above.
-pub const PROTO_RANGE: &str = "1-6";
+pub const PROTO_RANGE: &str = "1-7";
 
 /// Read/write payloads are capped to this many bytes per request so one huge
 /// file operation can never monopolize the connection (head-of-line blocking).
@@ -388,6 +396,58 @@ pub enum Request {
     /// begins again every mount, which makes a sequence useless for deciding
     /// whether a cache from an earlier mount is still good. A token is not.
     TreeToken,
+    /// v7+: a POSIX byte-range advisory lock.
+    ///
+    /// The pre-v7 `Lock`/`Unlock` above coarsen every range to the whole
+    /// file. That over-locks when taking, which is merely strict — and
+    /// UNDER-locks when releasing, which is not: `Unlock` drops every lock the
+    /// handle holds on the path, so an application holding two disjoint ranges
+    /// and releasing one is left believing it still holds the other while the
+    /// server holds nothing. SQLite performs exactly that sequence on every
+    /// read transaction (read-lock PENDING, read-lock the shared range, unlock
+    /// PENDING), which is why databases could not live on a mount.
+    ///
+    /// `len == 0` means "to the end of the file", matching `fcntl`'s
+    /// `l_len == 0`.
+    ///
+    /// `owner` is the lock owner, distinct from `fh`: two handles sharing an
+    /// owner never conflict with each other, which is what makes an upgrade an
+    /// upgrade rather than a self-deadlock. FUSE supplies it as `lock_owner`.
+    /// It is carried ALONGSIDE `fh` rather than replacing it — keying locks by
+    /// handle gives open-file-description semantics, where closing one
+    /// descriptor does not drop locks taken through another, and that is
+    /// strictly better than POSIX's drop-all-on-any-close.
+    LockRange {
+        fh: u64,
+        owner: u64,
+        kind: LockKind,
+        start: u64,
+        len: u64,
+        wait: bool,
+    },
+    /// v7+: release exactly `[start, start+len)` and nothing else. Splitting
+    /// a held range in two is a normal outcome.
+    UnlockRange {
+        fh: u64,
+        owner: u64,
+        start: u64,
+        len: u64,
+    },
+    /// v7+: `fcntl(F_GETLK)` — would this lock be granted, and if not, who
+    /// blocks it?
+    ///
+    /// Answering from a client's local list is not an option: it would report
+    /// "free" while another machine held the range, which is worse than the
+    /// `ENOLCK`/`ENOSYS` it replaces. SQLite calls this whenever a `-journal`
+    /// file exists and treats a failure as an I/O error, so its absence is why
+    /// recovery and concurrent writes failed outright rather than degrading.
+    TestLock {
+        fh: u64,
+        owner: u64,
+        kind: LockKind,
+        start: u64,
+        len: u64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -469,6 +529,23 @@ pub enum Response {
     TreeToken {
         token: u64,
     },
+    /// v7+: the answer to `TestLock`. `None` means the range is free for the
+    /// requested kind — i.e. `F_GETLK` reports `F_UNLCK`.
+    LockStatus(Option<LockConflict>),
+}
+
+/// v7+: the lock that would block a `TestLock`, in `fcntl(F_GETLK)`'s terms.
+///
+/// `pid` is reported as 0 when unknown, which it always is across a network:
+/// the holder is a handle on another machine and its process id means nothing
+/// here. SQLite ignores `l_pid`, and no correct caller can do otherwise on a
+/// shared filesystem.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct LockConflict {
+    pub kind: LockKind,
+    pub start: u64,
+    pub len: u64,
+    pub pid: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

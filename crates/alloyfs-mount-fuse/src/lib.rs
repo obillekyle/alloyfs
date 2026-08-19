@@ -13,7 +13,8 @@ use std::time::{Duration, SystemTime};
 use fuser::{
     Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo, LockOwner,
     MountOption, OpenAccMode, OpenFlags as FuseOpenFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
-    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request as FuseRequest, SessionACL,
+    ReplyEmpty, ReplyEntry, ReplyLock, ReplyOpen, ReplyStatfs, ReplyWrite, Request as FuseRequest,
+    SessionACL,
     TimeOrNow, WriteFlags,
 };
 
@@ -406,27 +407,115 @@ impl Filesystem for DsFuse {
         _req: &FuseRequest,
         _ino: INodeNo,
         fh: FileHandle,
-        _lock_owner: LockOwner,
-        _start: u64,
-        _end: u64,
+        lock_owner: LockOwner,
+        start: u64,
+        end: u64,
         typ: i32,
         _pid: u32,
         sleep: bool,
         reply: ReplyEmpty,
     ) {
-        // POSIX byte-range locks coarsened to whole-file server-side locks —
-        // documented limitation (don't run databases on the mount).
+        let len = fuse_range_len(start, end);
+        let owner = lock_owner.0;
         let result = match typ {
-            t if t == libc::F_RDLCK => self.fs.lock(fh.0, alloyfs_proto::LockKind::Shared, sleep),
-            t if t == libc::F_WRLCK => self.fs.lock(fh.0, alloyfs_proto::LockKind::Exclusive, sleep),
-            t if t == libc::F_UNLCK => self.fs.unlock(fh.0),
+            t if t == libc::F_RDLCK => self.fs.lock_range(
+                fh.0,
+                owner,
+                alloyfs_proto::LockKind::Shared,
+                start,
+                len,
+                sleep,
+            ),
+            t if t == libc::F_WRLCK => self.fs.lock_range(
+                fh.0,
+                owner,
+                alloyfs_proto::LockKind::Exclusive,
+                start,
+                len,
+                sleep,
+            ),
+            t if t == libc::F_UNLCK => self.fs.unlock_range(fh.0, owner, start, len),
             _ => {
                 reply.error(Errno::EINVAL);
                 return;
             }
         };
+        // A pre-v7 agent cannot do ranges. Coarsening is what this did for
+        // every lock until v7, and as a FALLBACK it is defensible for taking
+        // one — it claims more than was asked. It is not defensible for
+        // releasing one, where it drops every lock the handle holds, so an
+        // unlock against an old peer refuses rather than silently unlocking
+        // more than the caller named.
+        let result = match result {
+            Err(e) if is_version_mismatch(&e) => {
+                let kind = match typ {
+                    t if t == libc::F_RDLCK => alloyfs_proto::LockKind::Shared,
+                    t if t == libc::F_WRLCK => alloyfs_proto::LockKind::Exclusive,
+                    _ => {
+                        reply.error(Errno::ENOLCK);
+                        return;
+                    }
+                };
+                self.fs.lock(fh.0, kind, sleep)
+            }
+            other => other,
+        };
         match result {
             Ok(()) => reply.ok(),
+            Err(e) => reply.error(errno(&e)),
+        }
+    }
+
+    fn getlk(
+        &self,
+        _req: &FuseRequest,
+        _ino: INodeNo,
+        fh: FileHandle,
+        lock_owner: LockOwner,
+        start: u64,
+        end: u64,
+        typ: i32,
+        pid: u32,
+        reply: ReplyLock,
+    ) {
+        // Without this the kernel forwards F_GETLK here — it only answers
+        // locally when FUSE_POSIX_LOCKS is absent, and this mount advertises
+        // it — and fuser's default replies ENOSYS straight to the application.
+        // SQLite issues F_GETLK from `unixCheckReservedLock` whenever a
+        // journal file exists and treats a failure as an I/O error, so the
+        // missing implementation turned every recovery into a hard failure.
+        let kind = match typ {
+            t if t == libc::F_RDLCK => alloyfs_proto::LockKind::Shared,
+            t if t == libc::F_WRLCK => alloyfs_proto::LockKind::Exclusive,
+            _ => {
+                reply.error(Errno::EINVAL);
+                return;
+            }
+        };
+        match self
+            .fs
+            .test_lock(fh.0, lock_owner.0, kind, start, fuse_range_len(start, end))
+        {
+            // Free: F_GETLK reports F_UNLCK and leaves the rest untouched.
+            Ok(None) => reply.locked(start, end, libc::F_UNLCK, pid),
+            Ok(Some(c)) => {
+                let ctyp = match c.kind {
+                    alloyfs_proto::LockKind::Shared => libc::F_RDLCK,
+                    alloyfs_proto::LockKind::Exclusive => libc::F_WRLCK,
+                };
+                // Back to fuser's inclusive end. A conflict reported with
+                // len 0 runs to EOF, which is u64::MAX here.
+                let cend = if c.len == 0 {
+                    u64::MAX
+                } else {
+                    c.start.saturating_add(c.len).saturating_sub(1)
+                };
+                reply.locked(c.start, cend, ctyp, c.pid)
+            }
+            // ENOLCK against a pre-v7 agent, matching what the kernel backend
+            // has always returned — and never a local answer, which would
+            // report "free" while another machine held the range.
+            Err(e) if is_version_mismatch(&e) => reply.error(Errno::ENOLCK),
             Err(e) => reply.error(errno(&e)),
         }
     }
@@ -525,3 +614,22 @@ pub fn mount(
 
 #[cfg(test)]
 mod tests;
+
+/// fcntl's `l_len` from fuser's INCLUSIVE end.
+///
+/// fuser hands the kernel's `fuse_file_lock` through as `(start, end)` with
+/// `end` inclusive, and spells "to the end of the file" as `end == u64::MAX`.
+/// The wire uses fcntl's own convention, where that is `len == 0`, so the two
+/// conversions have to happen exactly here and nowhere else.
+fn fuse_range_len(start: u64, end: u64) -> u64 {
+    if end == u64::MAX {
+        0
+    } else {
+        end.saturating_sub(start).saturating_add(1)
+    }
+}
+
+/// Did this fail only because the agent is older than the operation needs?
+fn is_version_mismatch(e: &FsError) -> bool {
+    matches!(e, FsError::Remote(alloyfs_proto::ErrorCode::VersionMismatch))
+}

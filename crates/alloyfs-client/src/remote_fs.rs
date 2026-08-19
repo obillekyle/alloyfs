@@ -65,6 +65,81 @@ const NO_SERVER_FH: u64 = u64::MAX;
 /// server's own small counter will reach.
 pub(crate) const LAZY_FH_BIT: u64 = 1 << 62;
 
+/// One advisory lock a handle holds, in the client's mirror of server state.
+///
+/// `end` is exclusive, `u64::MAX` meaning "to the end of the file" — the same
+/// convention the agent keeps, so nothing has to be reinterpreted when a
+/// reconnect replays it. The wire spells that as `len == 0`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct HeldRange {
+    pub owner: u64,
+    pub kind: alloyfs_proto::LockKind,
+    pub start: u64,
+    pub end: u64,
+}
+
+impl HeldRange {
+    /// Back to the wire's spelling.
+    fn wire_len(&self) -> u64 {
+        if self.end == u64::MAX {
+            0
+        } else {
+            self.end - self.start
+        }
+    }
+}
+
+/// Exclusive end from the wire's `(start, len)`, where `len == 0` is to-EOF.
+pub(crate) fn range_end(start: u64, len: u64) -> u64 {
+    if len == 0 {
+        u64::MAX
+    } else {
+        start.saturating_add(len)
+    }
+}
+
+/// Record that `owner` holds `[start, end)` as `kind`, replacing whatever it
+/// held there.
+///
+/// A trimmed mirror of the agent's carve-then-insert: only this handle's own
+/// ranges matter here, since conflicts are the server's business. Keeping the
+/// shapes the same is what lets a reconnect replay exactly what the server
+/// has, rather than a superset that would claim more than was held.
+pub(crate) fn record_lock(
+    held: &mut Vec<HeldRange>,
+    owner: u64,
+    kind: alloyfs_proto::LockKind,
+    start: u64,
+    end: u64,
+) {
+    record_unlock(held, owner, start, end);
+    held.push(HeldRange {
+        owner,
+        kind,
+        start,
+        end,
+    });
+}
+
+/// Drop `[start, end)` from what `owner` holds, splitting anything it cuts
+/// through.
+pub(crate) fn record_unlock(held: &mut Vec<HeldRange>, owner: u64, start: u64, end: u64) {
+    let mut fragments = Vec::new();
+    held.retain(|h| {
+        if h.owner != owner || !(h.start < end && start < h.end) {
+            return true;
+        }
+        if h.start < start {
+            fragments.push(HeldRange { end: start, ..*h });
+        }
+        if h.end > end {
+            fragments.push(HeldRange { start: end, ..*h });
+        }
+        false
+    });
+    held.extend(fragments);
+}
+
 /// Client-side bookkeeping for one open remote handle. Keyed by the fh the
 /// KERNEL holds (stable across reconnects); `server_fh` is what the current
 /// server session knows and is rewritten by the reconnect supervisor.
@@ -83,9 +158,14 @@ pub(crate) struct OpenState {
     pub wrote: AtomicBool,
     /// Sequential prefetch window for this handle.
     pub ra: ReadAhead,
-    /// The advisory lock this fh currently holds (client mirror of server
+    /// The advisory locks this fh currently holds (client mirror of server
     /// state) — what the reconnect supervisor replays.
-    pub lock: std::sync::Mutex<Option<alloyfs_proto::LockKind>>,
+    ///
+    /// A list rather than one kind, because v7 locks byte ranges: a handle can
+    /// hold a read lock on one range and a write lock on another at the same
+    /// time, which is exactly what SQLite does. Replaying only the last one
+    /// taken would restore less than the server had and call it success.
+    pub lock: std::sync::Mutex<Vec<HeldRange>>,
     /// Set when a reconnect could not restore this handle's lock (or the
     /// handle itself, if it held one). A poisoned handle fails read/write/
     /// lock/flush with EIO — mutual exclusion may have been broken and the
@@ -584,7 +664,7 @@ impl RemoteFs {
                             cache_ok: AtomicBool::new(true),
                             wrote: AtomicBool::new(false),
                             ra: ReadAhead::new(),
-                            lock: std::sync::Mutex::new(None),
+                            lock: std::sync::Mutex::new(Vec::new()),
                             poisoned: AtomicBool::new(false),
                             version: AtomicU64::new(attr.version),
                         },
@@ -606,7 +686,7 @@ impl RemoteFs {
                 cache_ok: AtomicBool::new(cache_ok),
                 wrote: AtomicBool::new(false),
                 ra: ReadAhead::new(),
-                lock: std::sync::Mutex::new(None),
+                lock: std::sync::Mutex::new(Vec::new()),
                 poisoned: AtomicBool::new(false),
                 version: AtomicU64::new(attr.version),
             },
@@ -997,7 +1077,7 @@ impl RemoteFs {
                 cache_ok: AtomicBool::new(false),
                 wrote: AtomicBool::new(true),
                 ra: ReadAhead::new(),
-                lock: std::sync::Mutex::new(None),
+                lock: std::sync::Mutex::new(Vec::new()),
                 poisoned: AtomicBool::new(false),
                 version: AtomicU64::new(attr.version),
             },
@@ -1246,7 +1326,11 @@ impl RemoteFs {
         };
         expect_resp!(resp, Response::Ok => ());
         if let Some(state) = self.open_files.get(&fh) {
-            *state.lock.lock().unwrap() = Some(kind); // server did release-then-take
+            // Whole file, owner 0 — the coarse lock has no notion of either,
+            // and recording it the same shape as a range keeps one replay path.
+            let mut held = state.lock.lock().unwrap();
+            held.clear(); // server did release-then-take
+            record_lock(&mut held, 0, kind, 0, u64::MAX);
         }
         Ok(())
     }
@@ -1258,9 +1342,103 @@ impl RemoteFs {
         let server_fh = self.server_fh_for_io(fh)?;
         expect_resp!(self.call(Request::Unlock { fh: server_fh })?, Response::Ok => ());
         if let Some(state) = self.open_files.get(&fh) {
-            *state.lock.lock().unwrap() = None;
+            state.lock.lock().unwrap().clear();
         }
         Ok(())
+    }
+
+    /// v7+: take a byte-range lock. `len == 0` is fcntl's "to the end of the
+    /// file".
+    pub fn lock_range(
+        &self,
+        fh: u64,
+        owner: u64,
+        kind: alloyfs_proto::LockKind,
+        start: u64,
+        len: u64,
+        wait: bool,
+    ) -> Result<(), FsError> {
+        if fh & OVERLAY_FH_BIT != 0 {
+            return Ok(()); // single-machine data: advisory lock is a no-op
+        }
+        self.check_poisoned(fh)?;
+        self.require_proto(7, "byte-range lock")?;
+        let server_fh = self.server_fh_for_io(fh)?;
+        let req = Request::LockRange {
+            fh: server_fh,
+            owner,
+            kind,
+            start,
+            len,
+            wait,
+        };
+        // A blocking wait may legitimately outlast any fixed timeout: bound it
+        // by peer liveness instead, as the whole-file path does.
+        let resp = if wait {
+            self.rt.block_on(self.conn().request_keepalive(req))??
+        } else {
+            self.call(req)?
+        };
+        expect_resp!(resp, Response::Ok => ());
+        if let Some(state) = self.open_files.get(&fh) {
+            let mut held = state.lock.lock().unwrap();
+            record_lock(&mut held, owner, kind, start, range_end(start, len));
+        }
+        Ok(())
+    }
+
+    /// v7+: release exactly `[start, len)` and nothing else.
+    pub fn unlock_range(
+        &self,
+        fh: u64,
+        owner: u64,
+        start: u64,
+        len: u64,
+    ) -> Result<(), FsError> {
+        if fh & OVERLAY_FH_BIT != 0 {
+            return Ok(());
+        }
+        self.require_proto(7, "byte-range unlock")?;
+        let server_fh = self.server_fh_for_io(fh)?;
+        expect_resp!(
+            self.call(Request::UnlockRange {
+                fh: server_fh,
+                owner,
+                start,
+                len,
+            })?,
+            Response::Ok => ()
+        );
+        if let Some(state) = self.open_files.get(&fh) {
+            let mut held = state.lock.lock().unwrap();
+            record_unlock(&mut held, owner, start, range_end(start, len));
+        }
+        Ok(())
+    }
+
+    /// v7+: `fcntl(F_GETLK)` — what would block this lock, if anything.
+    pub fn test_lock(
+        &self,
+        fh: u64,
+        owner: u64,
+        kind: alloyfs_proto::LockKind,
+        start: u64,
+        len: u64,
+    ) -> Result<Option<alloyfs_proto::LockConflict>, FsError> {
+        if fh & OVERLAY_FH_BIT != 0 {
+            return Ok(None); // nothing else can hold overlay-routed data
+        }
+        self.check_poisoned(fh)?;
+        self.require_proto(7, "test lock")?;
+        let server_fh = self.server_fh_for_io(fh)?;
+        let resp = self.call(Request::TestLock {
+            fh: server_fh,
+            owner,
+            kind,
+            start,
+            len,
+        })?;
+        Ok(expect_resp!(resp, Response::LockStatus(c) => c))
     }
 
     /// EIO for handles whose lock (or reopen) was lost across a reconnect —
@@ -1569,7 +1747,7 @@ async fn reconnect_supervisor(fs: Arc<RemoteFs>) {
             if state.server_fh.load(Ordering::Acquire) == NO_SERVER_FH {
                 continue;
             }
-            let held = *state.lock.lock().unwrap();
+            let held: Vec<HeldRange> = state.lock.lock().unwrap().clone();
             let req = Request::Open {
                 path: state.path.clone(),
                 flags: state.flags,
@@ -1578,14 +1756,27 @@ async fn reconnect_supervisor(fs: Arc<RemoteFs>) {
                 Ok(Ok(Response::Opened { fh, .. })) => {
                     state.server_fh.store(fh, Ordering::Release);
                     reopened += 1;
-                    if let Some(kind) = held {
-                        if replay_lock(&new_conn, fh, kind).await {
+                    // EVERY range, or the handle is poisoned. Restoring some
+                    // of what was held and reporting success would leave the
+                    // application believing in exclusion it no longer has,
+                    // which is the one outcome this path exists to prevent.
+                    if !held.is_empty() {
+                        let proto = new_conn.proto;
+                        let mut all = true;
+                        for h in &held {
+                            if !replay_lock(&new_conn, fh, h, proto).await {
+                                all = false;
+                                break;
+                            }
+                        }
+                        if all {
                             locks_restored += 1;
                         } else {
                             locks_lost += 1;
                             state.poisoned.store(true, Ordering::Release);
                             tracing::warn!(
                                 path = %state.path,
+                                ranges = held.len(),
                                 "lock lost across reconnect; handle poisoned (EIO until reopened)"
                             );
                         }
@@ -1596,7 +1787,7 @@ async fn reconnect_supervisor(fs: Arc<RemoteFs>) {
                     // unless it held a lock, which makes the loss a mutual-
                     // exclusion break: poison so it surfaces as EIO.
                     failed += 1;
-                    if held.is_some() {
+                    if !held.is_empty() {
                         locks_lost += 1;
                         state.poisoned.store(true, Ordering::Release);
                     }
@@ -1618,19 +1809,38 @@ async fn reconnect_supervisor(fs: Arc<RemoteFs>) {
 /// Re-acquire one advisory lock on the new session. Retries WouldBlock a few
 /// times: the server may not have processed the OLD session's disconnect yet,
 /// so the first attempts can lose to our own zombie's still-held lock.
-async fn replay_lock(conn: &Arc<MuxConnection>, fh: u64, kind: alloyfs_proto::LockKind) -> bool {
+///
+/// Replays through whichever shape the NEW connection negotiated. A reconnect
+/// can land on a different server, so a range taken at v7 may have to be
+/// replayed against a v6 peer — where the honest thing is to coarsen it,
+/// claiming more than was held rather than less.
+async fn replay_lock(
+    conn: &Arc<MuxConnection>,
+    fh: u64,
+    held: &HeldRange,
+    proto: u16,
+) -> bool {
+    let req = if proto >= 7 {
+        Request::LockRange {
+            fh,
+            owner: held.owner,
+            kind: held.kind,
+            start: held.start,
+            len: held.wire_len(),
+            wait: false,
+        }
+    } else {
+        Request::Lock {
+            fh,
+            kind: held.kind,
+            wait: false,
+        }
+    };
     for attempt in 0..4 {
         if attempt > 0 {
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
-        match conn
-            .request(Request::Lock {
-                fh,
-                kind,
-                wait: false,
-            })
-            .await
-        {
+        match conn.request(req.clone()).await {
             Ok(Ok(Response::Ok)) => return true,
             Ok(Err(ErrorCode::WouldBlock)) => continue, // maybe our zombie; retry
             _ => return false,

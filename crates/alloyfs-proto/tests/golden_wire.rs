@@ -291,6 +291,50 @@ fn canonical() -> Vec<(&'static str, Frame)> {
                 token: 0x0123_4567_89ab_cdef,
             }),
         ),
+        // --- v7: byte-range locks ---
+        (
+            "req_lock_range",
+            req(Request::LockRange {
+                fh: 9,
+                owner: 0xfeed,
+                kind: LockKind::Exclusive,
+                start: 0x4000_0000,
+                len: 1,
+                wait: false,
+            }),
+        ),
+        (
+            "req_unlock_range",
+            req(Request::UnlockRange {
+                fh: 9,
+                owner: 0xfeed,
+                start: 0x4000_0002,
+                len: 510,
+            }),
+        ),
+        (
+            "req_test_lock",
+            req(Request::TestLock {
+                fh: 9,
+                owner: 0xfeed,
+                kind: LockKind::Shared,
+                start: 0x4000_0001,
+                len: 1,
+            }),
+        ),
+        (
+            "resp_lock_status_free",
+            ok(Response::LockStatus(None)),
+        ),
+        (
+            "resp_lock_status_held",
+            ok(Response::LockStatus(Some(alloyfs_proto::LockConflict {
+                kind: LockKind::Exclusive,
+                start: 0x4000_0001,
+                len: 1,
+                pid: 0,
+            }))),
+        ),
         // --- every ErrorCode (as Err) ---
         ("err_not_found", err(ErrorCode::NotFound)),
         ("err_permission_denied", err(ErrorCode::PermissionDenied)),
@@ -374,6 +418,9 @@ fn _variant_tripwire(
         Request::ReadLink { .. } => {} // v4: golden added, PROTO_VERSION_MAX bumped
         Request::Tree { .. } => {}    // v6: golden added, PROTO_VERSION_MAX bumped
         Request::TreeToken => {}      // v6: golden added, PROTO_VERSION_MAX bumped
+        Request::LockRange { .. } => {} // v7: golden added, PROTO_VERSION_MAX bumped
+        Request::UnlockRange { .. } => {} // v7: golden added, PROTO_VERSION_MAX bumped
+        Request::TestLock { .. } => {} // v7: golden added, PROTO_VERSION_MAX bumped
     }
     match response {
         Response::AttachOk { .. } => {}
@@ -390,6 +437,7 @@ fn _variant_tripwire(
         Response::WrittenAttr { .. } => {}   // v5: golden added, PROTO_VERSION_MAX bumped
         Response::Tree { .. } => {}          // v6: golden added, PROTO_VERSION_MAX bumped
         Response::TreeToken { .. } => {}     // v6: golden added, PROTO_VERSION_MAX bumped
+        Response::LockStatus(..) => {}       // v7: golden added, PROTO_VERSION_MAX bumped
     }
     match code {
         ErrorCode::NotFound => {}
@@ -435,8 +483,8 @@ fn _variant_tripwire(
 /// `cargo test -p alloyfs-proto print_goldens -- --ignored --nocapture`
 #[rustfmt::skip]
 const GOLDEN: &[(&str, &str)] = &[
-    ("hello", "00010606676f6c64656e"),
-    ("hello_ack", "010606676f6c64656e"),
+    ("hello", "00010706676f6c64656e"),
+    ("hello_ack", "010706676f6c64656e"),
     ("ping", "0507"),
     ("pong", "0607"),
     ("compressed", "0706676f6c64656e"),
@@ -479,6 +527,11 @@ const GOLDEN: &[(&str, &str)] = &[
     ("req_tree_token", "020718"),
     ("resp_tree", "0307000c010c6469722f66696c652e747874002a80e2cfaa06bc99ef3a80e2cfaa06bc99ef3aa403080140ef9bafcdf8acd19101"),
     ("resp_tree_token", "0307000def9bafcdf8acd19101"),
+    ("req_lock_range", "02071909edfd030180808080040100"),
+    ("req_unlock_range", "02071a09edfd038280808004fe03"),
+    ("req_test_lock", "02071b09edfd0300818080800401"),
+    ("resp_lock_status_free", "0307000e00"),
+    ("resp_lock_status_held", "0307000e010181808080040100"),
     ("err_not_found", "03070100"),
     ("err_permission_denied", "03070101"),
     ("err_already_exists", "03070102"),

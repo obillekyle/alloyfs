@@ -1,32 +1,46 @@
 # Locking
 
-`fcntl(F_SETLK)` on a Linux mount reaches the agent, so a lock taken on one
-machine excludes the others. Read the limits below before relying on that
-sentence — there are three, and two of them are sharp.
+`fcntl(F_SETLK)` and `fcntl(F_GETLK)` on a Linux mount reach the agent, so a
+lock taken on one machine excludes the others. Byte ranges are honoured as
+ranges from protocol v7 onward. The limits below are real and worth reading —
+two of them are sharp.
 
 ## What is supported
 
-**Whole-file advisory locks**, shared or exclusive, on both Linux backends.
+**POSIX byte-range advisory locks**, shared or exclusive, on `--backend fuse`
+against a v7 agent. Locks conflict when their ranges overlap, at least one is
+exclusive, and their owners differ — so two readers share a range, a writer
+excludes them, and disjoint ranges never interact.
 
-Blocking waits (`F_SETLKW`) work: the request sleeps until the holder releases,
+Releasing part of a held range splits it: the rest stays held. Re-locking part
+of a range with a different kind replaces exactly that part.
+
+**`fcntl(F_GETLK)`** reports the lock that would block a request, or `F_UNLCK`
+when the range is free. It is answered by the agent, never locally — a local
+answer would report "free" while another machine held the range.
+
+Blocking waits (`F_SETLKW`) work: the request sleeps until the range is free,
 bounded by peer liveness rather than a fixed timeout, so it fails fast if the
 holder's machine disappears instead of hanging forever.
 
-An upgrade or downgrade on a handle that already holds the file is honoured,
-and a handle never conflicts with itself. An upgrade that cannot be granted
-leaves the existing lock in place rather than dropping it.
+An owner never conflicts with itself, so an upgrade or downgrade on a range it
+already holds is granted. An upgrade that cannot be granted leaves the existing
+lock in place rather than dropping it.
 
-## Byte ranges are discarded, and unlocking is where that bites
+## Against a pre-v7 agent
 
-A range lock is coarsened to the whole file. Taking one is merely stricter than
-asked. **Releasing one is not**: a partial `F_UNLCK` releases everything the
-handle held on that file, so an application holding two disjoint ranges and
-releasing one is left believing it still holds the other while the agent holds
-nothing at all.
+A v7 client talking to an older agent falls back to whole-file locks:
 
-That is under-locking, and it is silent. It is also exactly the sequence SQLite
-performs on every read transaction, which is the concrete reason the databases
-warning below exists.
+- **Taking** a range lock coarsens to the whole file. That claims more than was
+  asked for, which is safe if inconvenient.
+- **Releasing** one refuses with `ENOLCK` rather than coarsening. A coarsened
+  release drops every lock the handle holds, so an application releasing one of
+  two ranges would be left believing it still held the other while the agent
+  held nothing. Refusing is the honest answer.
+- **`F_GETLK`** returns `ENOLCK`.
+
+Upgrade the agent to get ranges; the client and agent negotiate this per
+connection, so a mixed fleet works.
 
 ## `flock()` is LOCAL on `--backend fuse`
 
@@ -37,6 +51,13 @@ exclude each other; two machines do not.
 
 It IS forwarded on `--backend kernel`, which implements both `.lock` and
 `.flock`.
+
+## `--backend kernel` is still whole-file
+
+The kernel module forwards locks but has no byte ranges yet: every lock is
+coarsened to the whole file, and `F_GETLK` returns `ENOLCK`. The partial-release
+hazard described above applies there — releasing part of a range releases all of
+it. Use `--backend fuse` for anything that locks ranges.
 
 ## Windows forwards nothing
 
@@ -58,25 +79,29 @@ taken through another.
 
 ## Across a reconnect
 
-Locks are replayed onto the new connection. If one cannot be restored, that
-handle is **poisoned** — reads, writes, locks and flushes on it return `EIO`.
-Mutual exclusion may have been broken, and the application has to find out.
+Every range a handle held is replayed onto the new connection. If any one of
+them cannot be restored, that handle is **poisoned** — reads, writes, locks and
+flushes on it return `EIO`. Restoring some of what was held and reporting
+success would leave the application believing in exclusion it no longer has,
+which is the outcome this exists to prevent.
 
-## `fcntl(F_GETLK)`
+## Databases
 
-Returns `ENOLCK` on `--backend kernel` and `ENOSYS` on `--backend fuse`. The
-protocol has no way to ask *who* holds a lock, and answering from the local
-list would report "free" while another machine held it. Callers that see either
-fall back to attempting the lock, which is checked properly — except SQLite,
-which treats the failure as an I/O error.
+**Journal-mode SQLite works** on `--backend fuse` against a v7 agent, across
+machines. Its locking protocol depends on three disjoint byte regions
+(`PENDING`, `RESERVED`, and a 510-byte shared range) and on releasing one
+without releasing the others — which is exactly what whole-file coarsening
+could not express, and why earlier versions of this page said not to try.
 
-## Do not host databases
+**WAL mode cannot work**, here or on any network filesystem, and no amount of
+work on this one will change that. WAL requires every process to share memory,
+which processes on different machines cannot do; SQLite documents the
+restriction itself. Use `journal_mode=DELETE`, `TRUNCATE` or `PERSIST`.
+`locking_mode=EXCLUSIVE` avoids the shared memory but permits exactly one
+connection ever, which buys nothing over journal mode.
 
-SQLite and Postgres want byte-range locks and `F_GETLK`. Neither is available
-in the form they need, and the partial-unlock behaviour above actively breaks
-SQLite's locking protocol rather than merely restricting it. Put the database
-on local disk.
+**Postgres is still out.** It needs mmap'd shared memory and much stronger
+durability guarantees than write-through RPC provides.
 
-SQLite's WAL mode is impossible on any network filesystem regardless of what
-this one implements: WAL requires every process to share memory, which
-processes on different machines cannot do. That is SQLite's own constraint.
+Also note there is no `mmap` at all on `--backend kernel`, so nothing that maps
+a file — including executing a binary from the mount — works there.

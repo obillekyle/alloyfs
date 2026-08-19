@@ -5,16 +5,17 @@ a bug report.
 
 ## Locking
 
-**Whole-file advisory locks only, and the coarsening is NOT safe.** Byte ranges
-are discarded, which over-locks on the way in — but the same coarsening applies
-to unlocking, and there it *under*-locks: a partial `F_UNLCK` releases
-everything the handle held on that file. An application that locks two disjoint
-ranges and releases one believes it still holds the other, while the agent
-holds nothing and another machine is free to take the file.
+**Byte-range locks work on `--backend fuse` against a v7 agent**, including
+`F_GETLK`. Against an older agent, taking a lock coarsens to the whole file and
+releasing one refuses with `ENOLCK` — a coarsened release drops every lock the
+handle holds, which is worse than not answering.
 
-**`fcntl(F_GETLK)` returns `ENOLCK` on `--backend kernel`, and `ENOSYS` on
-`--backend fuse`.** The protocol cannot ask who holds a lock, and answering from
-the local list would report "free" while another machine held it.
+**`--backend kernel` is still whole-file**, and `F_GETLK` returns `ENOLCK`
+there. Releasing part of a range releases all of it.
+
+**`flock()` is local on `--backend fuse`.** The mount advertises POSIX lock
+support but not `FUSE_FLOCK_LOCKS`, so the kernel handles it without contacting
+the agent. It is forwarded on `--backend kernel`.
 
 **Locks are not forwarded at all on Windows.** WinFsp services lock requests
 entirely inside its own kernel driver — its filesystem interface has no lock
@@ -22,9 +23,10 @@ callback to implement — so byte-range locks are fully correct between processe
 on ONE Windows machine and provide no mutual exclusion whatsoever between
 machines sharing an export.
 
-**Do not host live database files** (SQLite, Postgres) on a shared mount. They
-want byte ranges and `F_GETLK`, and the partial-unlock behaviour above means
-SQLite loses its read lock during its own normal lock sequence.
+**Journal-mode SQLite works** on `--backend fuse` at v7. **WAL mode does not,
+and cannot**: it requires all processes to share memory, which processes on
+different machines cannot do. That is SQLite's own constraint, not this
+filesystem's. Postgres remains out entirely.
 
 ## Change notification
 

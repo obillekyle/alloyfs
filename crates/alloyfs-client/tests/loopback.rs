@@ -2090,3 +2090,198 @@ async fn a_remote_append_is_visible_through_an_open_handle() {
 
     on_fs(&b.fs, move |fs| fs.release(b_fh)).await;
 }
+
+// ------------------------------------------- v7 byte-range locks, end to end
+
+/// SQLite's offsets. The three regions are DISJOINT by one byte, and that
+/// disjointness is the entire mechanism the whole-file coarsening destroyed.
+const PENDING_BYTE: u64 = 0x4000_0000;
+const RESERVED_BYTE: u64 = PENDING_BYTE + 1;
+const SHARED_FIRST: u64 = PENDING_BYTE + 2;
+const SHARED_SIZE: u64 = 510;
+
+/// Two clients running SQLite's locking protocol against one export, over the
+/// real wire rather than against the LockManager directly.
+///
+/// Every step here failed before v7. Taking a SHARED lock ends by unlocking
+/// PENDING, and a coarsened unlock dropped the shared-range lock with it — so
+/// the connection believed it held SHARED while the agent held nothing at all.
+/// Then RESERVED, one byte from the shared range, had to wait for every reader
+/// instead of being granted alongside them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sqlite_locking_protocol_over_the_wire() {
+    let agent = start_agent(AgentOpts::default());
+    std::fs::write(agent.dir.path().join("db.sqlite"), b"payload").unwrap();
+    let a = connect(&agent, ClientOptions::default()).await;
+    let b = connect(&agent, ClientOptions::default()).await;
+
+    let fa = open_for_lock(&a, "db.sqlite").await;
+    let fb = open_for_lock(&b, "db.sqlite").await;
+
+    // --- A takes SHARED: read-lock PENDING, read-lock the shared range, then
+    // release PENDING and keep the shared range.
+    on_fs(&a.fs, move |fs| {
+        fs.lock_range(fa, 1, LockKind::Shared, PENDING_BYTE, 1, false)
+    })
+    .await
+    .unwrap();
+    on_fs(&a.fs, move |fs| {
+        fs.lock_range(fa, 1, LockKind::Shared, SHARED_FIRST, SHARED_SIZE, false)
+    })
+    .await
+    .unwrap();
+    on_fs(&a.fs, move |fs| {
+        fs.unlock_range(fa, 1, PENDING_BYTE, 1)
+    })
+    .await
+    .unwrap();
+
+    // The shared range survived the PENDING unlock — the assertion the old
+    // behaviour could not pass.
+    let held = on_fs(&b.fs, move |fs| {
+        fs.test_lock(fb, 2, LockKind::Exclusive, SHARED_FIRST, 1)
+    })
+    .await
+    .unwrap();
+    assert!(
+        held.is_some(),
+        "A's shared-range lock was dropped by unlocking PENDING"
+    );
+    // ...and PENDING itself really is free again.
+    let pending = on_fs(&b.fs, move |fs| {
+        fs.test_lock(fb, 2, LockKind::Exclusive, PENDING_BYTE, 1)
+    })
+    .await
+    .unwrap();
+    assert!(pending.is_none(), "PENDING should be free after unlock");
+
+    // --- B takes SHARED too: two readers coexist.
+    on_fs(&b.fs, move |fs| {
+        fs.lock_range(fb, 2, LockKind::Shared, SHARED_FIRST, SHARED_SIZE, false)
+    })
+    .await
+    .unwrap();
+
+    // --- A takes RESERVED while B keeps reading. Disjoint from the shared
+    // range, so it is granted: a writer stages its transaction without
+    // stopping readers, which coarsening turned into permanent SQLITE_BUSY.
+    on_fs(&a.fs, move |fs| {
+        fs.lock_range(fa, 1, LockKind::Exclusive, RESERVED_BYTE, 1, false)
+    })
+    .await
+    .unwrap();
+
+    // Only one RESERVED at a time.
+    let err = on_fs(&b.fs, move |fs| {
+        fs.lock_range(fb, 2, LockKind::Exclusive, RESERVED_BYTE, 1, false)
+    })
+    .await
+    .unwrap_err();
+    assert_eq!(remote_code(err), ErrorCode::WouldBlock);
+
+    // --- A cannot go EXCLUSIVE while B still reads...
+    let err = on_fs(&a.fs, move |fs| {
+        fs.lock_range(fa, 1, LockKind::Exclusive, SHARED_FIRST, SHARED_SIZE, false)
+    })
+    .await
+    .unwrap_err();
+    assert_eq!(remote_code(err), ErrorCode::WouldBlock);
+
+    // ...and can once B releases exactly its shared range.
+    on_fs(&b.fs, move |fs| {
+        fs.unlock_range(fb, 2, SHARED_FIRST, SHARED_SIZE)
+    })
+    .await
+    .unwrap();
+    on_fs(&a.fs, move |fs| {
+        fs.lock_range(fa, 1, LockKind::Exclusive, SHARED_FIRST, SHARED_SIZE, false)
+    })
+    .await
+    .unwrap();
+}
+
+/// Unlocking part of a held range leaves the rest held, across the wire.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unlocking_part_of_a_range_keeps_the_rest() {
+    let agent = start_agent(AgentOpts::default());
+    std::fs::write(agent.dir.path().join("r.bin"), b"x").unwrap();
+    let a = connect(&agent, ClientOptions::default()).await;
+    let b = connect(&agent, ClientOptions::default()).await;
+    let fa = open_for_lock(&a, "r.bin").await;
+    let fb = open_for_lock(&b, "r.bin").await;
+
+    on_fs(&a.fs, move |fs| {
+        fs.lock_range(fa, 1, LockKind::Exclusive, 0, 300, false)
+    })
+    .await
+    .unwrap();
+    on_fs(&a.fs, move |fs| fs.unlock_range(fa, 1, 100, 100))
+        .await
+        .unwrap();
+
+    // The hole is takeable...
+    on_fs(&b.fs, move |fs| {
+        fs.lock_range(fb, 2, LockKind::Exclusive, 100, 100, false)
+    })
+    .await
+    .unwrap();
+    // ...and both fragments either side are still held.
+    for start in [0u64, 250] {
+        let err = on_fs(&b.fs, move |fs| {
+            fs.lock_range(fb, 2, LockKind::Exclusive, start, 10, false)
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(remote_code(err), ErrorCode::WouldBlock, "at {start}");
+    }
+}
+
+/// A lock owner never conflicts with itself, so an upgrade on the same range
+/// is granted — and a refused one leaves what was already held intact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_range_upgrade_is_granted_and_a_refusal_keeps_the_lock() {
+    let agent = start_agent(AgentOpts::default());
+    std::fs::write(agent.dir.path().join("u.bin"), b"x").unwrap();
+    let a = connect(&agent, ClientOptions::default()).await;
+    let b = connect(&agent, ClientOptions::default()).await;
+    let fa = open_for_lock(&a, "u.bin").await;
+    let fb = open_for_lock(&b, "u.bin").await;
+
+    // Uncontended upgrade: shared then exclusive over the same bytes.
+    on_fs(&a.fs, move |fs| {
+        fs.lock_range(fa, 1, LockKind::Shared, 0, 64, false)
+    })
+    .await
+    .unwrap();
+    on_fs(&a.fs, move |fs| {
+        fs.lock_range(fa, 1, LockKind::Exclusive, 0, 64, false)
+    })
+    .await
+    .unwrap();
+
+    // Contended upgrade: back down to shared, let B read, then fail to upgrade.
+    on_fs(&a.fs, move |fs| {
+        fs.lock_range(fa, 1, LockKind::Shared, 0, 64, false)
+    })
+    .await
+    .unwrap();
+    on_fs(&b.fs, move |fs| {
+        fs.lock_range(fb, 2, LockKind::Shared, 0, 64, false)
+    })
+    .await
+    .unwrap();
+    let err = on_fs(&a.fs, move |fs| {
+        fs.lock_range(fa, 1, LockKind::Exclusive, 0, 64, false)
+    })
+    .await
+    .unwrap_err();
+    assert_eq!(remote_code(err), ErrorCode::WouldBlock);
+
+    // A's shared lock survived the refusal: B still cannot take it exclusively.
+    let err = on_fs(&b.fs, move |fs| {
+        fs.lock_range(fb, 2, LockKind::Exclusive, 0, 64, false)
+    })
+    .await
+    .unwrap_err();
+    assert_eq!(remote_code(err), ErrorCode::WouldBlock);
+}

@@ -1028,6 +1028,9 @@ impl SessionInner {
             // Handled in async context (handle()); never reach the pool.
             Request::Lock { .. }
             | Request::Unlock { .. }
+            | Request::LockRange { .. }
+            | Request::UnlockRange { .. }
+            | Request::TestLock { .. }
             | Request::Subscribe { .. }
             | Request::Auth { .. } => Err(ErrorCode::Io),
         }
@@ -1074,6 +1077,61 @@ impl RequestHandler for AgentSession {
                 export.locks.unlock(&path, inner.id, fh);
                 Ok(Response::Ok)
             }
+            // v7+. The end is computed rather than added because `len == 0` is
+            // fcntl's "to the end of the file, however large it grows" —
+            // `start + 0` would be an empty range, which is not what was asked.
+            Request::LockRange {
+                fh,
+                owner,
+                kind,
+                start,
+                len,
+                wait,
+            } => {
+                let inner = &self.inner;
+                let export = inner.export()?;
+                let path = inner.handle_of(fh)?.path.clone();
+                let owner = crate::locks::Owner::new(inner.id, fh, owner);
+                export
+                    .locks
+                    .lock_range(&path, owner, kind, start, range_end(start, len), wait)
+                    .await?;
+                Ok(Response::Ok)
+            }
+            Request::UnlockRange {
+                fh,
+                owner,
+                start,
+                len,
+            } => {
+                let inner = &self.inner;
+                let export = inner.export()?;
+                let path = inner.handle_of(fh)?.path.clone();
+                let owner = crate::locks::Owner::new(inner.id, fh, owner);
+                export
+                    .locks
+                    .unlock_range(&path, owner, start, range_end(start, len));
+                Ok(Response::Ok)
+            }
+            Request::TestLock {
+                fh,
+                owner,
+                kind,
+                start,
+                len,
+            } => {
+                let inner = &self.inner;
+                let export = inner.export()?;
+                let path = inner.handle_of(fh)?.path.clone();
+                let owner = crate::locks::Owner::new(inner.id, fh, owner);
+                Ok(Response::LockStatus(export.locks.test_range(
+                    &path,
+                    owner,
+                    kind,
+                    start,
+                    range_end(start, len),
+                )))
+            }
             req => {
                 let inner = self.inner.clone();
                 tokio::task::spawn_blocking(move || inner.dispatch_blocking(req))
@@ -1101,5 +1159,15 @@ impl RequestHandler for AgentSession {
         // to close before it returns, so keeping it here wedges the connection
         // open forever — see the field comment.
         self.inner.push.lock().unwrap().take();
+    }
+}
+
+/// Exclusive end of a lock range, in `fcntl`'s terms: `l_len == 0` means "to
+/// the end of the file, however large it grows", not an empty range.
+fn range_end(start: u64, len: u64) -> u64 {
+    if len == 0 {
+        u64::MAX
+    } else {
+        start.saturating_add(len)
     }
 }
