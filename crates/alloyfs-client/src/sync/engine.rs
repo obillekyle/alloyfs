@@ -874,6 +874,10 @@ impl SyncEngine {
             return Ok(());
         }
         tracing::info!(n = actions.len(), "reconcile plan");
+        // The count alone has twice been not enough to explain a wrong
+        // outcome: every action can succeed and still leave the tree wrong if
+        // the PLAN was wrong. At debug, say what it decided to do.
+        tracing::debug!(?actions, "reconcile plan detail");
         // Non-deletes in path order (parents first); deletes afterwards,
         // children first.
         let (deletes, rest): (Vec<_>, Vec<_>) = actions
@@ -993,25 +997,31 @@ async fn executor(engine: Arc<SyncEngine>, mut rx: mpsc::UnboundedReceiver<Op>) 
                         tracing::warn!(path = %path, error = %e, "local push failed");
                     }
                 }
-                // A dropped push is a LOST CHANGE. Nothing else revisits the
-                // path, so the local file stays newer than the manifest for as
-                // long as the process lives — the edit is simply never
-                // synced, silently, having been logged once at warn.
+                // A dropped push IS a lost change — nothing revisits the path,
+                // so the edit is never synced — and scheduling a reconcile
+                // here is the obvious repair. It was tried, and it is wrong as
+                // things stand, so this deliberately does not do it.
                 //
-                // Reconcile is the existing "work out what differs and fix
-                // it" pass and it is idempotent. It retries this specifically
-                // because a failed push never updated the manifest baseline,
-                // so the path still reads as locally-changed and gets planned
-                // as a PushLocal.
+                // A failed push most often means the file moved out from under
+                // the watcher, which is to say a rename is half-applied: the
+                // old name is gone locally and the new name's event has not
+                // been processed yet. Reconciling in that window makes the
+                // planner read the old name as "absent from the baseline,
+                // present on the remote" — remote-new — and PULL IT BACK.
+                // Observed directly: `actions=[Pull("proj/code.rs"),
+                // Push("proj/renamed.rs")]`, every action succeeding, and a
+                // renamed-away file resurrected on both sides.
                 //
-                // Scheduled once per BATCH rather than per failure: a dropped
-                // connection fails every push in the batch, and one reconcile
-                // settles all of them. That also keeps a permanently
-                // unpushable file from spinning — reconcile failing logs and
-                // stops rather than re-arming itself.
+                // That trades a change that syncs late for deleted data coming
+                // back, which is the worse of the two. The retry needs the
+                // planner to stop treating a missing baseline entry as
+                // remote-new while a delete for that path is still in flight;
+                // until then, losing the retry is the safer failure.
                 if failed > 0 {
-                    tracing::debug!(failed, "push failures; scheduling a reconcile to retry them");
-                    engine.enqueue(Op::Reconcile);
+                    tracing::debug!(
+                        failed,
+                        "pushes failed; they will not be retried until the next reconcile trigger"
+                    );
                 }
             }
             Op::Reconcile => {
