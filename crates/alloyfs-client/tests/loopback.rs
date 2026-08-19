@@ -1852,3 +1852,101 @@ async fn a_client_is_not_told_about_its_own_write() {
         "a client must not be echoed its own write, got {echoed:?}"
     );
 }
+
+// ---------------------------------------------------- the directory cache
+
+/// A repeat listing inside DIR_TTL is answered locally. Proven by severing the
+/// connection between the two calls: the second can only succeed from cache.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_repeat_readdir_is_answered_locally() {
+    let agent = start_agent(AgentOpts::default());
+    std::fs::write(agent.dir.path().join("a.txt"), b"a").unwrap();
+    std::fs::write(agent.dir.path().join("b.txt"), b"bb").unwrap();
+
+    let s = connect(&agent, ClientOptions::default()).await;
+    let first = on_fs(&s.fs, |fs| fs.readdir(ROOT_INO)).await.unwrap();
+    assert_eq!(first.len(), 2);
+
+    s.sever();
+    let second = on_fs(&s.fs, |fs| fs.readdir(ROOT_INO))
+        .await
+        .expect("a live listing must not need the server");
+    let names: Vec<&str> = second.iter().map(|(n, _, _)| n.as_str()).collect();
+    assert_eq!(names.len(), 2);
+    assert!(names.contains(&"a.txt") && names.contains(&"b.txt"));
+}
+
+/// The listing is COMPLETE, so it answers both directions without the server:
+/// a name it holds resolves, a name it lacks is NotFound — not a round trip,
+/// and after the sever, not an error either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_live_listing_answers_lookups_both_ways() {
+    let agent = start_agent(AgentOpts::default());
+    std::fs::write(agent.dir.path().join("real.txt"), b"here").unwrap();
+
+    let s = connect(&agent, ClientOptions::default()).await;
+    on_fs(&s.fs, |fs| fs.readdir(ROOT_INO)).await.unwrap();
+    s.sever();
+
+    let (_, attr) = on_fs(&s.fs, |fs| fs.lookup(ROOT_INO, "real.txt"))
+        .await
+        .expect("a listed name resolves from the listing");
+    assert_eq!(attr.size, 4);
+
+    // This is the desktop.ini / resolver-probe case: a miss must be a local
+    // NotFound, where it used to be a 60 ms round trip per probe, forever.
+    let err = on_fs(&s.fs, |fs| fs.lookup(ROOT_INO, "desktop.ini.missing"))
+        .await
+        .expect_err("an unlisted name is refused locally");
+    assert_eq!(remote_code(err), ErrorCode::NotFound);
+}
+
+/// Our own mutations bust the listing synchronously — the server strips
+/// self-origin events, so nothing else would.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_local_create_invalidates_the_listing() {
+    let agent = start_agent(AgentOpts::default());
+    std::fs::write(agent.dir.path().join("old.txt"), b"o").unwrap();
+
+    let s = connect(&agent, ClientOptions::default()).await;
+    let before = on_fs(&s.fs, |fs| fs.readdir(ROOT_INO)).await.unwrap();
+    assert_eq!(before.len(), 1);
+
+    mkfile(&s.fs, ROOT_INO, "new.txt", b"n").await;
+    let after = on_fs(&s.fs, |fs| fs.readdir(ROOT_INO)).await.unwrap();
+    let names: Vec<&str> = after.iter().map(|(n, _, _)| n.as_str()).collect();
+    assert!(
+        names.contains(&"new.txt"),
+        "the listing must show our own create immediately, got {names:?}"
+    );
+}
+
+/// Another client's change arrives through the pump and busts the listing —
+/// within a deadline well under DIR_TTL, so a pass means the event did it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_remote_change_invalidates_the_listing() {
+    let agent = start_agent(AgentOpts {
+        watch: true,
+        ..AgentOpts::default()
+    });
+    std::fs::write(agent.dir.path().join("seed.txt"), b"s").unwrap();
+
+    let s = connect(&agent, ClientOptions::default()).await;
+    s.fs.start_event_pump(|_| {}).await.unwrap();
+    let before = on_fs(&s.fs, |fs| fs.readdir(ROOT_INO)).await.unwrap();
+    assert_eq!(before.len(), 1);
+
+    std::fs::write(agent.dir.path().join("from-elsewhere.txt"), b"x").unwrap();
+    let started = std::time::Instant::now();
+    loop {
+        let now = on_fs(&s.fs, |fs| fs.readdir(ROOT_INO)).await.unwrap();
+        if now.iter().any(|(n, _, _)| n == "from-elsewhere.txt") {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "still serving the stale listing; at DIR_TTL(5s) it would refresh anyway and prove nothing"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}

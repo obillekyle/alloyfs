@@ -23,6 +23,9 @@ struct Fixture {
     /// The export's backing directory: tests assert against it directly, and
     /// dropping it removes the tree.
     dir: tempfile::TempDir,
+    /// The engine under the server — `notify_batch` applies events to it the
+    /// way the real daemon's pump does, cache invalidation first.
+    fs: Arc<RemoteFs>,
     server: Arc<Server>,
 }
 
@@ -52,6 +55,7 @@ async fn fixture() -> Fixture {
         .expect("attach");
     Fixture {
         dir,
+        fs: fs.clone(),
         server: Arc::new(Server::new(fs)),
     }
 }
@@ -573,6 +577,12 @@ async fn notify_batch(fx: &Fixture, batch: Vec<FsEvent>) -> Vec<Note> {
     let (server, sink_frames, stop2) = (fx.server.clone(), frames.clone(), stop.clone());
     let thread =
         std::thread::spawn(move || alloyfs_mount_kernel::notify::run(rx, server, sink_frames, stop2));
+    // Mirror the daemon's pump, which applies events to the engine BEFORE the
+    // sink sees them (events.rs: apply_events, then on_batch). Skipping this
+    // let the batch race a directory-listing cache the pump would have busted:
+    // notification_for's lookup of a just-created name was answered NotFound
+    // from a complete cached listing that genuinely did not contain it yet.
+    fx.fs.apply_events(&batch);
     sink.push(&batch);
     drop(sink); // the thread ends once the queue is drained and closed
     thread.join().expect("notify thread");

@@ -35,6 +35,18 @@ macro_rules! expect_resp {
 /// staleness if the event stream hiccups.
 const ATTR_TTL: Duration = Duration::from_secs(5);
 
+/// How long a cached directory listing may answer without re-asking.
+///
+/// Same value as [`ATTR_TTL`] and the same freshness contract: events are the
+/// real invalidation, the TTL only bounds staleness if the stream hiccups.
+/// Kept as its own constant because the two are tunable independently — a
+/// listing going stale mis-sorts a directory, an attribute going stale
+/// mis-serves a file, and those are not the same severity.
+const DIR_TTL: Duration = Duration::from_secs(5);
+
+/// One directory's cached remote listing: (name, ino, attr) per entry.
+type DirListing = Vec<(String, u64, Attr)>;
+
 /// `OpenState::server_fh` while no server handle has been taken out yet.
 ///
 /// A read-only open of a file the auto-cache already holds at the right
@@ -92,6 +104,25 @@ pub struct RemoteFs {
     pub ino: crate::InodeTable,
     pub root_attr: Attr,
     attr_cache: DashMap<u64, (Attr, Instant)>,
+    /// Complete REMOTE listing per directory ino, good for [`DIR_TTL`] or
+    /// until an event touches a child. One structure, three answers:
+    ///
+    /// - a repeat readdir is local (Explorer re-enumerates on focus, F5 and
+    ///   every navigation — measured 62.9 ms per listing without this);
+    /// - a lookup of a name PRESENT in a live listing is local, which is what
+    ///   kills the FUSE/kernel per-entry LOOKUP storm after a readdir;
+    /// - a lookup of a name ABSENT from a live listing is a local `NotFound`,
+    ///   because the listing is complete. Windows probes missing names
+    ///   pathologically (resolver walks, `desktop.ini`, `AutoRun.inf`), and
+    ///   each one was a full round trip forever. The excludes accidentally
+    ///   proved the fix: `desktop.ini` is in `LOCAL_ARTIFACTS`, routes to the
+    ///   overlay, and answers in 0.6 ms while every other missing name paid
+    ///   62 ms.
+    ///
+    /// REMOTE entries only — overlay children are merged live on every serve,
+    /// so local overlay activity never needs to invalidate this, and lookups
+    /// for overlay-routed names branch away before ever consulting it.
+    dir_cache: DashMap<u64, (DirListing, Instant)>,
     pub(crate) overlay: Option<Overlay>,
     pub(crate) cache: Option<Arc<AutoCache>>,
     pub(crate) open_files: DashMap<u64, OpenState>,
@@ -148,6 +179,7 @@ impl RemoteFs {
             ino: crate::InodeTable::new(),
             root_attr,
             attr_cache: DashMap::new(),
+            dir_cache: DashMap::new(),
             overlay,
             cache,
             open_files: DashMap::new(),
@@ -237,6 +269,19 @@ impl RemoteFs {
 
     pub fn invalidate_all(&self) {
         self.attr_cache.clear();
+        self.dir_cache.clear();
+    }
+
+    /// Drop the cached listing of `path`'s PARENT. Every mutation that adds,
+    /// removes or reshapes an entry calls this with the child's path — the
+    /// server strips self-origin events, so our own changes will never arrive
+    /// through the pump and the busting has to be synchronous, right here.
+    pub(crate) fn invalidate_parent_dir(&self, path: &RelPath) {
+        if let Some((parent, _)) = path.split() {
+            if let Some(pino) = self.ino.ino_of(&parent) {
+                self.dir_cache.remove(&pino);
+            }
+        }
     }
 
     /// Throw away everything this handle has prefetched or retained, so the
@@ -363,6 +408,21 @@ impl RemoteFs {
                 return Ok(attr);
             }
         }
+        // The WinFsp backend resolves names through getattr rather than
+        // lookup, so the negative half of the listing cache has to be
+        // consulted here too — a missing name allocates a fresh ino, lands
+        // here with no attr cached, and used to pay a round trip to be told
+        // "no" every single time.
+        if let Some((parent, name)) = path.split() {
+            if let Some(pino) = self.ino.ino_of(&parent) {
+                if let Some(hit) = self.dir_cache.get(&pino) {
+                    let (entries, when) = &*hit;
+                    if when.elapsed() < DIR_TTL && !entries.iter().any(|(n, _, _)| n == name) {
+                        return Err(ErrorCode::NotFound.into());
+                    }
+                }
+            }
+        }
         let attr = expect_resp!(self.call(Request::Getattr { path })?, Response::Attr(attr) => attr);
         self.cache_attr(ino, attr);
         Ok(attr)
@@ -375,6 +435,22 @@ impl RemoteFs {
             let attr = self.overlay_ref().getattr(&path)?;
             let ino = self.ino.get_or_alloc(path);
             return Ok((ino, attr));
+        }
+        // A live listing of the parent answers this in BOTH directions. The
+        // positive case is what saves the FUSE/kernel backends from one round
+        // trip per entry after every readdir; the negative case is the bigger
+        // one — the listing is complete, so a name it lacks does not exist,
+        // and Windows and every resolver probe missing names relentlessly.
+        // Overlay names never reach here (routed above), so absence from the
+        // remote listing is the whole answer.
+        if let Some(hit) = self.dir_cache.get(&parent) {
+            let (entries, when) = &*hit;
+            if when.elapsed() < DIR_TTL {
+                return match entries.iter().find(|(n, _, _)| n == name) {
+                    Some((_, ino, attr)) => Ok((*ino, *attr)),
+                    None => Err(ErrorCode::NotFound.into()),
+                };
+            }
         }
         let attr =
             expect_resp!(self.call(Request::Getattr { path: path.clone() })?, Response::Attr(attr) => attr);
@@ -395,7 +471,19 @@ impl RemoteFs {
             }
             return Ok(out);
         }
-        let mut out = Vec::new();
+        // Serve the remote half from cache while it is live. The overlay half
+        // is merged fresh on every call — it is a local read, so caching it
+        // would save microseconds and buy an invalidation problem.
+        if let Some(hit) = self.dir_cache.get(&ino) {
+            let (entries, when) = &*hit;
+            if when.elapsed() < DIR_TTL {
+                let mut out = entries.clone();
+                drop(hit);
+                self.merge_overlay_children(&dir, &mut out);
+                return Ok(out);
+            }
+        }
+        let mut remote = Vec::new();
         let mut cursor = 0u64;
         loop {
             let (entries, next_cursor) = expect_resp!(
@@ -409,15 +497,24 @@ impl RemoteFs {
                 }
                 let child_ino = self.ino.get_or_alloc(child);
                 self.cache_attr(child_ino, e.attr);
-                out.push((e.name, child_ino, e.attr));
+                remote.push((e.name, child_ino, e.attr));
             }
             match next_cursor {
                 Some(c) => cursor = c,
                 None => break,
             }
         }
+        self.dir_cache.insert(ino, (remote.clone(), Instant::now()));
+        let mut out = remote;
+        self.merge_overlay_children(&dir, &mut out);
+        Ok(out)
+    }
+
+    /// Append this directory's overlay children — always read live, never
+    /// cached; see the field comment on `dir_cache`.
+    fn merge_overlay_children(&self, dir: &RelPath, out: &mut DirListing) {
         if let Some(ov) = &self.overlay {
-            for (name, attr) in ov.readdir_children(&dir) {
+            for (name, attr) in ov.readdir_children(dir) {
                 let child = dir.join(&name);
                 if self.lives_in_overlay(&child) {
                     let child_ino = self.ino.get_or_alloc(child);
@@ -425,7 +522,6 @@ impl RemoteFs {
                 }
             }
         }
-        Ok(out)
     }
 
     pub fn open(&self, ino: u64, flags: OpenFlags) -> Result<(u64, Attr), FsError> {
@@ -813,6 +909,9 @@ impl RemoteFs {
             self.call(Request::Create { path: path.clone(), flags, mode })?,
             Response::Opened { fh, attr } => (fh, attr)
         );
+        // Self-origin events are stripped server-side, so the pump will never
+        // tell us about our own create — the listing has to be busted here.
+        self.invalidate_parent_dir(&path);
         let ino = self.ino.get_or_alloc(path.clone());
         self.cache_attr(ino, attr);
         self.open_files.insert(
@@ -841,6 +940,7 @@ impl RemoteFs {
             return Ok((ino, attr));
         }
         let attr = expect_resp!(self.call(Request::Mkdir { path: path.clone(), mode })?, Response::Attr(attr) => attr);
+        self.invalidate_parent_dir(&path);
         let ino = self.ino.get_or_alloc(path);
         self.cache_attr(ino, attr);
         Ok((ino, attr))
@@ -870,6 +970,7 @@ impl RemoteFs {
             Request::Unlink { path: path.clone() }
         };
         expect_resp!(self.call(req)?, Response::Ok => ());
+        self.invalidate_parent_dir(&path);
         if let Some(ino) = self.ino.ino_of(&path) {
             self.invalidate_attr(ino);
         }
@@ -900,6 +1001,11 @@ impl RemoteFs {
                     self.call(Request::Rename { from: from.clone(), to: to.clone(), replace })?,
                     Response::Ok => ()
                 );
+                // Both listings changed: one lost an entry, one gained it. The
+                // renamed directory's OWN cached listing survives — its ino is
+                // stable and the names inside it did not move.
+                self.invalidate_parent_dir(&from);
+                self.invalidate_parent_dir(&to);
                 self.ino.rename(&from, &to);
                 if let Some(cache) = &self.cache {
                     cache.rename(&from, &to);
@@ -927,6 +1033,9 @@ impl RemoteFs {
             self.call(Request::Setattr { path: path.clone(), size, mtime, mode })?,
             Response::Attr(attr) => attr
         );
+        // The parent's cached listing carries this entry's attributes; an
+        // explicit metadata change would otherwise show stale there for a TTL.
+        self.invalidate_parent_dir(&path);
         self.cache_attr(ino, attr);
         if size.is_some() {
             self.mark_path_written(&path);
@@ -946,6 +1055,7 @@ impl RemoteFs {
             }
             (false, false) => {
                 let attr = expect_resp!(self.call(Request::Link { target, link: link.clone() })?, Response::Attr(attr) => attr);
+                self.invalidate_parent_dir(&link);
                 let ino = self.ino.get_or_alloc(link);
                 self.cache_attr(ino, attr);
                 Ok((ino, attr))
@@ -1006,6 +1116,7 @@ impl RemoteFs {
             })?,
             Response::Attr(attr) => attr
         );
+        self.invalidate_parent_dir(&link);
         let ino = self.ino.get_or_alloc(link);
         self.cache_attr(ino, attr);
         Ok((ino, attr))

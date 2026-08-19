@@ -79,6 +79,8 @@ impl RemoteFs {
                     if let Some(ino) = self.ino.ino_of(&ev.path) {
                         self.invalidate_attr(ino);
                     }
+                    self.invalidate_parent_dir(&ev.path);
+                    self.invalidate_parent_dir(to);
                     self.ino.rename(&ev.path, to);
                     if let Some(ino) = self.ino.ino_of(to) {
                         self.invalidate_attr(ino);
@@ -88,6 +90,12 @@ impl RemoteFs {
                     if let Some(ino) = self.ino.ino_of(&ev.path) {
                         self.invalidate_attr(ino);
                     }
+                    // Created/Removed reshape the parent's listing; Modified
+                    // and AttrChanged stale the attrs a listing carries. All
+                    // of them bust it — a directory-cache hit that lies about
+                    // membership is the one failure mode this cache must not
+                    // have, and the busting is one map remove.
+                    self.invalidate_parent_dir(&ev.path);
                 }
             }
         }
