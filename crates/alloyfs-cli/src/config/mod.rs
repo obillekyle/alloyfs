@@ -160,14 +160,48 @@ pub(crate) fn home_dir() -> PathBuf {
 }
 
 /// `~/.alloyfs`, created on demand.
+///
+/// Owner-only on Unix: this directory holds the config, and the config holds
+/// `tcp_token`/`http_token` — the entire authentication boundary for a
+/// non-loopback export. Under a default umask it would be 0755 over a 0644
+/// file, which on a shared host hands every local account the token needed to
+/// mount every export this machine serves.
 pub fn app_dir() -> PathBuf {
     let dir = home_dir().join(".alloyfs");
     if !dir.exists() {
         if let Err(e) = std::fs::create_dir_all(&dir) {
             tracing::warn!(error = %e, path = %dir.display(), "could not create the AlloyFS directory");
         }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(e) = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)) {
+                tracing::warn!(error = %e, path = %dir.display(), "could not restrict the AlloyFS directory");
+            }
+        }
     }
     dir
+}
+
+/// Write a file only its owner can read. Windows inherits the user-profile
+/// ACL, which is already owner-only; Unix needs to be told.
+fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        f.write_all(contents.as_bytes())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, contents)
+    }
 }
 
 /// Where the old flat layout lived, for one-time migration.
@@ -392,7 +426,7 @@ pub fn default_config_path() -> Option<PathBuf> {
     }
 
     // Nothing anywhere: leave the user a file to edit.
-    match std::fs::write(&home_config, CONFIG_TEMPLATE) {
+    match write_private(&home_config, CONFIG_TEMPLATE) {
         Ok(()) => {
             tracing::info!(path = %home_config.display(), "created a starter config");
             Some(home_config)
