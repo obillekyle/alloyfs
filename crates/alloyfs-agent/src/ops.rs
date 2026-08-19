@@ -142,6 +142,25 @@ impl Export {
         v
     }
 
+    /// Advance the clock for a path that no longer exists, dropping whatever
+    /// version it had.
+    ///
+    /// `bump` only ever inserts, and unlink and rmdir called it on the path
+    /// they had just removed — so every delete left a tombstone that nothing
+    /// pruned. A create/unlink loop over unique names grew `versions` without
+    /// bound, and on a sub-gigabyte agent that ends as an OOM kill taking
+    /// every other mount with it. The tree index is bounded by live files
+    /// because it removes on delete; this map had no such path.
+    ///
+    /// The clock still advances, so a recreated path is handed a version
+    /// strictly greater than the one a client may have cached for the file
+    /// that used to be there.
+    pub fn forget_version(&self, path: &RelPath) -> u64 {
+        let v = self.vclock.fetch_add(1, Ordering::Relaxed) + 1;
+        self.versions.remove(path);
+        v
+    }
+
     /// Rename bookkeeping. Versions of children of a renamed directory keep
     /// their old keys — stale-but-harmless, since versions are freshness
     /// hints, not the source of truth.
@@ -827,7 +846,7 @@ impl SessionInner {
         let full = export.resolve(&path)?;
         std::fs::remove_file(&full).or_code()?;
         export.events.note_local_write(&path, self.id);
-        export.bump(&path);
+        export.forget_version(&path);
         Ok(Response::Ok)
     }
 
@@ -836,7 +855,7 @@ impl SessionInner {
         let full = export.resolve(&path)?;
         std::fs::remove_dir(&full).or_code()?;
         export.events.note_local_write(&path, self.id);
-        export.bump(&path);
+        export.forget_version(&path);
         Ok(Response::Ok)
     }
 
