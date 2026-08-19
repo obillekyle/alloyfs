@@ -695,8 +695,21 @@ impl FileSystemContext for WinFspFs {
 
         // 0 / INVALID_FILE_ATTRIBUTES mean "leave attributes alone"; the only
         // bit we can persist is READONLY, mapped onto the unix write bits.
+        //
+        // DIRECTORIES ARE EXEMPT. On Windows FILE_ATTRIBUTE_READONLY on a
+        // directory does not mean "cannot be written to" — it flags folder
+        // customization, and Explorer sets it routinely. Mapping it onto a
+        // unix mode chmods the directory to r-x, after which every create and
+        // delete INSIDE it fails with ACCESS_DENIED. `attributes()` also never
+        // reports the bit back for a directory, so the state was invisible:
+        // `attrib +R` appeared to succeed, read back as unset, and left the
+        // directory unwritable until someone cleared a box that already
+        // looked clear.
         let mut mode = None;
-        if file_attributes != 0 && file_attributes != INVALID_FILE_ATTRIBUTES {
+        if cur.kind != FileKind::Dir
+            && file_attributes != 0
+            && file_attributes != INVALID_FILE_ATTRIBUTES
+        {
             let readonly = file_attributes & FILE_ATTRIBUTE_READONLY != 0;
             let new_mode = if readonly {
                 cur.mode & !0o222
@@ -707,10 +720,20 @@ impl FileSystemContext for WinFspFs {
                 mode = Some(new_mode);
             }
         }
-        // 0 means "don't change" for times (and -1 means "disable implicit
-        // updates", which we also treat as no change).
-        let mtime =
-            (last_write_time != 0 && last_write_time != u64::MAX).then(|| from_filetime(last_write_time));
+        // Sentinels that all mean "do not set a time": 0 is "no change",
+        // -1 (u64::MAX) is "suspend implicit updates for this handle", and
+        // -2 is "resume them" (Windows 10 1607+). Only 0 and -1 were handled,
+        // so -2 was taken as a literal FILETIME and converted to an mtime
+        // around the year 2554 — visible in every sort order and picked up by
+        // any mtime-based sync that later read the file.
+        const FILETIME_NO_CHANGE: u64 = 0;
+        const FILETIME_SUSPEND_UPDATES: u64 = u64::MAX; // -1
+        const FILETIME_RESUME_UPDATES: u64 = u64::MAX - 1; // -2
+        let mtime = (!matches!(
+            last_write_time,
+            FILETIME_NO_CHANGE | FILETIME_SUSPEND_UPDATES | FILETIME_RESUME_UPDATES
+        ))
+        .then(|| from_filetime(last_write_time));
 
         let attr = if mode.is_some() || mtime.is_some() {
             self.fs.setattr(context.ino, None, mtime, mode).map_err(fsp_err)?
