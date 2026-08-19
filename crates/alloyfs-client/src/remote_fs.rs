@@ -123,6 +123,19 @@ pub struct RemoteFs {
     /// so local overlay activity never needs to invalidate this, and lookups
     /// for overlay-routed names branch away before ever consulting it.
     dir_cache: DashMap<u64, (DirListing, Instant)>,
+    /// Bumped by every listing invalidation, so a `readdir` that started
+    /// before a mutation cannot install its now-stale result after it.
+    ///
+    /// `readdir` fetches pages over several round trips and then inserts. The
+    /// invalidations are a bare `remove`, so the two interleave: mutate,
+    /// invalidate, then an in-flight fetch lands a pre-mutation listing and
+    /// stamps it fresh. That is worse than staleness — a listing is treated as
+    /// COMPLETE, so `lookup` answers a hard NotFound for a file that exists
+    /// (and keeps answering it for the rest of DIR_TTL). Comparing this before
+    /// and after the fetch closes it. Deliberately global rather than
+    /// per-directory: a mutation elsewhere only costs one skipped insert,
+    /// which is the safe direction to be wrong in.
+    dir_epoch: AtomicU64,
     pub(crate) overlay: Option<Overlay>,
     pub(crate) cache: Option<Arc<AutoCache>>,
     pub(crate) open_files: DashMap<u64, OpenState>,
@@ -180,6 +193,7 @@ impl RemoteFs {
             root_attr,
             attr_cache: DashMap::new(),
             dir_cache: DashMap::new(),
+            dir_epoch: AtomicU64::new(0),
             overlay,
             cache,
             open_files: DashMap::new(),
@@ -270,6 +284,7 @@ impl RemoteFs {
     pub fn invalidate_all(&self) {
         self.attr_cache.clear();
         self.dir_cache.clear();
+        self.dir_epoch.fetch_add(1, Ordering::Release);
     }
 
     /// Drop the cached listing of `path`'s PARENT. Every mutation that adds,
@@ -280,6 +295,7 @@ impl RemoteFs {
         if let Some((parent, _)) = path.split() {
             if let Some(pino) = self.ino.ino_of(&parent) {
                 self.dir_cache.remove(&pino);
+                self.dir_epoch.fetch_add(1, Ordering::Release);
             }
         }
     }
@@ -483,6 +499,10 @@ impl RemoteFs {
                 return Ok(out);
             }
         }
+        // Captured BEFORE the first page goes out. Paging is several round
+        // trips, and anything that invalidates a listing in that window makes
+        // what comes back a description of the past.
+        let epoch_at_start = self.dir_epoch.load(Ordering::Acquire);
         let mut remote = Vec::new();
         let mut cursor = 0u64;
         loop {
@@ -504,7 +524,13 @@ impl RemoteFs {
                 None => break,
             }
         }
-        self.dir_cache.insert(ino, (remote.clone(), Instant::now()));
+        // Only cache a listing that still describes the present. A mutation
+        // during the fetch means this result may already be wrong, and a wrong
+        // COMPLETE listing does not merely go stale — it answers NotFound for
+        // a file that exists. Skipping the insert costs one uncached readdir.
+        if self.dir_epoch.load(Ordering::Acquire) == epoch_at_start {
+            self.dir_cache.insert(ino, (remote.clone(), Instant::now()));
+        }
         let mut out = remote;
         self.merge_overlay_children(&dir, &mut out);
         Ok(out)
