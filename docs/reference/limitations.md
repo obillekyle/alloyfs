@@ -5,15 +5,26 @@ a bug report.
 
 ## Locking
 
-**Whole-file advisory locks only.** Byte ranges are coarsened to the whole file
-— safe (over-locking) rather than unsafe.
+**Whole-file advisory locks only, and the coarsening is NOT safe.** Byte ranges
+are discarded, which over-locks on the way in — but the same coarsening applies
+to unlocking, and there it *under*-locks: a partial `F_UNLCK` releases
+everything the handle held on that file. An application that locks two disjoint
+ranges and releases one believes it still holds the other, while the agent
+holds nothing and another machine is free to take the file.
 
-**`fcntl(F_GETLK)` returns `ENOLCK` on `--backend kernel`.** The protocol cannot
-ask who holds a lock, and answering from the local list would report "free"
-while another machine held it. Taking locks works normally on every backend.
+**`fcntl(F_GETLK)` returns `ENOLCK` on `--backend kernel`, and `ENOSYS` on
+`--backend fuse`.** The protocol cannot ask who holds a lock, and answering from
+the local list would report "free" while another machine held it.
+
+**Locks are not forwarded at all on Windows.** WinFsp services lock requests
+entirely inside its own kernel driver — its filesystem interface has no lock
+callback to implement — so byte-range locks are fully correct between processes
+on ONE Windows machine and provide no mutual exclusion whatsoever between
+machines sharing an export.
 
 **Do not host live database files** (SQLite, Postgres) on a shared mount. They
-want byte ranges and `F_GETLK`.
+want byte ranges and `F_GETLK`, and the partial-unlock behaviour above means
+SQLite loses its read lock during its own normal lock sequence.
 
 ## Change notification
 
