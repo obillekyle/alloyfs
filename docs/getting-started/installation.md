@@ -8,7 +8,8 @@
 irm alloy.okyle.dev/install.ps1 | iex
 ```
 
-From `cmd.exe`, which cannot pipe a download into a shell:
+**Windows, interactively** -- asks for administrator rights once, then installs
+the WinFsp driver too:
 
 ```bat
 curl -fsSL https://alloy.okyle.dev/install.cmd -o install.cmd && install.cmd
@@ -25,20 +26,28 @@ really is an executable rather than an error page, put it somewhere sensible,
 and add it to your `PATH`. **AlloyFS itself installs per-user and needs no
 administrator rights.**
 
-On Windows there is one exception, and it is the only prompt you should see.
+On Windows there is one thing that does, and it is the driver rather than
+AlloyFS.
 
 ### WinFsp
 
 A mount on Windows goes through [WinFsp](https://winfsp.dev), which is a kernel
-driver. Without it `alloyfs` runs perfectly well and every mount fails, so the
-installer offers to fetch and install it when it is missing. That step needs
-administrator rights and raises a UAC prompt; nothing else in the install does.
+driver. Without it `alloyfs` runs perfectly well and every mount fails.
 
-The elevation is scoped to that one step on purpose. Running the whole
-installer as an administrator is **not** the way to grant it: if you
-authenticate as a different account, `%LOCALAPPDATA%` and the user `PATH`
-become *that* account's, and AlloyFS installs into a profile nobody is logged
-into.
+The two Windows installers divide the work:
+
+- **`install.ps1` is silent.** It prompts for nothing and elevates nothing, so
+  it is safe to run unattended. It installs WinFsp only if it is already
+  running with administrator rights, and otherwise says that mounting will not
+  work yet and how to fix it.
+- **`install.cmd` is interactive.** It asks for administrator rights once, up
+  front, and then runs the silent installer with them. Consent comes before the
+  work rather than halfway through a download.
+
+AlloyFS itself installs into your own profile and needs no rights either way.
+The cmd installer resolves that location BEFORE elevating and carries it
+across, so that a UAC prompt answered with a different administrator account
+still installs AlloyFS for you rather than for them.
 
 Before running it, the installer checks the MSI's Authenticode signature and
 refuses anything that is not validly signed. It installs the driver and
@@ -87,9 +96,12 @@ doing the **mounting** needs a filesystem driver.
 
 ### Windows
 
-Install [WinFsp](https://winfsp.dev). The standard installer is enough — the
-Developer/SDK feature is only needed to build AlloyFS from source. The installer
-warns you if it is missing.
+[WinFsp](https://winfsp.dev). `install.cmd` installs it for you; `install.ps1`
+does too when already elevated, and otherwise tells you it is missing rather
+than leaving it to the first failed mount.
+
+Installing it by hand is fine as well. The standard installer is enough — the
+Developer/SDK feature is only needed to build AlloyFS from source.
 
 ### Linux
 

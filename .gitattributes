@@ -13,3 +13,9 @@ packaging/** text eol=lf
 # Served as-is by GitHub Pages. CNAME in particular is parsed as a single
 # hostname and a trailing CR would make it a different (invalid) one.
 docs/** text eol=lf
+# ...except batch files, which cmd.exe parses rather than a browser. A .cmd
+# with LF endings makes `goto` fail to find its labels — "The system cannot
+# find the batch label specified", measured rather than theorised — and
+# install.cmd is downloaded verbatim by `curl -o install.cmd` and run. This
+# rule comes after the docs/** line deliberately: the last match wins.
+docs/*.cmd text eol=crlf
