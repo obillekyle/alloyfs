@@ -566,3 +566,50 @@ async fn one_shot_reconciles_and_stops() {
     tokio::time::sleep(Duration::from_millis(600)).await;
     assert!(!agent.dir.path().join("y.txt").exists());
 }
+
+/// A local push that fails must not lose the change.
+///
+/// `Op::Local` used to log a failed push and move on. Nothing revisited the
+/// path, so the local file stayed newer than the manifest for the life of the
+/// process and the edit was simply never synced — logged once at warn, then
+/// silent. It surfaced as a gate flake: a push racing a rename failed, and the
+/// test waited out its full 15 s because nothing was ever going to retry.
+///
+/// The proof here is indirect on purpose, because asserting "the failed file
+/// eventually pushed" would need the failure to clear, and clearing it fires
+/// another local event that would do the push regardless — proving nothing.
+/// Instead the agent runs with NO watcher, so nothing can trigger a reconcile
+/// by itself, and a file is placed directly on the remote where only a
+/// reconcile would find it. If it lands locally, a reconcile ran, and the only
+/// thing that could have scheduled one is the failed push.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_local_push_schedules_a_reconcile() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // No watcher: the agent emits no events, so nothing but our failed push
+    // can put a Reconcile on the queue.
+    let agent = start_agent(AgentOpts::default());
+    let s = start_sync(&agent, |_| {}).await;
+    wait_quiescent(&s).await;
+
+    // Only a reconcile will ever see this: it is created server-side with the
+    // watcher off, so no event announces it.
+    std::fs::write(agent.dir.path().join("remote-only.txt"), b"found-by-reconcile").unwrap();
+
+    // A local file the push cannot read. `upload` does `std::fs::read`, so
+    // mode 000 makes it fail exactly the way the flake did.
+    let doomed = s.local.path().join("unreadable.bin");
+    std::fs::write(&doomed, b"cannot be read").unwrap();
+    std::fs::set_permissions(&doomed, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    // The local watcher notices the write and pushes; the read fails.
+    let pulled = s.local.path().join("remote-only.txt");
+    wait_until("reconcile pulled the remote-only file", 20, move || {
+        (std::fs::read(&pulled).ok()? == b"found-by-reconcile").then_some(())
+    })
+    .await;
+
+    // Leave the tempdir removable.
+    let _ = std::fs::set_permissions(&doomed, std::fs::Permissions::from_mode(0o644));
+}

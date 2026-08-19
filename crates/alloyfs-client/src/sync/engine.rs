@@ -986,10 +986,32 @@ async fn executor(engine: Arc<SyncEngine>, mut rx: mpsc::UnboundedReceiver<Op>) 
                 }
             }
             Op::Local(batch) => {
+                let mut failed = 0usize;
                 for (path, kind) in &batch {
                     if let Err(e) = engine.push_local(&path.0, kind).await {
+                        failed += 1;
                         tracing::warn!(path = %path, error = %e, "local push failed");
                     }
+                }
+                // A dropped push is a LOST CHANGE. Nothing else revisits the
+                // path, so the local file stays newer than the manifest for as
+                // long as the process lives — the edit is simply never
+                // synced, silently, having been logged once at warn.
+                //
+                // Reconcile is the existing "work out what differs and fix
+                // it" pass and it is idempotent. It retries this specifically
+                // because a failed push never updated the manifest baseline,
+                // so the path still reads as locally-changed and gets planned
+                // as a PushLocal.
+                //
+                // Scheduled once per BATCH rather than per failure: a dropped
+                // connection fails every push in the batch, and one reconcile
+                // settles all of them. That also keeps a permanently
+                // unpushable file from spinning — reconcile failing logs and
+                // stops rather than re-arming itself.
+                if failed > 0 {
+                    tracing::debug!(failed, "push failures; scheduling a reconcile to retry them");
+                    engine.enqueue(Op::Reconcile);
                 }
             }
             Op::Reconcile => {
