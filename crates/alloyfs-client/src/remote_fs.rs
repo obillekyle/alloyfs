@@ -664,13 +664,33 @@ impl RemoteFs {
         // then concurrent fetches for whatever is left.
         let chunk = DATA_CHUNK as u64;
         let first_block = ReadAhead::block_of(offset);
-        let last_block = ReadAhead::block_of(offset + size.max(1) as u64 - 1);
+        // saturating: an absurd offset from a direct-IO caller would otherwise
+        // wrap, leaving last_block < first_block and an empty block range that
+        // reads as a successful empty result rather than a refusal.
+        let last_block = ReadAhead::block_of(offset.saturating_add(size.max(1) as u64 - 1));
 
         // Top up the window BEFORE waiting on this read's own blocks: the
         // prefetches ride the same connection while we block, so the pipe
         // stays full instead of draining once per kernel read.
+        //
+        // Bounded at EOF. `missing`'s second argument exists for exactly this
+        // and was being handed u64::MAX, which makes its `.min()` a no-op — so
+        // a sequential read near the tail of a file fired a full window of
+        // requests PAST the end. They cost round trips, and their empty
+        // results were then retained, seeding precisely the short blocks that
+        // go on to answer a later read as a false EOF.
+        //
+        // A cold attr cache falls back to unbounded rather than guessing. This
+        // bound is a prefetch hint: too low only forgoes readahead, and too
+        // high is what the code did before.
+        let eof_block_exclusive = self
+            .ino
+            .ino_of(&state.path)
+            .and_then(|ino| self.attr_cache.get(&ino).map(|hit| hit.0.size))
+            .map(|size| ReadAhead::block_of(size.saturating_sub(1)) + 1)
+            .unwrap_or(u64::MAX);
         if prefetch {
-            for b in state.ra.missing(last_block + 1, u64::MAX) {
+            for b in state.ra.missing(last_block + 1, eof_block_exclusive) {
                 let conn = self.conn();
                 state
                     .ra
@@ -905,13 +925,41 @@ impl RemoteFs {
 
     /// Invalidate the cache entry, readahead windows, and every open fh's
     /// fast path for `path`.
-    fn mark_path_written(&self, path: &RelPath) {
+    /// Drop whatever open handles on `path` have prefetched or retained,
+    /// after a change that did not come from this client.
+    ///
+    /// `mark_path_written` does this for our own writes. Remote changes arrive
+    /// through the event pump instead, and nothing did it there: the attr
+    /// cache and the listing were busted — so `stat` told the truth — while
+    /// the bytes an open handle would serve still came from blocks fetched
+    /// before the change.
+    ///
+    /// The retained blocks are the sharp part. A block retained SHORT because
+    /// it was the tail of the file goes on answering after the file grows, and
+    /// the read returns zero bytes. The FUSE kernel, seeing an offset inside
+    /// i_size, reads that short reply as a hole and ZERO-FILLS the page, so
+    /// the application gets NULs rather than an error or the appended data,
+    /// for the life of the descriptor. `tail -f` across two machines is the
+    /// ordinary way to meet it.
+    pub(crate) fn invalidate_open_reads(&self, path: &RelPath) {
         for entry in self.open_files.iter() {
             if entry.value().path == *path {
                 entry.value().cache_ok.store(false, Ordering::Relaxed);
-                entry.value().ra.clear(); // prefetched blocks predate the write
+                entry.value().ra.clear();
             }
         }
+    }
+
+    /// The same, for every open handle: a resync means nothing is trusted.
+    pub(crate) fn invalidate_all_open_reads(&self) {
+        for entry in self.open_files.iter() {
+            entry.value().cache_ok.store(false, Ordering::Relaxed);
+            entry.value().ra.clear();
+        }
+    }
+
+    fn mark_path_written(&self, path: &RelPath) {
+        self.invalidate_open_reads(path);
         if let Some(cache) = &self.cache {
             cache.invalidate(path);
         }

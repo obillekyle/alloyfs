@@ -74,6 +74,7 @@ impl RemoteFs {
                 EventKind::ResyncRequired => {
                     tracing::warn!("server requested resync: flushing caches");
                     self.invalidate_all();
+                    self.invalidate_all_open_reads();
                 }
                 EventKind::RenamedFrom { to } => {
                     if let Some(ino) = self.ino.ino_of(&ev.path) {
@@ -85,6 +86,8 @@ impl RemoteFs {
                     if let Some(ino) = self.ino.ino_of(to) {
                         self.invalidate_attr(ino);
                     }
+                    self.invalidate_open_reads(&ev.path);
+                    self.invalidate_open_reads(to);
                 }
                 _ => {
                     if let Some(ino) = self.ino.ino_of(&ev.path) {
@@ -96,6 +99,15 @@ impl RemoteFs {
                     // membership is the one failure mode this cache must not
                     // have, and the busting is one map remove.
                     self.invalidate_parent_dir(&ev.path);
+                    // ...and an OPEN handle's prefetched bytes are just as
+                    // stale as the attrs, which is what this module's header
+                    // promises and what was missing: busting the attr cache
+                    // alone makes `stat` tell the truth while `read` goes on
+                    // serving blocks fetched before the change. Doing it here
+                    // covers all three backends at once; the kernel daemon's
+                    // own per-event hook becomes redundant rather than the
+                    // only thing keeping this honest.
+                    self.invalidate_open_reads(&ev.path);
                 }
             }
         }

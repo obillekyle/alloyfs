@@ -2015,3 +2015,78 @@ async fn writing_an_os_artifact_lands_in_the_overlay() {
         "it lives in the overlay"
     );
 }
+
+/// A handle held open across a REMOTE append must not go on answering from
+/// the blocks it retained before it.
+///
+/// The failure this guards is silent and worse than staleness. B reads to EOF,
+/// which retains a SHORT tail block. A appends. B's attr cache is invalidated
+/// by the event, so `stat` correctly reports the new size — but the read at
+/// the old EOF was served from that retained short block and came back EMPTY.
+/// Through a real FUSE mount the kernel sees an offset inside `i_size`, reads
+/// the short reply as a hole and ZERO-FILLS the page, so the application gets
+/// NULs rather than the appended bytes, for the life of the descriptor.
+/// `tail -f` across two machines is the ordinary way to meet it.
+///
+/// The kernel daemon compensated for this itself; FUSE and WinFsp had nothing,
+/// which is why the fix belongs to `apply_events` rather than to a backend.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_remote_append_is_visible_through_an_open_handle() {
+    let agent = start_agent(AgentOpts {
+        watch: true,
+        ..AgentOpts::default()
+    });
+    std::fs::write(agent.dir.path().join("log.txt"), b"first").unwrap();
+
+    let a = connect(&agent, ClientOptions::default()).await;
+    let b = connect(&agent, ClientOptions::default()).await;
+
+    let (b_tx, mut b_events) = tokio::sync::mpsc::unbounded_channel::<Vec<FsEvent>>();
+    b.fs
+        .start_event_pump(move |batch| {
+            let _ = b_tx.send(batch.to_vec());
+        })
+        .await
+        .unwrap();
+
+    // B opens and reads to EOF. That retains block 0 as a SHORT block, which
+    // is the state the bug needs — a full block would be replaced on its own.
+    let (b_ino, _) = lookup_path(&b.fs, "log.txt").await.unwrap();
+    let b_fh = on_fs(&b.fs, move |fs| fs.open(b_ino, ro()).unwrap().0).await;
+    let head = on_fs(&b.fs, move |fs| fs.read(b_fh, 0, 4096).unwrap()).await;
+    assert_eq!(head, b"first", "B did not read the original content");
+
+    // A appends through its own mount, with B's handle still open.
+    let (a_ino, _) = lookup_path(&a.fs, "log.txt").await.unwrap();
+    let a_fh = on_fs(&a.fs, move |fs| fs.open(a_ino, rw()).unwrap().0).await;
+    on_fs(&a.fs, move |fs| fs.write(a_fh, 5, b"-appended").unwrap()).await;
+    on_fs(&a.fs, move |fs| fs.release(a_fh)).await;
+
+    let mut captured: Vec<FsEvent> = Vec::new();
+    assert!(
+        recv_until(&mut b_events, &mut captured, 10, |evs| evs
+            .iter()
+            .any(|e| e.path.0 == "log.txt"))
+        .await,
+        "B never received an event for A's append; saw {captured:?}"
+    );
+
+    // The read the retained short block used to answer with nothing at all.
+    // Polled, because the invalidation travels through the watcher and the
+    // coalescer's debounce — but on a deadline well under ATTR_TTL, so a pass
+    // cannot come from a cache entry quietly expiring instead.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        let tail = on_fs(&b.fs, move |fs| fs.read(b_fh, 5, 4096).unwrap()).await;
+        if tail == b"-appended" {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "B cannot see the append through its open handle: read {tail:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    on_fs(&b.fs, move |fs| fs.release(b_fh)).await;
+}
