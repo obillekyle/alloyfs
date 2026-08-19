@@ -21,6 +21,7 @@ pub struct Holder {
 
 struct Waiter {
     session: u64,
+    fh: u64,
     kind: LockKind,
     wake: oneshot::Sender<()>,
 }
@@ -32,10 +33,25 @@ struct Entry {
 }
 
 impl Entry {
-    fn compatible(&self, kind: LockKind) -> bool {
+    /// Can `(session, fh)` hold `kind`, given who holds this path now?
+    ///
+    /// A handle NEVER conflicts with itself. Re-locking a handle is an upgrade
+    /// or a downgrade, so its own existing hold has to be excluded from the
+    /// test — and excluded by ignoring it, not by removing it first. Removing
+    /// first is what the old code did, and it lost the caller's lock outright
+    /// whenever the new one could not be granted: a handle that asked for more
+    /// and was refused ended up holding LESS than before the call, while its
+    /// client still believed it held the original. Restoring it around a
+    /// failed attempt is not enough either, because a caller parked waiting to
+    /// upgrade would then be blocked by its own retained hold, forever.
+    fn compatible_for(&self, kind: LockKind, session: u64, fh: u64) -> bool {
+        let mine = |h: &Holder| h.session == session && h.fh == fh;
         match kind {
-            LockKind::Shared => self.holders.iter().all(|h| h.kind == LockKind::Shared),
-            LockKind::Exclusive => self.holders.is_empty(),
+            LockKind::Shared => self
+                .holders
+                .iter()
+                .all(|h| h.kind == LockKind::Shared || mine(h)),
+            LockKind::Exclusive => self.holders.iter().all(mine),
         }
     }
 }
@@ -60,10 +76,13 @@ impl LockManager {
             let rx = {
                 let mut entries = self.entries.lock().unwrap();
                 let entry = entries.entry(path.clone()).or_default();
-                // Re-locking the same handle: treat as upgrade/downgrade by
-                // releasing our previous hold first (POSIX re-lock behavior).
-                entry.holders.retain(|h| !(h.session == session && h.fh == fh));
-                if entry.compatible(kind) {
+                // Tested BEFORE anything is removed: a handle does not
+                // conflict with itself, and its own hold must survive an
+                // attempt that fails. Only once the new lock is actually
+                // granted does the previous one go, which is the
+                // upgrade/downgrade replacing it.
+                if entry.compatible_for(kind, session, fh) {
+                    entry.holders.retain(|h| !(h.session == session && h.fh == fh));
                     entry.holders.push(Holder { session, fh, kind });
                     return Ok(());
                 }
@@ -73,6 +92,7 @@ impl LockManager {
                 let (tx, rx) = oneshot::channel();
                 entry.waiters.push_back(Waiter {
                     session,
+                    fh,
                     kind,
                     wake: tx,
                 });
@@ -116,7 +136,7 @@ impl LockManager {
     /// waiters wake in a batch; an exclusive waiter wakes alone.
     fn wake_waiters(entry: &mut Entry) {
         while let Some(front) = entry.waiters.front() {
-            if entry.compatible(front.kind) {
+            if entry.compatible_for(front.kind, front.session, front.fh) {
                 let w = entry.waiters.pop_front().unwrap();
                 // Waking is advisory — the waiter re-checks under the mutex.
                 let _ = w.wake.send(());
@@ -179,5 +199,70 @@ mod tests {
         lm.lock(&RelPath("x".into()), 8, 1, LockKind::Exclusive, false)
             .await
             .unwrap();
+    }
+
+    /// A refused upgrade leaves the caller holding exactly what it held.
+    ///
+    /// The previous code released the caller's hold BEFORE testing whether
+    /// the new one could be granted, and never put it back on the refusal
+    /// path. So a handle that asked for more and was told no came away
+    /// holding LESS than before the call, while its client went on believing
+    /// it held the original — a silent loss of mutual exclusion rather than a
+    /// failed operation.
+    #[tokio::test]
+    async fn a_refused_upgrade_keeps_the_existing_lock() {
+        let lm = LockManager::default();
+        lm.lock(&path(), 1, 10, LockKind::Shared, false).await.unwrap();
+        lm.lock(&path(), 2, 20, LockKind::Shared, false).await.unwrap();
+
+        // Session 1 tries to upgrade and loses to session 2's reader.
+        assert_eq!(
+            lm.lock(&path(), 1, 10, LockKind::Exclusive, false).await,
+            Err(ErrorCode::WouldBlock)
+        );
+
+        // Session 1's shared lock must have survived: with session 2 gone, a
+        // third party still cannot take the file exclusively.
+        lm.unlock(&path(), 2, 20);
+        assert_eq!(
+            lm.lock(&path(), 3, 30, LockKind::Exclusive, false).await,
+            Err(ErrorCode::WouldBlock)
+        );
+    }
+
+    /// ...and a handle is never blocked by its own hold, so an uncontended
+    /// upgrade still succeeds. Testing compatibility while ignoring the
+    /// caller is what makes both of these true at once; restoring the hold
+    /// around a failed attempt would fix the case above and deadlock this one
+    /// as soon as the caller parked to wait.
+    #[tokio::test]
+    async fn a_handle_can_upgrade_and_downgrade_its_own_lock() {
+        let lm = LockManager::default();
+        lm.lock(&path(), 1, 10, LockKind::Shared, false).await.unwrap();
+        lm.lock(&path(), 1, 10, LockKind::Exclusive, false).await.unwrap();
+        // Exclusive really took: nobody else can share it now.
+        assert_eq!(
+            lm.lock(&path(), 2, 20, LockKind::Shared, false).await,
+            Err(ErrorCode::WouldBlock)
+        );
+        // And back down again, after which a reader can join.
+        lm.lock(&path(), 1, 10, LockKind::Shared, false).await.unwrap();
+        lm.lock(&path(), 2, 20, LockKind::Shared, false).await.unwrap();
+    }
+
+    /// A blocked upgrade is woken by the conflicting reader leaving, rather
+    /// than waiting on itself forever.
+    #[tokio::test]
+    async fn a_blocked_upgrade_wakes_when_the_other_reader_leaves() {
+        let lm = std::sync::Arc::new(LockManager::default());
+        lm.lock(&path(), 1, 10, LockKind::Shared, false).await.unwrap();
+        lm.lock(&path(), 2, 20, LockKind::Shared, false).await.unwrap();
+        let lm2 = lm.clone();
+        let upgrade =
+            tokio::spawn(async move { lm2.lock(&path(), 1, 10, LockKind::Exclusive, true).await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!upgrade.is_finished(), "upgrade should be parked");
+        lm.unlock(&path(), 2, 20);
+        assert_eq!(upgrade.await.unwrap(), Ok(()));
     }
 }
