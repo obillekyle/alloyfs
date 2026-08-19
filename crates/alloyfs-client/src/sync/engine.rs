@@ -1021,9 +1021,34 @@ async fn executor(engine: Arc<SyncEngine>, mut rx: mpsc::UnboundedReceiver<Op>) 
                         tracing::warn!(path = %path, error = %e, "local push failed");
                     }
                 }
-                // A dropped push is a lost change; retrying it comes in the
-                // next commit, once the reason it was unsafe is gone.
-                let _ = failed;
+                // A dropped push is a LOST CHANGE: nothing else revisits the
+                // path, so the local file stays newer than the manifest for
+                // the life of the process and the edit is simply never synced.
+                // Reconcile is the existing "work out what differs and fix it"
+                // pass, it is idempotent, and it finds this case for free —
+                // a failed push never updated the baseline, so the path still
+                // reads as locally changed and gets planned as a PushLocal.
+                //
+                // Scheduled once per BATCH, so a dropped connection that fails
+                // every push schedules one pass rather than N, and a
+                // permanently unpushable file cannot spin: a failing reconcile
+                // logs and stops rather than re-arming itself.
+                //
+                // This was reverted once. Reconciling here happens while a
+                // rename is half-applied, and that used to resurrect the
+                // renamed-away file — `actions=[Pull("proj/code.rs"),
+                // Push("proj/renamed.rs")]`, every action succeeding. The
+                // cause was not here: `push` recorded its baseline from a stat
+                // taken AFTER the upload, so a file that vanished in that
+                // window left the baseline a generation behind, and every
+                // later delete compared stale-baseline against newer-remote
+                // and read it as delete-vs-edit. With that fixed the retry is
+                // safe, and the suite runs clean under load where it used to
+                // fail about one run in six.
+                if failed > 0 {
+                    tracing::debug!(failed, "push failures; scheduling a reconcile to retry them");
+                    engine.enqueue(Op::Reconcile);
+                }
             }
             Op::Reconcile => {
                 if let Err(e) = engine.reconcile().await {

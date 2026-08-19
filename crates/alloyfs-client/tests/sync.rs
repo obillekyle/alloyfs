@@ -612,8 +612,14 @@ async fn one_shot_reconciles_and_stops() {
 /// by itself, and a file is placed directly on the remote where only a
 /// reconcile would find it. If it lands locally, a reconcile ran, and the only
 /// thing that could have scheduled one is the failed push.
+///
+/// This was #[ignore]d for a while: scheduling the reconcile exposed a
+/// resurrection bug, where a renamed-away file was pulled back. The cause was
+/// upstream — `push` recorded its baseline from a stat taken AFTER the upload,
+/// so a file that vanished in that window left the baseline a generation
+/// behind and every later delete read as delete-vs-edit. With that fixed the
+/// retry is safe and this runs again.
 #[cfg(unix)]
-#[ignore = "documents the intended retry; the reconcile it asks for currently resurrects a renamed-away file — see the comment in engine.rs Op::Local"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failed_local_push_schedules_a_reconcile() {
     use std::os::unix::fs::PermissionsExt;
