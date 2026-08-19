@@ -104,7 +104,20 @@ impl RemoteFs {
         self: &Arc<Self>,
         on_batch: impl Fn(&[FsEvent]) + Send + 'static,
     ) -> Result<u64, FsError> {
-        self.start_event_pump_since(None, on_batch).await
+        // Resume from where the cache left off, not from nothing. The manifest
+        // records the sequence its blobs were current at, so a mount that finds
+        // one asks the server to replay only what happened since — one request
+        // to establish that the whole tree is still good, instead of proving it
+        // a file at a time. 0 means no manifest (or a pre-seq one), which
+        // subscribes live exactly as before.
+        //
+        // Correctness rests on the `TooOld` branch below: if the server cannot
+        // replay from this point, the cache is dropped rather than trusted.
+        let since = match self.cache.as_ref().map(|c| c.saved_seq()) {
+            Some(0) | None => None,
+            Some(seq) => Some(seq),
+        };
+        self.start_event_pump_since(since, on_batch).await
     }
 
     /// `start_event_pump` with an initial catch-up point: the first Subscribe
@@ -123,7 +136,17 @@ impl RemoteFs {
         let first = conn.request(Request::Subscribe { since_seq: since }).await?;
         let resp = match first {
             Err(alloyfs_proto::ErrorCode::TooOld) if since.is_some() => {
-                tracing::warn!(?since, "requested seq fell off the ring log; subscribing live");
+                // The cache cannot be trusted past a gap it never saw. Whatever
+                // changed while this client was away is unknown by definition,
+                // so every entry goes back to unverified and re-proves itself
+                // on next use. This is the resync half of the cursor: the seq
+                // is only worth persisting if failing to replay from it forces
+                // the tree to be re-established rather than quietly assumed.
+                tracing::warn!(?since, "requested seq fell off the ring log; resyncing");
+                self.invalidate_all();
+                if let Some(cache) = &self.cache {
+                    cache.mark_all_unverified();
+                }
                 conn.request(Request::Subscribe { since_seq: None }).await??
             }
             other => other?,
@@ -149,17 +172,32 @@ impl RemoteFs {
                 loop {
                     match rx.recv().await {
                         Ok(batch) => {
-                            if let Some(max) = batch.iter().map(|e| e.seq).max() {
+                            let high = batch.iter().map(|e| e.seq).max();
+                            if let Some(max) = high {
                                 fs.last_event_seq
                                     .fetch_max(max, std::sync::atomic::Ordering::AcqRel);
                             }
                             let batch = fs.filter_for_overlay(batch);
-                            if batch.is_empty() {
-                                continue;
+                            if !batch.is_empty() {
+                                fs.apply_events(&batch);
+                                fs.apply_events_to_cache(&batch);
+                                on_batch(&batch);
                             }
-                            fs.apply_events(&batch);
-                            fs.apply_events_to_cache(&batch);
-                            on_batch(&batch);
+                            // Persist the cursor only AFTER the batch has been
+                            // applied. The other order looks equivalent and is
+                            // not: a crash in between would leave a manifest
+                            // claiming to cover an event whose invalidation
+                            // never happened, and the next mount would trust a
+                            // stale blob because the seq said it was current.
+                            //
+                            // An empty batch still advances it. Empty here means
+                            // every event named an overlay path, which by
+                            // definition the server does not own and the cache
+                            // does not hold — nothing to apply, but the events
+                            // are genuinely accounted for.
+                            if let (Some(max), Some(cache)) = (high, &fs.cache) {
+                                cache.record_seq(max);
+                            }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                             // We fell behind the connection reader: safest reset.

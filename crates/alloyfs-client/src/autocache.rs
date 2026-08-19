@@ -47,6 +47,19 @@ fn default_true() -> bool {
 struct Manifest {
     format: u32,
     entries: BTreeMap<String, CacheEntry>,
+    /// The event sequence this cache was last known to be current at.
+    ///
+    /// This is what lets a cache survive a restart instead of merely a
+    /// reconnect. The blobs record WHAT was cached; without a cursor there is
+    /// no way to say WHEN, so every entry had to be re-proved one file at a
+    /// time. With it, the next mount resubscribes from here and the server
+    /// either replays what changed — leaving everything unmentioned provably
+    /// current — or answers `TooOld`, which forces a full resync.
+    ///
+    /// `default` so a format-1 manifest still loads: seq 0 means "no idea",
+    /// which subscribes live and re-verifies, exactly as before.
+    #[serde(default)]
+    seq: u64,
 }
 
 pub(crate) struct CacheState {
@@ -61,6 +74,9 @@ pub(crate) struct AutoCache {
     pins: ExcludeSet, // reused matcher type: "pin globs" share exclude semantics
     state: Mutex<CacheState>,
     fetch_tx: mpsc::UnboundedSender<RelPath>,
+    /// Event sequence the cache is current at. Loaded from the manifest and
+    /// written back on every flush, so the cursor outlives the process.
+    seq: std::sync::atomic::AtomicU64,
 }
 
 pub(crate) fn mtime_ns(t: SystemTime) -> u128 {
@@ -77,8 +93,10 @@ impl AutoCache {
         let pins = ExcludeSet::compile(&cfg.pins, cfg!(windows))?;
         let mut entries = BTreeMap::new();
         let mut total = 0u64;
+        let mut loaded_seq = 0u64;
         if let Ok(text) = std::fs::read_to_string(&cfg.manifest) {
             if let Ok(m) = serde_json::from_str::<Manifest>(&text) {
+                loaded_seq = m.seq;
                 for (path, entry) in m.entries {
                     let rel = RelPath(path);
                     // Crash tolerance: blob must exist with the recorded size.
@@ -130,7 +148,12 @@ impl AutoCache {
         let loaded = entries.len();
         let tick = entries.values().map(|e| e.last_used).max().unwrap_or(0) + 1;
         let (fetch_tx, fetch_rx) = mpsc::unbounded_channel();
-        tracing::info!(entries = loaded, bytes = total, "auto-cache manifest loaded");
+        tracing::info!(
+            entries = loaded,
+            bytes = total,
+            seq = loaded_seq,
+            "auto-cache manifest loaded"
+        );
         Ok((
             Self {
                 cfg,
@@ -142,9 +165,25 @@ impl AutoCache {
                     dirty: false,
                 }),
                 fetch_tx,
+                seq: std::sync::atomic::AtomicU64::new(loaded_seq),
             },
             fetch_rx,
         ))
+    }
+
+    /// The event sequence this cache was last current at, 0 when unknown.
+    pub fn saved_seq(&self) -> u64 {
+        self.seq.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Advance the recorded cursor. Monotonic — a late writer must never move
+    /// it backwards, or the next mount would ask to replay from a point it has
+    /// already passed and re-verify work it did not need to.
+    pub fn record_seq(&self, seq: u64) {
+        let prev = self.seq.fetch_max(seq, std::sync::atomic::Ordering::AcqRel);
+        if seq > prev {
+            self.st().dirty = true;
+        }
     }
 
     /// The state lock, one honest panic point instead of eighteen.
@@ -331,7 +370,11 @@ impl AutoCache {
             }
             st.dirty = false;
             Manifest {
-                format: 1,
+                // 2 adds `seq`. Not a breaking bump: `seq` defaults to 0 on
+                // read, and a format-1 file loads as a cache of unknown age,
+                // which is what it is.
+                format: 2,
+                seq: self.seq.load(std::sync::atomic::Ordering::Acquire),
                 entries: st.entries.iter().map(|(p, e)| (p.0.clone(), e.clone())).collect(),
             }
         };
