@@ -579,10 +579,7 @@ mod tests {
     /// the header said 3. Bind the two so the next bump cannot be half-made.
     #[test]
     fn abi_version_matches_the_header() {
-        let header = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../kernel/alloyfs/uapi/alloyfs.h"
-        );
+        let header = concat!(env!("CARGO_MANIFEST_DIR"), "/../../kernel/alloyfs/uapi/alloyfs.h");
         let src = std::fs::read_to_string(header).expect("uapi header is in the tree");
         let declared = src
             .lines()

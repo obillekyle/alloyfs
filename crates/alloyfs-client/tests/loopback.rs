@@ -2042,12 +2042,11 @@ async fn a_remote_append_is_visible_through_an_open_handle() {
     let b = connect(&agent, ClientOptions::default()).await;
 
     let (b_tx, mut b_events) = tokio::sync::mpsc::unbounded_channel::<Vec<FsEvent>>();
-    b.fs
-        .start_event_pump(move |batch| {
-            let _ = b_tx.send(batch.to_vec());
-        })
-        .await
-        .unwrap();
+    b.fs.start_event_pump(move |batch| {
+        let _ = b_tx.send(batch.to_vec());
+    })
+    .await
+    .unwrap();
 
     // B opens and reads to EOF. That retains block 0 as a SHORT block, which
     // is the state the bug needs — a full block would be replaced on its own.
@@ -2130,11 +2129,9 @@ async fn sqlite_locking_protocol_over_the_wire() {
     })
     .await
     .unwrap();
-    on_fs(&a.fs, move |fs| {
-        fs.unlock_range(fa, 1, PENDING_BYTE, 1)
-    })
-    .await
-    .unwrap();
+    on_fs(&a.fs, move |fs| fs.unlock_range(fa, 1, PENDING_BYTE, 1))
+        .await
+        .unwrap();
 
     // The shared range survived the PENDING unlock — the assertion the old
     // behaviour could not pass.
@@ -2188,11 +2185,9 @@ async fn sqlite_locking_protocol_over_the_wire() {
     assert_eq!(remote_code(err), ErrorCode::WouldBlock);
 
     // ...and can once B releases exactly its shared range.
-    on_fs(&b.fs, move |fs| {
-        fs.unlock_range(fb, 2, SHARED_FIRST, SHARED_SIZE)
-    })
-    .await
-    .unwrap();
+    on_fs(&b.fs, move |fs| fs.unlock_range(fb, 2, SHARED_FIRST, SHARED_SIZE))
+        .await
+        .unwrap();
     on_fs(&a.fs, move |fs| {
         fs.lock_range(fa, 1, LockKind::Exclusive, SHARED_FIRST, SHARED_SIZE, false)
     })

@@ -322,10 +322,7 @@ fn canonical() -> Vec<(&'static str, Frame)> {
                 len: 1,
             }),
         ),
-        (
-            "resp_lock_status_free",
-            ok(Response::LockStatus(None)),
-        ),
+        ("resp_lock_status_free", ok(Response::LockStatus(None))),
         (
             "resp_lock_status_held",
             ok(Response::LockStatus(Some(alloyfs_proto::LockConflict {

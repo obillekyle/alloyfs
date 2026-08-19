@@ -1388,13 +1388,7 @@ impl RemoteFs {
     }
 
     /// v7+: release exactly `[start, len)` and nothing else.
-    pub fn unlock_range(
-        &self,
-        fh: u64,
-        owner: u64,
-        start: u64,
-        len: u64,
-    ) -> Result<(), FsError> {
+    pub fn unlock_range(&self, fh: u64, owner: u64, start: u64, len: u64) -> Result<(), FsError> {
         if fh & OVERLAY_FH_BIT != 0 {
             return Ok(());
         }
@@ -1814,12 +1808,7 @@ async fn reconnect_supervisor(fs: Arc<RemoteFs>) {
 /// can land on a different server, so a range taken at v7 may have to be
 /// replayed against a v6 peer — where the honest thing is to coarsen it,
 /// claiming more than was held rather than less.
-async fn replay_lock(
-    conn: &Arc<MuxConnection>,
-    fh: u64,
-    held: &HeldRange,
-    proto: u16,
-) -> bool {
+async fn replay_lock(conn: &Arc<MuxConnection>, fh: u64, held: &HeldRange, proto: u16) -> bool {
     let req = if proto >= 7 {
         Request::LockRange {
             fh,

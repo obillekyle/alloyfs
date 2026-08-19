@@ -706,10 +706,7 @@ impl FileSystemContext for WinFspFs {
         // directory unwritable until someone cleared a box that already
         // looked clear.
         let mut mode = None;
-        if cur.kind != FileKind::Dir
-            && file_attributes != 0
-            && file_attributes != INVALID_FILE_ATTRIBUTES
-        {
+        if cur.kind != FileKind::Dir && file_attributes != 0 && file_attributes != INVALID_FILE_ATTRIBUTES {
             let readonly = file_attributes & FILE_ATTRIBUTE_READONLY != 0;
             let new_mode = if readonly {
                 cur.mode & !0o222

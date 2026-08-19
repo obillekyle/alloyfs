@@ -358,8 +358,7 @@ mod tests {
         let lm = std::sync::Arc::new(LockManager::default());
         lm.lock(&path(), 1, 1, LockKind::Exclusive, false).await.unwrap();
         let lm2 = lm.clone();
-        let waiter =
-            tokio::spawn(async move { lm2.lock(&path(), 2, 1, LockKind::Exclusive, true).await });
+        let waiter = tokio::spawn(async move { lm2.lock(&path(), 2, 1, LockKind::Exclusive, true).await });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(!waiter.is_finished());
         lm.unlock(&path(), 1, 1);
@@ -429,8 +428,7 @@ mod tests {
         lm.lock(&path(), 1, 10, LockKind::Shared, false).await.unwrap();
         lm.lock(&path(), 2, 20, LockKind::Shared, false).await.unwrap();
         let lm2 = lm.clone();
-        let upgrade =
-            tokio::spawn(async move { lm2.lock(&path(), 1, 10, LockKind::Exclusive, true).await });
+        let upgrade = tokio::spawn(async move { lm2.lock(&path(), 1, 10, LockKind::Exclusive, true).await });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(!upgrade.is_finished(), "upgrade should be parked");
         lm.unlock(&path(), 2, 20);
@@ -664,9 +662,8 @@ mod tests {
 
             // Would the model grant it? Conflict iff some byte in range is
             // held by ANOTHER owner and either side is exclusive.
-            let blocked = (start..end).any(|b| {
-                (0..OWNERS).any(|o| o != oi && matches!(model[b][o], Some(ex) if ex || exclusive))
-            });
+            let blocked = (start..end)
+                .any(|b| (0..OWNERS).any(|o| o != oi && matches!(model[b][o], Some(ex) if ex || exclusive)));
             let got = lm
                 .lock_range(&path(), owner, kind, start as u64, end as u64, false)
                 .await;

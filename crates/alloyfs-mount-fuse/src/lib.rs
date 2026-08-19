@@ -14,8 +14,7 @@ use fuser::{
     Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo, LockOwner,
     MountOption, OpenAccMode, OpenFlags as FuseOpenFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
     ReplyEmpty, ReplyEntry, ReplyLock, ReplyOpen, ReplyStatfs, ReplyWrite, Request as FuseRequest,
-    SessionACL,
-    TimeOrNow, WriteFlags,
+    SessionACL, TimeOrNow, WriteFlags,
 };
 
 use alloyfs_client::{FsError, RemoteFs, ROOT_INO};
@@ -351,7 +350,7 @@ impl Filesystem for DsFuse {
         // `from_bits_retain`, so this also refuses flags added after this was
         // written instead of silently mistranslating them.
         if !flags.difference(fuser::RenameFlags::RENAME_NOREPLACE).is_empty() {
-            reply.error(libc::EINVAL);
+            reply.error(Errno::EINVAL);
             return;
         }
         match self.fs.rename(parent.0, name, newparent.0, newname, !noreplace) {
@@ -418,22 +417,14 @@ impl Filesystem for DsFuse {
         let len = fuse_range_len(start, end);
         let owner = lock_owner.0;
         let result = match typ {
-            t if t == libc::F_RDLCK => self.fs.lock_range(
-                fh.0,
-                owner,
-                alloyfs_proto::LockKind::Shared,
-                start,
-                len,
-                sleep,
-            ),
-            t if t == libc::F_WRLCK => self.fs.lock_range(
-                fh.0,
-                owner,
-                alloyfs_proto::LockKind::Exclusive,
-                start,
-                len,
-                sleep,
-            ),
+            t if t == libc::F_RDLCK => {
+                self.fs
+                    .lock_range(fh.0, owner, alloyfs_proto::LockKind::Shared, start, len, sleep)
+            }
+            t if t == libc::F_WRLCK => {
+                self.fs
+                    .lock_range(fh.0, owner, alloyfs_proto::LockKind::Exclusive, start, len, sleep)
+            }
             t if t == libc::F_UNLCK => self.fs.unlock_range(fh.0, owner, start, len),
             _ => {
                 reply.error(Errno::EINVAL);
@@ -594,6 +585,26 @@ pub fn mount(
         MountOption::DefaultPermissions,
     ];
     config.acl = SessionACL::Owner;
+    // fuser dispatches on ONE thread unless told otherwise, and every callback
+    // runs to completion before the next is read off /dev/fuse. A blocking
+    // `fcntl(F_SETLKW)` therefore froze the entire mount — every read, write
+    // and stat, from every process — until the lock came free. Worse, if the
+    // holder was on this same mount its unlock is itself a FUSE request that
+    // could never be dispatched, so the wait never ended and Ctrl-C could not
+    // clear it: FUSE_INTERRUPT queues behind the stuck request.
+    //
+    // SQLite never hit this (it only ever issues non-blocking F_SETLK), but
+    // byte ranges make blocking waits genuinely useful, and `python
+    // fcntl.lockf` blocks by default.
+    //
+    // Linux only: fuser refuses n_threads != 1 on other platforms. Four is
+    // enough to keep a blocked lock from starving ordinary traffic without
+    // multiplying per-request state; `RemoteFs` is Sync throughout (atomics
+    // and DashMap), so concurrent callbacks need nothing further.
+    #[cfg(target_os = "linux")]
+    {
+        config.n_threads = Some(4);
+    }
     let adapter = DsFuse {
         fs,
         // SAFETY: geteuid/getegid are always safe to call.

@@ -14,9 +14,7 @@
 use std::sync::Arc;
 
 use alloyfs_agent::{AgentConfig, AgentSession, ExportConfig, ExportRegistry};
-use alloyfs_proto::{
-    Frame, FrameCodec, OpenFlags, RelPath, Request, PROTO_VERSION_MAX, PROTO_VERSION_MIN,
-};
+use alloyfs_proto::{Frame, FrameCodec, OpenFlags, RelPath, Request, PROTO_VERSION_MAX, PROTO_VERSION_MIN};
 use alloyfs_transport::{serve_connection, RequestHandler};
 use futures::{SinkExt, StreamExt};
 use tokio_util::codec::Framed;
