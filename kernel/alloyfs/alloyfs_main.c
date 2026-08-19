@@ -181,30 +181,70 @@ static ssize_t alloyfs_read_iter(struct kiocb *iocb, struct iov_iter *to)
 	struct inode *inode = file_inode(iocb->ki_filp);
 	struct alloyfs_conn *conn = alloyfs_conn_of(inode);
 	loff_t pos = iocb->ki_pos;
-	size_t want = iov_iter_count(to);
-	ssize_t ret;
-	void *buf;
-	int len;
+	ssize_t total = 0;
 
 	if (!conn)
 		return -EIO;
 
-	want = min_t(size_t, want, ALLOYFS_MAX_PAYLOAD);
-	if (!want)
-		return 0;
-	buf = kmalloc(want, GFP_KERNEL);
-	if (!buf)
-		return -ENOMEM;
-	len = alloyfs_request(conn, ALLOYFS_OP_READ, inode->i_ino, pos, want,
-			   NULL, 0, buf, want);
-	if (len < 0) {
-		kfree(buf);
-		return len;
+	/* One request per ALLOYFS_MAX_PAYLOAD, looping like the write side.
+	 *
+	 * A single request was a legal short read and stdio loops over it, but
+	 * it made this backend answer a 1 MiB read(2) with 128 KiB where FUSE
+	 * and WinFsp return the lot — a difference an application that reads
+	 * once into a big buffer notices and the others do not.
+	 */
+	while (iov_iter_count(to)) {
+		size_t want = min_t(size_t, iov_iter_count(to), ALLOYFS_MAX_PAYLOAD);
+		size_t copied;
+		void *buf;
+		int len;
+
+		/* kvmalloc, not kmalloc: ALLOYFS_MAX_PAYLOAD is 128 KiB, an
+		 * order-5 allocation that kmalloc can fail under fragmentation
+		 * while a vmalloc fallback succeeds. The write path chose
+		 * kvmalloc for exactly this reason; the read path spuriously
+		 * returned -ENOMEM instead.
+		 */
+		buf = kvmalloc(want, GFP_KERNEL);
+		if (!buf) {
+			if (!total)
+				total = -ENOMEM;
+			break;
+		}
+		len = alloyfs_request(conn, ALLOYFS_OP_READ, inode->i_ino, pos, want,
+				   NULL, 0, buf, want);
+		if (len < 0) {
+			kvfree(buf);
+			if (!total)
+				total = len;
+			break;
+		}
+		if (len == 0) {
+			kvfree(buf);
+			break;	/* EOF */
+		}
+		copied = copy_to_iter(buf, len, to);
+		kvfree(buf);
+		/* A wholly failed copy is a bad user buffer, not end of file.
+		 * Returning it as 0 told the caller EOF and silently truncated
+		 * whatever it was reading.
+		 */
+		if (!copied) {
+			if (!total)
+				total = -EFAULT;
+			break;
+		}
+		pos += copied;
+		total += copied;
+		if (copied < (size_t)len)
+			break;	/* the iterator is full */
+		if (len < (int)want)
+			break;	/* short reply: end of file */
 	}
-	ret = copy_to_iter(buf, len, to);
-	iocb->ki_pos = pos + ret;
-	kfree(buf);
-	return ret;
+
+	if (total > 0)
+		iocb->ki_pos = pos;
+	return total;
 }
 
 /* ------------------------------------------------------------- mutations
