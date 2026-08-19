@@ -175,6 +175,26 @@ impl MuxConnection {
         self.request_with_deadline(body, REQUEST_TIMEOUT).await
     }
 
+    /// Send a request and do NOT wait for its response.
+    ///
+    /// For requests whose reply the caller throws away. Waiting for one of
+    /// those costs a full round trip to learn nothing, which is invisible on a
+    /// loopback mount and dominates a remote one: at 60 ms RTT it is 60 ms per
+    /// call, paid on a code path that had already written `let _ =`.
+    ///
+    /// Ordering is unaffected. The frame is handed to the writer in the same
+    /// order as any other request, so the peer still processes it in sequence
+    /// — this drops the WAIT, not the send, and a later request cannot
+    /// overtake it.
+    ///
+    /// The inflight slot stays registered until the response lands, and the
+    /// reader then discards it against a dropped receiver. That is the exact
+    /// path a cancelled `request` already takes, which is why `request`
+    /// documents itself as cancel-safe.
+    pub async fn send_oneway(&self, body: Request) -> Result<(), TransportError> {
+        self.begin_request(body).await.map(|_| ())
+    }
+
     /// `request` with an explicit deadline (tests use short ones).
     pub async fn request_with_deadline(
         &self,

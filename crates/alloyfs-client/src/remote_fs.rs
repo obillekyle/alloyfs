@@ -989,7 +989,24 @@ impl RemoteFs {
                 }
             }
         }
-        let _ = self.call(Request::Release { fh: server_fh });
+        // Fire-and-forget. The reply was already being discarded, but `call`
+        // still blocked until it arrived — a full round trip on every close,
+        // for an answer nobody read.
+        //
+        // What that cost: `ls -la` over a 60 ms link spent ~2 RTT per file,
+        // one to open and one to wait out the release, and every open/close
+        // heavy client pays it the same way — Explorer, git, bun. The same
+        // listing against a loopback mount finished in 158 ms against 2293 ms
+        // remote, which is how the round trips were identified as the cost
+        // rather than anything the attribute cache could have helped with.
+        //
+        // Not retried on a dead connection, deliberately: a handle whose
+        // connection is gone has already been released by the agent, which
+        // drops a session's handles on disconnect and reclaims the rest when
+        // the lease expires. Retrying would re-open that question for no gain.
+        let _ = self
+            .rt
+            .block_on(self.conn().send_oneway(Request::Release { fh: server_fh }));
     }
 
     pub fn statfs(&self) -> Result<(u32, u64, u64), FsError> {
