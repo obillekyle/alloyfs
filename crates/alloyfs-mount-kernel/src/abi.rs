@@ -13,7 +13,7 @@
 
 #![allow(dead_code)] // some constants exist to document the ABI, not to be used
 
-pub const ABI_VERSION: u32 = 1;
+pub const ABI_VERSION: u32 = 3;
 pub const ROOT_NODEID: u64 = 1;
 
 /// Largest payload either direction; bounds every kernel-side allocation.
@@ -572,5 +572,28 @@ mod tests {
             name2: String::new(),
         };
         assert!(n.encode().is_none(), "the kernel rejects a zero-length name");
+    }
+
+    /// `alloyfs-abi-check.c` asserts the C header against a literal, which
+    /// leaves the Rust mirror free to drift — and it had, sitting at 1 while
+    /// the header said 3. Bind the two so the next bump cannot be half-made.
+    #[test]
+    fn abi_version_matches_the_header() {
+        let header = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../kernel/alloyfs/uapi/alloyfs.h"
+        );
+        let src = std::fs::read_to_string(header).expect("uapi header is in the tree");
+        let declared = src
+            .lines()
+            .find_map(|l| l.strip_prefix("#define ALLOYFS_ABI_VERSION "))
+            .expect("header declares ALLOYFS_ABI_VERSION")
+            .trim()
+            .parse::<u32>()
+            .expect("version is a number");
+        assert_eq!(
+            ABI_VERSION, declared,
+            "abi.rs mirrors the uapi header; bump both or neither"
+        );
     }
 }
