@@ -14,7 +14,7 @@ members = [
 ]
 
 [workspace.package]
-version = "1.0.0-alpha.25"
+version = "1.0.0-alpha.26"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/obillekyle/alloyfs"
