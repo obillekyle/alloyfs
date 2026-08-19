@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use alloyfs_proto::{ManyEntry, OpenFlags, RelPath, Request, Response, DATA_CHUNK};
+use alloyfs_proto::{Attr, ManyEntry, OpenFlags, RelPath, Request, Response, DATA_CHUNK};
 use tokio::sync::{mpsc, Semaphore};
 
 use crate::autocache::{stage_write, AutoCache};
@@ -57,6 +57,44 @@ pub(crate) fn spawn(
         // request per frame.
         let mut pending: Vec<RelPath> = Vec::new();
         let mut pending_bytes = 0u64;
+
+        // One exchange instead of one per directory, where the agent can. The
+        // BFS below stays as the fallback and is still what runs against a
+        // pre-v6 agent or an unindexed export.
+        let indexed = discover_by_tree(&fs).await;
+        if let Some(entries) = indexed {
+            walked_dirs = entries
+                .iter()
+                .filter(|(_, a)| a.kind == alloyfs_proto::FileKind::Dir)
+                .count();
+            for (path, attr) in entries {
+                if attr.kind != alloyfs_proto::FileKind::File || fs.is_overlay(&path) {
+                    continue;
+                }
+                if !cache.wants(&path, attr.size) || !cache.needs_fetch(&path, &attr) {
+                    continue;
+                }
+                fetched += 1;
+                pending_bytes += attr.size;
+                pending.push(path);
+                if pending.len() >= BATCH_FILES || pending_bytes >= READ_MANY_BUDGET as u64 {
+                    let sem = sem.clone();
+                    let fs = fs.clone();
+                    let cache = cache.clone();
+                    let batch = std::mem::take(&mut pending);
+                    pending_bytes = 0;
+                    tasks.spawn(async move {
+                        let _permit = sem.acquire_owned().await.unwrap();
+                        fetch_many(&fs, &cache, batch).await
+                    });
+                }
+                while let Some(done) = tasks.try_join_next() {
+                    ok += done.unwrap_or(0);
+                }
+            }
+            // Nothing left to walk: the tree already named every path.
+            level.clear();
+        }
 
         while !level.is_empty() {
             walked_dirs += level.len();
@@ -368,4 +406,62 @@ async fn fetch_many(fs: &Arc<RemoteFs>, cache: &Arc<AutoCache>, batch: Vec<RelPa
         remaining.drain(..served);
     }
     ok
+}
+
+/// Every file in the export, and what it costs to find them.
+///
+/// v6+ agents index the export and serve the whole subtree in one paginated
+/// exchange, so discovery is a handful of round trips regardless of shape. The
+/// BFS this replaces cost one `Readdir` per DIRECTORY — 535 of them measured
+/// 35.8 s against a 60 ms link, nearly all of it the network idle between
+/// questions.
+///
+/// `None` means the tree was not available and the caller should walk: an
+/// agent older than v6, or an export the server declined to index (too large
+/// for its cap, or indexing failed), which it signals with token 0.
+async fn discover_by_tree(fs: &Arc<RemoteFs>) -> Option<Vec<(RelPath, Attr)>> {
+    if fs.conn().proto < 6 {
+        return None;
+    }
+    let mut out = Vec::new();
+    let mut cursor = None;
+    let mut token_seen = 0u64;
+    let mut requests = 0usize;
+    loop {
+        let resp = fs
+            .conn()
+            .request(Request::Tree {
+                path: RelPath(String::new()),
+                cursor,
+            })
+            .await;
+        let (entries, next_cursor, token) = match resp {
+            Ok(Ok(Response::Tree {
+                entries,
+                next_cursor,
+                token,
+            })) => (entries, next_cursor, token),
+            // Unsupported, or the request failed: walk instead.
+            _ => return None,
+        };
+        requests += 1;
+        if token == 0 {
+            return None; // not indexed — the server is telling us to walk
+        }
+        // A token that moves between pages means the export changed underneath
+        // the read. Stitching two states into one tree would be worse than not
+        // answering, and the walk is a correct answer.
+        if token_seen != 0 && token != token_seen {
+            tracing::debug!("export changed while reading its tree; falling back to a walk");
+            return None;
+        }
+        token_seen = token;
+        out.extend(entries.into_iter().map(|e| (e.path, e.attr)));
+        match next_cursor {
+            Some(c) => cursor = Some(c),
+            None => break,
+        }
+    }
+    tracing::debug!(requests, entries = out.len(), "export tree fetched");
+    Some(out)
 }

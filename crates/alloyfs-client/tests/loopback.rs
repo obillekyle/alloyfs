@@ -2280,3 +2280,78 @@ async fn a_range_upgrade_is_granted_and_a_refusal_keeps_the_lock() {
     .unwrap_err();
     assert_eq!(remote_code(err), ErrorCode::WouldBlock);
 }
+
+// ------------------------------------------- the walker's two discovery paths
+
+/// Build a nested export and cache options that want all of it.
+fn nested_export(agent: &harness::TestAgent) -> Vec<String> {
+    let root = agent.dir.path();
+    let mut names = Vec::new();
+    for dir in ["a", "b", "a/deep"] {
+        std::fs::create_dir_all(root.join(dir)).unwrap();
+    }
+    for (i, rel) in ["top.txt", "a/one.txt", "b/two.txt", "a/deep/three.txt"]
+        .iter()
+        .enumerate()
+    {
+        std::fs::write(root.join(rel), format!("content-{i}")).unwrap();
+        names.push((*rel).to_string());
+    }
+    names
+}
+
+fn cache_opts(data_dir: &tempfile::TempDir) -> ClientOptions {
+    ClientOptions {
+        data_dir: data_dir.path().to_path_buf(),
+        cache_dir: data_dir.path().join("cache"),
+        mount_key: "t".into(),
+        auto_cache_max: Some(1 << 20),
+        auto_cache_budget: Some(10 << 20),
+        ..ClientOptions::default()
+    }
+}
+
+async fn expect_all_cached(data_dir: &tempfile::TempDir, names: &[String], what: &'static str) {
+    for (i, rel) in names.iter().enumerate() {
+        let blob = data_dir.path().join("cache").join("t").join(rel);
+        let want = format!("content-{i}").into_bytes();
+        wait_until(what, 15, move || {
+            (std::fs::read(&blob).ok()? == want).then_some(())
+        })
+        .await;
+    }
+}
+
+/// The walker warms the cache from the v6 tree — one exchange for the whole
+/// export instead of one Readdir per directory.
+///
+/// The nesting is the point: three directories deep, so a per-directory walk
+/// and a tree fetch differ in round trips even though both end with the same
+/// cache. What this pins is that the tree path finds every file, INCLUDING
+/// ones the BFS would only have reached on a later level.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_walker_warms_the_cache_from_the_tree() {
+    let agent = start_agent(AgentOpts::default());
+    let names = nested_export(&agent);
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let _s = connect(&agent, cache_opts(&data_dir)).await;
+    expect_all_cached(&data_dir, &names, "tree walk cached every file").await;
+}
+
+/// ...and it still works when there is no tree to use.
+///
+/// `tree_max_entries: 1` puts the export over the agent's index cap, so the
+/// server answers with token 0 — "not indexed, go and walk" — and the BFS has
+/// to carry it. Without a test for this the fallback would rot silently, since
+/// every ordinary export is indexed and would never take the branch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_walker_falls_back_to_readdir_when_the_export_is_not_indexed() {
+    let agent = start_agent(AgentOpts {
+        tree_max_entries: Some(1),
+        ..AgentOpts::default()
+    });
+    let names = nested_export(&agent);
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let _s = connect(&agent, cache_opts(&data_dir)).await;
+    expect_all_cached(&data_dir, &names, "readdir fallback cached every file").await;
+}
