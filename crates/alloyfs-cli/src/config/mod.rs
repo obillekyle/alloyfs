@@ -146,7 +146,10 @@ pub fn load_with_path(explicit: Option<PathBuf>) -> anyhow::Result<(Option<PathB
 /// Pre-AlloyFS and pre-layout locations, searched only to migrate away from.
 const LEGACY_ROOTS: &[&str] = &["alloyfs", "drive-sync"];
 
-fn home_dir() -> PathBuf {
+/// Visible to the rest of the crate so anything placing a file in the AlloyFS
+/// tree resolves `~` the one way, rather than each caller reaching for its own
+/// environment variable and disagreeing on Windows.
+pub(crate) fn home_dir() -> PathBuf {
     #[cfg(windows)]
     let var = "USERPROFILE";
     #[cfg(unix)]

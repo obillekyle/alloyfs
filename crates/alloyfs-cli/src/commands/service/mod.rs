@@ -1,28 +1,31 @@
 //! `alloyfs service` — mounts and agents that start on their own.
 //!
-//! Three rules shape everything here.
-//!
 //! **One source of truth.** An instance is a reference to what the config
 //! already describes — `alloyfs start`, or `alloyfs mount work` — never a
 //! second copy of it. See [`instance`] for what that costs and buys.
 //!
-//! **No terminal.** The managed process is launched with `CREATE_NO_WINDOW`
-//! into the interactive session, so nothing flashes at logon.
+//! **One command surface.** `setup`, `add`, `remove`, `start`, `stop`,
+//! `restart`, `list` and `reset` mean the same things on both platforms, so
+//! the bodies below are written once and the platform lives in [`scm`] on
+//! Windows and [`systemd`] on Linux. Both answer to the same function names;
+//! where a concept exists on only one of them, the other's version says so
+//! rather than pretending.
 //!
-//! **No elevation prompt.** Every subcommand that touches the service control
-//! manager requires an already-elevated shell and says so plainly. A tool that
-//! silently re-launches itself through `runas` teaches people to click through
-//! a UAC dialog they did not ask for, which is a worse habit than an error
-//! message. Elevation is not optional cosmetics either: without it the mount
-//! cannot register with the Mount Manager, and a session-local drive letter
-//! breaks `GetFinalPathNameByHandle` round-trips — the reason bun reports
-//! spurious ENOENT on this class of drive.
+//! The two differ most in what they ask of whoever runs them, and it is worth
+//! knowing why they differ in *opposite* directions:
+//!
+//! - **Windows demands an elevated shell.** A drive letter is per-session, so a
+//!   mount has to be created inside the logged-in user's session by a process
+//!   running as them. A service arranges that with LocalSystem, `SE_TCB_NAME`
+//!   and a token swap — see [`runtime`] and [`spawn`] — and none of it is
+//!   available unelevated. Nothing here raises its own privileges: a tool that
+//!   silently re-launches itself through `runas` teaches people to click
+//!   through a UAC dialog they did not ask for.
+//! - **Linux refuses `sudo`.** A systemd user unit already runs as the user, in
+//!   their session, with their environment and their keys, so there is nothing
+//!   to arrange and nothing to elevate for. Running `add` under sudo would
+//!   quietly register the mount for root instead.
 
-// On non-Windows every command below is `#[cfg(not(windows))] return
-// unsupported();` followed by a cfg'd-out block. The `return` is load-bearing
-// there — without it the function would fall through to nothing — but clippy
-// only sees the last statement in a function and calls it needless.
-#![cfg_attr(not(windows), allow(clippy::needless_return))]
 pub mod instance;
 
 #[cfg(windows)]
@@ -32,298 +35,225 @@ pub mod spawn;
 
 #[cfg(windows)]
 mod scm;
+#[cfg(unix)]
+mod systemd;
+
+// One alias so the commands below never mention a platform. The two modules are
+// kept deliberately parallel; adding a function to one without the other is a
+// build failure on the platform that was forgotten, which is the point.
+#[cfg(windows)]
+use scm as reg;
+#[cfg(unix)]
+use systemd as reg;
 
 pub use instance::{Instance, Scope};
-
-/// Everything except `list` refuses to run unelevated.
-#[cfg(windows)]
-pub fn require_elevation() -> anyhow::Result<()> {
-    use std::ffi::c_void;
-    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
-    use windows_sys::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
-    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-
-    let mut token: HANDLE = std::ptr::null_mut();
-    let opened = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) };
-    anyhow::ensure!(
-        opened != 0,
-        "OpenProcessToken: {}",
-        std::io::Error::last_os_error()
-    );
-
-    let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
-    let mut size = 0u32;
-    let ok = unsafe {
-        GetTokenInformation(
-            token,
-            TokenElevation,
-            &mut elevation as *mut _ as *mut c_void,
-            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
-            &mut size,
-        )
-    };
-    unsafe { CloseHandle(token) };
-    anyhow::ensure!(
-        ok != 0,
-        "GetTokenInformation: {}",
-        std::io::Error::last_os_error()
-    );
-
-    anyhow::ensure!(
-        elevation.TokenIsElevated != 0,
-        "this needs an elevated terminal.\n\
-         \n\
-         Open PowerShell or Terminal with \"Run as administrator\" and try again. \
-         alloyfs will not raise its own privileges: registering a service that runs \
-         at boot is not something a tool should arrange on your behalf behind a \
-         dialog you did not open."
-    );
-    Ok(())
-}
-
-// Never reached on this platform — every command bails with `unsupported()`
-// first — but kept so the call site does not need a cfg of its own.
-#[cfg_attr(not(windows), allow(dead_code))]
-#[cfg(not(windows))]
-pub fn require_elevation() -> anyhow::Result<()> {
-    Ok(())
-}
-
-/// Everything on this platform routes through here.
-#[cfg(not(windows))]
-fn unsupported() -> anyhow::Result<()> {
-    anyhow::bail!(
-        "`alloyfs service` is Windows-only for now.\n\
-         \n\
-         On Linux, install the agent as a systemd unit with:\n\
-         \x20 curl -fsSL https://alloy.okyle.dev/service.sh | sudo sh"
-    )
-}
 
 // ------------------------------------------------------------------ commands
 
 pub fn setup() -> anyhow::Result<()> {
-    #[cfg(not(windows))]
-    return unsupported();
-    #[cfg(windows)]
-    {
-        require_elevation()?;
-        scm::verify_winfsp()?;
-        let dir = instance::store_dir();
-        std::fs::create_dir_all(&dir)?;
-        scm::restrict_to_administrators(&dir)?;
-        println!("ready.");
-        println!("  instances: {}", dir.display());
+    reg::preflight()?;
+    reg::verify_supervisor()?;
+
+    let dir = instance::store_dir();
+    std::fs::create_dir_all(&dir)?;
+    reg::prepare_store(&dir)?;
+
+    println!("ready.");
+    println!("  instances: {}", dir.display());
+
+    // A note, not a refusal. An agent-only instance works perfectly well on a
+    // machine that never mounts anything, and `add` is the gate that knows
+    // whether this particular instance needs a filesystem driver — so refusing
+    // here would invent a requirement for every instance from the needs of one.
+    if let Err(e) = reg::verify_backend() {
         println!();
-        println!("Add one with:");
-        println!("  alloyfs service add alloyfs         # everything the config describes");
-        println!("  alloyfs service add work --mount work   # one mount from client.mounts");
-        Ok(())
+        println!("warning: {e}");
     }
+    if let Some(note) = reg::linger_note() {
+        println!();
+        println!("{note}");
+    }
+
+    println!();
+    println!("Add one with:");
+    println!("  alloyfs service add alloyfs         # everything the config describes");
+    println!("  alloyfs service add work --mount work   # one mount from client.mounts");
+    Ok(())
 }
 
 pub fn add(id: String, instance: Instance, start_now: bool) -> anyhow::Result<()> {
-    #[cfg(not(windows))]
-    {
-        let _ = (id, instance, start_now);
-        return unsupported();
+    reg::preflight()?;
+    instance::validate_id(&id)?;
+    if let Instance::Mount { name, .. } = &instance {
+        instance::validate_mount_name(name)?;
     }
-    #[cfg(windows)]
-    {
-        require_elevation()?;
-        instance::validate_id(&id)?;
-        if let Instance::Mount { name, .. } = &instance {
-            instance::validate_mount_name(name)?;
-        }
-        anyhow::ensure!(
-            !instance::instance_path(&id).exists(),
-            "service {id:?} already exists; remove it first"
-        );
-        // An agent-only instance works on a machine that never mounts
-        // anything, so the WinFsp check follows what the instance will do
-        // rather than inventing a requirement for all of them.
-        if instance.mounts_anything() {
-            scm::verify_winfsp()?;
-        }
-        check_reference(&instance)?;
+    anyhow::ensure!(
+        !instance::instance_path(&id).exists(),
+        "service {id:?} already exists; remove it first"
+    );
+    reg::verify_supervisor()?;
+    // An agent-only instance works on a machine that never mounts anything, so
+    // the filesystem-driver check follows what the instance will do rather than
+    // inventing a requirement for all of them.
+    if instance.mounts_anything() {
+        reg::verify_backend()?;
+    }
+    check_reference(&instance)?;
 
-        instance::save(&id, &instance)?;
-        scm::create(&id)?;
-        println!("added {id}: alloyfs {}", instance.command());
-        if start_now {
-            scm::start(&id)?;
-            println!("started.");
-        } else {
-            println!("It will start at boot. To start it now: alloyfs service start {id}");
-        }
-        Ok(())
+    instance::save(&id, &instance)?;
+    reg::create(&id, &instance)?;
+    println!("added {id}: alloyfs {}", instance.command());
+    if start_now {
+        reg::start(&id)?;
+        println!("started.");
+    } else {
+        println!("To start it now: alloyfs service start {id}");
     }
+    // When it comes back on its own. On Windows that is always "at boot"; a
+    // systemd user unit says so only when the account lingers, and claiming
+    // otherwise would be a promise the machine does not keep.
+    match reg::linger_note() {
+        None => println!("It starts again at boot."),
+        Some(note) => println!("{note}"),
+    }
+    Ok(())
 }
 
 pub fn remove(id: String) -> anyhow::Result<()> {
-    #[cfg(not(windows))]
-    {
-        let _ = id;
-        return unsupported();
+    reg::preflight()?;
+    instance::validate_id(&id)?;
+    let _ = reg::stop(&id);
+    reg::delete(&id)?;
+    let path = instance::instance_path(&id);
+    if path.exists() {
+        std::fs::remove_file(&path)?;
     }
-    #[cfg(windows)]
-    {
-        require_elevation()?;
-        instance::validate_id(&id)?;
-        let _ = scm::stop(&id);
-        scm::delete(&id)?;
-        let path = instance::instance_path(&id);
-        if path.exists() {
-            std::fs::remove_file(&path)?;
-        }
-        println!("removed {id}");
-        Ok(())
-    }
+    println!("removed {id}");
+    Ok(())
 }
 
 /// `start`, `stop` and `restart` all fan out the same way: one id, or every
 /// instance when none is given.
 pub fn control(action: &str, id: Option<String>) -> anyhow::Result<()> {
-    #[cfg(not(windows))]
-    {
-        let _ = (action, id);
-        return unsupported();
-    }
-    #[cfg(windows)]
-    {
-        require_elevation()?;
-        let ids = match id {
-            Some(one) => {
-                instance::validate_id(&one)?;
-                vec![one]
-            }
-            None => instance::list_ids(),
-        };
-        anyhow::ensure!(
-            !ids.is_empty(),
-            "no services defined; add one with `alloyfs service add`"
-        );
+    reg::preflight()?;
+    let ids = match id {
+        Some(one) => {
+            instance::validate_id(&one)?;
+            vec![one]
+        }
+        None => instance::list_ids(),
+    };
+    anyhow::ensure!(
+        !ids.is_empty(),
+        "no services defined; add one with `alloyfs service add`"
+    );
 
-        // Keep going after a failure and report at the end: stopping four of
-        // five drives and aborting silently on the last is worse than saying
-        // which one refused.
-        let mut failed = Vec::new();
-        for one in &ids {
-            let outcome = match action {
-                "start" => scm::start(one),
-                "stop" => scm::stop(one),
-                "restart" => scm::stop(one).and_then(|()| scm::start(one)),
-                other => anyhow::bail!("unknown action {other}"),
-            };
-            match outcome {
-                Ok(()) => println!("{action}ed {one}"),
-                Err(e) => {
-                    eprintln!("{one}: {e}");
-                    failed.push(one.clone());
-                }
+    // Keep going after a failure and report at the end: stopping four of five
+    // drives and aborting silently on the last is worse than saying which one
+    // refused.
+    let mut failed = Vec::new();
+    for one in &ids {
+        // "stop" does not take a bare -ed, and the report is the only evidence
+        // most of these commands leave behind.
+        let (outcome, done) = match action {
+            "start" => (reg::start(one), "started"),
+            "stop" => (reg::stop(one), "stopped"),
+            "restart" => (reg::stop(one).and_then(|()| reg::start(one)), "restarted"),
+            other => anyhow::bail!("unknown action {other}"),
+        };
+        match outcome {
+            Ok(()) => println!("{done} {one}"),
+            Err(e) => {
+                eprintln!("{one}: {e}");
+                failed.push(one.clone());
             }
         }
-        anyhow::ensure!(failed.is_empty(), "failed for: {}", failed.join(", "));
-        Ok(())
     }
+    anyhow::ensure!(failed.is_empty(), "failed for: {}", failed.join(", "));
+    Ok(())
 }
 
 pub fn list() -> anyhow::Result<()> {
-    #[cfg(not(windows))]
-    return unsupported();
-    #[cfg(windows)]
-    {
-        // Deliberately readable without elevation: "what is registered" is a
-        // question worth answering from any shell.
-        let ids = instance::list_ids();
-        if ids.is_empty() {
-            println!("no services defined.");
-            println!("  alloyfs service add alloyfs   # everything the config describes");
-            return Ok(());
-        }
-        // The command, not a paraphrase of it: the child is an ordinary CLI
-        // invocation, and printing what it actually runs is what makes
-        // reproducing a failure by hand a copy rather than a reconstruction.
-        // Twelve for the state: "unregistered" is the longest of them, and it
-        // is the one that shows up whenever a definition outlives its service.
-        println!("ID               KIND    STATE        COMMAND");
-        let mut carried_definitions = false;
-        for id in ids {
-            let (kind, command) = match instance::load(&id) {
-                Ok(i) => {
-                    carried_definitions |= matches!(i, Instance::Legacy(_));
-                    (i.kind().to_string(), format!("alloyfs {}", i.command()))
-                }
-                Err(e) => ("?".into(), format!("unreadable: {e}")),
-            };
-            let state = scm::state(&id);
-            println!("{id:<16} {kind:<7} {state:<12} {command}");
-        }
-        if carried_definitions {
-            println!();
-            println!(
-                "The instances marked `legacy` carry their own copy of a mount definition,\n\
-                 which the config cannot override. They keep working as they are. To move one:\n\
-                 \x20 1. describe the mount under `client.mounts:` in your config\n\
-                 \x20 2. alloyfs service remove <id>\n\
-                 \x20 3. alloyfs service add <id> --mount <name>"
-            );
-        }
-        Ok(())
+    // Deliberately skips `preflight`: "what is registered" is a question worth
+    // answering from any shell, elevated or not.
+    let ids = instance::list_ids();
+    if ids.is_empty() {
+        println!("no services defined.");
+        println!("  alloyfs service add alloyfs   # everything the config describes");
+        return Ok(());
     }
+    // The command, not a paraphrase of it: the child is an ordinary CLI
+    // invocation, and printing what it actually runs is what makes reproducing
+    // a failure by hand a copy rather than a reconstruction. Twelve for the
+    // state: "unregistered" is the longest of them, and it is the one that
+    // shows up whenever a definition outlives its service.
+    println!("ID               KIND    STATE        COMMAND");
+    let mut carried_definitions = false;
+    for id in ids {
+        let (kind, command) = match instance::load(&id) {
+            Ok(i) => {
+                carried_definitions |= matches!(i, Instance::Legacy(_));
+                (i.kind().to_string(), format!("alloyfs {}", i.command()))
+            }
+            Err(e) => ("?".into(), format!("unreadable: {e}")),
+        };
+        let state = reg::state(&id);
+        println!("{id:<16} {kind:<7} {state:<12} {command}");
+    }
+    if carried_definitions {
+        println!();
+        println!(
+            "The instances marked `legacy` carry their own copy of a mount definition,\n\
+             which the config cannot override. They keep working as they are. To move one:\n\
+             \x20 1. describe the mount under `client.mounts:` in your config\n\
+             \x20 2. alloyfs service remove <id>\n\
+             \x20 3. alloyfs service add <id> --mount <name>"
+        );
+    }
+    Ok(())
 }
 
 pub fn reset(confirm: bool) -> anyhow::Result<()> {
-    #[cfg(not(windows))]
-    {
-        let _ = confirm;
-        return unsupported();
-    }
-    #[cfg(windows)]
-    {
-        require_elevation()?;
-        let ids = instance::list_ids();
-        if !confirm {
-            println!("This removes every AlloyFS service and its definition:");
-            if ids.is_empty() {
-                println!("  (nothing is defined)");
-            }
-            for id in &ids {
-                println!("  {id}");
-            }
-            println!();
-            anyhow::bail!("re-run with --confirm to proceed");
+    reg::preflight()?;
+    let ids = instance::list_ids();
+    if !confirm {
+        println!("This removes every AlloyFS service and its definition:");
+        if ids.is_empty() {
+            println!("  (nothing is defined)");
         }
         for id in &ids {
-            let _ = scm::stop(id);
-            if let Err(e) = scm::delete(id) {
-                eprintln!("{id}: {e}");
-            }
+            println!("  {id}");
         }
-        let dir = instance::store_dir();
-        if dir.exists() {
-            std::fs::remove_dir_all(&dir)?;
-        }
-        println!("removed {} service(s).", ids.len());
-        Ok(())
+        println!();
+        anyhow::bail!("re-run with --confirm to proceed");
     }
+    for id in &ids {
+        let _ = reg::stop(id);
+        if let Err(e) = reg::delete(id) {
+            eprintln!("{id}: {e}");
+        }
+    }
+    let dir = instance::store_dir();
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir)?;
+    }
+    println!("removed {} service(s).", ids.len());
+    Ok(())
 }
 
 /// Resolve what the instance points at, before anything is registered.
 ///
-/// `add` runs in an elevated shell, as a person — so it can read the config
-/// that the service itself never can, and answer the question that matters
-/// while somebody is still watching: does this mount name exist? Registered
-/// against a name that does not, the service starts at boot, fails inside a
-/// process with no window, and says nothing. That is the same argument that
-/// puts the WinFsp check here rather than at launch.
+/// `add` runs as a person, in a shell — so it can read the config and answer
+/// the question that matters while somebody is still watching: does this mount
+/// name exist? Registered against a name that does not, the service starts on
+/// its own, fails where nobody is looking, and says nothing. That is the same
+/// argument that puts the filesystem-driver check here rather than at launch.
 ///
-/// The config consulted is the one THIS shell can see. The child resolves it
-/// again at launch as the console user, and the two answers differ when the
-/// elevated shell belongs to a different account, or was opened in a directory
-/// with an `alloyfs.yml` of its own. Naming the file that was read is what
-/// turns that from a mystery into a sentence.
-#[cfg(windows)]
+/// The config consulted is the one THIS shell can see. On Windows the child
+/// resolves it again at launch as the console user, and the two answers differ
+/// when the elevated shell belongs to a different account, or was opened in a
+/// directory with an `alloyfs.yml` of its own. Naming the file that was read is
+/// what turns that from a mystery into a sentence.
 fn check_reference(instance: &Instance) -> anyhow::Result<()> {
     let (path, cfg) = crate::config::load_with_path(instance.config().cloned())?;
     let source = match &path {
@@ -340,12 +270,7 @@ fn check_reference(instance: &Instance) -> anyhow::Result<()> {
 }
 
 /// What an instance amounts to in one config.
-///
-/// The fields are read by `check_reference`, which is Windows-only, so on
-/// other platforms they have no consumer outside the tests — and a derived
-/// `Debug` does not count as one for dead-code analysis.
 #[derive(Debug)]
-#[cfg_attr(not(windows), allow(dead_code))]
 struct Resolution {
     /// What to show whoever ran `add`: the mounts this service will start.
     lines: Vec<String>,
@@ -356,7 +281,6 @@ struct Resolution {
 /// Work out what an instance points at, without touching the disk or the
 /// terminal — which is what makes the interesting half of `add` testable on a
 /// machine where registering a service is not possible.
-#[cfg_attr(not(windows), allow(dead_code))]
 fn resolve_reference(
     instance: &Instance,
     cfg: &crate::config::Config,
@@ -414,7 +338,6 @@ fn resolve_reference(
 }
 
 /// The error for a name the config does not define, listing the ones it does.
-#[cfg_attr(not(windows), allow(dead_code))]
 fn unknown_mount(name: &str, cfg: &crate::config::Config, source: &str) -> anyhow::Error {
     let known = cfg.mount_names();
     if known.is_empty() {
@@ -435,19 +358,32 @@ fn unknown_mount(name: &str, cfg: &crate::config::Config, source: &str) -> anyho
     )
 }
 
-/// A LocalSystem service launches into the user's session with the user's
-/// environment, so their SSH keys are the ones in scope. Worth confirming out
-/// loud, because the opposite arrangement is the usual one and it fails at
-/// boot for a reason nobody connects to SSH agent scope.
-#[cfg(windows)]
+/// An `ssh://` mount authenticates as the user, with the user's agent — worth
+/// confirming out loud on both platforms, because the opposite arrangement is
+/// the usual one for services and it fails at a moment nobody connects to SSH.
+///
+/// The failure looks different on each. A LocalSystem service launches into the
+/// user's session with the user's environment, so their agent is simply in
+/// scope. A systemd user unit inherits the *user manager's* environment, which
+/// is not the shell's: `SSH_AUTH_SOCK` is set in a terminal and absent in the
+/// unit unless something puts it there. So the same mount works when typed by
+/// hand and hangs when started by systemd, which is the least obvious way for
+/// this to go wrong.
 fn warn_about_ssh(urls: &[String]) {
-    if urls.iter().any(|url| url.starts_with("ssh://")) {
-        println!(
-            "note: ssh mounts authenticate as you, using your own SSH keys and agent.\n\
-             \x20     Key-based auth must work non-interactively — check with `ssh <host> true`;\n\
-             \x20     a key with a passphrase and no agent will hang at boot."
-        );
+    if !urls.iter().any(|url| url.starts_with("ssh://")) {
+        return;
     }
+    println!(
+        "note: ssh mounts authenticate as you, using your own SSH keys and agent.\n\
+         \x20     Key-based auth must work non-interactively — check with `ssh <host> true`;\n\
+         \x20     a key with a passphrase and no agent will hang at startup."
+    );
+    #[cfg(unix)]
+    println!(
+        "\x20     A user unit does not inherit your shell's environment, so an agent that\n\
+         \x20     works in a terminal may be invisible to it. If the mount hangs:\n\
+         \x20       systemctl --user import-environment SSH_AUTH_SOCK"
+    );
 }
 
 #[cfg(test)]
@@ -464,7 +400,7 @@ mod tests {
 
     /// The check that only `add` can make, because only `add` runs as a person
     /// with the config in reach. A name that is not there has to fail here or
-    /// it fails at boot, inside a process with no window.
+    /// it fails at boot, where nobody is looking.
     #[test]
     fn a_name_the_config_does_not_define_is_refused_and_lists_the_ones_it_does() {
         let cfg = config(TWO_MOUNTS);

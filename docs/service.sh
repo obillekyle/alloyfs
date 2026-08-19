@@ -1,11 +1,17 @@
 #!/bin/sh
-# Installs the AlloyFS agent as a systemd service.
+# Installs the AlloyFS AGENT as a system-wide systemd service.
 #
 #   curl -fsSL https://alloy.okyle.dev/service.sh | sudo sh
 #   curl -fsSL https://alloy.okyle.dev/service.sh | sudo sh -s -- --user alice
 #
 # Removes with:
 #   sudo systemctl disable --now alloyfs@USER
+#
+# For MOUNTS, or for anything belonging to one account, use `alloyfs service`
+# instead. It registers systemd USER units: no root, no template unit, and the
+# process runs inside the session that owns the mount — so an ssh:// mount finds
+# the right keys and agent. This script covers the case a user unit cannot, an
+# agent on a machine nobody logs into.
 #
 # POSIX sh, no bashisms: this runs under whatever /bin/sh is on the box.
 set -eu
@@ -19,7 +25,7 @@ while [ $# -gt 0 ]; do
   --user) SERVICE_USER="${2:?--user wants a username}"; shift 2 ;;
   --exe) EXE="${2:?--exe wants a path}"; shift 2 ;;
   --no-start) START=0; shift ;;
-  -h | --help) sed -n '2,10p' "$0"; exit 0 ;;
+  -h | --help) sed -n '2,15p' "$0"; exit 0 ;;
   *) echo "unknown option: $1" >&2; exit 1 ;;
   esac
 done
@@ -82,6 +88,11 @@ cat >"$UNIT" <<EOF
 # The instance name is the user whose config and exports it serves:
 #   sudo systemctl enable --now alloyfs@$SERVICE_USER
 # Logs: journalctl -u alloyfs@$SERVICE_USER -f
+#
+# The agent only, deliberately. A system unit runs outside the user's session,
+# so it has no XDG_RUNTIME_DIR, no session bus and no SSH_AUTH_SOCK — fine for
+# serving local folders, useless for an ssh:// mount. Mounts belong to
+# `alloyfs service`, which registers a user unit per account.
 #
 # No --config: the agent finds ~<user>/.alloyfs/config.yml on its own, and
 # creates a starter one if none exists. An explicit path would defeat that.

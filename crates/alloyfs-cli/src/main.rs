@@ -229,8 +229,8 @@ enum Command {
 
 #[derive(Subcommand)]
 enum ServiceCmd {
-    /// One-time preparation: check WinFsp, create and lock down the instance
-    /// directory. Safe to re-run.
+    /// One-time preparation: check the filesystem driver, create the instance
+    /// directory and restrict it. Safe to re-run.
     Setup,
     /// Register a service that runs part of this machine's config at boot.
     ///
@@ -257,7 +257,11 @@ enum ServiceCmd {
         #[arg(long)]
         confirm: bool,
     },
-    /// Internal: the entry point the Windows service manager invokes.
+    /// Internal: the entry point the Windows service control manager invokes.
+    ///
+    /// Windows-only by nature rather than by omission. It exists to supervise a
+    /// child in another session; systemd starts `alloyfs` itself and supervises
+    /// it directly, so on Linux there is nothing for this to be.
     #[command(hide = true)]
     Run { id: String },
 }
@@ -501,10 +505,16 @@ async fn main() -> anyhow::Result<()> {
             #[cfg(windows)]
             ServiceCmd::Run { id } => commands::service::runtime::run(&id),
             #[cfg(not(windows))]
-            ServiceCmd::Run { id } => {
-                let _ = id;
-                anyhow::bail!("`service run` is Windows-only")
-            }
+            ServiceCmd::Run { id } => anyhow::bail!(
+                "`service run` is the Windows service control manager's entry point, and has \
+                 no counterpart here: systemd runs `alloyfs {}` itself.\n\
+                 \n\
+                 \x20 systemctl --user start alloyfs-{id}      # or: alloyfs service start {id}\n\
+                 \x20 journalctl --user -u alloyfs-{id} -f",
+                commands::service::instance::load(&id)
+                    .map(|i| i.command())
+                    .unwrap_or_else(|_| "start".into())
+            ),
         },
         Command::Cache { cmd } => match cmd {
             CacheCmd::Clear {

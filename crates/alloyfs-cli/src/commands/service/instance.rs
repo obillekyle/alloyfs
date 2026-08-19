@@ -12,17 +12,12 @@
 //! the service mounting yesterday's settings, with nothing on screen anywhere
 //! to suggest why.
 //!
-//! The store stays in ProgramData regardless. The service runs as LocalSystem
-//! and cannot read `C:\Users\<name>`, so what it reads here is the reference
-//! and only the child — running as the user, with the user's environment —
-//! resolves it.
-
-// Windows-only in practice: every command in the parent module returns the
-// "use service.sh" error on other platforms, so nothing here is reached and
-// `-D warnings` turns each unused item into a build failure. Allowed rather
-// than cfg-gated because the module is not Windows-specific in principle —
-// systemd units will consume exactly these definitions.
-#![cfg_attr(not(windows), allow(dead_code))]
+//! Where the store lives differs by platform, and for one reason: who has to
+//! read it. On Windows the service runs as LocalSystem and cannot see
+//! `C:\Users\<name>`, so the reference sits in ProgramData and only the child —
+//! running as the user — resolves it. On Linux nothing but the user's own
+//! tooling ever reads it, because systemd launches the command directly, so it
+//! belongs in the same `~/.alloyfs` tree as everything else.
 
 use std::path::PathBuf;
 
@@ -454,9 +449,16 @@ pub fn store_dir() -> PathBuf {
     PathBuf::from(root).join("alloyfs").join("services")
 }
 
+/// The user's own tree, beside their config and data.
+///
+/// Not `/etc/alloyfs/services`, which is where this pointed while the whole
+/// command was a stub: these register **systemd user units**, so an instance
+/// belongs to one person the same way `~/.alloyfs/config.yml` does, and putting
+/// it under `/etc` would mean asking for root to record a preference that root
+/// is not involved in acting on.
 #[cfg(not(windows))]
 pub fn store_dir() -> PathBuf {
-    PathBuf::from("/etc/alloyfs/services")
+    crate::config::home_dir().join(".alloyfs").join("services")
 }
 
 pub fn instance_path(id: &str) -> PathBuf {
@@ -494,8 +496,9 @@ pub fn list_ids() -> Vec<String> {
     ids
 }
 
-/// The Windows service name for an instance. Prefixed so `service stop` with
-/// no id can find every one of ours without a registry of its own.
+/// What the platform's supervisor calls this instance — a Windows service name,
+/// or the stem of a systemd unit. Prefixed so `service stop` with no id can
+/// find every one of ours without a registry of its own.
 pub fn service_name(id: &str) -> String {
     format!("alloyfs-{id}")
 }
