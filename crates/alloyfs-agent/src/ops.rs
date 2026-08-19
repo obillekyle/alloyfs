@@ -534,7 +534,31 @@ impl SessionInner {
         } else {
             opts.create(true).truncate(flags.truncate);
         }
+        // The mode goes to `open`, NOT to a chmod afterwards. They are not the
+        // same operation and the difference is visible in the resulting file:
+        //
+        //   - `open(..., O_CREAT, mode)` applies `mode & ~umask`, so the
+        //     SERVER's umask decides — which is what `mkdir` below already
+        //     relies on — and a default ACL on the parent directory
+        //     contributes its entries.
+        //   - `chmod(mode)` applies the mode verbatim, umask ignored, and
+        //     rewrites the ACL mask from the group bits, discarding whatever
+        //     the default ACL had granted.
+        //
+        // Measured on an export with umask 002 and a default ACL granting
+        // www-data rwx: chmod produced 0666 (world-writable, umask skipped),
+        // open produces 0664. The old code chmodded, which also meant a plain
+        // O_CREAT that merely OPENED an existing file silently reset its
+        // permissions — open has never done that, and nothing here wanted it.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(mode);
+        }
         let file = opts.open(&full).or_code()?;
+        // Windows has no umask and no mode; `set_mode` only maps the write bit
+        // onto the read-only attribute, so it still has to happen after open.
+        #[cfg(windows)]
         set_mode(&file, mode);
         let md = file.metadata().or_code()?;
         export.events.note_local_write(&path, self.id);

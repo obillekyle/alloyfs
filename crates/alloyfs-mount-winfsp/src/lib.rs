@@ -432,7 +432,12 @@ impl FileSystemContext for WinFspFs {
         }
 
         if create_options & FILE_DIRECTORY_FILE != 0 {
-            let (ino, attr) = self.fs.mkdir(parent_ino, name, 0o755).map_err(fsp_err)?;
+            // 0o777 for the same reason `create` sends 0o666: hand over the
+            // unrestricted mode and let the server's umask reduce it. The agent
+            // discards this value today, so nothing changes on the wire — but a
+            // dead argument that still carries a wrong number is a trap for
+            // whoever makes it live.
+            let (ino, attr) = self.fs.mkdir(parent_ino, name, 0o777).map_err(fsp_err)?;
             fill_file_info(file_info.as_mut(), ino, &attr);
             Ok(FileContext {
                 ino,
@@ -451,7 +456,24 @@ impl FileSystemContext for WinFspFs {
                 excl: true,
                 ..OpenFlags::default()
             };
-            let (ino, fh, attr) = self.fs.create(parent_ino, name, 0o644, excl).map_err(fsp_err)?;
+            // 0o666, not 0o644 — the maximally permissive mode, exactly as
+            // `fopen` and every `open(..., O_CREAT, 0666)` in C does it. Windows
+            // has no umask and no group-write bit, so ANY mode this client picks
+            // is fabricated; the only honest thing to send is "no restriction
+            // from here" and let the SERVER's umask decide. `mkdir` below says
+            // the same thing, and the agent has always ignored its mode for
+            // precisely that reason.
+            //
+            // Sending 0o644 was the client inventing a umask it does not have,
+            // and on a server with POSIX ACLs it did more than pick a mode: a
+            // new file's ACL mask is intersected with the group bits of the
+            // creation mode, so group `r--` clamped every ACL entry to
+            // read-only. Measured against an export whose default ACL granted
+            // www-data rwx: files written through the mount came out
+            // `mask::r--` and Apache could no longer write what it had been
+            // able to write before. With 0o666 and the server's umask of 002
+            // the same write lands 0664 and the mask stays rw-.
+            let (ino, fh, attr) = self.fs.create(parent_ino, name, 0o666, excl).map_err(fsp_err)?;
             fill_file_info(file_info.as_mut(), ino, &attr);
             Ok(FileContext {
                 ino,

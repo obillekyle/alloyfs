@@ -38,7 +38,7 @@ pub struct AgentSection {
     pub http_token: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExportConfig {
     pub path: PathBuf,
@@ -85,7 +85,7 @@ impl Default for ExportConfig {
 
 /// The `client:` section of an export: what this server recommends mounts
 /// configure locally (overlay excludes, pins, cache sizing).
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientDefaults {
     #[serde(default)]

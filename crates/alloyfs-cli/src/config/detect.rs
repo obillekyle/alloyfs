@@ -183,16 +183,20 @@ pub fn to_agent_config(config: &Config) -> alloyfs_agent::AgentConfig {
     out.agent.http_token = server.http_token.clone();
     if let Some(exports) = &server.exports {
         for (name, export) in exports {
-            out.exports.insert(
-                name.clone(),
-                alloyfs_agent::ExportConfig {
-                    path: export.path.clone(),
-                    read_only: export.read_only,
-                    exclude: export.exclude.clone(),
-                    default_excludes: export.default_excludes,
-                    client: None,
-                },
-            );
+            // A clone, not a field-by-field rebuild. Both sides are the same
+            // type, so listing the fields bought nothing and cost the export's
+            // `client:` block: it was rebuilt as `client: None`, which silently
+            // discarded every suggestion a server made to its mounts. serde had
+            // parsed the block correctly one step earlier, so nothing failed and
+            // nothing warned — the settings simply never arrived, and even a
+            // deliberately invalid `auto_cache_max` (which is resolved at boot
+            // precisely so a bad value cannot reach a mount) started cleanly.
+            //
+            // The general shape of the bug matters more than this instance:
+            // an exhaustive struct literal over a type you do not own turns
+            // every field added upstream into a silent default here. A clone
+            // cannot drift.
+            out.exports.insert(name.clone(), export.clone());
         }
     }
     out
@@ -276,6 +280,41 @@ mod tests {
         assert_eq!(a.read_only, b.read_only);
         assert_eq!(a.exclude, b.exclude);
         assert_eq!(a.default_excludes, b.default_excludes);
+    }
+
+    /// The suggestions an export makes to its mounts have to survive the trip
+    /// from `server.exports` into the agent config. They did not: the
+    /// conversion rebuilt each export field by field and wrote `client: None`,
+    /// so a server could describe defaults that never left the file.
+    ///
+    /// Nothing detected it, and the reason is worth keeping in view — the
+    /// round-trip test above asserts the same four fields the broken code
+    /// copied, so it agreed with the bug. This one asserts the fifth.
+    #[test]
+    fn an_export_keeps_the_client_settings_it_suggests() {
+        let text = "version: 3\n\
+                    server:\n  \
+                      exports:\n    \
+                        projects:\n      \
+                          path: /srv/projects\n      \
+                          client:\n        \
+                            exclude: [node_modules]\n        \
+                            pin: [\"*.lock\"]\n        \
+                            auto_cache_max: 2M\n";
+        let (config, shape) = from_value(serde_yaml::from_str(text).unwrap()).unwrap();
+        assert_eq!(shape, Shape::V3);
+
+        let agent = to_agent_config(&config);
+        let suggested = agent
+            .exports
+            .get("projects")
+            .expect("the export survived")
+            .client
+            .as_ref()
+            .expect("its client suggestions survived too");
+        assert_eq!(suggested.exclude, ["node_modules"]);
+        assert_eq!(suggested.pin, ["*.lock"]);
+        assert!(suggested.auto_cache_max.is_some());
     }
 
     #[test]
