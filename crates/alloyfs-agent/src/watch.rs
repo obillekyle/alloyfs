@@ -146,10 +146,39 @@ impl EventHub {
     }
 }
 
+/// What the OS watcher hands the coalescing loop.
+///
+/// A gap has to travel the same channel as the events, not a side path: it is
+/// ordered against them, and "everything before this point is suspect" only
+/// means anything if it arrives in sequence.
+enum WatchSignal {
+    Event(notify::Event),
+    /// The watcher can no longer describe what changed — the kernel queue
+    /// overflowed, or the backend failed. Everything the index believes may
+    /// now be wrong.
+    Gap,
+}
+
+/// Classify one watcher event.
+///
+/// The kernel queue overflowing means events were dropped and WHICH ones is
+/// precisely what nobody can know — `need_rescan` is how notify says so
+/// (inotify raises it on Q_OVERFLOW). It was being ignored: the event went
+/// through as an ordinary change and the index carried on believing it was
+/// complete, which is the one thing it is not.
+fn signal_for(event: notify::Event) -> WatchSignal {
+    if event.need_rescan() {
+        tracing::warn!("watcher reported a dropped-event gap; forcing a resync");
+        WatchSignal::Gap
+    } else {
+        WatchSignal::Event(event)
+    }
+}
+
 /// Spawn the watcher + coalescer for one export. The returned guard keeps the
 /// OS watcher alive; drop it to stop watching.
 pub fn spawn(export: Arc<Export>, hub: Arc<EventHub>, debounce: Duration) -> anyhow::Result<WatchGuard> {
-    let (raw_tx, raw_rx) = mpsc::unbounded_channel::<notify::Event>();
+    let (raw_tx, raw_rx) = mpsc::unbounded_channel::<WatchSignal>();
 
     // follow_symlinks(false) matters twice over: an export symlink pointing
     // outside (say, at /etc) must be neither watched (privacy) nor able to
@@ -158,9 +187,15 @@ pub fn spawn(export: Arc<Export>, hub: Arc<EventHub>, debounce: Duration) -> any
     let mut watcher = notify::RecommendedWatcher::new(
         move |res: Result<notify::Event, notify::Error>| match res {
             Ok(event) => {
-                let _ = raw_tx.send(event);
+                let _ = raw_tx.send(signal_for(event));
             }
-            Err(e) => tracing::warn!(error = %e, "watcher error"),
+            // A watcher error is the same class of problem: from here on the
+            // stream cannot be trusted to have described everything. Logging
+            // it and continuing left the index quietly wrong.
+            Err(e) => {
+                tracing::warn!(error = %e, "watcher error; forcing a resync");
+                let _ = raw_tx.send(WatchSignal::Gap);
+            }
         },
         config,
     )?;
@@ -181,7 +216,7 @@ async fn coalesce_loop(
     export: Arc<Export>,
     hub: Arc<EventHub>,
     debounce: Duration,
-    mut raw_rx: mpsc::UnboundedReceiver<notify::Event>,
+    mut raw_rx: mpsc::UnboundedReceiver<WatchSignal>,
 ) {
     // The collapse/pairing/exclude semantics live in alloyfs_common::coalesce —
     // ONE copy, shared with the sync engine's local watcher. This loop owns
@@ -196,13 +231,31 @@ async fn coalesce_loop(
         };
         tokio::select! {
             maybe = raw_rx.recv() => {
-                let Some(event) = maybe else { break }; // watcher dropped
-                co.ingest(event);
-                // Overflow guards: flush early on a huge or old backlog.
-                if co.len() >= BATCH_MAX
-                    || co.oldest_age().is_some_and(|age| age >= MAX_LATENCY)
-                {
-                    publish_batch(&export, &hub, co.take_batch());
+                let Some(signal) = maybe else { break }; // watcher dropped
+                match signal {
+                    WatchSignal::Event(event) => {
+                        co.ingest(event);
+                        // Overflow guards: flush early on a huge or old backlog.
+                        if co.len() >= BATCH_MAX
+                            || co.oldest_age().is_some_and(|age| age >= MAX_LATENCY)
+                        {
+                            publish_batch(&export, &hub, co.take_batch());
+                        }
+                    }
+                    // Publish what was already coalesced first — those events
+                    // did happen and describing them is still useful — then
+                    // the gap, which tells every reader that anything not
+                    // covered by them is unknown. Ordering matters: a resync
+                    // ahead of the events it supersedes would be undone by
+                    // them.
+                    WatchSignal::Gap => {
+                        publish_batch(&export, &hub, co.take_batch());
+                        publish_batch(
+                            &export,
+                            &hub,
+                            vec![(RelPath(String::new()), EventKind::ResyncRequired)],
+                        );
+                    }
                 }
             }
             _ = tokio::time::sleep(timeout) => {
@@ -337,5 +390,33 @@ mod tests {
                 .any(|e| matches!(e.kind, EventKind::Modified) && e.path.0 == "new.txt"),
             "real Modified on the target must survive: {batch:?}"
         );
+    }
+
+    /// A dropped-event gap must become a resync, not an ordinary change.
+    ///
+    /// This is the reachability half of the recovery path. `publish_batch`
+    /// has always invalidated the index on `ResyncRequired` — and nothing
+    /// ever produced one from the watcher, so the recovery its comment
+    /// describes could not happen. inotify raises this flag on Q_OVERFLOW,
+    /// which is the case that matters: events were dropped, WHICH ones is
+    /// unknowable, and the index is quietly describing a state that may never
+    /// have existed.
+    #[test]
+    fn a_rescan_flagged_event_becomes_a_gap() {
+        let overflowed = notify::Event::new(notify::EventKind::Other).set_flag(notify::event::Flag::Rescan);
+        assert!(
+            matches!(signal_for(overflowed), WatchSignal::Gap),
+            "an overflow must force a resync"
+        );
+    }
+
+    /// ...and an ordinary event must NOT, or every change would invalidate
+    /// the index and the whole point of having one is gone.
+    #[test]
+    fn an_ordinary_event_is_not_a_gap() {
+        let plain = notify::Event::new(notify::EventKind::Modify(notify::event::ModifyKind::Data(
+            notify::event::DataChange::Content,
+        )));
+        assert!(matches!(signal_for(plain), WatchSignal::Event(_)));
     }
 }
