@@ -46,7 +46,11 @@ pub(crate) async fn download_to(conn: &MuxConnection, rel: &str, staging: &Path)
 
 async fn fetch_body(conn: &MuxConnection, fh: u64, size: u64, staging: &Path) -> Result<(), FsError> {
     use futures::StreamExt;
-    let mut out = Vec::with_capacity(size as usize);
+    // Bounded like the walker's: `size` is whatever the server reported, and
+    // pre-allocating it outright turns a corrupt or hostile value into an
+    // abort rather than an error.
+    const MAX_PREALLOC: u64 = 8 * 1024 * 1024;
+    let mut out = Vec::with_capacity(size.min(MAX_PREALLOC) as usize);
     let chunks: Vec<(u64, u32)> = (0..size.max(1))
         .step_by(DATA_CHUNK as usize)
         .map(|off| (off, ((size - off.min(size)).min(DATA_CHUNK as u64)) as u32))
@@ -64,6 +68,21 @@ async fn fetch_body(conn: &MuxConnection, fh: u64, size: u64, staging: &Path) ->
         }
     }
     drop(stream);
+    // The chunk list was computed from the size at open; a truncate while the
+    // reads were in flight makes the later ones short and the file INCOMPLETE.
+    // Without this the short result is written out, stamped with the remote
+    // mtime by the caller, and recorded in the manifest under the ORIGINAL
+    // size — so the next reconcile compares a full-size manifest entry against
+    // a short local file and sees nothing to do. The walker has always checked
+    // this (`walker.rs`); the sync path never did.
+    if out.len() as u64 != size {
+        tracing::debug!(
+            expected = size,
+            got = out.len(),
+            "file changed mid-fetch; leaving it for the next event"
+        );
+        return Err(alloyfs_proto::ErrorCode::Io.into());
+    }
     std::fs::write(staging, &out).map_err(|_| alloyfs_proto::ErrorCode::Io)?;
     Ok(())
 }
