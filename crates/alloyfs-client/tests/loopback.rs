@@ -1950,3 +1950,68 @@ async fn a_remote_change_invalidates_the_listing() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
+
+// ------------------------------------------- OS artifacts on a bare mount
+
+/// A mount with NO user excludes still routes `LOCAL_ARTIFACTS` locally. The
+/// gate that built the overlay only when `--exclude` was passed quietly
+/// disabled the built-in list on exactly the default configuration — probes
+/// of desktop.ini/Thumbs.db/.DS_Store went to the wire, one round trip each,
+/// in every directory Explorer displayed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn os_artifacts_are_local_on_a_default_mount() {
+    let agent = start_agent(AgentOpts::default());
+    std::fs::write(agent.dir.path().join("real.txt"), b"x").unwrap();
+
+    let s = connect(&agent, ClientOptions::default()).await;
+    s.sever();
+
+    // No readdir first, so nothing is dir-cached: the ONLY way these answer
+    // with the connection gone is the overlay's artifact routing.
+    for name in ["desktop.ini", "Thumbs.db", ".DS_Store"] {
+        let err = on_fs(&s.fs, move |fs| fs.lookup(ROOT_INO, name))
+            .await
+            .expect_err("an absent artifact reads as missing");
+        assert_eq!(
+            remote_code(err),
+            ErrorCode::NotFound,
+            "{name} must be a LOCAL miss"
+        );
+    }
+}
+
+/// Writing an artifact name works — it lands in the overlay. Before the
+/// always-on overlay these names were server-excluded AND unroutable, so
+/// Explorer customising a folder (which writes desktop.ini) got an error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn writing_an_os_artifact_lands_in_the_overlay() {
+    let agent = start_agent(AgentOpts::default());
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let opts = ClientOptions {
+        data_dir: data_dir.path().to_path_buf(),
+        cache_dir: data_dir.path().join("cache"),
+        mount_key: "t".into(),
+        ..ClientOptions::default()
+    };
+    let s = connect(&agent, opts).await;
+
+    mkfile(&s.fs, ROOT_INO, "desktop.ini", b"[.ShellClassInfo]").await;
+    let (_, attr) = on_fs(&s.fs, |fs| fs.lookup(ROOT_INO, "desktop.ini"))
+        .await
+        .expect("readable back through the mount");
+    assert_eq!(attr.size, 17);
+
+    assert!(
+        !agent.dir.path().join("desktop.ini").exists(),
+        "the server must never receive it"
+    );
+    assert!(
+        data_dir
+            .path()
+            .join("overlay")
+            .join("t")
+            .join("desktop.ini")
+            .exists(),
+        "it lives in the overlay"
+    );
+}

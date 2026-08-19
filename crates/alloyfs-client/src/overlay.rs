@@ -35,7 +35,14 @@ impl Overlay {
         // The mounted volume presents case-insensitively on Windows, so the
         // matcher must too — "Node_Modules" still routes local there.
         let matcher = ExcludeSet::compile_with_defaults(patterns, cfg!(windows))?;
-        std::fs::create_dir_all(&root)?;
+        // No create_dir_all here, deliberately. The overlay now exists on
+        // EVERY mount so that `LOCAL_ARTIFACTS` route locally, and most
+        // mounts never write an excluded path — the matcher does all the
+        // work and the directory would sit empty. Every write path below
+        // already creates its parents, so the directory materialises on the
+        // first write and not before. Reads of a root that was never created
+        // fall through to "not found", which is the right answer for an
+        // overlay holding nothing.
         Ok(Self {
             matcher,
             root,
