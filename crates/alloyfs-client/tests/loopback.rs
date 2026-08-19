@@ -1736,3 +1736,119 @@ async fn an_unindexed_export_reports_zero_rather_than_failing() {
     let entries = on_fs(&s.fs, |fs| fs.readdir(ROOT_INO)).await.unwrap();
     assert_eq!(entries.len(), 3);
 }
+
+// ------------------------------------------------- two clients, one export
+
+/// Two mounts of the same export must see each other. This is the property the
+/// whole origin/echo mechanism exists to provide, and until now nothing pinned
+/// it: `events_end_to_end` uses one client and edits the disk directly, and
+/// every other two-client test is about locking.
+///
+/// The failure it guards against is silent — a second client would simply go
+/// on serving stale attributes, with nothing logged and nothing erroring.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_clients_write_reaches_another() {
+    let agent = start_agent(AgentOpts {
+        watch: true,
+        ..AgentOpts::default()
+    });
+    std::fs::write(agent.dir.path().join("shared.txt"), b"first").unwrap();
+
+    let a = connect(&agent, ClientOptions::default()).await;
+    let b = connect(&agent, ClientOptions::default()).await;
+
+    // B runs the event pump, which is what a real mount does and what applies
+    // events to the caches. A bare `subscribe` only opens a receiver — it
+    // delivers events to the test while leaving B's caches untouched, which
+    // would leave the TTL to do the work and prove nothing.
+    let (b_tx, mut b_events) = tokio::sync::mpsc::unbounded_channel::<Vec<FsEvent>>();
+    b.fs.start_event_pump(move |batch| {
+        let _ = b_tx.send(batch.to_vec());
+    })
+    .await
+    .unwrap();
+
+    // B learns the file the ordinary way, which also caches its attributes —
+    // so a stale answer later is a real possibility rather than a hypothetical.
+    let (b_ino, before) = lookup_path(&b.fs, "shared.txt").await.unwrap();
+    assert_eq!(before.size, 5);
+
+    // A writes through its own mount.
+    let (a_ino, _) = lookup_path(&a.fs, "shared.txt").await.unwrap();
+    let fh = on_fs(&a.fs, move |fs| fs.open(a_ino, rw()).unwrap().0).await;
+    on_fs(&a.fs, move |fs| fs.write(fh, 0, b"second-and-longer").unwrap()).await;
+    on_fs(&a.fs, move |fs| fs.release(fh)).await;
+
+    // B is told.
+    let mut captured: Vec<FsEvent> = Vec::new();
+    assert!(
+        recv_until(&mut b_events, &mut captured, 10, |evs| evs
+            .iter()
+            .any(|e| e.path.0 == "shared.txt"))
+        .await,
+        "B never received an event for A's write; saw {captured:?}"
+    );
+
+    // And the event is not merely delivered — B's cached attributes give way
+    // to it. Polled rather than read once, because the invalidation travels
+    // through the watcher and the coalescer's debounce.
+    //
+    // The deadline is deliberately shorter than ATTR_TTL (5 s). Allowing
+    // longer would have made this pass whether or not the event did anything:
+    // the cached attribute expires on its own, and a re-fetch would report the
+    // new size for reasons that have nothing to do with propagation. Timing it
+    // out below the TTL is what makes a pass mean "the event invalidated it".
+    let started = std::time::Instant::now();
+    loop {
+        let attr = on_fs(&b.fs, move |fs| fs.getattr(b_ino)).await.unwrap();
+        if attr.size == 17 {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "B still reports size {} after A wrote 17 bytes; at 5 s the TTL \
+             would have refreshed it anyway and this test would prove nothing",
+            attr.size
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the update arrived only after ATTR_TTL could have supplied it"
+    );
+
+    // The bytes themselves, not just the size.
+    assert_eq!(read_all(&b.fs, b_ino).await, b"second-and-longer");
+}
+
+/// The other half of the same mechanism: a client is NOT told about its own
+/// writes. It already applied them synchronously, so an echo would be a
+/// redundant invalidation that throws away a cache entry known to be correct.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_client_is_not_told_about_its_own_write() {
+    let agent = start_agent(AgentOpts {
+        watch: true,
+        ..AgentOpts::default()
+    });
+    let a = connect(&agent, ClientOptions::default()).await;
+    let b = connect(&agent, ClientOptions::default()).await;
+    let mut a_events = subscribe(&a).await;
+    let mut b_events = subscribe(&b).await;
+
+    mkfile(&a.fs, ROOT_INO, "mine.txt", b"x").await;
+
+    // B hears about it...
+    expect_event(&mut b_events, 10, |e| e.path.0 == "mine.txt").await;
+
+    // ...and by the time it has, A has had every chance to and did not. Using
+    // B's delivery as the barrier is what makes this a real assertion rather
+    // than a race with a short sleep.
+    let mut echoed = Vec::new();
+    while let Ok(batch) = a_events.try_recv() {
+        echoed.extend(batch.into_iter().filter(|e| e.path.0 == "mine.txt"));
+    }
+    assert!(
+        echoed.is_empty(),
+        "a client must not be echoed its own write, got {echoed:?}"
+    );
+}
