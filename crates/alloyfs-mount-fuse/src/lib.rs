@@ -340,6 +340,19 @@ impl Filesystem for DsFuse {
         let newname = ok_name!(newname, reply);
         // RENAME_NOREPLACE asks us to fail if the target exists.
         let noreplace = flags.contains(fuser::RenameFlags::RENAME_NOREPLACE);
+        // Every other flag the kernel forwards is unimplemented, and the
+        // contract is to say so rather than approximate it. RENAME_EXCHANGE
+        // asks for an atomic swap of two names and RENAME_WHITEOUT for an
+        // overlayfs whiteout; a plain replacing rename performs neither, so
+        // running one as the other destroys the target's content and reports
+        // success. `mv --exchange` (coreutils 9.4+) and ostree are the
+        // ordinary ways to reach it. bitflags keeps unknown bits via
+        // `from_bits_retain`, so this also refuses flags added after this was
+        // written instead of silently mistranslating them.
+        if !flags.difference(fuser::RenameFlags::RENAME_NOREPLACE).is_empty() {
+            reply.error(libc::EINVAL);
+            return;
+        }
         match self.fs.rename(parent.0, name, newparent.0, newname, !noreplace) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(errno(&e)),
