@@ -35,12 +35,35 @@ macro_rules! expect_resp {
 /// staleness if the event stream hiccups.
 const ATTR_TTL: Duration = Duration::from_secs(5);
 
+/// `OpenState::server_fh` while no server handle has been taken out yet.
+///
+/// A read-only open of a file the auto-cache already holds at the right
+/// version needs nothing from the server: the blob answers the reads, and the
+/// attribute that proves the blob current came from the readdir that listed
+/// the directory. Opening anyway cost a round trip to be told what was already
+/// known, and it is the dominant cost of browsing a remote mount — measured at
+/// 60 ms RTT, `ls -la` over 19 files issued 44 requests and 25 of them were
+/// opens.
+///
+/// `u64::MAX` rather than 0 because 0 is a perfectly good server handle.
+const NO_SERVER_FH: u64 = u64::MAX;
+
+/// Marks a handle the CLIENT invented because the open never reached the
+/// server. Distinct from `OVERLAY_FH_BIT` (1 << 63), and above anything the
+/// server's own small counter will reach.
+pub(crate) const LAZY_FH_BIT: u64 = 1 << 62;
+
 /// Client-side bookkeeping for one open remote handle. Keyed by the fh the
 /// KERNEL holds (stable across reconnects); `server_fh` is what the current
 /// server session knows and is rewritten by the reconnect supervisor.
 pub(crate) struct OpenState {
     pub path: RelPath,
     pub flags: OpenFlags,
+    /// The current session's handle, or [`NO_SERVER_FH`] when the open was
+    /// answered entirely from cache and the server was never told. Anything
+    /// that genuinely needs the server goes through
+    /// [`RemoteFs::server_fh_for_io`], which takes the handle out at that
+    /// point; the common case (reads that the blob satisfies) never does.
     pub server_fh: AtomicU64,
     /// May reads on this fh be served from the auto-cache blob?
     pub cache_ok: AtomicBool,
@@ -82,6 +105,10 @@ pub struct RemoteFs {
     detect_conflicts: bool,
     /// Local mountpoint, for symlink target rewriting. See `localize_target`.
     mount_root: Option<String>,
+    /// Counter for handles the client invents when an open is answered from
+    /// cache. Combined with [`LAZY_FH_BIT`] so it cannot collide with a server
+    /// handle or with the overlay's.
+    next_lazy_fh: AtomicU64,
 }
 
 impl RemoteFs {
@@ -130,6 +157,7 @@ impl RemoteFs {
             last_event_seq: AtomicU64::new(0),
             detect_conflicts: opts.detect_conflicts,
             mount_root: opts.mount_root.clone(),
+            next_lazy_fh: AtomicU64::new(1),
         });
         spawn_background_tasks(&fs, fetch_rx);
         Ok(fs)
@@ -258,6 +286,69 @@ impl RemoteFs {
             .unwrap_or(fh)
     }
 
+    /// The cached attribute for `ino`, if one is present and inside the TTL.
+    ///
+    /// Deliberately does NOT fetch on a miss: the callers are the ones deciding
+    /// whether they can avoid talking to the server at all, and a helper that
+    /// silently round-trips would defeat the whole point of asking.
+    fn cached_attr_fresh(&self, ino: u64) -> Option<Attr> {
+        let hit = self.attr_cache.get(&ino)?;
+        let (attr, when) = *hit;
+        (when.elapsed() < ATTR_TTL).then_some(attr)
+    }
+
+    /// The server handle for `fh`, opening the file on the server if this
+    /// handle has so far been served entirely from cache.
+    ///
+    /// Every operation that genuinely needs the server calls this instead of
+    /// [`Self::server_fh`]. Reads answered by the auto-cache return before
+    /// reaching it, which is the case this exists to keep off the wire.
+    fn server_fh_for_io(&self, fh: u64) -> Result<u64, FsError> {
+        let existing = self.server_fh(fh);
+        if existing != NO_SERVER_FH {
+            return Ok(existing);
+        }
+        let (path, flags) = {
+            let Some(state) = self.open_files.get(&fh) else {
+                return Err(ErrorCode::BadHandle.into());
+            };
+            (state.path.clone(), state.flags)
+        };
+        // No lock held across the call. A DashMap guard cannot span a blocking
+        // request without risking a deadlock against the same shard, so two
+        // threads are allowed to race and the loser gives its handle back.
+        // Racing costs one redundant open; holding a shard lock across a
+        // network round trip would cost the mount.
+        let (server_fh, attr) = expect_resp!(
+            self.call(Request::Open { path, flags })?,
+            Response::Opened { fh: server, attr } => (server, attr)
+        );
+        let Some(state) = self.open_files.get(&fh) else {
+            // Released while we were opening: hand the handle straight back.
+            let _ = self
+                .rt
+                .block_on(self.conn().send_oneway(Request::Release { fh: server_fh }));
+            return Err(ErrorCode::BadHandle.into());
+        };
+        match state
+            .server_fh
+            .compare_exchange(NO_SERVER_FH, server_fh, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => {
+                state.version.store(attr.version, Ordering::Relaxed);
+                Ok(server_fh)
+            }
+            // Someone else materialised first. Theirs is the handle every other
+            // thread already sees, so ours is the one that has to go.
+            Err(theirs) => {
+                let _ = self
+                    .rt
+                    .block_on(self.conn().send_oneway(Request::Release { fh: server_fh }));
+                Ok(theirs)
+            }
+        }
+    }
+
     // ---------------------------------------------------------------- reads
 
     pub fn getattr(&self, ino: u64) -> Result<Attr, FsError> {
@@ -342,6 +433,44 @@ impl RemoteFs {
         if self.is_overlay(&path) {
             return self.overlay_ref().open(&path, flags);
         }
+        // Read-only, and the cache already holds this file at the version the
+        // last listing reported? Then the server has nothing to add. Skipping
+        // the round trip here is what makes browsing a remote tree bearable:
+        // `ls`, git and Explorer's property handlers all open files they never
+        // read a byte of, and each of those opens was costing a full RTT.
+        //
+        // The freshness test is the SAME one the answer would have been fed
+        // through — `fresh_for` compares size, mtime and version — applied to
+        // the attribute the readdir already cached instead of to one fetched
+        // again. That attribute is at most ATTR_TTL old and the event stream
+        // invalidates it sooner, which is the freshness contract every other
+        // read on this mount already runs under.
+        //
+        // Writes, truncation, append and O_EXCL all still go to the server: a
+        // cached blob says what the file WAS, which is no basis for changing
+        // it.
+        if flags.read && !flags.write && !flags.truncate && !flags.append && !flags.excl {
+            if let Some(attr) = self.cached_attr_fresh(ino) {
+                if self.cache.as_ref().is_some_and(|c| c.fresh_for(&path, &attr)) {
+                    let fh = LAZY_FH_BIT | self.next_lazy_fh.fetch_add(1, Ordering::Relaxed);
+                    self.open_files.insert(
+                        fh,
+                        OpenState {
+                            path,
+                            flags,
+                            server_fh: AtomicU64::new(NO_SERVER_FH),
+                            cache_ok: AtomicBool::new(true),
+                            wrote: AtomicBool::new(false),
+                            ra: ReadAhead::new(),
+                            lock: std::sync::Mutex::new(None),
+                            poisoned: AtomicBool::new(false),
+                            version: AtomicU64::new(attr.version),
+                        },
+                    );
+                    return Ok((fh, attr));
+                }
+            }
+        }
         let (fh, attr) = expect_resp!(self.call(Request::Open { path: path.clone(), flags })?, Response::Opened { fh, attr } => (fh, attr));
         debug_assert!(fh & OVERLAY_FH_BIT == 0, "server fh collides with overlay bit");
         self.cache_attr(ino, attr);
@@ -393,6 +522,13 @@ impl RemoteFs {
                 // Blob vanished (eviction race): fall through to the network.
                 state.cache_ok.store(false, Ordering::Relaxed);
             }
+        }
+        // Past the cache, so this read genuinely needs the server. If the open
+        // never took a handle out, take one now — this is the eviction-race and
+        // partial-blob path, not the common one, and it must not be reached
+        // while holding a shard guard.
+        if self.server_fh(fh) == NO_SERVER_FH {
+            self.server_fh_for_io(fh)?;
         }
         let Some(state) = self.open_files.get(&fh) else {
             return self.read_blocks_direct(fh, offset, size); // untracked fh (walker)
@@ -550,7 +686,7 @@ impl RemoteFs {
             return self.overlay_ref().write(fh, offset, data).map(|n| (n, None));
         }
         self.check_poisoned(fh)?;
-        let server_fh = self.server_fh(fh);
+        let server_fh = self.server_fh_for_io(fh)?;
         // The version this write is allowed to overwrite. `None` when the flag
         // is off (the server then never checks) or when we never learned one.
         //
@@ -909,7 +1045,7 @@ impl RemoteFs {
             return Ok(()); // single-machine data: advisory lock is a no-op
         }
         self.check_poisoned(fh)?;
-        let server_fh = self.server_fh(fh);
+        let server_fh = self.server_fh_for_io(fh)?;
         let req = Request::Lock {
             fh: server_fh,
             kind,
@@ -934,7 +1070,7 @@ impl RemoteFs {
         if fh & OVERLAY_FH_BIT != 0 {
             return Ok(());
         }
-        let server_fh = self.server_fh(fh);
+        let server_fh = self.server_fh_for_io(fh)?;
         expect_resp!(self.call(Request::Unlock { fh: server_fh })?, Response::Ok => ());
         if let Some(state) = self.open_files.get(&fh) {
             *state.lock.lock().unwrap() = None;
@@ -956,7 +1092,7 @@ impl RemoteFs {
             return self.overlay_ref().flush(fh);
         }
         self.check_poisoned(fh)?;
-        let server_fh = self.server_fh(fh);
+        let server_fh = self.server_fh_for_io(fh)?;
         expect_resp!(self.call(Request::Flush { fh: server_fh })?, Response::Ok => ());
         Ok(())
     }
@@ -988,6 +1124,13 @@ impl RemoteFs {
                     cache.enqueue_refetch(state.path);
                 }
             }
+        }
+        // Nothing to release when the open was answered from cache: the server
+        // was never told this file was open, so it is holding nothing. This is
+        // the whole point of the lazy handle — `ls` and Explorer open, look and
+        // close again without the server ever hearing about it.
+        if server_fh == NO_SERVER_FH {
+            return;
         }
         // Fire-and-forget. The reply was already being discarded, but `call`
         // still blocked until it arrived — a full round trip on every close,
@@ -1222,6 +1365,13 @@ async fn reconnect_supervisor(fs: Arc<RemoteFs>) {
         for entry in fs.open_files.iter() {
             let state = entry.value();
             state.ra.clear(); // in-flight blocks belong to the dead conn
+                              // A handle the old session never knew about has nothing to restore.
+                              // It cannot hold a lock either — taking one materialises it — so
+                              // there is no mutual exclusion to have lost. It re-opens on its own
+                              // if a read ever escapes the cache.
+            if state.server_fh.load(Ordering::Acquire) == NO_SERVER_FH {
+                continue;
+            }
             let held = *state.lock.lock().unwrap();
             let req = Request::Open {
                 path: state.path.clone(),
