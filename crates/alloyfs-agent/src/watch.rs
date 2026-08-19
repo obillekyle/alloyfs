@@ -75,6 +75,23 @@ impl EventHub {
         self.seq.load(Ordering::Acquire)
     }
 
+    /// Everything in the ring above `since`.
+    ///
+    /// Unlike `subscribe`, this neither registers a listener nor reports
+    /// `TooOld` — the index build uses it to close the window between taking a
+    /// mark and finishing its walk, and a ring that rotated during a 33 ms walk
+    /// means the export is changing far faster than an index can track it. The
+    /// build would be rebuilt on the next `ResyncRequired` anyway.
+    pub fn since(&self, since: u64) -> Vec<FsEvent> {
+        self.log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.seq > since)
+            .cloned()
+            .collect()
+    }
+
     /// Subscribe from `since` (None = live only). Returns the catch-up batch
     /// plus a live receiver, or `TooOld` if the ring no longer reaches back
     /// far enough.
@@ -208,10 +225,20 @@ fn publish_batch(export: &Export, hub: &EventHub, batch: Vec<(RelPath, EventKind
         match kind {
             EventKind::RenamedFrom { to } => {
                 export.rename_version(path, to);
+                export.tree.note_change(&export.root, path, true);
+                export.tree.note_change(&export.root, to, false);
             }
-            EventKind::Removed => {}
+            EventKind::Removed => {
+                export.tree.note_change(&export.root, path, true);
+            }
+            // A gap means the watcher stopped being able to describe what
+            // changed, so the index describes a state that may never have
+            // existed. Dropping it costs one rebuild — cheap enough that it is
+            // the whole recovery path rather than the last resort.
+            EventKind::ResyncRequired => export.tree.invalidate(),
             _ => {
                 export.bump(path);
+                export.tree.note_change(&export.root, path, false);
             }
         }
     }

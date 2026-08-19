@@ -27,15 +27,22 @@ use crate::error::ErrorCode;
 /// client, because it is the server that chooses the reply shape: it answers
 /// with `Written` below v5 and `WrittenAttr` at v5+, and a v5 client accepts
 /// either.
+///
+/// v6: `Request::Tree` / `Request::TreeToken` + `Response::Tree` /
+/// `Response::TreeToken` — the server indexes an export and serves the whole
+/// subtree in one exchange, plus a content-derived token for "has anything
+/// changed at all". Gated on the client, which simply keeps using `Readdir`
+/// against an older peer; an indexed export is an optimisation, never a
+/// requirement.
 pub const PROTO_VERSION_MIN: u16 = 1;
-pub const PROTO_VERSION_MAX: u16 = 5;
+pub const PROTO_VERSION_MAX: u16 = 6;
 
 /// The protocol range this build speaks, for `--version` and diagnostics —
 /// "which wire version does this release talk" should not require reading
 /// source. A literal rather than a formatted string because clap's version
 /// output needs a `&'static str`; `proto_range_matches_the_constants` is what
 /// keeps it from drifting away from the two constants above.
-pub const PROTO_RANGE: &str = "1-5";
+pub const PROTO_RANGE: &str = "1-6";
 
 /// Read/write payloads are capped to this many bytes per request so one huge
 /// file operation can never monopolize the connection (head-of-line blocking).
@@ -127,6 +134,18 @@ pub struct Attr {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DirEntry {
     pub name: String,
+    pub attr: Attr,
+}
+
+/// One entry of a `Tree` reply.
+///
+/// Carries a `path` where [`DirEntry`] carries a `name`, because a tree page
+/// spans directories and a bare name would be ambiguous. Relative to the root
+/// the `Tree` request named, so a client can rebase a subtree without
+/// rewriting every entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TreeEntry {
+    pub path: RelPath,
     pub attr: Attr,
 }
 
@@ -282,6 +301,35 @@ pub enum Request {
     ReadLink {
         path: RelPath,
     },
+    /// v6+: the whole subtree under `path`, one reply instead of one round
+    /// trip per directory.
+    ///
+    /// This exists because a mount is latency-bound. Walking an export the
+    /// old way costs one `Readdir` per directory, and the client's cache
+    /// walker measured 535 directories in 35.8 s against a 60 ms link — 535
+    /// round trips, almost all of it waiting. The server holds the same
+    /// information: enumerating 3601 entries with stat took 33 ms locally,
+    /// and the result compressed to 44 KB. One round trip carries what used
+    /// to take hundreds.
+    ///
+    /// Paginated on `cursor` because a big export cannot fit in one frame
+    /// (`MAX_FRAME_LEN`), not because the client wants it piecemeal. An
+    /// export the server declined to index answers `Unsupported`, and the
+    /// client falls back to per-directory `Readdir`.
+    Tree {
+        path: RelPath,
+        cursor: Option<u64>,
+    },
+    /// v6+: the export's current tree token — one cheap exchange that answers
+    /// "has anything at all changed".
+    ///
+    /// Unlike an event sequence number, this is derived from the tree's
+    /// CONTENT rather than from a session counter, so it is the same value
+    /// after the agent restarts. That distinction is the whole point: an
+    /// `ssh://` agent is spawned per connection and its sequence numbering
+    /// begins again every mount, which makes a sequence useless for deciding
+    /// whether a cache from an earlier mount is still good. A token is not.
+    TreeToken,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -344,6 +392,24 @@ pub enum Response {
     WrittenAttr {
         n: u32,
         attr: Attr,
+    },
+    /// v6+: a page of the subtree, plus the token the whole page describes.
+    ///
+    /// `token` rides along so a client never has to ask twice: having walked
+    /// the pages, it knows both the contents and the exact state they are
+    /// contents OF. A token that changes between pages means the export moved
+    /// underneath the read, and the client restarts rather than stitching two
+    /// states into one tree.
+    Tree {
+        entries: Vec<TreeEntry>,
+        next_cursor: Option<u64>,
+        token: u64,
+    },
+    /// v6+: the export's tree token. 0 means the export is not indexed —
+    /// too large for the configured cap, or indexing failed — and the client
+    /// should keep using `Readdir`.
+    TreeToken {
+        token: u64,
     },
 }
 

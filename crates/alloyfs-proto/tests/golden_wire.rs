@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime};
 
 use alloyfs_proto::{
     Attr, DirEntry, ErrorCode, EventKind, FileKind, Frame, FsEvent, LockKind, OpenFlags, RelPath, Request,
-    Response, PROTO_VERSION_MAX, PROTO_VERSION_MIN,
+    Response, TreeEntry, PROTO_VERSION_MAX, PROTO_VERSION_MIN,
 };
 use bytes::Bytes;
 
@@ -266,6 +266,31 @@ fn canonical() -> Vec<(&'static str, Frame)> {
             "resp_written_attr",
             ok(Response::WrittenAttr { n: 42, attr: attr() }),
         ),
+        (
+            "req_tree",
+            req(Request::Tree {
+                path: path(),
+                cursor: Some(64),
+            }),
+        ),
+        ("req_tree_token", req(Request::TreeToken)),
+        (
+            "resp_tree",
+            ok(Response::Tree {
+                entries: vec![TreeEntry {
+                    path: path(),
+                    attr: attr(),
+                }],
+                next_cursor: Some(64),
+                token: 0x0123_4567_89ab_cdef,
+            }),
+        ),
+        (
+            "resp_tree_token",
+            ok(Response::TreeToken {
+                token: 0x0123_4567_89ab_cdef,
+            }),
+        ),
         // --- every ErrorCode (as Err) ---
         ("err_not_found", err(ErrorCode::NotFound)),
         ("err_permission_denied", err(ErrorCode::PermissionDenied)),
@@ -347,6 +372,8 @@ fn _variant_tripwire(
         Request::Auth { .. } => {}    // v3: golden added, PROTO_VERSION_MAX bumped
         Request::Symlink { .. } => {} // v4: golden added, PROTO_VERSION_MAX bumped
         Request::ReadLink { .. } => {} // v4: golden added, PROTO_VERSION_MAX bumped
+        Request::Tree { .. } => {}    // v6: golden added, PROTO_VERSION_MAX bumped
+        Request::TreeToken => {}      // v6: golden added, PROTO_VERSION_MAX bumped
     }
     match response {
         Response::AttachOk { .. } => {}
@@ -361,6 +388,8 @@ fn _variant_tripwire(
         Response::MountDefaults { .. } => {} // v2: golden added, PROTO_VERSION_MAX bumped
         Response::Target(..) => {}           // v4: golden added, PROTO_VERSION_MAX bumped
         Response::WrittenAttr { .. } => {}   // v5: golden added, PROTO_VERSION_MAX bumped
+        Response::Tree { .. } => {}          // v6: golden added, PROTO_VERSION_MAX bumped
+        Response::TreeToken { .. } => {}     // v6: golden added, PROTO_VERSION_MAX bumped
     }
     match code {
         ErrorCode::NotFound => {}
@@ -406,13 +435,8 @@ fn _variant_tripwire(
 /// `cargo test -p alloyfs-proto print_goldens -- --ignored --nocapture`
 #[rustfmt::skip]
 const GOLDEN: &[(&str, &str)] = &[
-    // hello/hello_ack embed PROTO_VERSION_MAX — they legitimately move when
-    // the protocol version bumps (v5: attributes on the write reply). They
-    // are also the ONLY existing entries allowed to move for that reason: a
-    // bump that disturbs any other line has changed a variant's index or
-    // shape, which is the failure this table exists to catch.
-    ("hello", "00010506676f6c64656e"),
-    ("hello_ack", "010506676f6c64656e"),
+    ("hello", "00010606676f6c64656e"),
+    ("hello_ack", "010606676f6c64656e"),
     ("ping", "0507"),
     ("pong", "0607"),
     ("compressed", "0706676f6c64656e"),
@@ -450,10 +474,11 @@ const GOLDEN: &[(&str, &str)] = &[
     ("req_symlink", "020715152e2e2f656c736577686572652f66696c652e7478740c6469722f66696c652e747874"),
     ("req_read_link", "0207160c6469722f66696c652e747874"),
     ("resp_target", "0307000a152e2e2f656c736577686572652f66696c652e747874"),
-    // Variant index 0b, appended after Target. Its tail is byte-for-byte the
-    // Attr encoding in resp_attr — proof the shared type did not shift while
-    // a variant carrying it was added.
     ("resp_written_attr", "0307000b2a002a80e2cfaa06bc99ef3a80e2cfaa06bc99ef3aa40308"),
+    ("req_tree", "0207170c6469722f66696c652e7478740140"),
+    ("req_tree_token", "020718"),
+    ("resp_tree", "0307000c010c6469722f66696c652e747874002a80e2cfaa06bc99ef3a80e2cfaa06bc99ef3aa403080140ef9bafcdf8acd19101"),
+    ("resp_tree_token", "0307000def9bafcdf8acd19101"),
     ("err_not_found", "03070100"),
     ("err_permission_denied", "03070101"),
     ("err_already_exists", "03070102"),

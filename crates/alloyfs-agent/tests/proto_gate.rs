@@ -174,7 +174,13 @@ async fn a_v5_peer_gets_the_follow_up_getattr_in_the_write_reply() {
     let dir = tempfile::TempDir::new().unwrap();
     let registry = registry_for(&dir);
     let mut peer = Peer::connect(&registry, PROTO_VERSION_MAX).await;
-    assert_eq!(peer.proto, 5);
+    // The gate is "v5 or later", not "exactly 5" — pinning the number here
+    // made this fail on the v6 bump for no reason connected to what it tests.
+    assert!(
+        peer.proto >= 5,
+        "negotiated {} , below the WrittenAttr gate",
+        peer.proto
+    );
 
     let (written, polled) = peer.attach_and_write("v5.txt", b"golden").await;
     let Response::WrittenAttr { n, attr } = written else {

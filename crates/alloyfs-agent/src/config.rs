@@ -62,6 +62,16 @@ pub struct ExportConfig {
     /// has no explicit value; `--no-server-defaults` opts out entirely.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client: Option<ClientDefaults>,
+    /// Entries above which this export is left unindexed and clients fall back
+    /// to per-directory `Readdir` (v6). Defaults to
+    /// [`crate::tree::DEFAULT_MAX_ENTRIES`].
+    ///
+    /// The index trades memory for round trips, and the exchange rate depends
+    /// on the box: roughly 150 bytes an entry against one saved round trip per
+    /// directory. Worth raising on a server with headroom and a deep tree;
+    /// worth lowering on a small one. Set 0 to switch indexing off entirely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree_max_entries: Option<usize>,
 }
 
 fn default_true() -> bool {
@@ -79,6 +89,7 @@ impl Default for ExportConfig {
             exclude: Vec::new(),
             default_excludes: true,
             client: None,
+            tree_max_entries: None,
         }
     }
 }

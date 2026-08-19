@@ -142,3 +142,86 @@ pub async fn events(
     }
     Ok(())
 }
+
+/// Fetch an export's whole tree in as few round trips as the server allows,
+/// and report what it cost.
+///
+/// A diagnostic rather than a feature: it answers "is this export indexed, and
+/// what does one exchange actually buy here" without needing a mount. The
+/// comparison it exists to make is against `Readdir`, which needs one round
+/// trip per directory — so the directory count in the output is roughly the
+/// number of round trips this replaced.
+pub async fn tree(url: String, remote_cmd: String, token: Option<String>) -> anyhow::Result<()> {
+    let (conn, export) = connect_target(&url, &remote_cmd, &whoami(), token.as_deref()).await?;
+    let export = require_export(export, &url)?;
+    conn.request(alloyfs_proto::Request::Attach { export }).await??;
+
+    if conn.proto < 6 {
+        anyhow::bail!(
+            "the agent speaks protocol {} — the tree index arrived in v6",
+            conn.proto
+        );
+    }
+
+    let started = std::time::Instant::now();
+    let mut cursor = None;
+    let mut requests = 0usize;
+    let mut files = 0usize;
+    let mut dirs = 0usize;
+    let mut bytes = 0u64;
+    let mut token_seen = 0u64;
+    loop {
+        let resp = conn
+            .request(alloyfs_proto::Request::Tree {
+                path: alloyfs_proto::RelPath(String::new()),
+                cursor,
+            })
+            .await??;
+        let alloyfs_proto::Response::Tree {
+            entries,
+            next_cursor,
+            token,
+        } = resp
+        else {
+            anyhow::bail!("expected a Tree reply, got {resp:?}");
+        };
+        requests += 1;
+        if token == 0 {
+            println!("{url}: not indexed — clients fall back to per-directory readdir");
+            println!("  (the export is past the agent's tree_max_entries, or indexing failed)");
+            return Ok(());
+        }
+        // A token that moves between pages means the export changed underneath
+        // the read; the pages would describe two different trees stitched into
+        // one, which is worse than not answering.
+        if token_seen != 0 && token != token_seen {
+            anyhow::bail!("the export changed while being read (token {token_seen} -> {token}); retry");
+        }
+        token_seen = token;
+        for e in &entries {
+            match e.attr.kind {
+                alloyfs_proto::FileKind::Dir => dirs += 1,
+                _ => {
+                    files += 1;
+                    bytes += e.attr.size;
+                }
+            }
+        }
+        match next_cursor {
+            Some(c) => cursor = Some(c),
+            None => break,
+        }
+    }
+    let ms = started.elapsed().as_secs_f64() * 1000.0;
+    println!("{url}");
+    println!("  token       {token_seen:#018x}");
+    println!(
+        "  entries     {} ({dirs} directories, {files} files)",
+        dirs + files
+    );
+    println!("  bytes       {bytes}");
+    println!("  requests    {requests}");
+    println!("  elapsed     {ms:.1} ms");
+    println!("  readdir would have needed ~{dirs} round trips for the same listing");
+    Ok(())
+}

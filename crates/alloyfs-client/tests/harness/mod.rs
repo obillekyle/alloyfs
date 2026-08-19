@@ -31,6 +31,8 @@ pub struct AgentOpts {
     pub debounce_ms: u64,
     /// The export's `client:` section — suggested mount defaults (proto v2).
     pub client_defaults: Option<alloyfs_agent::ClientDefaults>,
+    /// Entry cap for the v6 index; None uses the agent default.
+    pub tree_max_entries: Option<usize>,
 }
 
 impl Default for AgentOpts {
@@ -41,6 +43,7 @@ impl Default for AgentOpts {
             watch: false,
             debounce_ms: 100,
             client_defaults: None,
+            tree_max_entries: None,
         }
     }
 }
@@ -64,6 +67,7 @@ pub fn start_agent(mut opts: AgentOpts) -> TestAgent {
             read_only: opts.read_only,
             exclude: opts.excludes.clone(),
             client: opts.client_defaults.take(),
+            tree_max_entries: opts.tree_max_entries,
             ..Default::default()
         },
     );

@@ -8,6 +8,7 @@ mod config;
 mod fsutil;
 mod locks;
 mod ops;
+pub mod tree;
 pub mod watch;
 
 pub use config::{AgentConfig, ClientDefaults, ExportConfig};

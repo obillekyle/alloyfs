@@ -754,11 +754,22 @@ addEventListener('click', event => {
   if (!href.startsWith('?/')) return
 
   event.preventDefault()
-  const before = currentRoute().page
+  // **The ref counts as much as the page.** Comparing pages alone broke the one
+  // link that changes only the version: "read it in the current release" points
+  // at the page being read, minus `?v=`, so the page matched, the fragment was
+  // scrolled to instead of the content being rebuilt, and clicking it did
+  // visibly nothing — the URL lost its version and the screen kept the old ref's
+  // markdown, including the banner offering the link again.
+  const before = routeKey()
   history.pushState(null, '', href)
-  if (currentRoute().page === before) goToAnchor()
+  if (routeKey() === before) goToAnchor()
   else route()
 })
+
+/** What has to match for a click to be a move within the same rendered page. */
+function routeKey() {
+  return JSON.stringify([currentRoute().page, requestedRef()])
+}
 
 addEventListener('popstate', () => route())
 
@@ -810,6 +821,13 @@ async function route() {
   // After the heading is in the DOM, since the first batch appends to it.
   if (isLog) startChangelogFeed(content, split.entries, page, anchor)
   document.title = `${content.querySelector('h1')?.textContent || 'AlloyFS'} | AlloyFS`
+
+  // The title is the one link in the static shell rather than in generated
+  // markup, so it is the one `routeHref` never got to build. Left as written it
+  // sends a reader pinned to an old version back to the current release without
+  // saying so — the same silent unpinning the query-string scheme exists to
+  // prevent everywhere else.
+  document.querySelector('.brand')?.setAttribute('href', routeHref('README'))
 
   // on-page contents
   const aside = document.getElementById('aside')

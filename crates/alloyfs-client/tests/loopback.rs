@@ -1581,3 +1581,158 @@ async fn a_write_reply_refreshes_the_attr_cache_instead_of_costing_a_getattr() {
     assert_eq!(cached.size, 6, "the cached attr must be the post-write one");
     assert_eq!(cached.version, written.version);
 }
+
+// ------------------------------------------------------- v6: the tree index
+
+/// Ask for the whole tree, following pages, and return (paths, token).
+async fn fetch_tree(s: &Session, root: &str) -> (Vec<String>, u64) {
+    let conn = s.conn();
+    let mut paths = Vec::new();
+    let mut cursor = None;
+    let mut token;
+    loop {
+        let resp = conn
+            .request(Request::Tree {
+                path: RelPath(root.into()),
+                cursor,
+            })
+            .await
+            .expect("transport")
+            .expect("tree");
+        let Response::Tree {
+            entries,
+            next_cursor,
+            token: t,
+        } = resp
+        else {
+            panic!("expected a Tree reply, got {resp:?}");
+        };
+        token = t;
+        paths.extend(entries.into_iter().map(|e| e.path.0));
+        match next_cursor {
+            Some(c) => cursor = Some(c),
+            None => break,
+        }
+    }
+    (paths, token)
+}
+
+async fn tree_token(s: &Session) -> u64 {
+    let conn = s.conn();
+    match conn
+        .request(Request::TreeToken)
+        .await
+        .expect("transport")
+        .expect("tree token")
+    {
+        Response::TreeToken { token } => token,
+        other => panic!("expected TreeToken, got {other:?}"),
+    }
+}
+
+/// The whole point of the index: one exchange returns what a directory-by-
+/// directory walk would need one round trip per directory to discover.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_tree_returns_a_whole_subtree_at_once() {
+    let agent = start_agent(AgentOpts::default());
+    let root = agent.dir.path();
+    std::fs::create_dir_all(root.join("a/b/c")).unwrap();
+    std::fs::write(root.join("top.txt"), b"t").unwrap();
+    std::fs::write(root.join("a/one.txt"), b"1").unwrap();
+    std::fs::write(root.join("a/b/two.txt"), b"22").unwrap();
+    std::fs::write(root.join("a/b/c/three.txt"), b"333").unwrap();
+
+    let s = connect(&agent, ClientOptions::default()).await;
+    let (mut paths, token) = fetch_tree(&s, "").await;
+    paths.sort();
+    assert_eq!(
+        paths,
+        [
+            "a",
+            "a/b",
+            "a/b/c",
+            "a/b/c/three.txt",
+            "a/b/two.txt",
+            "a/one.txt",
+            "top.txt"
+        ],
+        "four directories deep, one exchange"
+    );
+    assert_ne!(token, 0, "an indexed export reports a non-zero token");
+
+    // A subtree query is scoped, and does not re-list its ancestors.
+    let (sub, _) = fetch_tree(&s, "a/b").await;
+    let mut sub = sub;
+    sub.sort();
+    assert_eq!(sub, ["a/b/c", "a/b/c/three.txt", "a/b/two.txt"]);
+}
+
+/// The token is what a client compares against a cache it kept from a previous
+/// mount, so it must be stable while nothing changes and move when something
+/// does — including through a path the client never asks about.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_token_tracks_the_export() {
+    let agent = start_agent(AgentOpts {
+        // The second half of this test changes a file WITHOUT going through
+        // alloyfs, so the watcher has to be the thing that notices.
+        watch: true,
+        ..AgentOpts::default()
+    });
+    std::fs::write(agent.dir.path().join("one.txt"), b"1").unwrap();
+
+    let s = connect(&agent, ClientOptions::default()).await;
+    let first = tree_token(&s).await;
+    assert_ne!(first, 0);
+    assert_eq!(first, tree_token(&s).await, "stable while nothing changes");
+
+    // Polled rather than read once: the watcher path is asynchronous, and the
+    // harness's `wait_until` takes a synchronous probe while asking for a token
+    // means a request.
+    async fn token_changing_from(s: &Session, old: u64, what: &str) -> u64 {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let t = tree_token(s).await;
+            if t != old {
+                return t;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{what} did not move the token"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    // A write THROUGH the mount moves it.
+    mkfile(&s.fs, ROOT_INO, "two.txt", b"22").await;
+    let after_create = token_changing_from(&s, first, "creating a file").await;
+
+    // And so does one made behind alloyfs's back, since the watcher feeds the
+    // same index.
+    std::fs::write(agent.dir.path().join("three.txt"), b"333").unwrap();
+    token_changing_from(&s, after_create, "a change made directly on the server").await;
+}
+
+/// An export past the cap is not an error: the client is told so with token 0
+/// and carries on with `Readdir`. Reporting a failure would push a decision
+/// onto every caller for something that is only ever an optimisation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unindexed_export_reports_zero_rather_than_failing() {
+    let agent = start_agent(AgentOpts {
+        tree_max_entries: Some(1),
+        ..AgentOpts::default()
+    });
+    std::fs::write(agent.dir.path().join("a.txt"), b"a").unwrap();
+    std::fs::write(agent.dir.path().join("b.txt"), b"b").unwrap();
+    std::fs::write(agent.dir.path().join("c.txt"), b"c").unwrap();
+
+    let s = connect(&agent, ClientOptions::default()).await;
+    assert_eq!(tree_token(&s).await, 0, "over the cap reads as unindexed");
+    let (paths, token) = fetch_tree(&s, "").await;
+    assert_eq!(token, 0);
+    assert!(paths.is_empty(), "no entries, but no error either");
+
+    // Readdir still works, which is the entire point of the fallback.
+    let entries = on_fs(&s.fs, |fs| fs.readdir(ROOT_INO)).await.unwrap();
+    assert_eq!(entries.len(), 3);
+}

@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use alloyfs_common::{attr_from_metadata, read_fully, set_mode, write_fully, ExcludeSet, OrCode};
 use alloyfs_proto::{
-    DirEntry, ErrorCode, EventKind, FsEvent, OpenFlags, RelPath, Request, Response, DATA_CHUNK,
+    Attr, DirEntry, ErrorCode, EventKind, FsEvent, OpenFlags, RelPath, Request, Response, DATA_CHUNK,
     PROTO_VERSION_MIN,
 };
 use alloyfs_transport::{EventPusher, RequestHandler};
@@ -14,6 +14,11 @@ use dashmap::DashMap;
 
 /// Max directory entries per Readdir response; clients page with the cursor.
 const READDIR_PAGE: usize = 1024;
+
+/// Entries per `Tree` page. Larger than a readdir page because the whole
+/// point is fewer round trips, and bounded because `MAX_FRAME_LEN` is 1 MiB —
+/// at roughly 80 bytes an encoded entry, 4096 leaves generous headroom.
+const TREE_PAGE: usize = 4096;
 
 pub struct Export {
     pub name: String,
@@ -34,6 +39,9 @@ pub struct Export {
     pub exclude: ExcludeSet,
     /// Suggested client settings (already size-parsed), served to v2 mounts.
     pub mount_defaults: MountDefaults,
+    /// The v6 index. Built on first request, not at startup — an export no
+    /// client asks a tree of is never walked.
+    pub tree: crate::tree::ExportTree,
 }
 
 /// Resolved form of the config's `client:` section.
@@ -189,6 +197,9 @@ impl ExportRegistry {
                     locks: crate::locks::LockManager::default(),
                     exclude,
                     mount_defaults,
+                    tree: crate::tree::ExportTree::new(
+                        ec.tree_max_entries.unwrap_or(crate::tree::DEFAULT_MAX_ENTRIES),
+                    ),
                 }),
             );
         }
@@ -448,6 +459,85 @@ impl SessionInner {
         let full = export.resolve(&path)?;
         let md = std::fs::metadata(&full).or_code()?;
         Ok(Response::Attr(attr_from_metadata(&md, export.version_of(&path))))
+    }
+
+    /// Build the index if needed, replaying anything that changed during the
+    /// walk.
+    ///
+    /// The mark is taken BEFORE walking. The watcher has been running since
+    /// the export was created — well before any client could ask — so a change
+    /// landing mid-walk is either visible to the walk or present in the replay
+    /// above the mark. Applying it through both paths is harmless: each is an
+    /// idempotent overwrite of one path's entry.
+    fn indexed_token(&self, export: &Arc<Export>) -> u64 {
+        if export.tree.token() != 0 {
+            return export.tree.token();
+        }
+        let mark = export.events.last_seq();
+        let token = export.tree.ensure(&export.root, &export.exclude);
+        if token == 0 {
+            return 0;
+        }
+        for e in export.events.since(mark) {
+            match e.kind {
+                EventKind::Removed => export.tree.note_change(&export.root, &e.path, true),
+                EventKind::RenamedFrom { ref to } => {
+                    export.tree.note_change(&export.root, &e.path, true);
+                    export.tree.note_change(&export.root, to, false);
+                }
+                // A gap during the build makes the build itself suspect.
+                EventKind::ResyncRequired => export.tree.invalidate(),
+                _ => export.tree.note_change(&export.root, &e.path, false),
+            }
+        }
+        export.tree.token()
+    }
+
+    fn tree(&self, path: RelPath, cursor: Option<u64>) -> Result<Response, ErrorCode> {
+        let export = self.export()?;
+        // Resolve for the same reason readdir does: an excluded or escaping
+        // path must not become listable just because a different verb asked.
+        export.resolve(&path)?;
+        // "Not indexed" is reported in-band as token 0 rather than as an
+        // error. It is not a failure — the export is simply larger than the
+        // cap, or indexing did not work here — and the client's answer is to
+        // carry on with `Readdir`. An error code would also have meant
+        // appending a variant to `ErrorCode` permanently, to say something the
+        // token already says.
+        let unindexed = Ok(Response::Tree {
+            entries: Vec::new(),
+            next_cursor: None,
+            token: 0,
+        });
+        if self.indexed_token(&export) == 0 {
+            return unindexed;
+        }
+        let offset = cursor.unwrap_or(0) as usize;
+        let Some((entries, more, token)) = export.tree.page(&path, offset, TREE_PAGE) else {
+            return unindexed;
+        };
+        let next_cursor = more.then(|| (offset + entries.len()) as u64);
+        Ok(Response::Tree {
+            entries: entries
+                .into_iter()
+                .map(|(p, attr)| alloyfs_proto::TreeEntry {
+                    attr: Attr {
+                        version: export.version_of(&p),
+                        ..attr
+                    },
+                    path: p,
+                })
+                .collect(),
+            next_cursor,
+            token,
+        })
+    }
+
+    fn tree_token(&self) -> Result<Response, ErrorCode> {
+        let export = self.export()?;
+        Ok(Response::TreeToken {
+            token: self.indexed_token(&export),
+        })
     }
 
     fn readdir(&self, path: RelPath, cursor: u64) -> Result<Response, ErrorCode> {
@@ -842,6 +932,8 @@ impl SessionInner {
             Request::Attach { export } => self.attach(export),
             Request::Getattr { path } => self.getattr(path),
             Request::Readdir { path, cursor } => self.readdir(path, cursor),
+            Request::Tree { path, cursor } => self.tree(path, cursor),
+            Request::TreeToken => self.tree_token(),
             Request::Open { path, flags } => self.open(path, flags),
             Request::Create { path, flags, mode } => self.create(path, flags, mode),
             Request::Read { fh, offset, len } => self.read(fh, offset, len),

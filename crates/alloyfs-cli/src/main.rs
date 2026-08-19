@@ -170,6 +170,17 @@ enum Command {
         #[arg(long)]
         token: Option<String>,
     },
+    /// Fetch an export.s whole tree in one exchange and report what it cost
+    /// (url: tcp://host:port/export or ssh://host/export).
+    Tree {
+        url: String,
+        /// Remote alloyfs command for ssh:// urls.
+        #[arg(long, default_value = "alloyfs")]
+        remote_cmd: String,
+        /// Shared secret for token-protected TCP servers.
+        #[arg(long)]
+        token: Option<String>,
+    },
     /// Measure round-trip latency to an agent (url: tcp://host:port or ssh://host).
     Ping {
         url: String,
@@ -529,6 +540,11 @@ async fn main() -> anyhow::Result<()> {
             remote_cmd,
             token,
         } => commands::diag::events(url, since, remote_cmd, token).await,
+        Command::Tree {
+            url,
+            remote_cmd,
+            token,
+        } => commands::diag::tree(url, remote_cmd, token).await,
         Command::Ping { url, count, token } => commands::diag::ping(url, count, token).await,
         Command::Stress { url, count, token } => commands::diag::stress(url, count, token).await,
         Command::Bench {
