@@ -116,7 +116,15 @@ fn supervise(id: &str) -> anyhow::Result<()> {
         wait_hint: Duration::default(),
         process_id: None,
     };
-    let accepted = ServiceControlAccept::STOP | ServiceControlAccept::SESSION_CHANGE;
+    // SHUTDOWN as well as STOP. The handler above has always treated the two
+    // alike, but without advertising it here Windows never SENT the shutdown
+    // control — it just terminated the process — so `sc query` reported
+    // IGNORES_SHUTDOWN and the mount was killed rather than stopped on every
+    // reboot. The child never ran `fs.shutdown()`, which cost up to 30 s of
+    // auto-cache manifest delta each time: re-derived on next boot, so wasted
+    // work rather than corruption, but wasted on every single shutdown.
+    let accepted =
+        ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN | ServiceControlAccept::SESSION_CHANGE;
     status_handle.set_service_status(report(ServiceState::Running, accepted))?;
 
     let mut child: Option<spawn::Handle> = None;
