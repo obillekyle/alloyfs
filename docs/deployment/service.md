@@ -230,7 +230,7 @@ What the supervisor does with it:
   failing rather than finishing, so it backs off instead of spinning.
 
 None of this exists on Linux. A systemd user unit is already in the right
-session, and `Restart=always` with `RestartSec=5` is the whole of the
+session, and `Restart=on-failure` with `RestartSec=5` is the whole of the
 supervision.
 
 ### Which config, read by whom

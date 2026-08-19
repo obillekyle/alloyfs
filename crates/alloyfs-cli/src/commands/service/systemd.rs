@@ -127,7 +127,19 @@ pub fn unit_text(id: &str, exe: &Path, instance: &Instance) -> String {
          [Service]\n\
          Type=simple\n\
          ExecStart={exec}\n\
-         Restart=always\n\
+         # on-failure, not always: `alloyfs start` already distinguishes the two\n\
+         # cases in its exit code, and `always` threw that away. A config that\n\
+         # describes nothing exits 0 and will never start anything however often\n\
+         # it is retried, so it lands in `failed`... which is to say, it stops,\n\
+         # having journalled why. A mount that dies exits non-zero and comes\n\
+         # back. A deliberate stop or a hand unmount is also a clean exit, and\n\
+         # is not fought.\n\
+         #\n\
+         # No StartLimit deliberately. It would stop the retry loop on an empty\n\
+         # config, but at the price of capping recovery for a mount whose server\n\
+         # is down for a few minutes — and that outage is exactly what `Restart`\n\
+         # is here to survive.\n\
+         Restart=on-failure\n\
          RestartSec=5\n\
          # alloyfs unmounts on SIGINT; systemd's default stop signal is SIGTERM,\n\
          # which it does not handle. Stopping the unit would then kill it with the\n\
@@ -472,6 +484,6 @@ mod tests {
             scope: Scope::All,
         });
         assert!(!unit.contains("Wants=network-online.target"), "{unit}");
-        assert!(unit.contains("Restart=always"), "{unit}");
+        assert!(unit.contains("Restart=on-failure"), "{unit}");
     }
 }

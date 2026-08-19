@@ -244,7 +244,7 @@ impl Filesystem for DsFuse {
     fn write(
         &self,
         _req: &FuseRequest,
-        ino: INodeNo,
+        _ino: INodeNo,
         fh: FileHandle,
         offset: u64,
         data: &[u8],
@@ -253,11 +253,15 @@ impl Filesystem for DsFuse {
         _lock_owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
-        match self.fs.write(fh.0, offset, data) {
-            Ok(n) => {
-                self.fs.invalidate_attr(ino.0); // size/mtime changed server-side
-                reply.written(n);
-            }
+        // `write_at` rather than `write`: at protocol 5 the reply carries the
+        // post-write attributes, and it re-seeds the cache with them. Calling
+        // `invalidate_attr` here would throw that away and put the round-trip
+        // back — the next GETATTR would have to ask again for what the write
+        // reply already said. Against an older agent the reply carries nothing
+        // and `write_at` invalidates instead, which is exactly what this used
+        // to do by hand.
+        match self.fs.write_at(fh.0, offset, data) {
+            Ok((n, _attr)) => reply.written(n),
             Err(e) => reply.error(errno(&e)),
         }
     }

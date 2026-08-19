@@ -372,10 +372,13 @@ impl Server {
             return Ok(abi::write_out(0));
         }
         let fh = self.handle_for(nodeid, true)?;
-        let n = self.fs.write(fh, offset, data).map_err(|e| errno_of(&e))?;
-        // The kernel updated i_size from the reply; our own attr cache must
-        // not keep serving the pre-write size to the next GETATTR.
-        self.fs.invalidate_attr(nodeid);
+        // The kernel updates i_size from the reply, and our own attr cache must
+        // not keep serving the pre-write size to the next GETATTR. At protocol
+        // 5 the write reply carries the new attributes and `write_at` re-seeds
+        // the cache with them; against an older agent it invalidates instead.
+        // Either way the stale entry is gone — but only the first spares the
+        // extra round-trip that adding the attributes to the reply was for.
+        let (n, _attr) = self.fs.write_at(fh, offset, data).map_err(|e| errno_of(&e))?;
         Ok(abi::write_out(n))
     }
 

@@ -101,7 +101,14 @@ pub fn add(id: String, instance: Instance, start_now: bool) -> anyhow::Result<()
     check_reference(&instance)?;
 
     instance::save(&id, &instance)?;
-    reg::create(&id, &instance)?;
+    // A failed registration must not leave the definition behind. `add` refuses
+    // an id that already has one, and `remove` used to give up before reaching
+    // the file — so the orphan was unreachable by every command that could have
+    // cleared it, and only `reset --confirm` or deleting it by hand got out.
+    if let Err(e) = reg::create(&id, &instance) {
+        let _ = std::fs::remove_file(instance::instance_path(&id));
+        return Err(e);
+    }
     println!("added {id}: alloyfs {}", instance.command());
     if start_now {
         reg::start(&id)?;
@@ -123,12 +130,21 @@ pub fn remove(id: String) -> anyhow::Result<()> {
     reg::preflight()?;
     instance::validate_id(&id)?;
     let _ = reg::stop(&id);
-    reg::delete(&id)?;
+    // Best-effort, and the definition goes either way. A registration that is
+    // already absent is the state `remove` is being asked to reach, so treating
+    // it as a failure left the definition stranded — refused by `add` for
+    // existing, and never reached by `remove` because it gave up one line
+    // earlier. Whatever the registry says, the file is what makes the id look
+    // taken, so the file is what has to go.
+    let unregistered = reg::delete(&id);
     let path = instance::instance_path(&id);
     if path.exists() {
         std::fs::remove_file(&path)?;
     }
-    println!("removed {id}");
+    match unregistered {
+        Ok(()) => println!("removed {id}"),
+        Err(e) => println!("removed the definition for {id}; it was not registered ({e})"),
+    }
     Ok(())
 }
 
