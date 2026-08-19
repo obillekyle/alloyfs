@@ -270,6 +270,7 @@ async fn mount_fuse(
     let export = export.to_string();
     let (notifier_tx, notifier_rx) = tokio::sync::oneshot::channel();
     let mount_fs = fs.clone();
+    let signal_path = mountpoint.clone();
     // The mount blocks its thread until unmount; the runtime stays free to
     // service the connection and the event pump.
     let mount_task = tokio::task::spawn_blocking(move || {
@@ -286,9 +287,71 @@ async fn mount_fuse(
         })
         .await?;
     }
-    mount_task.await??;
+    // Unmount on Ctrl-C, the same as the kernel backend and WinFsp already do.
+    // Without it this backend answered SIGINT with nothing at all: the process
+    // stayed up, the mountpoint stayed attached, and stopping it any other way
+    // left a mountpoint whose every operation fails with ENOTCONN.
+    let on_signal = tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            tracing::info!("unmounting");
+            release(&signal_path);
+        }
+    });
+    let result = mount_task.await?;
+    on_signal.abort();
+    result?;
     fs.shutdown(); // persist the auto-cache manifest
     Ok(())
+}
+
+/// Detach a FUSE mountpoint so the blocked session returns.
+///
+/// The session sits on `/dev/fuse` inside `alloyfs_mount_fuse::mount` and only
+/// comes back when the kernel closes that channel. Asking the setuid helper to
+/// unmount is what arranges it — the same call `fuser` makes for an
+/// unprivileged mount, and the same one a person runs by hand — so the mount
+/// thread returns and the ordinary shutdown path continues from there.
+///
+/// `fusermount3` first, then `fusermount`, then `umount`: distributions differ
+/// on which exists, and the last only works for a mount the caller owns or has
+/// been granted. Failure is logged rather than raised, because this runs while
+/// shutting down and a mount that has already gone is not an error worth
+/// reporting.
+///
+/// Lazy (`-z`, `-l`), deliberately. A plain unmount refuses while anything still
+/// holds a file on the drive — a shell sitting in a directory is enough — and
+/// refusing here does not keep the mount usable: the process is on its way out
+/// either way, and under a service manager the refusal becomes a stop that
+/// hangs until it is killed, which leaves exactly the stale mountpoint this
+/// exists to prevent. Detaching now and letting the last handle drain is the
+/// outcome with no bad ending.
+#[cfg(unix)]
+fn release(mountpoint: &std::path::Path) {
+    for (program, args) in [
+        ("fusermount3", ["-u", "-z"].as_slice()),
+        ("fusermount", ["-u", "-z"].as_slice()),
+        ("umount", ["-l"].as_slice()),
+    ] {
+        match std::process::Command::new(program)
+            .args(args)
+            .arg(mountpoint)
+            .output()
+        {
+            Ok(out) if out.status.success() => return,
+            // Present but refused: say why, then try the next one.
+            Ok(out) => tracing::debug!(
+                program,
+                stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+                "unmount helper refused"
+            ),
+            // Absent: nothing to report, the next candidate is the answer.
+            Err(_) => continue,
+        }
+    }
+    tracing::warn!(
+        mountpoint = %mountpoint.display(),
+        "could not detach the mountpoint; it may need `fusermount -u` by hand"
+    );
 }
 
 /// The alloyfs kernel module. Same shape as the FUSE path — mount on a
