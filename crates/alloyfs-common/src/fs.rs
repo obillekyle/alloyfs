@@ -17,8 +17,27 @@ pub fn attr_from_metadata(md: &Metadata, version: u64) -> Attr {
     } else {
         FileKind::File
     };
-    let mtime = md.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-    let ctime = md.created().unwrap_or(mtime);
+    // Clamped to the epoch, not merely defaulted to it. serde SERIALIZES a
+    // `SystemTime` by its offset from UNIX_EPOCH and returns an error for any
+    // instant before it, and an encode error on the writer is fatal to the
+    // connection. So one file with a pre-1970 mtime — a tar or rsync restore,
+    // `touch -d 1969`, a clock-skewed writer — makes every response carrying
+    // its Attr fail to encode: the readdir of its directory resets the
+    // connection, the client retries, and it resets again. Worse under v6,
+    // where `Response::Tree` carries every entry's Attr, so a single such file
+    // anywhere in the export breaks the whole-tree fetch that mounting needs.
+    //
+    // `unwrap_or` below handles a metadata call that FAILED; it does nothing
+    // about a successful call returning a valid pre-epoch time.
+    let clamp = |t: SystemTime| {
+        if t < SystemTime::UNIX_EPOCH {
+            SystemTime::UNIX_EPOCH
+        } else {
+            t
+        }
+    };
+    let mtime = clamp(md.modified().unwrap_or(SystemTime::UNIX_EPOCH));
+    let ctime = clamp(md.created().unwrap_or(mtime));
     Attr {
         kind,
         size: md.len(),
