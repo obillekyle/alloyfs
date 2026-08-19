@@ -771,8 +771,32 @@ impl SyncEngine {
     /// ordering / reconcile ordering).
     async fn push(&self, rel: &str) -> Result<(), FsError> {
         let conn = self.conn();
-        let attr = upload(&conn, rel, &self.full(rel)).await?;
+        // Stat BEFORE the upload, and record THAT.
+        //
+        // The baseline's whole job is to describe what was last sent. Taking
+        // the stat afterwards described whatever the file happened to be by
+        // then, and had two failure modes, both silent:
+        //
+        // - The file changed during the upload: the baseline claims a
+        //   generation that was never sent. Harmless on its own — the change
+        //   raises another event and another push corrects it.
+        // - The file VANISHED during the upload (a rename, most often): the
+        //   post-upload stat returns None, `push` reports Io — after the
+        //   upload has already succeeded — and the baseline is never updated
+        //   at all. The server moves on and the manifest stays a generation
+        //   behind, permanently.
+        //
+        // That second one is not a lost update, it is a lost DELETE later:
+        // every subsequent local removal of the path compares a stale
+        // baseline against a newer remote, reads it as delete-vs-edit, and
+        // pulls the file back. A renamed-away file reappearing is what it
+        // looks like from outside.
+        //
+        // If the file vanishes between this stat and the upload, `upload`'s
+        // own read fails and nothing is recorded — the remote is untouched
+        // and the two stay consistent, which is the outcome to want.
         let local = self.local_stat(rel).ok_or(ErrorCode::Io)?;
+        let attr = upload(&conn, rel, &self.full(rel)).await?;
         self.record(rel, EntryKind::File, local.size, local.mtime_ns, attr.version);
         self.stats.pushes.fetch_add(1, Relaxed);
         Ok(())
@@ -997,32 +1021,9 @@ async fn executor(engine: Arc<SyncEngine>, mut rx: mpsc::UnboundedReceiver<Op>) 
                         tracing::warn!(path = %path, error = %e, "local push failed");
                     }
                 }
-                // A dropped push IS a lost change — nothing revisits the path,
-                // so the edit is never synced — and scheduling a reconcile
-                // here is the obvious repair. It was tried, and it is wrong as
-                // things stand, so this deliberately does not do it.
-                //
-                // A failed push most often means the file moved out from under
-                // the watcher, which is to say a rename is half-applied: the
-                // old name is gone locally and the new name's event has not
-                // been processed yet. Reconciling in that window makes the
-                // planner read the old name as "absent from the baseline,
-                // present on the remote" — remote-new — and PULL IT BACK.
-                // Observed directly: `actions=[Pull("proj/code.rs"),
-                // Push("proj/renamed.rs")]`, every action succeeding, and a
-                // renamed-away file resurrected on both sides.
-                //
-                // That trades a change that syncs late for deleted data coming
-                // back, which is the worse of the two. The retry needs the
-                // planner to stop treating a missing baseline entry as
-                // remote-new while a delete for that path is still in flight;
-                // until then, losing the retry is the safer failure.
-                if failed > 0 {
-                    tracing::debug!(
-                        failed,
-                        "pushes failed; they will not be retried until the next reconcile trigger"
-                    );
-                }
+                // A dropped push is a lost change; retrying it comes in the
+                // next commit, once the reason it was unsafe is gone.
+                let _ = failed;
             }
             Op::Reconcile => {
                 if let Err(e) = engine.reconcile().await {

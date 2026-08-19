@@ -129,9 +129,22 @@ pub fn plan(manifest: &SyncManifest, local: &Snapshot, remote: &Snapshot) -> Vec
             }
             (None, Some(r)) => {
                 if base.is_none() {
-                    actions.push(Action::Pull(path.to_string())); // remote-new
+                    // Gone locally with no baseline: as far as this engine
+                    // knows the path was never synced, so the remote copy is
+                    // new. That reading is wrong when a delete for it is still
+                    // in flight, which is how a renamed-away file gets pulled
+                    // back — logged because the outcome is indistinguishable
+                    // from a genuine remote-new without it.
+                    tracing::debug!(path, remote = ?r, "reconcile: pull (no baseline, remote present)");
+                    actions.push(Action::Pull(path.to_string()));
                 } else if r_changed {
                     // Delete-vs-edit: the edit wins — resurrect locally.
+                    tracing::debug!(
+                        path,
+                        base = ?base,
+                        remote = ?r,
+                        "reconcile: pull (local delete loses to a remote edit)"
+                    );
                     actions.push(Action::Pull(path.to_string()));
                 } else {
                     actions.push(Action::DeleteRemote(path.to_string(), r.kind));
