@@ -16,6 +16,7 @@ mod options;
 mod overlay;
 mod readahead;
 mod remote_fs;
+mod stream_pool;
 mod symlink;
 pub mod sync;
 mod walker;

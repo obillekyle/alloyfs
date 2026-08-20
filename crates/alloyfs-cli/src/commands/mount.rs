@@ -242,6 +242,10 @@ pub async fn run(
         // Survive connection loss: re-dial, re-attach, re-open handles,
         // resubscribe events. Locks do not survive (documented).
         dialer: Some(dialer_for(&url, &remote_cmd, &whoami(), token)),
+        // Cold sequential streams stripe across extra connections — 4 lanes
+        // with the primary, rclone's stream count. Lazy: nothing dials until
+        // a big cold read qualifies (see stream_pool.rs).
+        stream_conns: 3,
         data_dir,
     };
     let fs = alloyfs_client::RemoteFs::attach_with(conn, &export, opts).await?;

@@ -3451,3 +3451,56 @@ async fn a_lazy_handle_rides_through_a_reconnect() {
     );
     assert_eq!(body.unwrap(), b"content-1");
 }
+
+/// Multi-stream transport: a big cold sequential read engages the stream
+/// pool, which dials extra in-process connections and stripes readahead
+/// blocks across them. Two things are pinned: the reassembled bytes are
+/// exactly the file (a block landing on the wrong lane, offset, or handle
+/// would corrupt the pattern), and the pool genuinely established its extra
+/// connections — without that, this test would pass with the pool dead and
+/// every block on the primary.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cold_stream_stripes_across_pool_connections() {
+    let agent = start_agent(AgentOpts::default());
+    let data = patterned(6 * 1024 * 1024); // 48 blocks — past the 32-block gate
+    std::fs::write(agent.dir.path().join("big.bin"), &data).unwrap();
+
+    let opts = ClientOptions {
+        stream_conns: 2,
+        ..ClientOptions::default()
+    };
+    let s = connect_reconnectable(&agent, opts).await;
+
+    let (ino, attr) = lookup_path(&s.fs, "big.bin").await.expect("lookup");
+    assert_eq!(attr.size, data.len() as u64);
+
+    // Kernel-shaped sequential reads: 128 KiB steps, so the readahead arms,
+    // the window tops up, and qualifying rounds stripe across the pool.
+    let got = on_fs(&s.fs, move |fs| {
+        let flags = OpenFlags {
+            read: true,
+            ..OpenFlags::default()
+        };
+        let (fh, attr) = fs.open(ino, flags).expect("open");
+        let mut out = Vec::with_capacity(attr.size as usize);
+        let mut off = 0u64;
+        while off < attr.size {
+            let chunk = fs.read(fh, off, 128 * 1024).expect("read");
+            assert!(!chunk.is_empty(), "short read inside the file at {off}");
+            off += chunk.len() as u64;
+            out.extend_from_slice(&chunk);
+        }
+        fs.release(fh);
+        out
+    })
+    .await;
+    assert_eq!(got.len(), data.len());
+    assert!(got == data, "striped blocks must reassemble to exactly the file");
+
+    // The fill task runs to target once engaged (in-process dials cannot
+    // fail), so both extras must land — asynchronously, hence the wait.
+    wait_until("stream pool dials complete", 5, || {
+        (s.fs.stream_conns_established() >= 2).then_some(())
+    })
+    .await;
+}

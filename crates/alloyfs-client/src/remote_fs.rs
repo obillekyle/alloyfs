@@ -186,6 +186,9 @@ pub struct RemoteFs {
     pub(crate) open_files: DashMap<u64, OpenState>,
     export: String,
     pub(crate) dialer: Option<Dialer>,
+    /// Extra data connections for cold sequential streams; None unless a
+    /// dialer exists and stream_conns > 0. See stream_pool.rs.
+    pub(crate) stream_pool: Option<Arc<crate::stream_pool::StreamPool>>,
     /// Bumped after every successful reconnect; the event pump watches it.
     conn_epoch: tokio::sync::watch::Sender<u64>,
     /// Highest event seq the pump has applied — reconnect resubscribes here.
@@ -293,6 +296,15 @@ impl RemoteFs {
             open_files: DashMap::new(),
             export: export.to_string(),
             dialer: opts.dialer.clone(),
+            stream_pool: match (&opts.dialer, opts.stream_conns) {
+                (Some(d), n) if n > 0 => Some(crate::stream_pool::StreamPool::new(
+                    d.clone(),
+                    export.to_string(),
+                    n,
+                    &tokio::runtime::Handle::current(),
+                )),
+                _ => None,
+            },
             conn_epoch: epoch_tx,
             last_event_seq: AtomicU64::new(0),
             pump_healthy: std::sync::atomic::AtomicBool::new(false),
@@ -321,6 +333,14 @@ impl RemoteFs {
     /// never hold it across long waits).
     pub fn conn(&self) -> Arc<MuxConnection> {
         self.conn.read().unwrap().clone()
+    }
+
+    /// Connections the stream pool has established over its lifetime; 0
+    /// without a pool. Observability: the loopback test pins engagement on
+    /// it, and a diag can tell "pool never dialed" from "pool dialed and
+    /// died" without packet captures.
+    pub fn stream_conns_established(&self) -> usize {
+        self.stream_pool.as_ref().map_or(0, |p| p.established())
     }
 
     /// The reconnect epoch right now. Capture it BEFORE doing work whose
@@ -975,11 +995,32 @@ impl RemoteFs {
             .map(|size| ReadAhead::block_of(size.saturating_sub(1)) + 1)
             .unwrap_or(u64::MAX);
         if prefetch {
+            // Multi-stream: a long cold stream stripes its window across the
+            // pool's extra connections — same window depth, more congestion
+            // windows under it (see stream_pool.rs). Engaging is async: the
+            // first rounds ride the primary while the pool dials, and an
+            // empty `lanes` costs nothing. Unknown size (u64::MAX) never
+            // engages — no point dialing for what may be two blocks.
+            let lanes = match &self.stream_pool {
+                Some(pool)
+                    if eof_block_exclusive != u64::MAX
+                        && eof_block_exclusive.saturating_sub(first_block)
+                            >= crate::stream_pool::MIN_BLOCKS_AHEAD =>
+                {
+                    pool.lanes(&self.rt)
+                }
+                _ => Vec::new(),
+            };
+            let total_lanes = lanes.len() as u64 + 1;
             for b in state.ra.missing(last_block + 1, eof_block_exclusive) {
-                let conn = self.conn();
-                state
-                    .ra
-                    .put(b, self.rt.spawn(Self::fetch_block(conn, server_fh, b)));
+                let lane = (b % total_lanes) as usize;
+                let task = if lane == 0 {
+                    self.rt.spawn(Self::fetch_block(self.conn(), server_fh, b))
+                } else {
+                    let entry = lanes[lane - 1].clone();
+                    self.rt.spawn(entry.fetch_block(state.path.clone(), b))
+                };
+                state.ra.put(b, task);
             }
         }
 
@@ -1833,6 +1874,12 @@ impl RemoteFs {
         }
         let server_fh = self.server_fh(fh);
         if let Some((_, state)) = self.open_files.remove(&fh) {
+            // Pool sessions opened their own handles for this file's stream;
+            // close them with it so long-lived pool connections don't
+            // accumulate handles (and Windows-server share locks).
+            if let Some(pool) = &self.stream_pool {
+                pool.forget_path(&self.rt, &state.path);
+            }
             if crate::readahead::Stats::enabled() {
                 let s = &state.ra.stats;
                 use std::sync::atomic::Ordering::Relaxed;

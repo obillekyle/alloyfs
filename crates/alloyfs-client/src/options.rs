@@ -35,6 +35,11 @@ pub struct ClientOptions {
     pub auto_cache_budget_fallback: u64,
     pub pins: Vec<String>,
     pub dialer: Option<Dialer>,
+    /// Extra data connections for cold sequential streams (see
+    /// stream_pool.rs). 0 = off, the library default; the CLI mounts with 3
+    /// (4 lanes with the primary, rclone's stream count). Meaningless
+    /// without a dialer — the pool needs a way to dial.
+    pub stream_conns: usize,
     /// Ignore the server's suggested client settings entirely.
     pub no_server_defaults: bool,
     /// Disable the v10 write batcher: every mutation blocks until the server
@@ -68,6 +73,7 @@ impl Default for ClientOptions {
             auto_cache_budget_fallback: 512 * 1024 * 1024,
             pins: Vec::new(),
             dialer: None,
+            stream_conns: 0,
             no_server_defaults: false,
             write_through: false,
             detect_conflicts: false,
