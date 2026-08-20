@@ -282,14 +282,18 @@ impl AutoCache {
         fresh
     }
 
-    /// Read from the blob; None on any miss/short-read (caller falls through
-    /// to the network — eviction races resolve themselves this way).
-    /// The blob as an open handle — the only read entry point, because every
-    /// caller reads more than once. The mount retains one per open fh;
-    /// opening per read priced every cached 64 K with a path build and a
-    /// file open/close.
-    pub fn open_blob(&self, path: &RelPath) -> Option<std::fs::File> {
-        std::fs::File::open(blob_path(&self.cfg.root, path)).ok()
+    /// The blob mapped for serving — the only read entry point, because
+    /// every caller reads more than once. The mount retains one per open fh
+    /// (opening per read priced every cached 64 K with a path build and a
+    /// file open/close), and the retained thing is now a MAPPING rather
+    /// than a file handle: a warm read is one memcpy out of the page cache
+    /// instead of a positional-read syscall plus a zeroed scratch buffer.
+    ///
+    /// `None` on any open/map failure — the caller falls through to the
+    /// network, which is how eviction races resolve themselves.
+    pub fn map_blob(&self, path: &RelPath) -> Option<Blob> {
+        let f = std::fs::File::open(blob_path(&self.cfg.root, path)).ok()?;
+        Blob::of(&f)
     }
 
     /// Record a fully fetched blob (already staged at its final path by the
@@ -476,6 +480,53 @@ pub(crate) fn blob_path(root: &std::path::Path, rel: &RelPath) -> PathBuf {
     full
 }
 
+/// A committed blob, memory-mapped for serving.
+///
+/// Reads are a bounds-checked slice copy — the page cache serves them
+/// directly, with no syscall after fault-in and no zeroed scratch buffer.
+/// A read past the mapping's end returns the short/empty tail, which is the
+/// same EOF answer the positional-read path gave: a committed blob is the
+/// COMPLETE file, so its end is the file's end.
+///
+/// Mapping instead of holding a file handle keeps the exact lifecycle the
+/// handle had: on unix a blob replaced (stage + rename) or evicted
+/// (remove_file) under the map leaves the old inode alive until the map
+/// drops, and on Windows the map blocks deletion just as the open handle
+/// did — eviction already treats that as a race it loses gracefully.
+pub struct Blob {
+    /// `None` = the blob is an empty file (zero-length mappings are an
+    /// error on Windows); every read of it is the empty EOF answer.
+    map: Option<memmap2::Mmap>,
+}
+
+impl Blob {
+    /// Map `f`. `None` when mapping fails (the caller falls through to the
+    /// network, exactly as a failed open always did).
+    pub(crate) fn of(f: &std::fs::File) -> Option<Self> {
+        if f.metadata().ok()?.len() == 0 {
+            return Some(Self { map: None });
+        }
+        // SAFETY: the mapping is only sound while no one truncates the file
+        // in place, and blob files are never touched in place — the fetcher
+        // stages `.part` and RENAMES over the final path, eviction removes
+        // the file. Under both, the mapped inode's length is immutable for
+        // the mapping's lifetime, which is the same discipline the retained
+        // read handle already leaned on.
+        let map = unsafe { memmap2::Mmap::map(f) }.ok()?;
+        Some(Self { map: Some(map) })
+    }
+
+    pub fn read(&self, offset: u64, size: u32) -> Vec<u8> {
+        let Some(map) = &self.map else {
+            return Vec::new();
+        };
+        let len = map.len() as u64;
+        let start = offset.min(len) as usize;
+        let end = offset.saturating_add(size as u64).min(len) as usize;
+        map[start..end].to_vec()
+    }
+}
+
 /// Convenience wrapper so callers get FsError-flavored IO errors.
 pub(crate) fn stage_write(path: &std::path::Path, data: &[u8]) -> Result<(), alloyfs_proto::ErrorCode> {
     if let Some(parent) = path.parent() {
@@ -486,13 +537,9 @@ pub(crate) fn stage_write(path: &std::path::Path, data: &[u8]) -> Result<(), all
 
 #[cfg(test)]
 mod tests {
-    /// Reads exactly as the mount does: an open handle, positional reads.
+    /// Reads exactly as the mount does: a retained mapping, sliced.
     fn read_via_handle(c: &AutoCache, p: &RelPath, offset: u64, len: usize) -> Option<Vec<u8>> {
-        let f = c.open_blob(p)?;
-        let mut buf = vec![0u8; len];
-        let n = alloyfs_common::read_fully(&f, &mut buf, offset).ok()?;
-        buf.truncate(n);
-        Some(buf)
+        Some(c.map_blob(p)?.read(offset, len as u32))
     }
 
     use super::*;
