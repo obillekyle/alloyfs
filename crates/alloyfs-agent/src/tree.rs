@@ -42,12 +42,18 @@ pub const DEFAULT_MAX_ENTRIES: usize = 200_000;
 
 /// Where an index's contents come from.
 ///
-/// An interface rather than a function because the fast path on Windows is not
-/// a walk at all: `FSCTL_ENUM_USN_DATA` reads MFT records without a stat per
-/// file, and the USN journal supplies a durable cursor into the bargain. A
-/// native recursive enumeration here measured ~104 us/entry against ~9 us/entry
-/// on the Linux box, so that difference is worth a second implementation —
-/// and it should arrive as another source, not as a rewrite of this one.
+/// An interface rather than a function so a faster platform enumeration can
+/// arrive as another source instead of a rewrite. One candidate has already
+/// been tried and retired ON PAPER: `FSCTL_ENUM_USN_DATA` (the MFT) was
+/// planned back when the walk here measured ~104 us/entry against ~9 on
+/// ext4 — but that gap turned out to be a per-entry re-stat throwing away
+/// the attributes FindFirstFile had already returned, not enumeration cost.
+/// With `DirEntry::metadata` the walk runs at ~15 us/entry (see the comment
+/// in `WalkSource`), and since USN records carry no size or mtime, an MFT
+/// source would still pay a stat per entry — same floor, plus admin rights,
+/// an NTFS-only gate, and a volume-wide scan. If a second source ever lands,
+/// its case will have to be a durable change CURSOR (the USN journal),
+/// not enumeration speed.
 pub trait TreeSource: Send + Sync {
     /// Enumerate `root`, skipping anything `exclude` hides, stopping once more
     /// than `cap` entries have been produced.
@@ -87,10 +93,47 @@ impl TreeSource for WalkSource {
                 if exclude.is_excluded(&child) {
                     continue;
                 }
-                // symlink_metadata: a link is indexed as a link. Following it
-                // would let a link out of the export pull foreign paths into
-                // the index, and would loop on a cycle.
-                let Ok(md) = std::fs::symlink_metadata(item.path()) else {
+                // DirEntry::metadata, for both of its properties. It does not
+                // traverse symlinks — a link is indexed as a link, so a link
+                // out of the export can neither pull foreign paths in nor
+                // loop on a cycle. And on Windows it is FREE: FindFirstFile
+                // already returned the attributes with the name, where the
+                // `symlink_metadata(item.path())` this replaces re-opened
+                // every file to ask again. Measured over the same 16k-entry
+                // NTFS tree, interleaved: 73.2 us/entry warm (164.8 cold)
+                // for the re-stat against 15.4 us/entry warm (22.1 cold) for
+                // the find data — 4.8x, and within ~1.7x of the same walk on
+                // ext4. That number is also what retired the planned
+                // FSCTL_ENUM_USN_DATA source: USN records carry no size or
+                // mtime, so an MFT enumeration still pays a per-entry stat —
+                // its floor is this walk's floor, plus admin rights, an
+                // NTFS-only gate, and a volume-wide scan.
+                // (bench_walk_stat_strategies re-measures this.)
+                //
+                // Files only, though. What FindFirstFile serves is NTFS's
+                // "duplicated information" — a copy kept in the parent's
+                // index that settles asynchronously — and for a directory
+                // with freshly written children it can lag the authoritative
+                // value by whole milliseconds (caught by the index-vs-disk
+                // equivalence test: the same dir listed 510 us apart carried
+                // two different mtimes). A lagged FILE converges through the
+                // event feed and matches what the disk readdir path serves
+                // anyway; a lagged DIRECTORY would sit in the token until
+                // rebuild and make an idle rebuild look like a tree change.
+                // Directories are rare enough to stat authoritatively: with
+                // them re-stated (17% of the bench tree), the walk still
+                // measures ~3x the old strategy in every interleaved round
+                // (42-63 us/entry against 89-254 under identical load).
+                let md = if item.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    #[cfg(windows)]
+                    let md = std::fs::symlink_metadata(item.path());
+                    #[cfg(not(windows))]
+                    let md = item.metadata();
+                    md
+                } else {
+                    item.metadata()
+                };
+                let Ok(md) = md else {
                     continue;
                 };
                 if md.is_dir() {
@@ -508,6 +551,71 @@ mod tests {
         assert_eq!(token, 0, "over the cap means unindexed, which reads as 0");
         assert!(tree.page(&RelPath(String::new()), 0, 10).is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Measure `WalkSource` (find-data attrs) against the strategy it
+    /// replaced (a `symlink_metadata` re-stat per entry) over the same tree.
+    /// The numbers in `WalkSource`'s comment came from here; if they ever
+    /// need re-deriving, this is the tool. Ignored: it is a measurement, not
+    /// an assertion — run with
+    /// `ALLOYFS_BENCH_TREE=<dir> cargo test --release -p alloyfs-agent bench_walk -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_walk_stat_strategies() {
+        let Ok(root) = std::env::var("ALLOYFS_BENCH_TREE") else {
+            eprintln!("set ALLOYFS_BENCH_TREE to a directory");
+            return;
+        };
+        let root = std::path::PathBuf::from(root);
+        let ex = ExcludeSet::compile(&[], false).unwrap();
+
+        // The retired strategy, kept inline as the baseline.
+        fn walk_restat(root: &Path, exclude: &ExcludeSet) -> Vec<(RelPath, Attr)> {
+            let mut out = Vec::new();
+            let mut stack = vec![(root.to_path_buf(), RelPath(String::new()))];
+            while let Some((dir, rel)) = stack.pop() {
+                let Ok(entries) = std::fs::read_dir(&dir) else {
+                    continue;
+                };
+                for item in entries.flatten() {
+                    let Ok(name) = item.file_name().into_string() else {
+                        continue;
+                    };
+                    let child = rel.join(&name);
+                    if exclude.is_excluded(&child) {
+                        continue;
+                    }
+                    let Ok(md) = std::fs::symlink_metadata(item.path()) else {
+                        continue;
+                    };
+                    if md.is_dir() {
+                        stack.push((item.path(), child.clone()));
+                    }
+                    out.push((child, attr_from_metadata(&md, 0)));
+                }
+            }
+            out
+        }
+
+        // Interleaved A/B/A/B so cache drift hits both strategies equally.
+        for round in 0..2 {
+            let t = std::time::Instant::now();
+            let a = walk_restat(&root, &ex);
+            let t_a = t.elapsed();
+            let t = std::time::Instant::now();
+            let b = WalkSource.enumerate(&root, &ex, usize::MAX).unwrap().unwrap();
+            let t_b = t.elapsed();
+            eprintln!(
+                "round {round}: re-stat {} entries in {:?} ({:.1} us/entry) | WalkSource {} entries in {:?} ({:.1} us/entry)",
+                a.len(),
+                t_a,
+                t_a.as_micros() as f64 / a.len() as f64,
+                b.len(),
+                t_b,
+                t_b.as_micros() as f64 / b.len() as f64,
+            );
+            assert_eq!(a.len(), b.len(), "both strategies must see the same tree");
+        }
     }
 
     #[test]
