@@ -153,10 +153,15 @@ impl EventHub {
 /// means anything if it arrives in sequence.
 enum WatchSignal {
     Event(notify::Event),
-    /// The watcher can no longer describe what changed — the kernel queue
-    /// overflowed, or the backend failed. Everything the index believes may
-    /// now be wrong.
+    /// The watcher could not describe what changed — the kernel queue
+    /// overflowed. Everything the index believes may now be wrong, but the
+    /// watch itself is still armed and later changes will arrive.
     Gap,
+    /// The watch is gone: the backend reported an error, and on both
+    /// platforms that means it stopped watching (RDCW unwatches on error;
+    /// an inotify error is a broken stream). A gap covers the past; this
+    /// also demands a REBUILD, or every future change goes unseen too.
+    Dead,
 }
 
 /// Classify one watcher event.
@@ -176,10 +181,29 @@ fn signal_for(event: notify::Event) -> WatchSignal {
 }
 
 /// Spawn the watcher + coalescer for one export. The returned guard keeps the
-/// OS watcher alive; drop it to stop watching.
+/// watch alive; drop it to stop watching.
 pub fn spawn(export: Arc<Export>, hub: Arc<EventHub>, debounce: Duration) -> anyhow::Result<WatchGuard> {
     let (raw_tx, raw_rx) = mpsc::unbounded_channel::<WatchSignal>();
+    // The FIRST watcher is built here rather than in the task, so a root that
+    // cannot be watched at all fails spawn() loudly — the caller downgrades
+    // the export to no-events and says so once, instead of a supervisor
+    // retrying forever against a path the config got wrong.
+    let watcher = build_watcher(&export.root, raw_tx.clone())?;
+    tracing::info!(export = export.name, "watching for changes");
 
+    let (stop_tx, stop_rx) = mpsc::channel::<()>(1);
+    tokio::spawn(coalesce_loop(
+        export, hub, debounce, raw_rx, raw_tx, watcher, stop_rx,
+    ));
+    Ok(WatchGuard { _stop: stop_tx })
+}
+
+/// One OS watcher on `root`, reporting into `raw_tx`. Built at spawn and
+/// rebuilt by the supervisor whenever a watch dies.
+fn build_watcher(
+    root: &std::path::Path,
+    raw_tx: mpsc::UnboundedSender<WatchSignal>,
+) -> notify::Result<notify::RecommendedWatcher> {
     // follow_symlinks(false) matters twice over: an export symlink pointing
     // outside (say, at /etc) must be neither watched (privacy) nor able to
     // fail the watch setup on unreadable directories.
@@ -189,27 +213,26 @@ pub fn spawn(export: Arc<Export>, hub: Arc<EventHub>, debounce: Duration) -> any
             Ok(event) => {
                 let _ = raw_tx.send(signal_for(event));
             }
-            // A watcher error is the same class of problem: from here on the
-            // stream cannot be trusted to have described everything. Logging
-            // it and continuing left the index quietly wrong.
+            // An error means the watch itself is gone, not just some events:
+            // the (vendored) RDCW backend reports exactly the conditions
+            // where it drops the watch, and an inotify error is a broken
+            // stream. Logging it and continuing left the index quietly wrong
+            // AND the export dark from then on.
             Err(e) => {
-                tracing::warn!(error = %e, "watcher error; forcing a resync");
-                let _ = raw_tx.send(WatchSignal::Gap);
+                tracing::warn!(error = %e, "watcher error; resyncing and rebuilding the watch");
+                let _ = raw_tx.send(WatchSignal::Dead);
             }
         },
         config,
     )?;
-    watcher.watch(&export.root, RecursiveMode::Recursive)?;
-    tracing::info!(export = export.name, "watching for changes");
-
-    tokio::spawn(coalesce_loop(export, hub, debounce, raw_rx));
-    Ok(WatchGuard {
-        _watcher: Box::new(watcher),
-    })
+    watcher.watch(root, RecursiveMode::Recursive)?;
+    Ok(watcher)
 }
 
+/// Keeps the watch alive by existing; dropping it stops the supervisor loop
+/// and with it the OS watcher.
 pub struct WatchGuard {
-    _watcher: Box<dyn std::any::Any + Send>,
+    _stop: mpsc::Sender<()>,
 }
 
 async fn coalesce_loop(
@@ -217,6 +240,9 @@ async fn coalesce_loop(
     hub: Arc<EventHub>,
     debounce: Duration,
     mut raw_rx: mpsc::UnboundedReceiver<WatchSignal>,
+    raw_tx: mpsc::UnboundedSender<WatchSignal>,
+    mut _watcher: notify::RecommendedWatcher,
+    mut stop_rx: mpsc::Receiver<()>,
 ) {
     // The collapse/pairing/exclude semantics live in alloyfs_common::coalesce —
     // ONE copy, shared with the sync engine's local watcher. This loop owns
@@ -256,11 +282,59 @@ async fn coalesce_loop(
                             vec![(RelPath(String::new()), EventKind::ResyncRequired)],
                         );
                     }
+                    // Everything Gap does, plus a rebuild: an overflow leaves
+                    // the watch armed, an error does not, and without a new
+                    // watcher every change from here on would go unseen — the
+                    // resync would fix the index once and it would rot again.
+                    WatchSignal::Dead => {
+                        publish_batch(&export, &hub, co.take_batch());
+                        publish_batch(
+                            &export,
+                            &hub,
+                            vec![(RelPath(String::new()), EventKind::ResyncRequired)],
+                        );
+                        let mut delay = Duration::from_secs(1);
+                        loop {
+                            match build_watcher(&export.root, raw_tx.clone()) {
+                                Ok(w) => {
+                                    // Replacing drops whatever was left of the
+                                    // dead one.
+                                    _watcher = w;
+                                    // The window between the death and this
+                                    // rebuild is unobserved by definition;
+                                    // say so again now that the stream is
+                                    // live, or changes made during it stay
+                                    // unseen forever.
+                                    publish_batch(
+                                        &export,
+                                        &hub,
+                                        vec![(RelPath(String::new()), EventKind::ResyncRequired)],
+                                    );
+                                    tracing::info!(export = export.name, "watcher rebuilt");
+                                    break;
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        export = export.name,
+                                        error = %e,
+                                        retry_in = ?delay,
+                                        "watcher rebuild failed"
+                                    );
+                                    tokio::select! {
+                                        _ = tokio::time::sleep(delay) => {}
+                                        _ = stop_rx.recv() => return,
+                                    }
+                                    delay = (delay * 2).min(Duration::from_secs(30));
+                                }
+                            }
+                        }
+                    }
                 }
             }
             _ = tokio::time::sleep(timeout) => {
                 publish_batch(&export, &hub, co.take_batch());
             }
+            _ = stop_rx.recv() => break,
         }
     }
     // Drain on shutdown so nothing observed is silently dropped.
@@ -418,5 +492,69 @@ mod tests {
             notify::event::DataChange::Content,
         )));
         assert!(matches!(signal_for(plain), WatchSignal::Event(_)));
+    }
+
+    /// A watch whose root vanishes reports itself, resyncs, and — once the
+    /// root exists again — REBUILDS, after which changes are seen again.
+    ///
+    /// This is the whole recovery chain for a dead watch: RDCW drops the
+    /// watch when its directory is deleted (surfaced as an error by the
+    /// vendored notify patch — upstream unwatched in silence), the supervisor
+    /// publishes `ResyncRequired`, retries the rebuild until the root is
+    /// back, and publishes another resync for the dark window. Gated to
+    /// Windows because inotify reports a root deletion as ordinary remove
+    /// events — the silent-unwatch failure mode does not exist there.
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dead_watch_resyncs_and_rebuilds() {
+        let (dir, export) = test_export();
+        let hub = export.events.clone();
+        let mut rx = hub.subscribe(None).unwrap().1;
+        let _guard = spawn(export.clone(), hub.clone(), Duration::from_millis(50)).unwrap();
+
+        // Kill the watched root out from under ReadDirectoryChangesW. The
+        // watch handle is opened with FILE_SHARE_DELETE, so the deletion is
+        // allowed; RDCW completes with ERROR_ACCESS_DENIED and a gone dir.
+        std::fs::remove_dir_all(&export.root).unwrap();
+
+        let resync = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let batch = rx.recv().await.expect("hub alive");
+                if batch.iter().any(|e| matches!(e.kind, EventKind::ResyncRequired)) {
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(resync.is_ok(), "a dead watch must publish ResyncRequired");
+
+        // Give the supervisor its root back; the 1 s-backoff rebuild finds it
+        // and publishes the dark-window resync.
+        std::fs::create_dir_all(&export.root).unwrap();
+        let rebuilt = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let batch = rx.recv().await.expect("hub alive");
+                if batch.iter().any(|e| matches!(e.kind, EventKind::ResyncRequired)) {
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(rebuilt.is_ok(), "the rebuild must publish its own resync");
+
+        // The proof the rebuilt watch is LIVE, not just constructed: a change
+        // in the recreated root arrives as an ordinary event.
+        std::fs::write(export.root.join("again.txt"), b"back").unwrap();
+        let seen = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let batch = rx.recv().await.expect("hub alive");
+                if batch.iter().any(|e| e.path.0 == "again.txt") {
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(seen.is_ok(), "the rebuilt watch must see new changes");
+        drop(dir);
     }
 }
