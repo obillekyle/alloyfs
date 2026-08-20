@@ -39,11 +39,7 @@ const READ_MANY_BUDGET: u32 = 768 * 1024;
 /// fills one long before 256 of them accumulate.
 const BATCH_FILES: usize = 256;
 
-pub(crate) fn spawn(
-    fs: Arc<RemoteFs>,
-    cache: Arc<AutoCache>,
-    mut fetch_rx: mpsc::UnboundedReceiver<RelPath>,
-) {
+pub(crate) fn spawn(fs: Arc<RemoteFs>, cache: Arc<AutoCache>, fetch_rx: mpsc::UnboundedReceiver<RelPath>) {
     tokio::spawn(async move {
         let started = std::time::Instant::now();
         let sem = Arc::new(Semaphore::new(FILE_CONCURRENCY));
@@ -126,18 +122,7 @@ pub(crate) fn spawn(
                     );
                     // Straight to serving the re-fetch queue: events and our
                     // own writes still keep the cache honest from here.
-                    while let Some(path) = fetch_rx.recv().await {
-                        if fs.is_overlay(&path) {
-                            continue;
-                        }
-                        let permit = sem.clone().acquire_owned().await.unwrap();
-                        let fs = fs.clone();
-                        let cache = cache.clone();
-                        tokio::spawn(async move {
-                            let _ = fetch_one(&fs, &cache, &path).await;
-                            drop(permit);
-                        });
-                    }
+                    drain_refetch_queue(fs, cache, fetch_rx, sem).await;
                     return;
                 }
                 // Changed, unindexed (token 0), or an agent that cannot
@@ -224,15 +209,8 @@ pub(crate) fn spawn(
                 pending_bytes += attr.size;
                 pending.push(path);
                 if pending.len() >= BATCH_FILES || pending_bytes >= READ_MANY_BUDGET as u64 {
-                    let sem = sem.clone();
-                    let fs = fs.clone();
-                    let cache = cache.clone();
-                    let batch = std::mem::take(&mut pending);
+                    spawn_fetch_batch(&mut tasks, &sem, &fs, &cache, std::mem::take(&mut pending));
                     pending_bytes = 0;
-                    tasks.spawn(async move {
-                        let _permit = sem.acquire_owned().await.unwrap();
-                        fetch_many(&fs, &cache, batch).await
-                    });
                 }
                 while let Some(done) = tasks.try_join_next() {
                     ok += done.unwrap_or(0);
@@ -299,20 +277,14 @@ pub(crate) fn spawn(
                                     if pending.len() >= BATCH_FILES
                                         || pending_bytes >= READ_MANY_BUDGET as u64
                                     {
-                                        // The permit is taken INSIDE the task,
-                                        // so a full fetch pipeline never stalls
-                                        // the walk — discovery and download
-                                        // overlap instead of strangling each
-                                        // other.
-                                        let sem = sem.clone();
-                                        let fs = fs.clone();
-                                        let cache = cache.clone();
-                                        let batch = std::mem::take(&mut pending);
+                                        spawn_fetch_batch(
+                                            &mut tasks,
+                                            &sem,
+                                            &fs,
+                                            &cache,
+                                            std::mem::take(&mut pending),
+                                        );
                                         pending_bytes = 0;
-                                        tasks.spawn(async move {
-                                            let _permit = sem.acquire_owned().await.unwrap();
-                                            fetch_many(&fs, &cache, batch).await
-                                        });
                                     }
                                 }
                             }
@@ -330,13 +302,7 @@ pub(crate) fn spawn(
         }
         // Whatever never reached a full batch still has to be fetched.
         if !pending.is_empty() {
-            let sem = sem.clone();
-            let fs = fs.clone();
-            let cache = cache.clone();
-            tasks.spawn(async move {
-                let _permit = sem.acquire_owned().await.unwrap();
-                fetch_many(&fs, &cache, pending).await
-            });
+            spawn_fetch_batch(&mut tasks, &sem, &fs, &cache, pending);
         }
         while let Some(done) = tasks.join_next().await {
             ok += done.unwrap_or(0);
@@ -392,18 +358,7 @@ pub(crate) fn spawn(
         let _ = tokio::task::spawn_blocking(move || c.flush_manifest()).await;
 
         // Re-fetch queue: events and local writes land here forever after.
-        while let Some(path) = fetch_rx.recv().await {
-            if fs.is_overlay(&path) {
-                continue;
-            }
-            let permit = sem.clone().acquire_owned().await.unwrap();
-            let fs = fs.clone();
-            let cache = cache.clone();
-            tokio::spawn(async move {
-                let _ = fetch_one(&fs, &cache, &path).await;
-                drop(permit);
-            });
-        }
+        drain_refetch_queue(fs, cache, fetch_rx, sem).await;
     });
 }
 
@@ -669,4 +624,49 @@ async fn current_tree_token(fs: &Arc<RemoteFs>) -> u64 {
         Ok(Ok(Response::TreeToken { token })) => token,
         _ => 0,
     }
+}
+
+/// Serve the re-fetch queue until the mount closes: events and our own writes
+/// enqueue paths here forever, whichever way the initial pass ended. One copy,
+/// because the skip path and the completed walk both used to carry it inline
+/// and identical — the kind of duplication that stays identical only until an
+/// edit lands in one of them.
+async fn drain_refetch_queue(
+    fs: Arc<RemoteFs>,
+    cache: Arc<AutoCache>,
+    mut fetch_rx: mpsc::UnboundedReceiver<RelPath>,
+    sem: Arc<Semaphore>,
+) {
+    while let Some(path) = fetch_rx.recv().await {
+        if fs.is_overlay(&path) {
+            continue;
+        }
+        let permit = sem.clone().acquire_owned().await.unwrap();
+        let fs = fs.clone();
+        let cache = cache.clone();
+        tokio::spawn(async move {
+            let _ = fetch_one(&fs, &cache, &path).await;
+            drop(permit);
+        });
+    }
+}
+
+/// Queue one accumulated batch for fetching, permit taken inside the task so a
+/// full pipeline never stalls discovery. One copy for the three places a
+/// batch leaves the accumulator: the tree path's threshold, the BFS path's
+/// threshold, and the end-of-walk remainder.
+fn spawn_fetch_batch(
+    tasks: &mut tokio::task::JoinSet<usize>,
+    sem: &Arc<Semaphore>,
+    fs: &Arc<RemoteFs>,
+    cache: &Arc<AutoCache>,
+    batch: Vec<RelPath>,
+) {
+    let sem = sem.clone();
+    let fs = fs.clone();
+    let cache = cache.clone();
+    tasks.spawn(async move {
+        let _permit = sem.acquire_owned().await.unwrap();
+        fetch_many(&fs, &cache, batch).await
+    });
 }
