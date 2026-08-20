@@ -5,7 +5,9 @@ Export a folder on one machine; mount it as a real drive on another.
 AlloyFS is a virtual drive service for Windows and Linux. The **agent** publishes
 folders; **clients** mount them as an ordinary drive letter (WinFsp) or
 mountpoint (FUSE), or — on Linux — through a custom kernel filesystem that can
-deliver remote changes as genuine `inotify` events.
+deliver remote changes as genuine `inotify` events. Every pairing is a
+supported deployment: a Windows machine serves Linux mounts as readily as the
+reverse.
 
 ```bash
 # on the machine with the files
@@ -34,8 +36,10 @@ Not a sync service by default — a mount is write-through, so an acknowledged
 write is on the server. If you want files on local disk instead, that is
 [sync mode](#/guides/sync-mode), which is a different tool in the same binary.
 
-Not a database host. Whole-file advisory locks only; see
-[Limitations](#/reference/limitations).
+Not quite a database host. Byte-range advisory locks are forwarded on Linux
+mounts — enough for journal-mode SQLite shared between machines — but WAL
+needs shared memory no network filesystem can provide, and Windows mounts
+keep locks local; see [Limitations](#/reference/limitations).
 
 ## Install
 
