@@ -317,9 +317,10 @@ impl ExportTree {
         Some((page, more, idx.token()))
     }
 
-    /// One readdir page: the direct children of `dir`, name-ordered, from
-    /// child offset `offset`. Each entry is the child's NAME (not its full
-    /// path) plus its indexed attrs.
+    /// The complete direct-child listing of `dir`, name-ordered, plus the
+    /// token it was built under. The ops layer snapshots this once and pages
+    /// from the snapshot, so a listing is one build — not one subtree scan
+    /// per page.
     ///
     /// `None` means "answer from disk instead" — either the export is not
     /// indexed, or the index does not know `dir` as a directory. The second
@@ -327,12 +328,7 @@ impl ExportTree {
     /// not-a-directory, the case-insensitive spellings a real volume resolves
     /// and this byte-keyed map cannot), so the index only ever answers the
     /// one question it answers exactly.
-    pub fn readdir_page(
-        &self,
-        dir: &RelPath,
-        offset: usize,
-        limit: usize,
-    ) -> Option<(Vec<(String, Attr)>, bool)> {
+    pub fn readdir_all(&self, dir: &RelPath) -> Option<(Vec<(String, Attr)>, u64)> {
         let st = self.state.lock().unwrap();
         let State::Live(idx) = &*st else {
             return None;
@@ -348,28 +344,44 @@ impl ExportTree {
         } else {
             format!("{}/", dir.0)
         };
-        // Same seek as `page`, plus a filter: an entry is a DIRECT child
-        // exactly when nothing past the prefix contains another '/'. The map
-        // orders full paths byte-wise and siblings share the prefix, so the
-        // survivors come out in byte order of their names — the same order
-        // the disk path produces by sorting names. (Descendants interleave
-        // between siblings in the range; filtering a sorted sequence leaves
-        // the survivors sorted.)
-        let mut kids = idx
-            .entries
-            .range(RelPath(prefix.clone())..)
-            .take_while(|(p, _)| prefix.is_empty() || p.0.starts_with(&prefix))
-            .filter(|(p, _)| {
+        // The map orders FULL paths byte-wise, so a child's descendants do
+        // not follow it directly: siblings whose next byte is below '/'
+        // (0x2F) — "c!x", "c.txt" — sort between "c" and "c/…", and the
+        // subtree "c/…" sits wholly before "c0" (0x30). Walking linearly and
+        // filtering out descendants therefore costs O(subtree) per listing —
+        // the old shape — where re-seeking past a subtree the moment the
+        // walk lands in one costs O(log n) per directory child instead.
+        // Survivors come out in byte order of their names, the same order
+        // the disk path produces by sorting.
+        let mut out: Vec<(String, Attr)> = Vec::new();
+        let mut from = std::ops::Bound::Included(RelPath(prefix.clone()));
+        'walk: loop {
+            let range = idx.entries.range((from.clone(), std::ops::Bound::Unbounded));
+            for (p, a) in range {
+                if !(prefix.is_empty() || p.0.starts_with(&prefix)) {
+                    break 'walk; // left the subtree
+                }
                 let rest = &p.0[prefix.len()..];
-                !rest.is_empty() && !rest.contains('/')
-            })
-            .skip(offset);
-        let mut page = Vec::with_capacity(limit.min(1024));
-        for (p, a) in kids.by_ref().take(limit) {
-            page.push((p.0[prefix.len()..].to_string(), *a));
+                if rest.is_empty() {
+                    continue; // the dir's own entry (root has none)
+                }
+                match rest.find('/') {
+                    None => out.push((rest.to_string(), *a)),
+                    Some(slash) => {
+                        // Landed inside a child's subtree: hop to the first
+                        // key past it. '0' is the byte after '/', so
+                        // "<child>0" bounds exactly the "<child>/…" range —
+                        // and a real sibling named "<child>0…" is ≥ the
+                        // bound, so nothing legitimate is skipped.
+                        let child = &rest[..slash];
+                        from = std::ops::Bound::Included(RelPath(format!("{prefix}{child}0")));
+                        continue 'walk;
+                    }
+                }
+            }
+            break;
         }
-        let more = kids.next().is_some();
-        Some((page, more))
+        Some((out, idx.token()))
     }
 
     /// Apply one observed change. Cheap enough to call per event.
@@ -479,14 +491,16 @@ mod tests {
         }
     }
 
-    /// `readdir_page` must serve exactly what a disk readdir of the same map
-    /// would: direct children only, name order, offset paging — and refuse
-    /// (None) whenever the answer would need disk semantics it cannot supply.
+    /// `readdir_all` must serve exactly what a disk readdir of the same map
+    /// would: direct children only, name order — and refuse (None) whenever
+    /// the answer would need disk semantics it cannot supply.
     #[test]
-    fn readdir_pages_direct_children_in_name_order() {
+    fn readdir_all_lists_direct_children_in_name_order() {
         let mut idx = Indexed::default();
         // "a.txt" sorts between "a" and "a/deep" in full-path byte order —
-        // the interleaving the direct-child filter has to survive.
+        // the interleaving the subtree hop has to survive: after emitting
+        // dir "a" the walk must still visit "a.txt" (it sorts BEFORE the
+        // "a/…" subtree), and hopping past "a/deep" must land on "b".
         idx.insert(RelPath("d".into()), dir_attr());
         idx.insert(RelPath("d/a".into()), dir_attr());
         idx.insert(RelPath("d/a/deep".into()), attr_of(9));
@@ -497,28 +511,51 @@ mod tests {
         let tree = ExportTree::new(10);
         *tree.state.lock().unwrap() = State::Live(idx);
 
-        let (kids, more) = tree.readdir_page(&RelPath("d".into()), 0, 100).unwrap();
+        let (kids, token) = tree.readdir_all(&RelPath("d".into())).unwrap();
         let names: Vec<&str> = kids.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, ["a", "a.txt", "b"], "direct children, name-sorted");
-        assert!(!more);
+        assert_eq!(
+            token,
+            tree.token(),
+            "the listing carries the token it was built under"
+        );
 
         // Root listing: the subtree stays out of it.
-        let (root, _) = tree.readdir_page(&RelPath(String::new()), 0, 100).unwrap();
+        let (root, _) = tree.readdir_all(&RelPath(String::new())).unwrap();
         let names: Vec<&str> = root.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, ["d", "plain"]);
 
-        // Offset paging: limit 2 leaves one more, and the cursor picks it up.
-        let (page, more) = tree.readdir_page(&RelPath("d".into()), 0, 2).unwrap();
-        assert_eq!(page.len(), 2);
-        assert!(more);
-        let (rest, more) = tree.readdir_page(&RelPath("d".into()), 2, 2).unwrap();
-        assert_eq!(rest[0].0, "b");
-        assert!(!more);
-
         // Anything the index cannot answer exactly goes to disk: a path it
         // does not know, and a path it knows as a file.
-        assert!(tree.readdir_page(&RelPath("missing".into()), 0, 10).is_none());
-        assert!(tree.readdir_page(&RelPath("plain".into()), 0, 10).is_none());
+        assert!(tree.readdir_all(&RelPath("missing".into())).is_none());
+        assert!(tree.readdir_all(&RelPath("plain".into())).is_none());
+    }
+
+    #[test]
+    fn readdir_all_subtree_hop_skips_nothing_legitimate() {
+        // The hop after landing in "c/…" seeks to "c0" — every byte-order
+        // neighbour a name can produce is planted around it: "c!x" and
+        // "c.txt" sort BETWEEN "c" and "c/…" (bytes below 0x2F), and "c0"
+        // itself is a legal sibling name sitting exactly on the seek bound.
+        let mut idx = Indexed::default();
+        idx.insert(RelPath("c".into()), dir_attr());
+        idx.insert(RelPath("c/w".into()), attr_of(1));
+        idx.insert(RelPath("c/w2".into()), attr_of(2));
+        idx.insert(RelPath("c!x".into()), attr_of(3));
+        idx.insert(RelPath("c.txt".into()), attr_of(4));
+        idx.insert(RelPath("c0".into()), attr_of(5));
+        idx.insert(RelPath("czz".into()), attr_of(6));
+
+        let tree = ExportTree::new(10);
+        *tree.state.lock().unwrap() = State::Live(idx);
+
+        let (root, _) = tree.readdir_all(&RelPath(String::new())).unwrap();
+        let names: Vec<&str> = root.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            ["c", "c!x", "c.txt", "c0", "czz"],
+            "between-siblings and the on-bound name must all survive the hop"
+        );
     }
 
     #[test]

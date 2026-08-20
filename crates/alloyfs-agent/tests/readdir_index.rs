@@ -250,6 +250,76 @@ async fn excluded_names_never_appear_in_either_path() {
     }
 }
 
+/// A directory big enough to page parks a listing snapshot after its first
+/// page (continuation pages slice it instead of rebuilding the world). An
+/// agent-mediated mutation must drop that snapshot — the version funnel
+/// hooks — so the next listing shows the change, while the in-flight
+/// pagination still completes.
+///
+/// The DISK path is where this is observable and load-bearing: disk-built
+/// snapshots have no tree token to invalidate them, only a 30 s TTL — so
+/// without the funnel hook, the create would stay invisible to listings for
+/// the whole TTL. (The index path can't show this in a watcherless rig:
+/// agent-mediated creates only reach the index through the event feed, which
+/// is the watcher's — pinned by `a_live_index_is_what_answers_readdir`.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_mutation_mid_listing_reaches_the_next_listing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    for i in 0..1100 {
+        std::fs::write(dir.path().join(format!("f{i:04}.txt")), b"x").unwrap();
+    }
+    let registry = registry(dir.path(), Some(0), vec![]);
+    let mut peer = Peer::connect(&registry).await;
+    assert_eq!(
+        peer.tree_token().await,
+        0,
+        "cap 0 must leave the export unindexed"
+    );
+
+    let (page0, next) = peer.readdir_page("", 0).await;
+    let cursor = next.expect("1100 entries must page");
+
+    // Through the agent, so the funnel (bump) sees it. The name sorts last:
+    // the continuation's remaining range is not shifted by the insert, so
+    // the completed listing can be asserted exactly.
+    let created = peer
+        .call(Request::Create {
+            path: RelPath("zz-mid-listing.txt".into()),
+            flags: alloyfs_proto::OpenFlags {
+                read: true,
+                write: true,
+                ..Default::default()
+            },
+            mode: 0o644,
+        })
+        .await;
+    assert!(matches!(created, Ok(Response::Opened { .. })), "got {created:?}");
+
+    // The in-flight continuation completes (a dropped snapshot rebuilds at
+    // the requested cursor), and the rebuild already serves the new truth.
+    let mut rest = Vec::new();
+    let mut c = cursor;
+    loop {
+        let (page, next) = peer.readdir_page("", c).await;
+        rest.extend(page);
+        match next {
+            Some(n) => c = n,
+            None => break,
+        }
+    }
+    assert_eq!(
+        rest.last().map(|e| e.name.as_str()),
+        Some("zz-mid-listing.txt"),
+        "the rebuild behind the dropped snapshot serves the mutation"
+    );
+    assert_eq!(page0.len() + rest.len(), 1101, "nothing lost across the drop");
+
+    // And a fresh listing agrees end to end.
+    let (all, _) = peer.readdir_all("").await;
+    assert_eq!(all.len(), 1101);
+    assert!(all.iter().any(|e| e.name == "zz-mid-listing.txt"));
+}
+
 /// Pin WHICH path answers. No watcher runs in these tests, so a file created
 /// behind the agent's back is the one observable difference: the disk path
 /// would list it, a live index cannot know it yet. (In production the watcher

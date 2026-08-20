@@ -52,6 +52,9 @@ pub struct Export {
     /// The v6 index. Built on first request, not at startup — an export no
     /// client asks a tree of is never walked.
     pub tree: crate::tree::ExportTree,
+    /// Paged-listing snapshots (see listings.rs): built once per listing,
+    /// sliced per page, dropped by the version funnel below.
+    pub listings: crate::listings::ListingCache,
     /// v11 Windows attribute bits: native NTFS on a Windows agent, the
     /// export's `.alloyfs` sidecar on Linux. See winattr.rs.
     pub winattrs: crate::winattr::WinAttrs,
@@ -210,6 +213,7 @@ impl Export {
     pub fn bump(&self, path: &RelPath) -> u64 {
         let v = self.vclock.fetch_add(1, Ordering::Relaxed) + 1;
         self.versions.insert(path.clone(), v);
+        self.listings.drop_for(path);
         v
     }
 
@@ -229,6 +233,7 @@ impl Export {
     pub fn forget_version(&self, path: &RelPath) -> u64 {
         let v = self.vclock.fetch_add(1, Ordering::Relaxed) + 1;
         self.versions.remove(path);
+        self.listings.drop_for(path);
         v
     }
 
@@ -237,6 +242,7 @@ impl Export {
     /// hints, not the source of truth.
     pub fn rename_version(&self, from: &RelPath, to: &RelPath) -> u64 {
         self.versions.remove(from);
+        self.listings.drop_for(from);
         self.bump(to)
     }
 
@@ -346,6 +352,7 @@ impl ExportRegistry {
                     tree: crate::tree::ExportTree::new(
                         ec.tree_max_entries.unwrap_or(crate::tree::DEFAULT_MAX_ENTRIES),
                     ),
+                    listings: crate::listings::ListingCache::default(),
                 }),
             );
         }
@@ -692,13 +699,38 @@ impl SessionInner {
         })
     }
 
+    /// One page out of a complete listing, with the `next_cursor` chain the
+    /// wire shape promises. Pure slicing — every build cost was paid once,
+    /// by whoever parked `entries`.
+    fn listing_page(entries: &[DirEntry], cursor: u64) -> Response {
+        let start = cursor as usize;
+        let page: Vec<DirEntry> = entries.iter().skip(start).take(READDIR_PAGE).cloned().collect();
+        let next_cursor = if start + page.len() < entries.len() {
+            Some((start + page.len()) as u64)
+        } else {
+            None
+        };
+        Response::Dir {
+            entries: page,
+            next_cursor,
+        }
+    }
+
     fn readdir(&self, path: RelPath, cursor: u64) -> Result<Response, ErrorCode> {
         let export = self.export()?;
-        // Serve from the v6 index when it can answer exactly. The disk path
-        // below re-reads and re-stats the ENTIRE directory on every page —
-        // O(N) disk work per page and O(N²) to list a big directory in full —
-        // where the index has paid that cost once and is kept current by the
-        // watcher. Three things make the swap safe:
+        // Continuation pages come from the snapshot the first page parked —
+        // a lookup and a slice, not a rebuild (see listings.rs for what the
+        // rebuild-per-page used to cost, and for the freshness rules). A
+        // stale or missing snapshot rebuilds at the requested cursor, which
+        // stays correct: a cursor past the new length is simply the empty
+        // final page.
+        if cursor > 0 {
+            if let Some(entries) = export.listings.get_fresh(&path, export.tree.token()) {
+                return Ok(Self::listing_page(&entries, cursor));
+            }
+        }
+        // Build the COMPLETE listing once. From the v6 index when it can
+        // answer exactly. Three things make that swap safe:
         //
         // - Excludes: the index never contains an excluded path (the build
         //   walk filters them, and the Coalescer drops their events before
@@ -714,7 +746,7 @@ impl SessionInner {
         //   indexed, path unknown to it, not a directory, a case-insensitive
         //   spelling only the volume can resolve) and falls through to disk,
         //   keeping every error identical.
-        if let Some((children, more)) = export.tree.readdir_page(&path, cursor as usize, READDIR_PAGE) {
+        if let Some((children, token)) = export.tree.readdir_all(&path) {
             let entries: Vec<DirEntry> = children
                 .into_iter()
                 .map(|(name, attr)| {
@@ -744,8 +776,11 @@ impl SessionInner {
                     }
                 })
                 .collect();
-            let next_cursor = more.then(|| cursor + entries.len() as u64);
-            return Ok(Response::Dir { entries, next_cursor });
+            let entries = std::sync::Arc::new(entries);
+            if entries.len() > READDIR_PAGE {
+                export.listings.put(path, entries.clone(), token);
+            }
+            return Ok(Self::listing_page(&entries, cursor));
         }
         let full = export.resolve(&path)?;
         let mut entries: Vec<DirEntry> = Vec::new();
@@ -773,21 +808,13 @@ impl SessionInner {
             });
         }
         entries.sort_by(|a, b| a.name.cmp(&b.name));
-        let start = cursor as usize;
-        let total = entries.len();
-        // `into_iter`, not `iter().cloned()`: `entries` is dead after this, so
-        // cloning every returned DirEntry (name String included) bought
-        // nothing.
-        let page: Vec<DirEntry> = entries.into_iter().skip(start).take(READDIR_PAGE).collect();
-        let next_cursor = if start + page.len() < total {
-            Some((start + page.len()) as u64)
-        } else {
-            None
-        };
-        Ok(Response::Dir {
-            entries: page,
-            next_cursor,
-        })
+        let entries = std::sync::Arc::new(entries);
+        // Token 0 = disk-built: no index to validate against, so the
+        // snapshot lives on the TTL clock instead (see listings.rs).
+        if entries.len() > READDIR_PAGE {
+            export.listings.put(path, entries.clone(), 0);
+        }
+        Ok(Self::listing_page(&entries, cursor))
     }
 
     fn open(&self, path: RelPath, flags: OpenFlags) -> Result<Response, ErrorCode> {

@@ -6,6 +6,7 @@
 
 mod config;
 mod fsutil;
+mod listings;
 mod locks;
 mod ops;
 pub mod tree;
