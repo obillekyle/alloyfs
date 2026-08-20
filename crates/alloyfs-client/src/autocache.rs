@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use alloyfs_common::ExcludeSet;
-use alloyfs_common::{read_fully, OrCode};
+use alloyfs_common::OrCode;
 
 pub(crate) struct AutoCacheConfig {
     pub max_file_size: u64,
@@ -284,12 +284,12 @@ impl AutoCache {
 
     /// Read from the blob; None on any miss/short-read (caller falls through
     /// to the network — eviction races resolve themselves this way).
-    pub fn read(&self, path: &RelPath, offset: u64, len: u32) -> Option<Vec<u8>> {
-        let file = std::fs::File::open(blob_path(&self.cfg.root, path)).ok()?;
-        let mut buf = vec![0u8; len as usize];
-        let n = read_fully(&file, &mut buf, offset).ok()?;
-        buf.truncate(n);
-        Some(buf)
+    /// The blob as an open handle — the only read entry point, because every
+    /// caller reads more than once. The mount retains one per open fh;
+    /// opening per read priced every cached 64 K with a path build and a
+    /// file open/close.
+    pub fn open_blob(&self, path: &RelPath) -> Option<std::fs::File> {
+        std::fs::File::open(blob_path(&self.cfg.root, path)).ok()
     }
 
     /// Record a fully fetched blob (already staged at its final path by the
@@ -486,6 +486,15 @@ pub(crate) fn stage_write(path: &std::path::Path, data: &[u8]) -> Result<(), all
 
 #[cfg(test)]
 mod tests {
+    /// Reads exactly as the mount does: an open handle, positional reads.
+    fn read_via_handle(c: &AutoCache, p: &RelPath, offset: u64, len: usize) -> Option<Vec<u8>> {
+        let f = c.open_blob(p)?;
+        let mut buf = vec![0u8; len];
+        let n = alloyfs_common::read_fully(&f, &mut buf, offset).ok()?;
+        buf.truncate(n);
+        Some(buf)
+    }
+
     use super::*;
     use alloyfs_proto::FileKind;
 
@@ -525,7 +534,7 @@ mod tests {
         assert!(!c.fresh_for(&p, &attr(5, 101, 7)), "mtime mismatch");
         assert!(!c.fresh_for(&p, &attr(5, 100, 8)), "version mismatch");
         assert!(c.fresh_for(&p, &attr(5, 100, 0)), "version 0 escape hatch");
-        assert_eq!(c.read(&p, 0, 5).as_deref(), Some(&b"hello"[..]));
+        assert_eq!(read_via_handle(&c, &p, 0, 5).as_deref(), Some(&b"hello"[..]));
         c.flush_manifest();
 
         // Reload: entry survives; corrupt the blob size → dropped.
@@ -570,7 +579,7 @@ mod tests {
         assert!(!c.known(&a));
         assert!(c.known(&RelPath("e/x.txt".into())));
         assert_eq!(
-            c.read(&RelPath("e/x.txt".into()), 0, 1).as_deref(),
+            read_via_handle(&c, &RelPath("e/x.txt".into()), 0, 1).as_deref(),
             Some(&b"1"[..])
         );
         let _ = std::fs::remove_dir_all(&dir);

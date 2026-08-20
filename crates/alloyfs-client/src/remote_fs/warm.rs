@@ -16,34 +16,33 @@ use crate::metacache::MetaSnapshot;
 
 use super::RemoteFs;
 
-/// Metadata TTLs, two of each: the ceiling while the event pump is live and
-/// healthy, and the floor for every other state.
+/// Metadata TTLs: a short floor for every state where the event pump cannot
+/// be trusted, and NO timer at all while it can.
 ///
 /// Event-driven invalidation is the real freshness mechanism — remote changes
 /// bust attrs, listings, readahead and the warm tier the moment the pump
-/// applies them, and our own writes bust synchronously. While that machinery
-/// is demonstrably running, a 5-second TTL was pure waste: it re-asked the
-/// server every five seconds for answers the event stream had already
-/// promised to correct, and on a 60 ms link that re-ask is the dominant cost
-/// of re-navigation. The TTL's actual job is to bound staleness when the
-/// stream CANNOT be trusted — before the first subscribe, after a lag, during
-/// a reconnect — so that is when the short value applies.
+/// applies them, and our own writes bust synchronously. Under a healthy pump
+/// a timer adds nothing but cost, and the cost was measured: the old 60 s
+/// ceiling expired listings MID-WALK on the bench's second warm round, so an
+/// identical walk measured 19 ms or 92 ms depending on where the clock stood
+/// — WAN refreshes for answers the event stream had already promised to
+/// correct. The warm tier has served under exactly this no-timer contract
+/// since it existed; the live caches now share it.
 ///
 /// The choice is made at READ time from the pump's health right now, not
 /// stamped into the entry at insert. That gives the snap-down its teeth: the
-/// moment health drops, an entry cached 40 seconds ago under the long ceiling
+/// moment health drops, an entry cached an hour ago under the armed regime
 /// fails the 5-second test immediately — there is no window where old entries
 /// coast on the trust that existed when they were written. (Lag and resync
 /// also flush the caches outright; the read-time check is what covers the
 /// states that do not.)
-const ATTR_TTL_PUSH: Duration = Duration::from_secs(60);
+const TTL_ARMED: Duration = Duration::MAX;
 const ATTR_TTL_POLL: Duration = Duration::from_secs(5);
 
-/// Listing TTLs, same contract and same health switch as the attr pair. Kept
-/// separate because the two are tunable independently — a listing going stale
-/// mis-sorts a directory, an attribute going stale mis-serves a file, and
-/// those are not the same severity.
-const DIR_TTL_PUSH: Duration = Duration::from_secs(60);
+/// Listing floor, kept separate from the attr floor because the two are
+/// tunable independently — a listing going stale mis-sorts a directory, an
+/// attribute going stale mis-serves a file, and those are not the same
+/// severity.
 const DIR_TTL_POLL: Duration = Duration::from_secs(5);
 
 impl RemoteFs {
@@ -121,11 +120,11 @@ impl RemoteFs {
         self.pump_healthy.load(Ordering::Acquire)
     }
 
-    /// The attr TTL as of this instant — long under a healthy pump, 5 s
+    /// The attr TTL as of this instant — untimed under a healthy pump, 5 s
     /// otherwise. Read-time selection is deliberate; see the TTL constants.
     pub(super) fn attr_ttl(&self) -> Duration {
         if self.pump_healthy.load(Ordering::Acquire) {
-            ATTR_TTL_PUSH
+            TTL_ARMED
         } else {
             ATTR_TTL_POLL
         }
@@ -134,7 +133,7 @@ impl RemoteFs {
     /// The listing TTL as of this instant. Same switch as `attr_ttl`.
     pub(super) fn dir_ttl(&self) -> Duration {
         if self.pump_healthy.load(Ordering::Acquire) {
-            DIR_TTL_PUSH
+            TTL_ARMED
         } else {
             DIR_TTL_POLL
         }
@@ -199,6 +198,7 @@ impl RemoteFs {
     pub fn invalidate_read_cache(&self, fh: u64) {
         if let Some(state) = self.open_files.get(&fh) {
             state.ra.clear();
+            *state.blob.write().unwrap() = None;
         }
     }
 
@@ -243,6 +243,7 @@ impl RemoteFs {
             if entry.value().path == *path {
                 entry.value().cache_ok.store(false, Ordering::Relaxed);
                 entry.value().ra.clear();
+                *entry.value().blob.write().unwrap() = None;
             }
         }
     }
@@ -252,6 +253,7 @@ impl RemoteFs {
         for entry in self.open_files.iter() {
             entry.value().cache_ok.store(false, Ordering::Relaxed);
             entry.value().ra.clear();
+            *entry.value().blob.write().unwrap() = None;
         }
     }
 

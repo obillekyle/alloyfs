@@ -263,10 +263,11 @@ async fn reconnect_supervisor(fs: Arc<RemoteFs>) {
         for entry in fs.open_files.iter() {
             let state = entry.value();
             state.ra.clear(); // in-flight blocks belong to the dead conn
-                              // A handle the old session never knew about has nothing to restore.
-                              // It cannot hold a lock either — taking one materialises it — so
-                              // there is no mutual exclusion to have lost. It re-opens on its own
-                              // if a read ever escapes the cache.
+            *state.blob.write().unwrap() = None;
+            // A handle the old session never knew about has nothing to restore.
+            // It cannot hold a lock either — taking one materialises it — so
+            // there is no mutual exclusion to have lost. It re-opens on its own
+            // if a read ever escapes the cache.
             if state.server_fh.load(Ordering::Acquire) == NO_SERVER_FH {
                 continue;
             }

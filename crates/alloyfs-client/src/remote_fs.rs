@@ -98,6 +98,15 @@ pub(crate) struct OpenState {
     /// A batched NEW file still accumulating locally; None on every handle
     /// the server knows about. See batcher.rs.
     pub pending_new: Option<std::sync::Mutex<crate::batcher::PendingNew>>,
+    /// The auto-cache blob, held open across this handle's reads. Opening
+    /// the blob PER READ cost a file open, a path build, and a close on
+    /// every cached 64 K — measured as most of the gap between a warm
+    /// random read (222 µs p50) and rclone's (126 µs), four hundred times
+    /// over on a small-file sweep. Positional reads keep it shareable;
+    /// every path that flips `cache_ok` off drops it too, both because the
+    /// blob may be replaced and because an open handle blocks eviction's
+    /// remove on Windows.
+    pub blob: std::sync::RwLock<Option<std::fs::File>>,
     /// Server version this handle last saw, for --detect-conflicts. Seeded at
     /// open, advanced by our own writes. 0 = unknown, which never conflicts:
     /// refusing a write because we never learned a version would be a bug
@@ -684,6 +693,7 @@ impl RemoteFs {
                             lock: std::sync::Mutex::new(Vec::new()),
                             poisoned: AtomicBool::new(false),
                             pending_new: None,
+                            blob: std::sync::RwLock::new(None),
                             version: AtomicU64::new(attr.version),
                         },
                     );
@@ -740,6 +750,7 @@ impl RemoteFs {
                 lock: std::sync::Mutex::new(Vec::new()),
                 poisoned: AtomicBool::new(false),
                 pending_new: None,
+                blob: std::sync::RwLock::new(None),
                 version: AtomicU64::new(attr.version),
             },
         );
@@ -760,6 +771,15 @@ impl RemoteFs {
             Ok(Ok(Response::Data(data))) => Some(data),
             _ => None,
         }
+    }
+
+    /// One positional read from a retained blob handle. `None` on an I/O
+    /// error — the caller treats it as "the blob stopped being the answer".
+    fn blob_read(f: &std::fs::File, offset: u64, size: u32) -> Option<Vec<u8>> {
+        let mut buf = vec![0u8; size as usize];
+        let n = alloyfs_common::read_fully(f, &mut buf, offset).ok()?;
+        buf.truncate(n);
+        Some(buf)
     }
 
     /// A pending NEW file outgrew the batcher — a non-sequential write, or
@@ -862,14 +882,30 @@ impl RemoteFs {
                 return Ok(p.data[start..end].to_vec());
             }
         }
-        // Auto-cache fast path: serve from the local blob when fresh.
+        // Auto-cache fast path: serve from the local blob when fresh, through
+        // a handle retained on the fh — see the `blob` field for why.
         if let (Some(cache), Some(state)) = (&self.cache, self.open_files.get(&fh)) {
             if state.cache_ok.load(Ordering::Relaxed) {
-                if let Some(data) = cache.read(&state.path, offset, size) {
+                let served = {
+                    let held = state.blob.read().unwrap();
+                    match held.as_ref() {
+                        Some(f) => Self::blob_read(f, offset, size),
+                        None => None,
+                    }
+                };
+                if let Some(data) = served {
                     return Ok(data);
+                }
+                if let Some(f) = cache.open_blob(&state.path) {
+                    let data = Self::blob_read(&f, offset, size);
+                    *state.blob.write().unwrap() = Some(f);
+                    if let Some(data) = data {
+                        return Ok(data);
+                    }
                 }
                 // Blob vanished (eviction race): fall through to the network.
                 state.cache_ok.store(false, Ordering::Relaxed);
+                *state.blob.write().unwrap() = None;
             }
         }
         // Past the cache, so this read genuinely needs the server. If the open
@@ -1327,6 +1363,7 @@ impl RemoteFs {
                             ra: ReadAhead::new(),
                             lock: std::sync::Mutex::new(Vec::new()),
                             poisoned: AtomicBool::new(false),
+                            blob: std::sync::RwLock::new(None),
                             pending_new: Some(std::sync::Mutex::new(PendingNew {
                                 data: Vec::new(),
                                 mode,
@@ -1365,6 +1402,7 @@ impl RemoteFs {
                 lock: std::sync::Mutex::new(Vec::new()),
                 poisoned: AtomicBool::new(false),
                 pending_new: None,
+                blob: std::sync::RwLock::new(None),
                 version: AtomicU64::new(attr.version),
             },
         );
