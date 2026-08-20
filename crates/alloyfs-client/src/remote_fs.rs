@@ -31,19 +31,35 @@ macro_rules! expect_resp {
     };
 }
 
-/// How long a cached attribute may serve reads before we re-ask the server.
-/// Event-driven invalidation is the primary freshness mechanism; this bounds
-/// staleness if the event stream hiccups.
-const ATTR_TTL: Duration = Duration::from_secs(5);
-
-/// How long a cached directory listing may answer without re-asking.
+/// Metadata TTLs, two of each: the ceiling while the event pump is live and
+/// healthy, and the floor for every other state.
 ///
-/// Same value as [`ATTR_TTL`] and the same freshness contract: events are the
-/// real invalidation, the TTL only bounds staleness if the stream hiccups.
-/// Kept as its own constant because the two are tunable independently — a
-/// listing going stale mis-sorts a directory, an attribute going stale
-/// mis-serves a file, and those are not the same severity.
-const DIR_TTL: Duration = Duration::from_secs(5);
+/// Event-driven invalidation is the real freshness mechanism — remote changes
+/// bust attrs, listings, readahead and the warm tier the moment the pump
+/// applies them, and our own writes bust synchronously. While that machinery
+/// is demonstrably running, a 5-second TTL was pure waste: it re-asked the
+/// server every five seconds for answers the event stream had already
+/// promised to correct, and on a 60 ms link that re-ask is the dominant cost
+/// of re-navigation. The TTL's actual job is to bound staleness when the
+/// stream CANNOT be trusted — before the first subscribe, after a lag, during
+/// a reconnect — so that is when the short value applies.
+///
+/// The choice is made at READ time from the pump's health right now, not
+/// stamped into the entry at insert. That gives the snap-down its teeth: the
+/// moment health drops, an entry cached 40 seconds ago under the long ceiling
+/// fails the 5-second test immediately — there is no window where old entries
+/// coast on the trust that existed when they were written. (Lag and resync
+/// also flush the caches outright; the read-time check is what covers the
+/// states that do not.)
+const ATTR_TTL_PUSH: Duration = Duration::from_secs(60);
+const ATTR_TTL_POLL: Duration = Duration::from_secs(5);
+
+/// Listing TTLs, same contract and same health switch as the attr pair. Kept
+/// separate because the two are tunable independently — a listing going stale
+/// mis-sorts a directory, an attribute going stale mis-serves a file, and
+/// those are not the same severity.
+const DIR_TTL_PUSH: Duration = Duration::from_secs(60);
+const DIR_TTL_POLL: Duration = Duration::from_secs(5);
 
 /// One directory's cached remote listing: (name, ino, attr) per entry.
 type DirListing = Vec<(String, u64, Attr)>;
@@ -185,7 +201,7 @@ pub struct RemoteFs {
     pub ino: crate::InodeTable,
     pub root_attr: Attr,
     attr_cache: DashMap<u64, (Attr, Instant)>,
-    /// Complete REMOTE listing per directory ino, good for [`DIR_TTL`] or
+    /// Complete REMOTE listing per directory ino, good for [`DIR_TTL_PUSH`]/[`DIR_TTL_POLL`] (pump-health-dependent) or
     /// until an event touches a child. One structure, three answers:
     ///
     /// - a repeat readdir is local (Explorer re-enumerates on focus, F5 and
@@ -212,7 +228,7 @@ pub struct RemoteFs {
     /// invalidate, then an in-flight fetch lands a pre-mutation listing and
     /// stamps it fresh. That is worse than staleness — a listing is treated as
     /// COMPLETE, so `lookup` answers a hard NotFound for a file that exists
-    /// (and keeps answering it for the rest of DIR_TTL). Comparing this before
+    /// (and keeps answering it for the rest of the listing TTL). Comparing this before
     /// and after the fetch closes it. Deliberately global rather than
     /// per-directory: a mutation elsewhere only costs one skipped insert,
     /// which is the safe direction to be wrong in.
@@ -225,7 +241,7 @@ pub struct RemoteFs {
     /// same token proof that lets the auto-cache serve blobs without
     /// re-validation.
     ///
-    /// No TTL, deliberately. DIR_TTL exists because a live listing's
+    /// No TTL, deliberately. The listing TTL exists because a live listing's
     /// freshness is a bet on the event stream staying up; a warm listing's
     /// freshness is the tree token the walker verified at mount. It stays
     /// until an invalidation removes it, so every path that busts `dir_cache`
@@ -253,6 +269,12 @@ pub struct RemoteFs {
     conn_epoch: tokio::sync::watch::Sender<u64>,
     /// Highest event seq the pump has applied — reconnect resubscribes here.
     pub(crate) last_event_seq: AtomicU64,
+    /// Is the event pump subscribed and keeping up RIGHT NOW? Selects between
+    /// the push and poll TTLs above. False until the first successful
+    /// subscribe — a mount that never starts a pump keeps today's 5 s
+    /// behaviour — and false again on lag, stream close, or while waiting out
+    /// a reconnect. Set only by the pump (events.rs).
+    pub(crate) pump_healthy: std::sync::atomic::AtomicBool,
     /// Send `expect_version` with writes and refuse to clobber (opt-in).
     detect_conflicts: bool,
     /// Local mountpoint, for symlink target rewriting. See `localize_target`.
@@ -312,6 +334,7 @@ impl RemoteFs {
             dialer: opts.dialer.clone(),
             conn_epoch: epoch_tx,
             last_event_seq: AtomicU64::new(0),
+            pump_healthy: std::sync::atomic::AtomicBool::new(false),
             detect_conflicts: opts.detect_conflicts,
             mount_root: opts.mount_root.clone(),
             next_lazy_fh: AtomicU64::new(1),
@@ -451,6 +474,32 @@ impl RemoteFs {
         self.warm.len()
     }
 
+    /// Is the event pump subscribed and keeping up right now? Diagnostic
+    /// counterpart of `auto_cache_walk_skipped`: "which TTL regime is this
+    /// mount in" is otherwise invisible from outside.
+    pub fn event_pump_healthy(&self) -> bool {
+        self.pump_healthy.load(Ordering::Acquire)
+    }
+
+    /// The attr TTL as of this instant — long under a healthy pump, 5 s
+    /// otherwise. Read-time selection is deliberate; see the TTL constants.
+    fn attr_ttl(&self) -> Duration {
+        if self.pump_healthy.load(Ordering::Acquire) {
+            ATTR_TTL_PUSH
+        } else {
+            ATTR_TTL_POLL
+        }
+    }
+
+    /// The listing TTL as of this instant. Same switch as `attr_ttl`.
+    fn dir_ttl(&self) -> Duration {
+        if self.pump_healthy.load(Ordering::Acquire) {
+            DIR_TTL_PUSH
+        } else {
+            DIR_TTL_POLL
+        }
+    }
+
     /// The warm-invalidation epoch right now. The walker captures it BEFORE
     /// asking the server for its tree token, for the same reason `readdir`
     /// captures `dir_epoch` before its first page: the install that follows
@@ -561,7 +610,7 @@ impl RemoteFs {
     fn cached_attr_fresh(&self, ino: u64) -> Option<Attr> {
         let hit = self.attr_cache.get(&ino)?;
         let (attr, when) = *hit;
-        (when.elapsed() < ATTR_TTL).then_some(attr)
+        (when.elapsed() < self.attr_ttl()).then_some(attr)
     }
 
     /// The server handle for `fh`, opening the file on the server if this
@@ -626,7 +675,7 @@ impl RemoteFs {
         }
         if let Some(hit) = self.attr_cache.get(&ino) {
             let (attr, when) = *hit;
-            if when.elapsed() < ATTR_TTL {
+            if when.elapsed() < self.attr_ttl() {
                 return Ok(attr);
             }
         }
@@ -639,7 +688,7 @@ impl RemoteFs {
             if let Some(pino) = self.ino.ino_of(&parent) {
                 if let Some(hit) = self.dir_cache.get(&pino) {
                     let (entries, when) = &*hit;
-                    if when.elapsed() < DIR_TTL && !entries.iter().any(|(n, _, _)| n == name) {
+                    if when.elapsed() < self.dir_ttl() && !entries.iter().any(|(n, _, _)| n == name) {
                         return Err(ErrorCode::NotFound.into());
                     }
                 }
@@ -683,7 +732,7 @@ impl RemoteFs {
         // remote listing is the whole answer.
         if let Some(hit) = self.dir_cache.get(&parent) {
             let (entries, when) = &*hit;
-            if when.elapsed() < DIR_TTL {
+            if when.elapsed() < self.dir_ttl() {
                 return match entries.iter().find(|(n, _, _)| n == name) {
                     Some((_, ino, attr)) => Ok((*ino, *attr)),
                     None => Err(ErrorCode::NotFound.into()),
@@ -731,7 +780,7 @@ impl RemoteFs {
         // would save microseconds and buy an invalidation problem.
         if let Some(hit) = self.dir_cache.get(&ino) {
             let (entries, when) = &*hit;
-            if when.elapsed() < DIR_TTL {
+            if when.elapsed() < self.dir_ttl() {
                 let mut out = entries.clone();
                 drop(hit);
                 self.merge_overlay_children(&dir, &mut out);
@@ -825,7 +874,7 @@ impl RemoteFs {
         // The freshness test is the SAME one the answer would have been fed
         // through — `fresh_for` compares size, mtime and version — applied to
         // the attribute the readdir already cached instead of to one fetched
-        // again. That attribute is at most ATTR_TTL old and the event stream
+        // again. That attribute is at most one attr-TTL old and the event stream
         // invalidates it sooner, which is the freshness contract every other
         // read on this mount already runs under.
         //

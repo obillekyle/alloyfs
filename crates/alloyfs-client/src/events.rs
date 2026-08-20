@@ -190,6 +190,10 @@ impl RemoteFs {
             Response::Subscribed { last_seq } => last_seq,
             _ => return Err(alloyfs_proto::ErrorCode::Io.into()),
         };
+        // The pump is live from here: metadata may coast on the long TTLs
+        // until something says otherwise.
+        self.pump_healthy
+            .store(true, std::sync::atomic::Ordering::Release);
         // Seed the resubscription cursor so a reconnect before the first
         // batch still resumes from the caller's point, not from zero.
         if let Some(s) = since {
@@ -218,6 +222,13 @@ impl RemoteFs {
                                 fs.apply_events_to_cache(&batch);
                                 on_batch(&batch);
                             }
+                            // A cleanly received batch is proof the stream
+                            // flows: after a lag flushed the caches, this is
+                            // what restores the long TTLs — without it a
+                            // single transient lag on a dialer-less mount
+                            // (which can never resubscribe) would downgrade
+                            // it to poll-grade forever.
+                            fs.pump_healthy.store(true, std::sync::atomic::Ordering::Release);
                             // Persist the cursor only AFTER the batch has been
                             // applied. The other order looks equivalent and is
                             // not: a crash in between would leave a manifest
@@ -236,12 +247,21 @@ impl RemoteFs {
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                             // We fell behind the connection reader: safest reset.
+                            // Health drops WITH the flush: the flush clears
+                            // what exists, and the short TTL keeps what gets
+                            // cached next from coasting until the stream
+                            // proves it flows again — the next cleanly
+                            // received batch restores it (above).
+                            fs.pump_healthy.store(false, std::sync::atomic::Ordering::Release);
                             tracing::warn!(missed = n, "event pump lagged; flushing caches");
                             fs.invalidate_all();
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
                 }
+                // The stream is gone; nothing can push invalidations until a
+                // resubscribe succeeds. Everything cached is now poll-grade.
+                fs.pump_healthy.store(false, std::sync::atomic::Ordering::Release);
                 if fs.dialer.is_none() {
                     break;
                 }
@@ -255,6 +275,7 @@ impl RemoteFs {
                 match conn.request(Request::Subscribe { since_seq: since }).await {
                     Ok(Ok(Response::Subscribed { .. })) => {
                         tracing::info!(since = seen, "event stream resubscribed");
+                        fs.pump_healthy.store(true, std::sync::atomic::Ordering::Release);
                     }
                     Ok(Err(alloyfs_proto::ErrorCode::TooOld)) => {
                         tracing::warn!("event history expired during outage; flushing caches");
@@ -262,7 +283,15 @@ impl RemoteFs {
                         if let Some(cache) = &fs.cache {
                             cache.mark_all_unverified();
                         }
-                        let _ = conn.request(Request::Subscribe { since_seq: None }).await;
+                        // Health follows the OUTCOME: the live resubscribe
+                        // succeeding is a fresh stream over freshly flushed
+                        // caches; it failing leaves this loop retrying on the
+                        // next reconnect with everything at poll-grade.
+                        if let Ok(Ok(Response::Subscribed { .. })) =
+                            conn.request(Request::Subscribe { since_seq: None }).await
+                        {
+                            fs.pump_healthy.store(true, std::sync::atomic::Ordering::Release);
+                        }
                     }
                     other => {
                         tracing::warn!(?other, "resubscribe failed; will retry on next reconnect");

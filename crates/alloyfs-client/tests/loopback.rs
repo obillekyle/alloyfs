@@ -2659,3 +2659,65 @@ async fn an_event_busts_the_warm_listing_for_its_parent() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
+
+// ---------------------------------------------------- adaptive metadata TTLs
+
+/// With a healthy event pump, cached attributes outlive the old 5-second
+/// ceiling — served with the connection SEVERED six seconds after caching,
+/// which only the long TTL can explain. Then the flip side on a second
+/// session: with no pump at all, the same six-second-old attribute is NOT
+/// served — the TTL floor still protects a mount that has no push
+/// invalidation to lean on.
+///
+/// The snap-down on pump death is not separately assertable here without
+/// racing the pump's close notification, but it needs no test of its own:
+/// health is read at serve time, so the no-pump case below and the
+/// health-restoring paths in events.rs bound it from both sides.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_healthy_pump_extends_the_attr_ttl_and_no_pump_does_not() {
+    let agent = start_agent(AgentOpts {
+        watch: true,
+        ..AgentOpts::default()
+    });
+    std::fs::write(agent.dir.path().join("t.txt"), b"body").unwrap();
+
+    // Session WITH a pump: cache the attr, age it past the poll TTL, and ask
+    // again with the connection ALIVE — severing is no use here, because the
+    // pump on this same connection notices the close and drops health, which
+    // is the snap-down doing its job (it failed exactly that way when this
+    // test was first written with a sever). The request counter is the
+    // no-wire proof that leaves health intact.
+    let a = connect(&agent, ClientOptions::default()).await;
+    a.fs.start_event_pump(|_| {}).await.unwrap();
+    let (ino, _) = lookup_path(&a.fs, "t.txt").await.unwrap();
+    // Let the file's own CREATE event land and do its invalidation first —
+    // the pump busting a just-cached attr for the file this test just wrote
+    // is correct behaviour, not the staleness being measured. One second
+    // clears the watcher debounce; the getattr after it re-primes the cache
+    // with nothing left in flight to invalidate it.
+    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+    on_fs(&a.fs, move |fs| fs.getattr(ino).unwrap()).await;
+    tokio::time::sleep(std::time::Duration::from_millis(6200)).await;
+    let before = a.conn().requests_sent();
+    let attr = on_fs(&a.fs, move |fs| fs.getattr(ino)).await;
+    let after = a.conn().requests_sent();
+    assert!(attr.is_ok(), "getattr failed under a healthy pump: {attr:?}");
+    assert_eq!(
+        before, after,
+        "a six-second-old attr went to the wire despite a healthy pump"
+    );
+
+    // Session WITHOUT a pump: same age, same sever — and the poll TTL must
+    // refuse it, which surfaces as an error once the wire is gone.
+    let b = connect(&agent, ClientOptions::default()).await;
+    let (ino_b, _) = lookup_path(&b.fs, "t.txt").await.unwrap();
+    on_fs(&b.fs, move |fs| fs.getattr(ino_b).unwrap()).await;
+    tokio::time::sleep(std::time::Duration::from_millis(6200)).await;
+    b.sever();
+    let stale = on_fs(&b.fs, move |fs| fs.getattr(ino_b)).await;
+    assert!(
+        stale.is_err(),
+        "without a pump the poll TTL must expire a six-second-old attr, \
+         forcing the wire (which is severed): {stale:?}"
+    );
+}

@@ -45,6 +45,11 @@ pub enum TransportError {
 /// socket — request N can resolve before request N-1.
 pub struct MuxConnection {
     next_id: AtomicU64,
+    /// Requests sent over this connection's lifetime. Observability: lets a
+    /// test (or a diag) assert an answer came from a local cache by watching
+    /// this NOT move — the strongest no-wire proof short of severing the
+    /// connection, and unlike severing it leaves the connection usable.
+    requests_sent: AtomicU64,
     tx: mpsc::Sender<Frame>,
     inflight: Arc<DashMap<u64, oneshot::Sender<Result<Response, ErrorCode>>>>,
     pings: Arc<DashMap<u64, oneshot::Sender<()>>>,
@@ -100,6 +105,7 @@ impl MuxConnection {
         // Reader task: routes every incoming frame to its waiter.
         let conn = Arc::new(Self {
             next_id: AtomicU64::new(1),
+            requests_sent: AtomicU64::new(0),
             tx,
             inflight: inflight.clone(),
             pings: pings.clone(),
@@ -161,6 +167,11 @@ impl MuxConnection {
         });
 
         Ok(conn)
+    }
+
+    /// Requests sent so far; see the field for what this is for.
+    pub fn requests_sent(&self) -> u64 {
+        self.requests_sent.load(Ordering::Relaxed)
     }
 
     /// Send one request and await its response, bounded by REQUEST_TIMEOUT.
@@ -249,6 +260,7 @@ impl MuxConnection {
             return Err(TransportError::Closed);
         }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        self.requests_sent.fetch_add(1, Ordering::Relaxed);
         let (done_tx, done_rx) = oneshot::channel();
         self.inflight.insert(id, done_tx);
         // Re-check AFTER inserting: the reader flips closed before clearing
