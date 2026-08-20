@@ -12,11 +12,12 @@
 //!   `.alloyfs` directory is auto-excluded on every export, so no client
 //!   ever lists it.
 //!
-//! Writes are rare (a person toggling Hidden), so the sidecar saves
-//! synchronously — tmp + rename, the same durability idiom the manifest
-//! uses — rather than carrying a flusher for a file that changes once a
-//! week. Renames move entries (subtrees included); removals drop them;
-//! entries whose paths no longer exist are dropped at load.
+//! Writes are rare (a person toggling Hidden), so single mutations save
+//! synchronously — tmp + rename, the manifest's durability idiom. Bulk
+//! handlers hold a [`SidecarBatch`] instead: a save is O(whole map), and a
+//! WriteMany carrying a thousand executables would otherwise serialize the
+//! store a thousand times. Renames move entries (subtrees included);
+//! removals drop them; entries whose paths no longer exist drop at load.
 
 use alloyfs_proto::RelPath;
 #[cfg(unix)]
@@ -37,6 +38,40 @@ use alloyfs_proto::MODE_WIN_MASK;
 pub struct SidecarMap {
     file: std::path::PathBuf,
     map: std::sync::Mutex<std::collections::BTreeMap<String, u32>>,
+    /// While > 0, mutations mark `dirty` instead of saving — the bulk
+    /// handlers hold a [`SidecarBatch`] across their loop, because a save is
+    /// O(whole map) and a WriteMany carrying a thousand executables would
+    /// otherwise serialize the store a thousand times (O(n²) for the burst).
+    /// JSON is not the cost; save-per-mutation was.
+    suspend: std::sync::atomic::AtomicU32,
+    dirty: std::sync::atomic::AtomicBool,
+    /// How many times the file has been written — what the batching test
+    /// pins, so the O(n²) can never quietly return.
+    saves: std::sync::atomic::AtomicU64,
+}
+
+/// Suspends sidecar saves while alive; the drop performs one save if
+/// anything changed. Nesting is fine (bulk inside bulk saves once, at the
+/// outermost drop). Concurrent single mutations from other sessions fold
+/// into the same final save — their dirty mark survives until the last
+/// guard drops.
+pub struct SidecarBatch<'a>(&'a SidecarMap);
+
+impl Drop for SidecarBatch<'_> {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        // The lock comes BEFORE the counter drop. Every mutation checks
+        // `suspend` while holding this same lock, so it lands wholly before
+        // this drop (its dirty mark is visible here and saved) or wholly
+        // after (it reads suspend == 0 and saves itself). Checking outside
+        // the lock left a window where both sides declined to save and a
+        // mutation sat in memory until the next unrelated save.
+        let map = self.0.map.lock().unwrap();
+        if self.0.suspend.fetch_sub(1, Ordering::AcqRel) == 1 && self.0.dirty.swap(false, Ordering::AcqRel) {
+            self.0.saves.fetch_add(1, Ordering::Relaxed);
+            SidecarMap::save(&self.0.file, &map);
+        }
+    }
 }
 
 impl SidecarMap {
@@ -53,7 +88,37 @@ impl SidecarMap {
         Self {
             file,
             map: std::sync::Mutex::new(map),
+            suspend: std::sync::atomic::AtomicU32::new(0),
+            dirty: std::sync::atomic::AtomicBool::new(false),
+            saves: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// Suspend saves for the guard's lifetime; one save happens at the
+    /// outermost drop if anything changed. Bulk handlers hold this across
+    /// their loops.
+    pub fn batch(&self) -> SidecarBatch<'_> {
+        self.suspend.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        SidecarBatch(self)
+    }
+
+    /// Total file writes so far — exists for the batching test's pin, so
+    /// it compiles only there (on Linux nothing else can reach it: the
+    /// map sits behind `WinAttrs`' private field).
+    #[cfg(test)]
+    pub fn save_count(&self) -> u64 {
+        self.saves.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Save now unless suspended (then just mark dirty for the guard).
+    fn save_or_defer(&self, map: &std::collections::BTreeMap<String, u32>) {
+        use std::sync::atomic::Ordering;
+        if self.suspend.load(Ordering::Acquire) > 0 {
+            self.dirty.store(true, Ordering::Release);
+            return;
+        }
+        self.saves.fetch_add(1, Ordering::Relaxed);
+        Self::save(&self.file, map);
     }
 
     pub fn get(&self, rel: &RelPath) -> Option<u32> {
@@ -71,7 +136,7 @@ impl SidecarMap {
                 map.remove(&rel.0);
             }
         }
-        Self::save(&self.file, &map);
+        self.save_or_defer(&map);
     }
 
     pub fn remove(&self, rel: &RelPath) {
@@ -80,7 +145,7 @@ impl SidecarMap {
         let before = map.len();
         map.retain(|p, _| p != &rel.0 && !p.starts_with(&prefix));
         if map.len() != before {
-            Self::save(&self.file, &map);
+            self.save_or_defer(&map);
         }
     }
 
@@ -100,7 +165,7 @@ impl SidecarMap {
             let tail = &p[from.0.len()..];
             map.insert(format!("{}{}", to.0, tail), bits);
         }
-        Self::save(&self.file, &map);
+        self.save_or_defer(&map);
     }
 
     fn save(file: &std::path::Path, map: &std::collections::BTreeMap<String, u32>) {
@@ -154,6 +219,11 @@ mod imp {
             self.0.remove(rel);
         }
 
+        /// Suspend saves across a bulk of mutations.
+        pub fn batch(&self) -> super::SidecarBatch<'_> {
+            self.0.batch()
+        }
+
         pub fn rename(&self, from: &RelPath, to: &RelPath) {
             self.0.rename(from, to);
         }
@@ -168,6 +238,9 @@ mod imp {
     /// Stateless: NTFS is the store. `get` is unused because
     /// `attr_from_metadata` reads the bits straight from every `Metadata`.
     pub struct WinAttrs;
+
+    /// What a no-op batch hands back — droppable, holds nothing.
+    pub struct NoopBatch;
 
     impl WinAttrs {
         pub fn load(_root: &Path) -> Self {
@@ -210,6 +283,12 @@ mod imp {
 
         pub fn remove(&self, _rel: &RelPath) {}
         pub fn rename(&self, _from: &RelPath, _to: &RelPath) {}
+
+        /// Nothing to batch: NTFS is the store. The zero-sized guard keeps
+        /// call sites uniform with the sidecar backend.
+        pub fn batch(&self) -> NoopBatch {
+            NoopBatch
+        }
     }
 
     #[link(name = "kernel32")]
@@ -220,3 +299,39 @@ mod imp {
 }
 
 pub use imp::WinAttrs;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The efficiency contract: a bulk of N mutations writes the file ONCE,
+    /// and the batch's content is durably there on reload. Without the
+    /// guard, N mutations were N O(map)-sized serializations — O(n²) for a
+    /// WriteMany full of executables.
+    #[test]
+    fn a_batch_of_mutations_saves_once() {
+        let dir = tempfile::TempDir::new().unwrap();
+        for i in 0..300 {
+            std::fs::write(dir.path().join(format!("f{i}")), b"x").unwrap();
+        }
+        let map = SidecarMap::load(dir.path(), "t.json", |_| true);
+        {
+            let _bulk = map.batch();
+            for i in 0..300 {
+                map.put(&RelPath(format!("f{i}")), Some(0o755));
+            }
+            assert_eq!(map.save_count(), 0, "suspended: nothing written yet");
+        }
+        assert_eq!(map.save_count(), 1, "one save for the whole batch");
+
+        // Singles outside a batch still save immediately — durability for
+        // the ordinary one-off chmod is unchanged.
+        map.put(&RelPath("f0".into()), Some(0o700));
+        assert_eq!(map.save_count(), 2);
+
+        // And the batch actually landed: a fresh load sees it.
+        let reloaded = SidecarMap::load(dir.path(), "t.json", |_| true);
+        assert_eq!(reloaded.get(&RelPath("f299".into())), Some(0o755));
+        assert_eq!(reloaded.get(&RelPath("f0".into())), Some(0o700));
+    }
+}

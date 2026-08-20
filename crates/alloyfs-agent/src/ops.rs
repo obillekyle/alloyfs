@@ -1168,6 +1168,9 @@ impl SessionInner {
     /// that knowable on Windows, where the mode is applied post-open).
     fn write_many(&self, files: Vec<alloyfs_proto::ManyWrite>) -> Result<Response, ErrorCode> {
         let export = self.writable_export()?;
+        // One sidecar save for the whole batch, not one per executable.
+        #[cfg(windows)]
+        let _sidecar = export.posix_modes.batch();
         let mut out = Vec::with_capacity(files.len());
         for f in files {
             out.push(self.write_one_whole(&export, f));
@@ -1224,6 +1227,10 @@ impl SessionInner {
     /// v10+: several removals in one exchange, in order, answered per entry.
     fn remove_many(&self, entries: Vec<alloyfs_proto::ManyRemove>) -> Result<Response, ErrorCode> {
         let export = self.writable_export()?;
+        // Sidecar removals coalesce to one save per batch on both platforms.
+        let _wa = export.winattrs.batch();
+        #[cfg(windows)]
+        let _pm = export.posix_modes.batch();
         let mut out = Vec::with_capacity(entries.len());
         for e in entries {
             let one = (|| -> Result<Option<Attr>, ErrorCode> {
@@ -1247,6 +1254,12 @@ impl SessionInner {
     /// v10+: several metadata changes in one exchange — `setattr2`'s body per
     /// entry, so the readonly-onto-mode mapping stays server-side and atomic.
     fn setattr_many(&self, entries: Vec<alloyfs_proto::ManySetattr>) -> Result<Response, ErrorCode> {
+        // chmod -R shape: one sidecar save for the whole sweep. The export
+        // binding keeps the Arc alive for the guard borrowing into it.
+        #[cfg(windows)]
+        let export = self.export()?;
+        #[cfg(windows)]
+        let _sidecar = export.posix_modes.batch();
         let mut out = Vec::with_capacity(entries.len());
         for e in entries {
             out.push(match self.setattr2(e.path, e.size, e.mtime, e.mode, e.readonly) {
