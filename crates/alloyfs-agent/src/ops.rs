@@ -55,6 +55,12 @@ pub struct Export {
     /// v11 Windows attribute bits: native NTFS on a Windows agent, the
     /// export's `.alloyfs` sidecar on Linux. See winattr.rs.
     pub winattrs: crate::winattr::WinAttrs,
+    /// The mirror problem: POSIX modes on a WINDOWS agent, where NTFS has
+    /// no execute bit to hold a Linux client's `chmod +x`. Same sidecar
+    /// machinery, opposite direction; no wire change — `mode` was always
+    /// there, this just makes a Windows server stop fabricating it.
+    #[cfg(windows)]
+    pub posix_modes: crate::winattr::SidecarMap,
 }
 
 impl Export {
@@ -75,8 +81,37 @@ impl Export {
             }
         }
         #[cfg(windows)]
-        let _ = rel;
+        {
+            if attr.kind == FileKind::File {
+                if let Some(m) = self.posix_modes.get(rel) {
+                    // The sidecar carries the POSIX intent; the native
+                    // ReadOnly attribute stays authoritative for the write
+                    // bits, so a server-side `attrib +r` is never overridden
+                    // by an older chmod.
+                    let write = if attr.mode & 0o222 == 0 { 0 } else { m & 0o222 };
+                    let merged = (m & !0o222 & 0o7777) | write;
+                    return Attr {
+                        mode: (attr.mode & !0o7777) | merged,
+                        ..attr
+                    };
+                }
+            }
+        }
         attr
+    }
+
+    /// Every sidecar's view of a removal — whichever platform carries one.
+    fn sidecars_remove(&self, rel: &RelPath) {
+        self.winattrs.remove(rel);
+        #[cfg(windows)]
+        self.posix_modes.remove(rel);
+    }
+
+    /// Every sidecar's view of a rename.
+    fn sidecars_rename(&self, from: &RelPath, to: &RelPath) {
+        self.winattrs.rename(from, to);
+        #[cfg(windows)]
+        self.posix_modes.rename(from, to);
     }
 }
 
@@ -298,6 +333,8 @@ impl ExportRegistry {
                 Arc::new(Export {
                     name: name.clone(),
                     winattrs: crate::winattr::WinAttrs::load(&root),
+                    #[cfg(windows)]
+                    posix_modes: crate::winattr::SidecarMap::load(&root, "posix.json", |m| m & 0o7777 != 0),
                     root,
                     read_only: ec.read_only,
                     versions: DashMap::new(),
@@ -901,6 +938,13 @@ impl SessionInner {
         // onto the read-only attribute, so it still has to happen after open.
         #[cfg(windows)]
         alloyfs_common::set_mode(&file, mode);
+        // Only interesting creation modes earn a sidecar entry — a Linux
+        // client creating an executable must keep its x-bits, while the
+        // ocean of 0o666 creates stays out of the store.
+        #[cfg(windows)]
+        if mode & 0o111 != 0 {
+            export.posix_modes.put(&path, Some(mode & 0o7777));
+        }
         let md = file.metadata().or_code()?;
         export.events.note_local_write(&path, self.id);
         let attr = export.with_winattrs(&path, attr_from_metadata(&md, export.bump(&path)));
@@ -1083,6 +1127,14 @@ impl SessionInner {
             // on a Windows server. A path chmod needs no write access on any
             // platform.
             set_mode_path(&full, mode).or_code()?;
+            // A Windows filesystem holds only the write-bit projection of
+            // that chmod; the full mode persists in the export's posix
+            // sidecar so a Linux client's chmod survives verbatim — this is
+            // what makes `chmod +x` real on a Windows server.
+            #[cfg(windows)]
+            if std::fs::metadata(&full).map(|m| m.is_file()).unwrap_or(false) {
+                export.posix_modes.put(&path, Some(mode & 0o7777));
+            }
         }
         let md = std::fs::metadata(&full).or_code()?;
         export.events.note_local_write(&path, self.id);
@@ -1151,6 +1203,11 @@ impl SessionInner {
         #[cfg(windows)]
         if created {
             alloyfs_common::set_mode(&file, f.mode);
+            // Same rule as create: x-bits earn a posix-sidecar entry so a
+            // Linux client's batched executable stays executable.
+            if f.mode & 0o111 != 0 {
+                export.posix_modes.put(&f.path, Some(f.mode & 0o7777));
+            }
         }
         #[cfg(not(windows))]
         let _ = created;
@@ -1179,7 +1236,7 @@ impl SessionInner {
                 }
                 export.events.note_local_write(&e.path, self.id);
                 export.forget_version(&e.path);
-                export.winattrs.remove(&e.path);
+                export.sidecars_remove(&e.path);
                 Ok(None)
             })();
             out.push(one);
@@ -1229,7 +1286,7 @@ impl SessionInner {
         std::fs::remove_file(&full).or_code()?;
         export.events.note_local_write(&path, self.id);
         export.forget_version(&path);
-        export.winattrs.remove(&path);
+        export.sidecars_remove(&path);
         Ok(Response::Ok)
     }
 
@@ -1239,7 +1296,7 @@ impl SessionInner {
         std::fs::remove_dir(&full).or_code()?;
         export.events.note_local_write(&path, self.id);
         export.forget_version(&path);
-        export.winattrs.remove(&path);
+        export.sidecars_remove(&path);
         Ok(Response::Ok)
     }
 
@@ -1258,7 +1315,7 @@ impl SessionInner {
         export.events.note_local_write(&from, self.id);
         export.events.note_local_write(&to, self.id);
         export.rename_version(&from, &to);
-        export.winattrs.rename(&from, &to);
+        export.sidecars_rename(&from, &to);
         Ok(Response::Ok)
     }
 

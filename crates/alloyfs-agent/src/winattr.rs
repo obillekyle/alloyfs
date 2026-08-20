@@ -22,100 +22,140 @@ use alloyfs_proto::RelPath;
 #[cfg(unix)]
 use alloyfs_proto::MODE_WIN_MASK;
 
+/// A path → bits map persisted in the export's `.alloyfs` directory: the
+/// shared machinery for metadata one platform has natively and the other
+/// must carry. Two instances exist, one per direction:
+///
+/// - `winattrs.json` on a LINUX export: Windows Hidden/System bits.
+/// - `posix.json` on a WINDOWS export: POSIX modes, so a Linux client's
+///   `chmod +x` survives — NTFS has no execute bit to hold it.
+///
+/// Same rules for both: writes are rare and save synchronously (tmp +
+/// rename), renames move entries subtree-and-all, removals drop them,
+/// entries for vanished paths are dropped at load, and an empty store
+/// removes its own file and directory.
+pub struct SidecarMap {
+    file: std::path::PathBuf,
+    map: std::sync::Mutex<std::collections::BTreeMap<String, u32>>,
+}
+
+impl SidecarMap {
+    pub fn load(root: &std::path::Path, name: &str, keep: impl Fn(u32) -> bool) -> Self {
+        let file = root.join(".alloyfs").join(name);
+        let mut map: std::collections::BTreeMap<String, u32> = std::fs::read_to_string(&file)
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default();
+        // Entries for paths that no longer exist are litter from out-of-band
+        // deletes; drop them rather than resurrecting bits onto a future
+        // file of the same name.
+        map.retain(|p, bits| root.join(p).exists() && keep(*bits));
+        Self {
+            file,
+            map: std::sync::Mutex::new(map),
+        }
+    }
+
+    pub fn get(&self, rel: &RelPath) -> Option<u32> {
+        self.map.lock().unwrap().get(&rel.0).copied()
+    }
+
+    /// Insert or replace; `None` removes.
+    pub fn put(&self, rel: &RelPath, value: Option<u32>) {
+        let mut map = self.map.lock().unwrap();
+        match value {
+            Some(v) => {
+                map.insert(rel.0.clone(), v);
+            }
+            None => {
+                map.remove(&rel.0);
+            }
+        }
+        Self::save(&self.file, &map);
+    }
+
+    pub fn remove(&self, rel: &RelPath) {
+        let mut map = self.map.lock().unwrap();
+        let prefix = format!("{}/", rel.0);
+        let before = map.len();
+        map.retain(|p, _| p != &rel.0 && !p.starts_with(&prefix));
+        if map.len() != before {
+            Self::save(&self.file, &map);
+        }
+    }
+
+    pub fn rename(&self, from: &RelPath, to: &RelPath) {
+        let mut map = self.map.lock().unwrap();
+        let prefix = format!("{}/", from.0);
+        let moved: Vec<(String, u32)> = map
+            .iter()
+            .filter(|(p, _)| *p == &from.0 || p.starts_with(&prefix))
+            .map(|(p, b)| (p.clone(), *b))
+            .collect();
+        if moved.is_empty() {
+            return;
+        }
+        for (p, bits) in moved {
+            map.remove(&p);
+            let tail = &p[from.0.len()..];
+            map.insert(format!("{}{}", to.0, tail), bits);
+        }
+        Self::save(&self.file, &map);
+    }
+
+    fn save(file: &std::path::Path, map: &std::collections::BTreeMap<String, u32>) {
+        let Some(dir) = file.parent() else { return };
+        if map.is_empty() {
+            // An empty store earns no file — and no directory, unless the
+            // sibling sidecar still needs it.
+            let _ = std::fs::remove_file(file);
+            let _ = std::fs::remove_dir(dir);
+            return;
+        }
+        if std::fs::create_dir_all(dir).is_err() {
+            return;
+        }
+        let tmp = file.with_extension("json.tmp");
+        let Ok(text) = serde_json::to_string_pretty(map) else {
+            return;
+        };
+        if std::fs::write(&tmp, text).is_ok() {
+            let _ = std::fs::rename(&tmp, file);
+        }
+    }
+}
+
 #[cfg(unix)]
 mod imp {
     use super::*;
-    use std::collections::BTreeMap;
-    use std::path::{Path, PathBuf};
-    use std::sync::Mutex;
 
-    pub struct WinAttrs {
-        file: PathBuf,
-        map: Mutex<BTreeMap<String, u32>>,
-    }
+    pub struct WinAttrs(SidecarMap);
 
     impl WinAttrs {
-        pub fn load(root: &Path) -> Self {
-            let file = root.join(".alloyfs").join("winattrs.json");
-            let mut map: BTreeMap<String, u32> = std::fs::read_to_string(&file)
-                .ok()
-                .and_then(|t| serde_json::from_str(&t).ok())
-                .unwrap_or_default();
-            // Entries for paths that no longer exist are litter from
-            // out-of-band deletes; drop them rather than resurrecting bits
-            // onto a future file of the same name.
-            map.retain(|p, bits| root.join(p).exists() && *bits & MODE_WIN_MASK != 0);
-            Self {
-                file,
-                map: Mutex::new(map),
-            }
+        pub fn load(root: &std::path::Path) -> Self {
+            Self(SidecarMap::load(root, "winattrs.json", |bits| {
+                bits & MODE_WIN_MASK != 0
+            }))
         }
 
         pub fn get(&self, rel: &RelPath) -> u32 {
-            self.map.lock().unwrap().get(&rel.0).copied().unwrap_or(0)
+            self.0.get(rel).unwrap_or(0)
         }
 
         /// Apply a masked set/clear intent; returns the resulting bits.
         pub fn apply(&self, rel: &RelPath, set: u32, clear: u32) -> u32 {
-            let mut map = self.map.lock().unwrap();
-            let cur = map.get(&rel.0).copied().unwrap_or(0);
+            let cur = self.get(rel);
             let next = (cur | (set & MODE_WIN_MASK)) & !(clear & MODE_WIN_MASK);
-            if next == 0 {
-                map.remove(&rel.0);
-            } else {
-                map.insert(rel.0.clone(), next);
-            }
-            Self::save(&self.file, &map);
+            self.0.put(rel, (next != 0).then_some(next));
             next
         }
 
         pub fn remove(&self, rel: &RelPath) {
-            let mut map = self.map.lock().unwrap();
-            let prefix = format!("{}/", rel.0);
-            let before = map.len();
-            map.retain(|p, _| p != &rel.0 && !p.starts_with(&prefix));
-            if map.len() != before {
-                Self::save(&self.file, &map);
-            }
+            self.0.remove(rel);
         }
 
         pub fn rename(&self, from: &RelPath, to: &RelPath) {
-            let mut map = self.map.lock().unwrap();
-            let prefix = format!("{}/", from.0);
-            let moved: Vec<(String, u32)> = map
-                .iter()
-                .filter(|(p, _)| *p == &from.0 || p.starts_with(&prefix))
-                .map(|(p, b)| (p.clone(), *b))
-                .collect();
-            if moved.is_empty() {
-                return;
-            }
-            for (p, bits) in moved {
-                map.remove(&p);
-                let tail = &p[from.0.len()..];
-                map.insert(format!("{}{}", to.0, tail), bits);
-            }
-            Self::save(&self.file, &map);
-        }
-
-        fn save(file: &Path, map: &BTreeMap<String, u32>) {
-            let Some(dir) = file.parent() else { return };
-            if map.is_empty() {
-                // An empty store earns no directory in the export.
-                let _ = std::fs::remove_file(file);
-                let _ = std::fs::remove_dir(dir);
-                return;
-            }
-            if std::fs::create_dir_all(dir).is_err() {
-                return;
-            }
-            let tmp = file.with_extension("json.tmp");
-            let Ok(text) = serde_json::to_string_pretty(map) else {
-                return;
-            };
-            if std::fs::write(&tmp, text).is_ok() {
-                let _ = std::fs::rename(&tmp, file);
-            }
+            self.0.rename(from, to);
         }
     }
 }

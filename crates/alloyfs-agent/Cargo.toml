@@ -19,6 +19,9 @@ dashmap.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
+# Both .alloyfs sidecars (winattrs on Linux exports, posix modes on Windows
+# exports) persist as JSON.
+serde_json.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
@@ -29,9 +32,6 @@ tokio-util.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
-# The v11 winattr sidecar (.alloyfs/winattrs.json) is Linux-only; Windows
-# agents use the native NTFS attributes and never touch JSON.
-serde_json.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys.workspace = true

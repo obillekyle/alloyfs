@@ -3145,6 +3145,56 @@ async fn a_v10_session_neither_sees_nor_sends_win_attrs() {
     );
 }
 
+/// The fourth quadrant: POSIX modes on a WINDOWS server. NTFS has no
+/// execute bit, so a Linux client's `chmod +x` used to vanish — the server
+/// fabricated modes from the ReadOnly attribute alone. The posix sidecar
+/// makes the chmod stick, the native ReadOnly attribute stays authoritative
+/// for the write bits, and renames carry entries along. No wire change:
+/// `mode` was always there.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn posix_modes_persist_on_a_windows_server() {
+    let agent = start_agent(AgentOpts::default());
+    std::fs::write(agent.dir.path().join("tool.sh"), b"#!/bin/sh\necho hi").unwrap();
+    let s = connect(&agent, ClientOptions::default()).await;
+    let (ino, before) = lookup_path(&s.fs, "tool.sh").await.unwrap();
+    assert_eq!(before.mode & 0o111, 0, "a Windows server fabricates no x-bits");
+
+    let after = on_fs(&s.fs, move |fs| fs.setattr(ino, None, None, Some(0o755)))
+        .await
+        .unwrap();
+    assert_eq!(after.mode & 0o7777, 0o755, "chmod must stick verbatim");
+
+    // The listing serves the sidecar mode too.
+    let entries = on_fs(&s.fs, |fs| fs.readdir(ROOT_INO)).await.unwrap();
+    let (_, _, listed) = entries.iter().find(|(n, _, _)| n == "tool.sh").unwrap();
+    assert_eq!(listed.mode & 0o7777, 0o755, "listings carry the chmod");
+
+    // A second session sees it: this is persistence, not a cache.
+    let s2 = connect(&agent, ClientOptions::default()).await;
+    let (_, seen) = lookup_path(&s2.fs, "tool.sh").await.unwrap();
+    assert_eq!(seen.mode & 0o7777, 0o755, "persists across sessions");
+
+    // chmod 0o400 also sets the native ReadOnly projection, and the native
+    // bit stays authoritative: the served write bits are clamped by it.
+    let ro = on_fs(&s.fs, move |fs| fs.setattr(ino, None, None, Some(0o400)))
+        .await
+        .unwrap();
+    assert_eq!(ro.mode & 0o7777, 0o400);
+
+    // A rename carries the sidecar entry with the file.
+    on_fs(&s.fs, move |fs| fs.setattr(ino, None, None, Some(0o755)))
+        .await
+        .unwrap();
+    on_fs(&s.fs, |fs| {
+        fs.rename(ROOT_INO, "tool.sh", ROOT_INO, "renamed.sh", false)
+    })
+    .await
+    .unwrap();
+    let (_, moved) = lookup_path(&s.fs, "renamed.sh").await.unwrap();
+    assert_eq!(moved.mode & 0o7777, 0o755, "the mode follows the rename");
+}
+
 // ------------------------------------------------------------- v9 round trips
 
 /// One exchange opens a small file AND leaves its head where the first read
