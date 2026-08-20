@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use alloyfs_proto::{EventKind, FsEvent, Request, Response};
+use alloyfs_proto::{EventKind, FsEvent, RelPath, Request, Response};
 
 use crate::error::FsError;
 use crate::remote_fs::RemoteFs;
@@ -67,8 +67,13 @@ impl RemoteFs {
         }
     }
 
-    /// Apply one server event batch to local state (attr cache + inode table).
-    pub fn apply_events(&self, batch: &[FsEvent]) {
+    /// Apply one server event batch to local state (attr cache + inode
+    /// table). Returns the paths whose warm attr entry this batch actually
+    /// dropped and that still exist — the candidate list for the v12 bulk
+    /// re-warm ([`Self::spawn_attr_rewarm`]); callers that don't re-warm
+    /// just ignore it.
+    pub fn apply_events(&self, batch: &[FsEvent]) -> Vec<RelPath> {
+        let mut hot: Vec<RelPath> = Vec::new();
         for ev in batch {
             match &ev.kind {
                 EventKind::ResyncRequired => {
@@ -96,14 +101,20 @@ impl RemoteFs {
                     self.warm_forget_subtree(to);
                     self.ino.rename(&ev.path, to);
                     if let Some(ino) = self.ino.ino_of(to) {
-                        self.invalidate_attr(ino);
+                        if self.invalidate_attr(ino) {
+                            hot.push(to.clone());
+                        }
                     }
                     self.invalidate_open_reads(&ev.path);
                     self.invalidate_open_reads(to);
                 }
                 _ => {
                     if let Some(ino) = self.ino.ino_of(&ev.path) {
-                        self.invalidate_attr(ino);
+                        // Removed paths are dropped, never re-warmed — a
+                        // re-warm would just buy a NotFound.
+                        if self.invalidate_attr(ino) && !matches!(ev.kind, EventKind::Removed) {
+                            hot.push(ev.path.clone());
+                        }
                     }
                     // Created/Removed reshape the parent's listing; Modified
                     // and AttrChanged stale the attrs a listing carries. All
@@ -126,7 +137,57 @@ impl RemoteFs {
                 }
             }
         }
+        hot
     }
+
+    /// v12 bulk re-warm: one `GetattrMany` re-seeds the attr entries an
+    /// event batch just dropped, so the next stat of a path this client
+    /// demonstrably cares about is local instead of a lazy round trip.
+    ///
+    /// Fire-and-forget from the pump; correctness never depends on it. The
+    /// epoch captured here is compared again before seeding — any attr
+    /// invalidation in between (a newer event batch) discards the whole
+    /// reply rather than racing it. Below wire v12 nothing is sent at all.
+    pub(crate) fn spawn_attr_rewarm(self: &Arc<Self>, mut hot: Vec<RelPath>) {
+        /// A change storm is refetch/walker territory, not a micro-re-warm;
+        /// past this many paths the batch is dropped whole.
+        const REWARM_CAP: usize = 128;
+        if hot.is_empty() || self.conn().proto < 12 {
+            return;
+        }
+        hot.sort();
+        hot.dedup();
+        if hot.len() > REWARM_CAP {
+            return;
+        }
+        let fs = self.clone();
+        let epoch = fs.attr_epoch.load(std::sync::atomic::Ordering::Acquire);
+        self.rt.spawn(async move {
+            let resp = fs
+                .conn()
+                .request(Request::GetattrMany { paths: hot.clone() })
+                .await;
+            let Ok(Ok(Response::ManyOutcome(out))) = resp else {
+                return;
+            };
+            if out.len() != hot.len() {
+                return; // a malformed peer's reply seeds nothing
+            }
+            if fs.attr_epoch.load(std::sync::atomic::Ordering::Acquire) != epoch {
+                return; // newer truth arrived while this was in flight
+            }
+            for (path, verdict) in hot.iter().zip(out) {
+                if let Ok(Some(attr)) = verdict {
+                    // The ino can be gone (a rename raced) — skip, never fetch.
+                    if let Some(ino) = fs.ino.ino_of(path) {
+                        fs.cache_attr(ino, attr);
+                        fs.rewarmed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            }
+        });
+    }
+
     /// Subscribe on the server and spawn the pump task. `on_batch` runs after
     /// cache invalidation — mount backends re-emit events natively from it.
     ///
@@ -218,8 +279,9 @@ impl RemoteFs {
                             }
                             let batch = fs.filter_for_overlay(batch);
                             if !batch.is_empty() {
-                                fs.apply_events(&batch);
+                                let hot = fs.apply_events(&batch);
                                 fs.apply_events_to_cache(&batch);
+                                fs.spawn_attr_rewarm(hot);
                                 on_batch(&batch);
                             }
                             // A cleanly received batch is proof the stream

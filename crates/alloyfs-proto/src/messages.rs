@@ -74,15 +74,22 @@ use crate::error::ErrorCode;
 /// NTFS attributes) and in the export's `.alloyfs/winattrs.json` sidecar
 /// where it does not (Linux exports) — the sidecar travels with the data,
 /// and `.alloyfs` is server-excluded from every listing.
+///
+/// v12: `Request::GetattrMany` — the read side of the v10 bulk family:
+/// attributes for many paths in one exchange, answered with the SAME
+/// `Response::ManyOutcome` shape the v10 mutations already use. Client-
+/// gated: sent only on v12+ sessions (an older server would kill the
+/// connection decoding an unknown variant); nothing to gate in the reply
+/// direction, `ManyOutcome` has existed since v10.
 pub const PROTO_VERSION_MIN: u16 = 1;
-pub const PROTO_VERSION_MAX: u16 = 11;
+pub const PROTO_VERSION_MAX: u16 = 12;
 
 /// The protocol range this build speaks, for `--version` and diagnostics —
 /// "which wire version does this release talk" should not require reading
 /// source. A literal rather than a formatted string because clap's version
 /// output needs a `&'static str`; `proto_range_matches_the_constants` is what
 /// keeps it from drifting away from the two constants above.
-pub const PROTO_RANGE: &str = "1-11";
+pub const PROTO_RANGE: &str = "1-12";
 
 /// Read/write payloads are capped to this many bytes per request so one huge
 /// file operation can never monopolize the connection (head-of-line blocking).
@@ -610,6 +617,21 @@ pub enum Request {
         path: RelPath,
         set: u32,
         clear: u32,
+    },
+    /// v12+: attributes for several paths in ONE exchange — the read side
+    /// of the v10 bulk family.
+    ///
+    /// Answered with [`Response::ManyOutcome`], per path, request order,
+    /// same length: `Ok(Some(attr))` for a path that exists, `Err(code)`
+    /// exactly as a lone `Getattr` of that path would have failed.
+    /// `Ok(None)` is never produced for this request.
+    ///
+    /// The consumer that motivates it holds a LIST already: the event pump
+    /// re-warming attr-cache entries a change batch just invalidated —
+    /// paths this client demonstrably cares about, refreshed in one round
+    /// trip instead of one lazy Getattr per future stat.
+    GetattrMany {
+        paths: Vec<RelPath>,
     },
 }
 

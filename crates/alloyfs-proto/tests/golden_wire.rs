@@ -440,6 +440,12 @@ fn canonical() -> Vec<(&'static str, Frame)> {
             }),
         ),
         (
+            "req_getattr_many",
+            req(Request::GetattrMany {
+                paths: vec![path(), RelPath("other.bin".into())],
+            }),
+        ),
+        (
             "resp_many_outcome",
             ok(Response::ManyOutcome(vec![
                 Ok(Some(attr())),
@@ -541,6 +547,7 @@ fn _variant_tripwire(
         Request::RemoveMany { .. } => {} // v10: golden added, PROTO_VERSION_MAX bumped
         Request::SetattrMany { .. } => {} // v10: golden added, PROTO_VERSION_MAX bumped
         Request::SetWinAttrs { .. } => {} // v11: golden added, PROTO_VERSION_MAX bumped
+        Request::GetattrMany { .. } => {} // v12: golden added, PROTO_VERSION_MAX bumped
     }
     match response {
         Response::AttachOk { .. } => {}
@@ -608,8 +615,8 @@ fn _variant_tripwire(
 /// `cargo test -p alloyfs-proto print_goldens -- --ignored --nocapture`
 #[rustfmt::skip]
 const GOLDEN: &[(&str, &str)] = &[
-    ("hello", "00010b06676f6c64656e"),
-    ("hello_ack", "010b06676f6c64656e"),
+    ("hello", "00010c06676f6c64656e"),
+    ("hello_ack", "010c06676f6c64656e"),
     ("ping", "0507"),
     ("pong", "0607"),
     ("compressed", "0706676f6c64656e"),
@@ -669,6 +676,7 @@ const GOLDEN: &[(&str, &str)] = &[
     ("req_remove_many", "020721010c6469722f66696c652e74787400"),
     ("req_setattr_many", "020722010c6469722f66696c652e747874012a00000101"),
     ("req_set_win_attrs", "0207230c6469722f66696c652e74787480804080808001"),
+    ("req_getattr_many", "020724020c6469722f66696c652e747874096f746865722e62696e"),
     ("resp_many_outcome", "03070012030001002a80e2cfaa06bc99ef3a80e2cfaa06bc99ef3aa4030800000100"),
     ("err_not_found", "03070100"),
     ("err_permission_denied", "03070101"),

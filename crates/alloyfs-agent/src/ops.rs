@@ -609,12 +609,27 @@ impl SessionInner {
 
     fn getattr(&self, path: RelPath) -> Result<Response, ErrorCode> {
         let export = self.export()?;
-        let full = export.resolve(&path)?;
+        Ok(Response::Attr(Self::getattr_one(&export, &path)?))
+    }
+
+    /// The single-path core `Getattr` and `GetattrMany` share, so a bulk
+    /// entry can never answer differently from the lone request it replaces.
+    fn getattr_one(export: &Arc<Export>, path: &RelPath) -> Result<Attr, ErrorCode> {
+        let full = export.resolve(path)?;
         let md = std::fs::metadata(&full).or_code()?;
-        Ok(Response::Attr(export.with_winattrs(
-            &path,
-            attr_from_metadata(&md, export.version_of(&path)),
-        )))
+        Ok(export.with_winattrs(path, attr_from_metadata(&md, export.version_of(path))))
+    }
+
+    /// v12+: attributes for several paths in one exchange. Per-path
+    /// verdicts in request order, same length — `Err` mirrors exactly what
+    /// a lone `Getattr` of that path would have answered.
+    fn getattr_many(&self, paths: Vec<RelPath>) -> Result<Response, ErrorCode> {
+        let export = self.export()?;
+        let out = paths
+            .iter()
+            .map(|p| Self::getattr_one(&export, p).map(Some))
+            .collect();
+        Ok(Response::ManyOutcome(out))
     }
 
     /// Build the index if needed, replaying anything that changed during the
@@ -1497,6 +1512,7 @@ impl SessionInner {
             Request::RemoveMany { entries } => self.remove_many(entries),
             Request::SetattrMany { entries } => self.setattr_many(entries),
             Request::SetWinAttrs { path, set, clear } => self.set_win_attrs(path, set, clear),
+            Request::GetattrMany { paths } => self.getattr_many(paths),
             Request::Write {
                 fh,
                 offset,

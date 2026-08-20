@@ -3504,3 +3504,87 @@ async fn a_cold_stream_stripes_across_pool_connections() {
     })
     .await;
 }
+
+/// v12 bulk re-warm: an external change batch drops warm attrs and ONE
+/// GetattrMany re-seeds them, so the very next stat of a path this client
+/// cared about is local AND fresh — no lazy per-path round trip.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_event_batch_bulk_rewarms_the_attrs_it_dropped() {
+    let agent = start_agent(AgentOpts {
+        watch: true,
+        ..AgentOpts::default()
+    });
+    std::fs::write(agent.dir.path().join("one.txt"), b"1").unwrap();
+    std::fs::write(agent.dir.path().join("two.txt"), b"22").unwrap();
+
+    let s = connect(&agent, ClientOptions::default()).await;
+    s.fs.start_event_pump(|_| {}).await.unwrap();
+
+    // Warm both attrs through the mount — only DROPPED entries re-warm.
+    let (ino1, a1) = lookup_path(&s.fs, "one.txt").await.expect("one");
+    let (ino2, a2) = lookup_path(&s.fs, "two.txt").await.expect("two");
+    assert_eq!((a1.size, a2.size), (1, 2));
+
+    // Both change behind the mount's back; the watcher's batch drops both
+    // warm entries and the pump re-warms them in bulk.
+    std::fs::write(agent.dir.path().join("one.txt"), b"one-grew").unwrap();
+    std::fs::write(agent.dir.path().join("two.txt"), b"two-grew!").unwrap();
+    wait_until("bulk re-warm lands", 10, || {
+        (s.fs.rewarmed_paths() >= 2).then_some(())
+    })
+    .await;
+
+    // The pin: the stats that follow are LOCAL (no wire) and tell the new
+    // truth. TTLs are untimed under the healthy pump, so a hit proves the
+    // re-warm seeded — a dropped-and-not-reseeded entry would have fetched.
+    let r = s.conn().requests_sent();
+    let (s1, s2) = on_fs(&s.fs, move |fs| {
+        (
+            fs.getattr(ino1).expect("one").size,
+            fs.getattr(ino2).expect("two").size,
+        )
+    })
+    .await;
+    assert_eq!((s1, s2), (8, 9), "re-warmed attrs carry the post-change sizes");
+    assert_eq!(
+        s.conn().requests_sent(),
+        r,
+        "both stats answered from the re-warmed cache, not the wire"
+    );
+}
+
+/// The v12 gate: a session negotiated at v11 must never send GetattrMany —
+/// an old agent would kill the connection decoding it. Invalidation still
+/// happens; the re-warm just never fires.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_v11_session_sends_no_bulk_rewarm() {
+    let agent = start_agent(AgentOpts {
+        watch: true,
+        ..AgentOpts::default()
+    });
+    std::fs::write(agent.dir.path().join("f.txt"), b"x").unwrap();
+
+    let s = connect_with_max(&agent, ClientOptions::default(), 11).await;
+    s.fs.start_event_pump(|_| {}).await.unwrap();
+    let (ino, _) = lookup_path(&s.fs, "f.txt").await.expect("lookup");
+
+    std::fs::write(agent.dir.path().join("f.txt"), b"grown").unwrap();
+    // The event invalidates; the NEXT stat pays its own round trip (the
+    // classic contract) — by then the pump has long since decided whether
+    // to re-warm, and on v11 it must have decided no.
+    let started = std::time::Instant::now();
+    loop {
+        let size = on_fs(&s.fs, move |fs| fs.getattr(ino).map(|a| a.size))
+            .await
+            .unwrap_or(0);
+        if size == 5 {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the external change never became visible through a fresh stat"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(s.fs.rewarmed_paths(), 0, "v11 must never bulk re-warm");
+}

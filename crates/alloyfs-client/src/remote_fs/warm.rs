@@ -46,16 +46,24 @@ const ATTR_TTL_POLL: Duration = Duration::from_secs(5);
 const DIR_TTL_POLL: Duration = Duration::from_secs(5);
 
 impl RemoteFs {
-    pub(super) fn cache_attr(&self, ino: u64, attr: Attr) {
+    pub(crate) fn cache_attr(&self, ino: u64, attr: Attr) {
         self.attr_cache.insert(ino, (attr, Instant::now()));
     }
 
-    pub fn invalidate_attr(&self, ino: u64) {
-        self.attr_cache.remove(&ino);
+    /// Reports whether an entry was actually dropped — the event pump's
+    /// bulk re-warm only asks about attrs someone demonstrably had warm.
+    /// Every call bumps `attr_epoch`, dropped or not: an in-flight re-warm
+    /// reply compares the epoch before seeding, and "any event happened"
+    /// is the cheap, safe reason to discard it (same global trade as
+    /// `dir_epoch`).
+    pub fn invalidate_attr(&self, ino: u64) -> bool {
+        self.attr_epoch.fetch_add(1, std::sync::atomic::Ordering::Release);
+        self.attr_cache.remove(&ino).is_some()
     }
 
     pub fn invalidate_all(&self) {
         self.attr_cache.clear();
+        self.attr_epoch.fetch_add(1, Ordering::Release);
         self.dir_cache.clear();
         self.dir_epoch.fetch_add(1, Ordering::Release);
         // Every caller of this is a "we may have missed events" path — lag,

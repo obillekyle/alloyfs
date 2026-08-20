@@ -118,7 +118,7 @@ pub(crate) struct OpenState {
 
 pub struct RemoteFs {
     conn: RwLock<Arc<MuxConnection>>,
-    rt: tokio::runtime::Handle,
+    pub(crate) rt: tokio::runtime::Handle,
     pub ino: crate::InodeTable,
     pub root_attr: Attr,
     attr_cache: DashMap<u64, (Attr, Instant)>,
@@ -141,6 +141,15 @@ pub struct RemoteFs {
     /// so local overlay activity never needs to invalidate this, and lookups
     /// for overlay-routed names branch away before ever consulting it.
     dir_cache: DashMap<u64, (DirListing, Instant)>,
+    /// Bumped by every attr invalidation. An in-flight bulk re-warm
+    /// (events.rs) compares it before seeding, so a `GetattrMany` reply can
+    /// never re-install attributes over a newer invalidation. Global on
+    /// purpose, the same trade `dir_epoch` documents below: an unrelated
+    /// event only costs one discarded re-warm, the safe direction.
+    pub(crate) attr_epoch: AtomicU64,
+    /// Paths the event pump's bulk re-warm has re-seeded — observability
+    /// for tests and diagnostics, like `requests_sent` on the mux.
+    pub(crate) rewarmed: AtomicU64,
     /// Bumped by every listing invalidation, so a `readdir` that started
     /// before a mutation cannot install its now-stale result after it.
     ///
@@ -286,6 +295,8 @@ impl RemoteFs {
             ino: crate::InodeTable::new(),
             root_attr,
             attr_cache: DashMap::new(),
+            attr_epoch: AtomicU64::new(0),
+            rewarmed: AtomicU64::new(0),
             dir_cache: DashMap::new(),
             dir_epoch: AtomicU64::new(0),
             warm: DashMap::new(),
@@ -341,6 +352,12 @@ impl RemoteFs {
     /// died" without packet captures.
     pub fn stream_conns_established(&self) -> usize {
         self.stream_pool.as_ref().map_or(0, |p| p.established())
+    }
+
+    /// Paths the event pump's bulk re-warm has re-seeded so far. 0 forever
+    /// below wire v12 — the pin the gating test uses.
+    pub fn rewarmed_paths(&self) -> u64 {
+        self.rewarmed.load(Ordering::Relaxed)
     }
 
     /// The reconnect epoch right now. Capture it BEFORE doing work whose
@@ -1287,7 +1304,9 @@ impl RemoteFs {
             // a pre-write size would be worse than paying for the round-trip.
             match (fresh, self.ino.ino_of(&state.path)) {
                 (Some(attr), Some(ino)) => self.cache_attr(ino, attr),
-                (None, Some(ino)) => self.invalidate_attr(ino),
+                (None, Some(ino)) => {
+                    self.invalidate_attr(ino);
+                }
                 (_, None) => {} // never stat'ed through this mount: nothing cached
             }
         }
