@@ -48,15 +48,20 @@ use crate::error::ErrorCode;
 /// client, which falls back to open+read per file against an older peer.
 /// Measured before it was proposed: 200 files totalling 8 KB cost 35.9 s
 /// against ~4 ms of actual transfer.
+///
+/// v9: `OpenRead`/`OpenedData` (open + first read, one exchange), `Setattr2`
+/// (adds `readonly`, applied server-side against the current mode), and
+/// `Attach2`/`Attached2` (attach + mount defaults + tree token in one).
+/// All client-gated with per-feature fallbacks to the older verbs.
 pub const PROTO_VERSION_MIN: u16 = 1;
-pub const PROTO_VERSION_MAX: u16 = 8;
+pub const PROTO_VERSION_MAX: u16 = 9;
 
 /// The protocol range this build speaks, for `--version` and diagnostics —
 /// "which wire version does this release talk" should not require reading
 /// source. A literal rather than a formatted string because clap's version
 /// output needs a `&'static str`; `proto_range_matches_the_constants` is what
 /// keeps it from drifting away from the two constants above.
-pub const PROTO_RANGE: &str = "1-8";
+pub const PROTO_RANGE: &str = "1-9";
 
 /// Read/write payloads are capped to this many bytes per request so one huge
 /// file operation can never monopolize the connection (head-of-line blocking).
@@ -479,6 +484,48 @@ pub enum Request {
         paths: Vec<RelPath>,
         budget: u32,
     },
+    /// v9+: open a file and carry back its head in the same exchange.
+    ///
+    /// After ReadMany removed the per-file cost of bulk fetching, the residual
+    /// per-file price on a mount was the open+first-read pair — two round
+    /// trips for every small file an application touches. This folds them:
+    /// the reply carries the handle, the attributes, and up to `len` bytes
+    /// from offset 0 (capped at DATA_CHUNK server-side), which the client
+    /// plants in its readahead so the following read never leaves the machine.
+    ///
+    /// `len == 0` asks for no data — the write-only and truncating opens,
+    /// where head bytes would be read only to be discarded.
+    OpenRead {
+        path: RelPath,
+        flags: OpenFlags,
+        len: u32,
+    },
+    /// v9+: `Setattr` plus the one attribute Windows kept read-modify-writing.
+    ///
+    /// A NEW variant rather than a field on `Setattr` — postcard decodes by
+    /// shape, so growing an existing variant would make a v8 peer misread the
+    /// stream (the same reasoning recorded at `WrittenAttr`).
+    ///
+    /// `readonly` maps onto the write bits SERVER-side against the file's
+    /// current mode, atomically. The WinFsp adapter used to do that mapping
+    /// client-side as getattr-then-Setattr, which both cost a round trip and
+    /// raced any concurrent chmod between the two.
+    Setattr2 {
+        path: RelPath,
+        size: Option<u64>,
+        mtime: Option<SystemTime>,
+        mode: Option<u32>,
+        readonly: Option<bool>,
+    },
+    /// v9+: everything a mount needs to become usable, in one exchange.
+    ///
+    /// `Attach` alone answers with the root attr; a real mount then asks
+    /// `MountDefaults` (v2) and `TreeToken` (v6) before it can serve — three
+    /// round trips of pure sequence. One reply carrying all three halves the
+    /// measured time-to-first-file on a 60 ms link.
+    Attach2 {
+        export: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -569,6 +616,27 @@ pub enum Response {
     /// paging mechanism: a reply is always a PREFIX of what was asked for, so
     /// the client knows exactly which paths are outstanding without a cursor.
     Many(Vec<ManyEntry>),
+    /// v9+: `Opened` plus the head of the file. `data` is empty when the
+    /// request asked for none, when the file is empty, or when it is not a
+    /// regular file; it is the FIRST `min(len, DATA_CHUNK, size)` bytes
+    /// otherwise, read under the same open handle being returned.
+    OpenedData {
+        fh: u64,
+        attr: Attr,
+        data: Bytes,
+    },
+    /// v9+: the `Attach2` answer — attach, mount defaults, and the tree token
+    /// in one. `defaults` mirrors `Response::MountDefaults`; `tree_token` is 0
+    /// for an unindexed export, exactly as `TreeToken` reports it.
+    Attached2 {
+        export_id: u32,
+        root_attr: Attr,
+        exclude: Vec<String>,
+        pin: Vec<String>,
+        auto_cache_max: Option<u64>,
+        auto_cache_budget: Option<u64>,
+        tree_token: u64,
+    },
 }
 
 /// One file in a `ReadMany` reply.

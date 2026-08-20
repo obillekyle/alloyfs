@@ -351,6 +351,54 @@ fn canonical() -> Vec<(&'static str, Frame)> {
             ])),
         ),
         ("err_too_large", err(ErrorCode::TooLarge)),
+        // --- v9: open+read, setattr2, attach2 ---
+        (
+            "req_open_read",
+            req(Request::OpenRead {
+                path: path(),
+                flags: OpenFlags {
+                    read: true,
+                    ..Default::default()
+                },
+                len: 128 * 1024,
+            }),
+        ),
+        (
+            "req_setattr2",
+            req(Request::Setattr2 {
+                path: path(),
+                size: Some(42),
+                mtime: None,
+                mode: None,
+                readonly: Some(true),
+            }),
+        ),
+        (
+            "req_attach2",
+            req(Request::Attach2 {
+                export: "docs".into(),
+            }),
+        ),
+        (
+            "resp_opened_data",
+            ok(Response::OpenedData {
+                fh: 9,
+                attr: attr(),
+                data: bytes::Bytes::from_static(b"head"),
+            }),
+        ),
+        (
+            "resp_attached2",
+            ok(Response::Attached2 {
+                export_id: 7,
+                root_attr: attr(),
+                exclude: vec!["node_modules".into()],
+                pin: vec![],
+                auto_cache_max: Some(1 << 20),
+                auto_cache_budget: None,
+                tree_token: 0x0123_4567_89ab_cdef,
+            }),
+        ),
         // --- every ErrorCode (as Err) ---
         ("err_not_found", err(ErrorCode::NotFound)),
         ("err_permission_denied", err(ErrorCode::PermissionDenied)),
@@ -438,6 +486,9 @@ fn _variant_tripwire(
         Request::UnlockRange { .. } => {} // v7: golden added, PROTO_VERSION_MAX bumped
         Request::TestLock { .. } => {} // v7: golden added, PROTO_VERSION_MAX bumped
         Request::ReadMany { .. } => {} // v8: golden added, PROTO_VERSION_MAX bumped
+        Request::OpenRead { .. } => {} // v9: golden added, PROTO_VERSION_MAX bumped
+        Request::Setattr2 { .. } => {} // v9: golden added, PROTO_VERSION_MAX bumped
+        Request::Attach2 { .. } => {} // v9: golden added, PROTO_VERSION_MAX bumped
     }
     match response {
         Response::AttachOk { .. } => {}
@@ -456,6 +507,8 @@ fn _variant_tripwire(
         Response::TreeToken { .. } => {}     // v6: golden added, PROTO_VERSION_MAX bumped
         Response::LockStatus(..) => {}       // v7: golden added, PROTO_VERSION_MAX bumped
         Response::Many(..) => {}             // v8: golden added, PROTO_VERSION_MAX bumped
+        Response::OpenedData { .. } => {}    // v9: golden added, PROTO_VERSION_MAX bumped
+        Response::Attached2 { .. } => {}     // v9: golden added, PROTO_VERSION_MAX bumped
     }
     match code {
         ErrorCode::NotFound => {}
@@ -502,8 +555,8 @@ fn _variant_tripwire(
 /// `cargo test -p alloyfs-proto print_goldens -- --ignored --nocapture`
 #[rustfmt::skip]
 const GOLDEN: &[(&str, &str)] = &[
-    ("hello", "00010806676f6c64656e"),
-    ("hello_ack", "010806676f6c64656e"),
+    ("hello", "00010906676f6c64656e"),
+    ("hello_ack", "010906676f6c64656e"),
     ("ping", "0507"),
     ("pong", "0607"),
     ("compressed", "0706676f6c64656e"),
@@ -554,6 +607,11 @@ const GOLDEN: &[(&str, &str)] = &[
     ("req_read_many", "02071c020c6469722f66696c652e7478740d6469722f6f746865722e747874808030"),
     ("resp_many", "0307000f0200002a80e2cfaa06bc99ef3a80e2cfaa06bc99ef3aa403080268690112"),
     ("err_too_large", "03070112"),
+    ("req_open_read", "02071d0c6469722f66696c652e7478740100000000808008"),
+    ("req_setattr2", "02071e0c6469722f66696c652e747874012a00000101"),
+    ("req_attach2", "02071f04646f6373"),
+    ("resp_opened_data", "0307001009002a80e2cfaa06bc99ef3a80e2cfaa06bc99ef3aa403080468656164"),
+    ("resp_attached2", "0307001107002a80e2cfaa06bc99ef3a80e2cfaa06bc99ef3aa40308010c6e6f64655f6d6f64756c6573000180804000ef9bafcdf8acd19101"),
     ("err_not_found", "03070100"),
     ("err_permission_denied", "03070101"),
     ("err_already_exists", "03070102"),

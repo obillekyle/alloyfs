@@ -705,16 +705,17 @@ impl FileSystemContext for WinFspFs {
         // `attrib +R` appeared to succeed, read back as unset, and left the
         // directory unwritable until someone cleared a box that already
         // looked clear.
-        let mut mode = None;
+        // Carried as INTENT ("make it readonly / writable"), not as a computed
+        // mode: `setattr_readonly` resolves it against the file's current mode
+        // server-side (v9+), which removes both the extra getattr this used to
+        // cost and the race against a chmod landing between the read and the
+        // write. Pre-v9 agents get the old read-modify-write inside that call.
+        let mut readonly = None;
         if cur.kind != FileKind::Dir && file_attributes != 0 && file_attributes != INVALID_FILE_ATTRIBUTES {
-            let readonly = file_attributes & FILE_ATTRIBUTE_READONLY != 0;
-            let new_mode = if readonly {
-                cur.mode & !0o222
-            } else {
-                cur.mode | 0o200
-            };
-            if new_mode != cur.mode {
-                mode = Some(new_mode);
+            let want = file_attributes & FILE_ATTRIBUTE_READONLY != 0;
+            let have = cur.mode & 0o222 == 0;
+            if want != have {
+                readonly = Some(want);
             }
         }
         // Sentinels that all mean "do not set a time": 0 is "no change",
@@ -732,10 +733,13 @@ impl FileSystemContext for WinFspFs {
         ))
         .then(|| from_filetime(last_write_time));
 
-        let attr = if mode.is_some() || mtime.is_some() {
-            self.fs.setattr(context.ino, None, mtime, mode).map_err(fsp_err)?
-        } else {
-            cur
+        let attr = match readonly {
+            Some(ro) => self
+                .fs
+                .setattr_readonly(context.ino, None, mtime, ro)
+                .map_err(fsp_err)?,
+            None if mtime.is_some() => self.fs.setattr(context.ino, None, mtime, None).map_err(fsp_err)?,
+            None => cur,
         };
         fill_file_info(file_info, context.ino, &attr);
         Ok(())

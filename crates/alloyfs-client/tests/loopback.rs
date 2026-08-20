@@ -2721,3 +2721,87 @@ async fn a_healthy_pump_extends_the_attr_ttl_and_no_pump_does_not() {
          forcing the wire (which is severed): {stale:?}"
     );
 }
+
+// ------------------------------------------------------------- v9 round trips
+
+/// One exchange opens a small file AND leaves its head where the first read
+/// looks: the read after open costs zero wire requests.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_open_carries_the_head_and_the_first_read_is_local() {
+    let agent = start_agent(AgentOpts::default());
+    std::fs::write(agent.dir.path().join("s.txt"), b"small body").unwrap();
+    let s = connect(&agent, ClientOptions::default()).await;
+    let (ino, _) = lookup_path(&s.fs, "s.txt").await.unwrap();
+
+    let fh = on_fs(&s.fs, move |fs| fs.open(ino, ro()).unwrap().0).await;
+    let before = s.conn().requests_sent();
+    let head = on_fs(&s.fs, move |fs| fs.read(fh, 0, 4096).unwrap()).await;
+    let after = s.conn().requests_sent();
+    assert_eq!(head, b"small body");
+    assert_eq!(
+        before, after,
+        "the first read after open should be served from the planted head"
+    );
+
+    // ...and the data is not a one-shot fluke: a sub-range re-read of the
+    // same block stays local too.
+    let mid = on_fs(&s.fs, move |fs| fs.read(fh, 6, 4).unwrap()).await;
+    assert_eq!(mid, b"body");
+    assert_eq!(s.conn().requests_sent(), after, "re-reads stay local");
+}
+
+/// A write-open asks for no head — bytes fetched only to be truncated or
+/// overwritten would be waste — and writing then reading back stays correct.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_truncating_open_carries_no_head_and_stays_correct() {
+    let agent = start_agent(AgentOpts::default());
+    std::fs::write(agent.dir.path().join("w.txt"), b"old contents").unwrap();
+    let s = connect(&agent, ClientOptions::default()).await;
+    let (ino, _) = lookup_path(&s.fs, "w.txt").await.unwrap();
+
+    let tr = OpenFlags {
+        read: true,
+        write: true,
+        truncate: true,
+        ..OpenFlags::default()
+    };
+    let (fh, attr) = on_fs(&s.fs, move |fs| fs.open(ino, tr).unwrap()).await;
+    assert_eq!(attr.size, 0, "truncate happened at open");
+    on_fs(&s.fs, move |fs| fs.write(fh, 0, b"new").unwrap()).await;
+    let back = on_fs(&s.fs, move |fs| fs.read(fh, 0, 16).unwrap()).await;
+    assert_eq!(back, b"new", "no stale head shadows the write");
+}
+
+/// The readonly attribute round-trips through the server-side resolution:
+/// set it, see the write bits drop; clear it, see owner-write return —
+/// without the client ever computing a mode.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn setattr_readonly_resolves_against_the_current_mode() {
+    let agent = start_agent(AgentOpts::default());
+    std::fs::write(agent.dir.path().join("ro.txt"), b"x").unwrap();
+    let s = connect(&agent, ClientOptions::default()).await;
+    let (ino, before) = lookup_path(&s.fs, "ro.txt").await.unwrap();
+    assert_ne!(before.mode & 0o200, 0, "starts writable");
+
+    let a = on_fs(&s.fs, move |fs| {
+        fs.setattr_readonly(ino, None, None, true).unwrap()
+    })
+    .await;
+    assert_eq!(
+        a.mode & 0o222,
+        0,
+        "readonly cleared every write bit: {:o}",
+        a.mode
+    );
+
+    let b = on_fs(&s.fs, move |fs| {
+        fs.setattr_readonly(ino, None, None, false).unwrap()
+    })
+    .await;
+    assert_ne!(
+        b.mode & 0o200,
+        0,
+        "clearing readonly restored owner-write: {:o}",
+        b.mode
+    );
+}

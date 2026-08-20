@@ -269,6 +269,10 @@ pub struct RemoteFs {
     conn_epoch: tokio::sync::watch::Sender<u64>,
     /// Highest event seq the pump has applied — reconnect resubscribes here.
     pub(crate) last_event_seq: AtomicU64,
+    /// The tree token `Attach2` carried, spent by the walker's first skip
+    /// check (take-once: 0 after). Mount-time only — anything later must ask
+    /// the wire, because this describes the export as of attach.
+    pub(crate) attach_tree_token: AtomicU64,
     /// Is the event pump subscribed and keeping up RIGHT NOW? Selects between
     /// the push and poll TTLs above. False until the first successful
     /// subscribe — a mount that never starts a pump keeps today's 5 s
@@ -298,17 +302,48 @@ impl RemoteFs {
         export: &str,
         opts: ClientOptions,
     ) -> Result<Arc<Self>, FsError> {
-        let root_attr = expect_resp!(
-            conn.request(Request::Attach { export: export.into() }).await??,
-            Response::AttachOk { root_attr, .. } => root_attr
-        );
+        // v9+: attach, mount defaults and the tree token arrive in ONE
+        // exchange. The three used to be sequential round trips — attach,
+        // then ask for defaults, then (in the walker) ask for the token —
+        // pure protocol ceremony before a mount could serve anything, and on
+        // a 60 ms link the difference between one exchange and three is the
+        // difference a user feels at mount time.
+        //
+        // The defaults ride into `negotiate_defaults` as a locally
+        // synthesized `MountDefaults` response, so the negotiation logic —
+        // union lists, explicit-zero rules, all of it pinned by its own unit
+        // tests — runs unchanged on either wire shape.
+        let (root_attr, prefetched, attach_token) = if conn.proto >= 9 {
+            let resp = conn
+                .request(Request::Attach2 {
+                    export: export.into(),
+                })
+                .await??;
+            expect_resp!(resp, Response::Attached2 {
+                root_attr, exclude, pin, auto_cache_max, auto_cache_budget, tree_token, ..
+            } => (
+                root_attr,
+                Some(Response::MountDefaults { exclude, pin, auto_cache_max, auto_cache_budget }),
+                tree_token,
+            ))
+        } else {
+            let resp = conn
+                .request(Request::Attach {
+                    export: export.into(),
+                })
+                .await??;
+            expect_resp!(resp, Response::AttachOk { root_attr, .. } => (root_attr, None, 0))
+        };
 
         let Negotiated {
             opts,
             auto_cache_max,
             auto_cache_budget,
         } = negotiate_defaults(opts, conn.proto, || async {
-            conn.request(Request::MountDefaults).await.ok()?.ok()
+            match prefetched {
+                Some(resp) => Some(resp),
+                None => conn.request(Request::MountDefaults).await.ok()?.ok(),
+            }
         })
         .await;
 
@@ -335,6 +370,7 @@ impl RemoteFs {
             conn_epoch: epoch_tx,
             last_event_seq: AtomicU64::new(0),
             pump_healthy: std::sync::atomic::AtomicBool::new(false),
+            attach_tree_token: AtomicU64::new(attach_token),
             detect_conflicts: opts.detect_conflicts,
             mount_root: opts.mount_root.clone(),
             next_lazy_fh: AtomicU64::new(1),
@@ -903,10 +939,43 @@ impl RemoteFs {
                 }
             }
         }
-        let (fh, attr) = expect_resp!(self.call(Request::Open { path: path.clone(), flags })?, Response::Opened { fh, attr } => (fh, attr));
+        // v9+: a plain read-open carries the head of the file back with the
+        // handle, folding the open+first-read pair — the residual per-file
+        // cost after ReadMany — into one exchange. Only when the auto-cache
+        // will not already answer the read locally (cache_ok below), and only
+        // for opens that will read: head bytes for a write-only or truncating
+        // open would be fetched to be thrown away. `len == 0` spells exactly
+        // that on the wire.
+        let wants_head = flags.read && !flags.truncate;
+        let (fh, attr, head) = if self.conn().proto >= 9 {
+            let len = if wants_head { DATA_CHUNK } else { 0 };
+            let resp = self.call(Request::OpenRead {
+                path: path.clone(),
+                flags,
+                len,
+            })?;
+            expect_resp!(resp, Response::OpenedData { fh, attr, data } => (fh, attr, Some(data)))
+        } else {
+            let resp = self.call(Request::Open {
+                path: path.clone(),
+                flags,
+            })?;
+            expect_resp!(resp, Response::Opened { fh, attr } => (fh, attr, None))
+        };
         debug_assert!(fh & OVERLAY_FH_BIT == 0, "server fh collides with overlay bit");
         self.cache_attr(ino, attr);
         let cache_ok = self.cache.as_ref().is_some_and(|c| c.fresh_for(&path, &attr));
+        let ra = ReadAhead::new();
+        // Plant the head where the first read will look. Retained block 0 is
+        // exactly what a post-open read at offset 0 consults, so a small file
+        // is now open+read in one round trip and read locally after. An empty
+        // head is NOT planted: an empty retained block would answer reads at
+        // offset 0 with EOF for a file that merely declined to send bytes.
+        if let Some(data) = head {
+            if !data.is_empty() && !cache_ok {
+                ra.retain(0, data);
+            }
+        }
         self.open_files.insert(
             fh,
             OpenState {
@@ -915,7 +984,7 @@ impl RemoteFs {
                 server_fh: AtomicU64::new(fh),
                 cache_ok: AtomicBool::new(cache_ok),
                 wrote: AtomicBool::new(false),
-                ra: ReadAhead::new(),
+                ra,
                 lock: std::sync::Mutex::new(Vec::new()),
                 poisoned: AtomicBool::new(false),
                 version: AtomicU64::new(attr.version),
@@ -1433,12 +1502,72 @@ impl RemoteFs {
             self.call(Request::Setattr { path: path.clone(), size, mtime, mode })?,
             Response::Attr(attr) => attr
         );
+        self.finish_setattr(ino, &path, size, attr)
+    }
+
+    /// `setattr` with the readonly bit resolved SERVER-side (v9+).
+    ///
+    /// Callers that want "make it readonly / writable" without dictating a
+    /// full mode — WinFsp's attribute mapping — used to fetch the current
+    /// mode and send a computed one: a round trip, plus a race against any
+    /// chmod landing between the two. Against a pre-v9 agent this does
+    /// exactly that old dance as the fallback, so the caller no longer has to.
+    pub fn setattr_readonly(
+        &self,
+        ino: u64,
+        size: Option<u64>,
+        mtime: Option<std::time::SystemTime>,
+        readonly: bool,
+    ) -> Result<Attr, FsError> {
+        let path = self.path_of(ino)?;
+        if self.is_overlay(&path) {
+            let cur = self.overlay_ref().getattr(&path)?;
+            let mode = if readonly {
+                cur.mode & !0o222
+            } else {
+                cur.mode | 0o200
+            };
+            return self.overlay_ref().setattr(&path, size, mtime, Some(mode));
+        }
+        if self.conn().proto >= 9 {
+            let attr = expect_resp!(
+                self.call(Request::Setattr2 {
+                    path: path.clone(),
+                    size,
+                    mtime,
+                    mode: None,
+                    readonly: Some(readonly),
+                })?,
+                Response::Attr(attr) => attr
+            );
+            return self.finish_setattr(ino, &path, size, attr);
+        }
+        // Pre-v9: the read-modify-write this method exists to retire, kept as
+        // the compatibility path — claims exactly what the caller always got.
+        let cur = self.getattr(ino)?;
+        let mode = if readonly {
+            cur.mode & !0o222
+        } else {
+            cur.mode | 0o200
+        };
+        self.setattr(ino, size, mtime, Some(mode))
+    }
+
+    /// The shared tail of every setattr flavour: cache upkeep in one place so
+    /// the two wire paths cannot drift.
+    fn finish_setattr(
+        &self,
+        ino: u64,
+        path: &RelPath,
+        size: Option<u64>,
+        attr: Attr,
+    ) -> Result<Attr, FsError> {
         // The parent's cached listing carries this entry's attributes; an
         // explicit metadata change would otherwise show stale there for a TTL.
-        self.invalidate_parent_dir(&path);
+        self.invalidate_parent_dir(path);
         self.cache_attr(ino, attr);
         if size.is_some() {
-            self.mark_path_written(&path);
+            self.mark_path_written(path);
         }
         Ok(attr)
     }

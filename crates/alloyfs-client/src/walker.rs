@@ -84,7 +84,17 @@ pub(crate) fn spawn(
             // happened while the answer was in flight — the same in-flight
             // re-install bug the dir_epoch guard closed for readdir.
             let warm_epoch = fs.warm_epoch_now();
-            match fs.conn().request(Request::TreeToken).await {
+            // Attach2 (v9+) already carried the token; spend it instead of
+            // asking again — take-once, so any LATER check in this task's
+            // lifetime goes back to the wire rather than trusting a value
+            // that only described the export as of attach.
+            let attach_token = fs.attach_tree_token.swap(0, std::sync::atomic::Ordering::AcqRel);
+            let current = if attach_token != 0 {
+                Ok(Ok(Response::TreeToken { token: attach_token }))
+            } else {
+                fs.conn().request(Request::TreeToken).await
+            };
+            match current {
                 Ok(Ok(Response::TreeToken { token })) if token == saved_token => {
                     cache.note_walk_skipped();
                     // The same proof that lets the blobs serve without

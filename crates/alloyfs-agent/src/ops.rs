@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::Arc;
 
-use alloyfs_common::{attr_from_metadata, read_fully, set_mode, write_fully, ExcludeSet, OrCode};
+use alloyfs_common::{attr_from_metadata, read_fully, set_mode_path, write_fully, ExcludeSet, OrCode};
 use alloyfs_proto::{
     Attr, DirEntry, ErrorCode, EventKind, FileKind, FsEvent, ManyEntry, OpenFlags, RelPath, Request,
     Response, DATA_CHUNK, PROTO_VERSION_MIN,
@@ -737,6 +737,89 @@ impl SessionInner {
         Ok(Response::Opened { fh, attr })
     }
 
+    /// v9+: `open` that carries the head of the file back with the handle.
+    ///
+    /// The read happens under the SAME handle being returned, after the open
+    /// decided everything else — so every rule `open` enforces (read-only
+    /// exports, truncate bumping the version, IsADirectory) holds identically,
+    /// and a race with a concurrent writer is no wider than open-then-read
+    /// always was.
+    fn open_read(&self, path: RelPath, flags: OpenFlags, len: u32) -> Result<Response, ErrorCode> {
+        let opened = self.open(path, flags)?;
+        let Response::Opened { fh, attr } = opened else {
+            return Ok(opened); // open() only returns Opened, but stay total
+        };
+        // No data wanted, none to have, or nothing that reads like a file:
+        // answer with an empty head rather than refusing — the caller still
+        // saved the round trip it actually needed (the open).
+        let want = len.min(DATA_CHUNK).min(attr.size.min(u32::MAX as u64) as u32);
+        let data = if want == 0 || flags.truncate {
+            bytes::Bytes::new()
+        } else {
+            let of = self.handle_of(fh)?;
+            let mut buf = vec![0u8; want as usize];
+            let n = read_fully(&of.file, &mut buf, 0).or_code()?;
+            buf.truncate(n);
+            buf.into()
+        };
+        Ok(Response::OpenedData { fh, attr, data })
+    }
+
+    /// v9+: `setattr` plus `readonly`, resolved against the file's current
+    /// mode HERE — one atomic step where the WinFsp adapter used to
+    /// getattr-then-Setattr, paying a round trip and racing concurrent chmods.
+    fn setattr2(
+        &self,
+        path: RelPath,
+        size: Option<u64>,
+        mtime: Option<std::time::SystemTime>,
+        mode: Option<u32>,
+        readonly: Option<bool>,
+    ) -> Result<Response, ErrorCode> {
+        let mode = match (mode, readonly) {
+            // An explicit mode wins outright; readonly alongside it would be
+            // two writers for one field.
+            (Some(m), _) => Some(m),
+            (None, Some(ro)) => {
+                let export = self.writable_export()?;
+                let full = export.resolve(&path)?;
+                let cur = std::fs::metadata(&full).or_code()?;
+                let cur_mode = alloyfs_common::mode_of_md(&cur);
+                Some(if ro { cur_mode & !0o222 } else { cur_mode | 0o200 })
+            }
+            (None, None) => None,
+        };
+        self.setattr(path, size, mtime, mode)
+    }
+
+    /// v9+: attach + mount defaults + tree token, one exchange. Each half is
+    /// the existing handler's answer verbatim; only the round trips fold.
+    fn attach2(&self, export_name: String) -> Result<Response, ErrorCode> {
+        let attached = self.attach(export_name)?;
+        let Response::AttachOk { export_id, root_attr } = attached else {
+            return Ok(attached);
+        };
+        let export = self.export()?;
+        let d = &export.mount_defaults;
+        Ok(Response::Attached2 {
+            export_id,
+            root_attr,
+            exclude: d.exclude.clone(),
+            pin: d.pin.clone(),
+            auto_cache_max: d.auto_cache_max,
+            auto_cache_budget: d.auto_cache_budget,
+            // `token()`, never `ensure()`: attach must not build the index.
+            // Forcing it here broke two contracts at once — "an export no
+            // client asks a tree of is never walked", and worse, on an
+            // UNWATCHED export the freshly built index is frozen, and readdir
+            // (which serves from a live index) stops seeing mutations. 0 here
+            // means "not currently indexed"; a client that wants the token
+            // asks `TreeToken`, which is the request that builds — same as
+            // v6 always worked.
+            tree_token: export.tree.token(),
+        })
+    }
+
     fn create(&self, path: RelPath, flags: OpenFlags, mode: u32) -> Result<Response, ErrorCode> {
         let export = self.writable_export()?;
         let full = export.resolve_new(&path)?;
@@ -774,7 +857,7 @@ impl SessionInner {
         // Windows has no umask and no mode; `set_mode` only maps the write bit
         // onto the read-only attribute, so it still has to happen after open.
         #[cfg(windows)]
-        set_mode(&file, mode);
+        alloyfs_common::set_mode(&file, mode);
         let md = file.metadata().or_code()?;
         export.events.note_local_write(&path, self.id);
         let attr = attr_from_metadata(&md, export.bump(&path));
@@ -950,8 +1033,13 @@ impl SessionInner {
                 .or_code()?;
         }
         if let Some(mode) = mode {
-            let f = File::options().write(true).open(&full).or_code()?;
-            set_mode(&f, mode);
+            // By PATH, not through a write-opened handle. Opening for write
+            // was refused for exactly the file most likely to have its mode
+            // changed: a READONLY one — Windows denies the write-open before
+            // the chmod can run, so clearing the readonly bit was impossible
+            // on a Windows server. A path chmod needs no write access on any
+            // platform.
+            set_mode_path(&full, mode).or_code()?;
         }
         let md = std::fs::metadata(&full).or_code()?;
         export.events.note_local_write(&path, self.id);
@@ -1121,6 +1209,8 @@ impl SessionInner {
     fn dispatch_blocking(&self, req: Request) -> Result<Response, ErrorCode> {
         match req {
             Request::Attach { export } => self.attach(export),
+            Request::Attach2 { export } => self.attach2(export),
+            Request::OpenRead { path, flags, len } => self.open_read(path, flags, len),
             Request::Getattr { path } => self.getattr(path),
             Request::Readdir { path, cursor } => self.readdir(path, cursor),
             Request::Tree { path, cursor } => self.tree(path, cursor),
@@ -1143,6 +1233,13 @@ impl SessionInner {
                 mtime,
                 mode,
             } => self.setattr(path, size, mtime, mode),
+            Request::Setattr2 {
+                path,
+                size,
+                mtime,
+                mode,
+                readonly,
+            } => self.setattr2(path, size, mtime, mode, readonly),
             Request::Mkdir { path, mode } => self.mkdir(path, mode),
             Request::Unlink { path } => self.unlink(path),
             Request::Rmdir { path } => self.rmdir(path),

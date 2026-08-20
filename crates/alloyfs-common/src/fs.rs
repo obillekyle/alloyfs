@@ -43,19 +43,22 @@ pub fn attr_from_metadata(md: &Metadata, version: u64) -> Attr {
         size: md.len(),
         mtime,
         ctime,
-        mode: mode_of(md),
+        mode: mode_of_md(md),
         version,
     }
 }
 
+/// The mode an `Attr` would carry for this metadata — public because the
+/// server-side `readonly` resolution (Setattr2) needs the same reading of
+/// the current mode that `attr_from_metadata` bakes into replies.
 #[cfg(unix)]
-fn mode_of(md: &Metadata) -> u32 {
+pub fn mode_of_md(md: &Metadata) -> u32 {
     use std::os::unix::fs::PermissionsExt;
     md.permissions().mode() & 0o7777
 }
 
 #[cfg(windows)]
-fn mode_of(md: &Metadata) -> u32 {
+pub fn mode_of_md(md: &Metadata) -> u32 {
     let base = if md.is_dir() { 0o755 } else { 0o644 };
     if md.permissions().readonly() {
         base & !0o222
@@ -138,4 +141,22 @@ pub fn write_fully(file: &File, buf: &[u8], offset: u64) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// `set_mode` by path — the form `Setattr` needs, because the fd form
+/// requires a write-open and Windows refuses to write-open a READONLY file:
+/// the one mode change users actually make (clearing readonly) was the one
+/// the fd form could never perform on a Windows server.
+pub fn set_mode_path(path: &std::path::Path, mode: u32) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & 0o7777))
+    }
+    #[cfg(windows)]
+    {
+        let mut perms = std::fs::metadata(path)?.permissions();
+        perms.set_readonly(mode & 0o200 == 0);
+        std::fs::set_permissions(path, perms)
+    }
 }
