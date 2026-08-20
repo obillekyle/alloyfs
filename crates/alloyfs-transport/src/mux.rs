@@ -66,6 +66,22 @@ impl MuxConnection {
     where
         S: AsyncRead + AsyncWrite + Send + 'static,
     {
+        Self::establish_with_max(stream, client_name, PROTO_VERSION_MAX).await
+    }
+
+    /// [`Self::establish`] with the advertised ceiling lowered. Tests use it to
+    /// negotiate an old-protocol session against a current peer: the handshake
+    /// takes the min of both sides, so clamping the hello is enough to make a
+    /// v9 agent answer as a v5 one — which is how "never send a variant the
+    /// session's proto does not cover" gets exercised without an old binary.
+    pub async fn establish_with_max<S>(
+        stream: S,
+        client_name: &str,
+        proto_max: u16,
+    ) -> Result<Arc<Self>, TransportError>
+    where
+        S: AsyncRead + AsyncWrite + Send + 'static,
+    {
         let (r, w) = tokio::io::split(stream);
         let mut reader = FramedRead::new(r, FrameCodec::default());
         let mut writer = FramedWrite::new(w, FrameCodec::default());
@@ -73,7 +89,7 @@ impl MuxConnection {
         writer
             .send(&Frame::Hello {
                 proto_min: PROTO_VERSION_MIN,
-                proto_max: PROTO_VERSION_MAX,
+                proto_max,
                 client: client_name.to_string(),
             })
             .await?;

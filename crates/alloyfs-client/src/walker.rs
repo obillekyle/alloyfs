@@ -93,8 +93,17 @@ pub(crate) fn spawn(fs: Arc<RemoteFs>, cache: Arc<AutoCache>, fetch_rx: mpsc::Un
             let warm_epoch = fs.warm_epoch_now();
             let current = if current_token != 0 {
                 Ok(Ok(Response::TreeToken { token: current_token }))
-            } else {
+            } else if fs.conn().proto >= 6 {
                 fs.conn().request(Request::TreeToken).await
+            } else {
+                // A saved token with a pre-v6 server on the wire: the cache
+                // was written by a newer session than the one now attached
+                // (reconnects can land elsewhere; caches outlive servers).
+                // The agent cannot answer TreeToken — and must not be ASKED,
+                // because an unknown variant index kills the connection
+                // rather than failing cleanly. Answer for it: cannot verify,
+                // so walk.
+                Ok(Err(alloyfs_proto::ErrorCode::VersionMismatch))
             };
             if let Ok(Ok(Response::TreeToken { token })) = &current {
                 current_token = *token;
@@ -493,12 +502,30 @@ async fn commit_blob(
 ///
 /// The reply is always a PREFIX of the request — the server stops when its
 /// budget is spent — so what is outstanding is simply what was not answered,
-/// and the loop re-asks for it. Two fallbacks keep this from ever losing a
-/// file: a pre-v8 agent (or any failed request) reverts to the per-file path,
-/// and so does a single file the server declines as too large for a bulk
-/// reply, which is exactly the case the chunked reader exists for.
+/// and the loop re-asks for it. Pre-v8 agents are gated up front (they cannot
+/// decode the variant, so asking kills the connection instead of failing);
+/// two fallbacks then keep this from ever losing a file: any failed request
+/// reverts to the per-file path, and so does a single file the server
+/// declines as too large for a bulk reply, which is exactly the case the
+/// chunked reader exists for.
 async fn fetch_many(fs: &Arc<RemoteFs>, cache: &Arc<AutoCache>, batch: Vec<RelPath>) -> usize {
     let mut ok = 0usize;
+    // Checked BEFORE sending, per call because a reconnect can land on a
+    // different server. The fallback arm below cannot cover the pre-v8 case:
+    // an agent that lacks the variant does not answer with an error, its
+    // postcard decode fails at the codec and it KILLS THE CONNECTION —
+    // measured against a v6 agent, where every mount looped walk → ReadMany →
+    // reset → reconnect and the cache never filled. Same rule as
+    // `require_proto`: too-old is something to know, never to discover by
+    // sending.
+    if fs.conn().proto < 8 {
+        for path in &batch {
+            if fetch_one(fs, cache, path).await {
+                ok += 1;
+            }
+        }
+        return ok;
+    }
     let mut remaining = batch;
 
     while !remaining.is_empty() {
@@ -511,7 +538,7 @@ async fn fetch_many(fs: &Arc<RemoteFs>, cache: &Arc<AutoCache>, batch: Vec<RelPa
             .await;
         let entries = match resp {
             Ok(Ok(Response::Many(entries))) if !entries.is_empty() => entries,
-            // An older agent, a refusal, or a reply that served nothing —
+            // A refusal, a dead connection, or a reply that served nothing —
             // which would spin here. Read them the ordinary way instead of
             // dropping them on the floor.
             _ => {

@@ -18,8 +18,9 @@ use alloyfs_proto::{
 use alloyfs_transport::TransportError;
 use bytes::Bytes;
 use harness::{
-    connect, connect_raw_with_server_token, connect_reconnectable, deadline_after, expect_event, lookup_path,
-    mkfile, on_fs, patterned, read_all, remote_code, start_agent, wait_until, AgentOpts, Session,
+    connect, connect_raw_with_server_token, connect_reconnectable, connect_with_max, deadline_after,
+    expect_event, lookup_path, mkfile, on_fs, patterned, read_all, remote_code, start_agent, wait_until,
+    AgentOpts, Session,
 };
 
 fn rw() -> OpenFlags {
@@ -2354,6 +2355,74 @@ async fn the_walker_falls_back_to_readdir_when_the_export_is_not_indexed() {
     let data_dir = tempfile::TempDir::new().unwrap();
     let _s = connect(&agent, cache_opts(&data_dir)).await;
     expect_all_cached(&data_dir, &names, "readdir fallback cached every file").await;
+}
+
+/// A pre-v8 session still warms the whole cache — one file at a time, never
+/// via `ReadMany`.
+///
+/// The gate this pins cannot live in the fallback arm: an agent that lacks
+/// the variant does not answer with an error, its postcard decode fails at
+/// the codec and it kills the CONNECTION. Measured against a real v6 agent,
+/// every mount looped walk → ReadMany → reset → reconnect and the cache
+/// never filled. This harness has no dialer, so if the gate regresses the
+/// first `ReadMany` leaves the link dead and no blob ever lands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pre_v8_session_warms_the_cache_per_file() {
+    let agent = start_agent(AgentOpts::default());
+    let names = nested_export(&agent);
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let s = connect_with_max(&agent, cache_opts(&data_dir), 7).await;
+    expect_all_cached(&data_dir, &names, "a v7 session cached every file").await;
+    // The link survived the whole pass — nothing v8-shaped went down it.
+    on_fs(&s.fs, |fs| fs.getattr(ROOT_INO))
+        .await
+        .expect("connection alive");
+}
+
+/// A saved tree token must not be VERIFIED against a pre-v6 server — asking
+/// would kill the connection the same way `ReadMany` does. The walker answers
+/// for it ("cannot verify, so walk") and the mount still ends up complete.
+///
+/// Real shape of this case: the cache outlives servers, so a token written by
+/// a v6+ session can absolutely meet an older agent on the next mount.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_saved_token_is_not_asked_of_a_pre_v6_server() {
+    // watch: true because the v5 discovery path is readdir, and readdir
+    // serves from the index — which only the watcher keeps current. Without
+    // it the out-of-band file below would be invisible to the walk for a
+    // documented reason that has nothing to do with what this test pins.
+    let agent = start_agent(AgentOpts {
+        watch: true,
+        ..AgentOpts::default()
+    });
+    let names = nested_export(&agent);
+    let data_dir = tempfile::TempDir::new().unwrap();
+
+    // First mount at the current protocol: cache filled, token recorded.
+    {
+        let s = connect(&agent, cache_opts(&data_dir)).await;
+        expect_all_cached(&data_dir, &names, "first mount cached every file").await;
+        on_fs(&s.fs, |fs| fs.shutdown()).await;
+    }
+
+    // A file added between mounts: the v5 remount can only pick it up by
+    // actually walking, which is also the proof the connection survived the
+    // skip-check — a regressed gate kills the link before discovery starts.
+    std::fs::write(agent.dir.path().join("late.txt"), b"content-9").unwrap();
+    // Same settle as a_changed_export_still_walks_on_remount: the index
+    // learns of the write from the watcher, and mounting under it races it.
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+
+    let s2 = connect_with_max(&agent, cache_opts(&data_dir), 5).await;
+    let blob = data_dir.path().join("cache").join("t").join("late.txt");
+    wait_until("the v5 remount walked and fetched", 15, move || {
+        (std::fs::read(&blob).ok()? == b"content-9").then_some(())
+    })
+    .await;
+    assert!(
+        !s2.fs.auto_cache_walk_skipped(),
+        "a token that cannot be verified must not be trusted"
+    );
 }
 
 // ------------------------------------------- the tree token across remounts

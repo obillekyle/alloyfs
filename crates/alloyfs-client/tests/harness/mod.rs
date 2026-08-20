@@ -310,6 +310,25 @@ pub async fn connect(agent: &TestAgent, opts: ClientOptions) -> Session {
     }
 }
 
+/// Like `connect`, but the client's hello advertises `proto_max`, so the
+/// session negotiates an OLD protocol against the current agent. What the
+/// old-server tests use: "never send a variant the session does not cover"
+/// can only be exercised on a session that genuinely lacks the variant.
+pub async fn connect_with_max(agent: &TestAgent, opts: ClientOptions, proto_max: u16) -> Session {
+    let slot: SeverSlot = Arc::new(Mutex::new(None));
+    let (client_io, server) = spawn_server_link(&agent.registry, &slot);
+    let conn = MuxConnection::establish_with_max(client_io, "test-client", proto_max)
+        .await
+        .expect("handshake");
+    assert_eq!(conn.proto, proto_max, "the clamp must decide the session");
+    let fs = RemoteFs::attach_with(conn, "test", opts).await.expect("attach");
+    Session {
+        fs,
+        sever: slot,
+        _server: Some(server),
+    }
+}
+
 /// Like `connect`, but wires a `Dialer` into the options so the reconnect
 /// supervisor can re-dial after `Session::sever()`: every dial builds a fresh
 /// duplex pair + fresh `AgentSession` against the SAME registry, and the
