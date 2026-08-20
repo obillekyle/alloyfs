@@ -86,21 +86,16 @@ impl MuxConnection {
         // v3+: both sides may compress large frames from here on.
         writer.encoder_mut().compress = proto >= 3;
 
-        let (tx, mut out_rx) = mpsc::channel::<Frame>(256);
+        let (tx, out_rx) = mpsc::channel::<Frame>(256);
         let inflight: Arc<DashMap<u64, oneshot::Sender<Result<Response, ErrorCode>>>> =
             Arc::new(DashMap::new());
         let pings: Arc<DashMap<u64, oneshot::Sender<()>>> = Arc::new(DashMap::new());
         let (events_tx, _) = broadcast::channel(256);
         let (closed_tx, closed_rx) = watch::channel(false);
 
-        // Writer task: sole owner of the outgoing half.
-        tokio::spawn(async move {
-            while let Some(frame) = out_rx.recv().await {
-                if writer.send(&frame).await.is_err() {
-                    break;
-                }
-            }
-        });
+        // Writer task: sole owner of the outgoing half. Batches flushes when
+        // several frames are already queued (see writer::drain).
+        tokio::spawn(crate::writer::drain(writer, out_rx));
 
         // Reader task: routes every incoming frame to its waiter.
         let conn = Arc::new(Self {

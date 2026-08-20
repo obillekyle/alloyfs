@@ -210,6 +210,80 @@ async fn ping_round_trips() {
     conn.ping().await.expect("pong");
 }
 
+// ------------------------------------------------------------- write batching
+
+/// The writer batches flushes when frames are queued back-to-back; this pins
+/// down what batching must NOT change. Server→client: 200 event batches
+/// pushed without a pause between them are exactly the burst the writer
+/// coalesces, and events are the one frame kind whose ORDER the transport
+/// promises (responses are correlated by id instead) — so all 200 must arrive,
+/// in sequence, none stuck in a buffer waiting for a flush that never comes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pushed_burst_arrives_complete_and_in_order() {
+    const N: u64 = 200;
+    let handler = Arc::new(Echo::default());
+    let conn = connect(handler.clone()).await;
+    let mut rx = conn.events();
+
+    let push = handler.push.lock().unwrap().clone().expect("connected() ran");
+    tokio::spawn(async move {
+        for seq in 0..N {
+            let batch = vec![FsEvent {
+                seq,
+                kind: alloyfs_proto::EventKind::Created,
+                path: RelPath(format!("f{seq}")),
+                new_version: None,
+                origin: None,
+            }];
+            if !push.events(batch).await {
+                panic!("connection died mid-burst");
+            }
+        }
+    });
+
+    for want in 0..N {
+        let got = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("burst frame arrived")
+            .expect("no broadcast lag for 200 buffered events");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].seq, want, "batched writes must not reorder frames");
+    }
+}
+
+/// Client→server direction of the same burst: 200 requests issued
+/// concurrently pile up in the outbound channel faster than the writer can
+/// drain them, and every one must still get ITS OWN reply. The replies also
+/// come back as a server-side burst, so both writers batch here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_burst_resolves_every_caller() {
+    const N: u64 = 200;
+    let handler = Arc::new(Echo::default());
+    let conn = connect(handler.clone()).await;
+
+    let tasks: Vec<_> = (0..N)
+        .map(|n| {
+            let c = conn.clone();
+            tokio::spawn(async move {
+                // The Echo handler answers with the number in the path, so a
+                // misrouted reply is detectable, not just a hang.
+                c.request(Request::Getattr {
+                    path: RelPath(n.to_string()),
+                })
+                .await
+            })
+        })
+        .collect();
+
+    for (n, task) in tasks.into_iter().enumerate() {
+        match task.await.expect("join").expect("transport").expect("no error") {
+            Response::Attr(a) => assert_eq!(a.size, n as u64, "reply went to the wrong caller"),
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+    assert_eq!(handler.handled.load(Ordering::SeqCst), N as u32);
+}
+
 // ------------------------------------------------------------- push + teardown
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -133,16 +133,12 @@ where
     // request with the wrong shape.
     handler.negotiated(proto).await;
 
-    let (out_tx, mut out_rx) = mpsc::channel::<Frame>(256);
+    let (out_tx, out_rx) = mpsc::channel::<Frame>(256);
     handler.connected(EventPusher { tx: out_tx.clone() }).await;
 
-    let mut write_task = tokio::spawn(async move {
-        while let Some(frame) = out_rx.recv().await {
-            if writer.send(&frame).await.is_err() {
-                break;
-            }
-        }
-    });
+    // Batches flushes when several responses are already queued (see
+    // writer::drain) — one flush per burst, not one per frame.
+    let mut write_task = tokio::spawn(crate::writer::drain(writer, out_rx));
 
     let result = loop {
         match reader.next().await {

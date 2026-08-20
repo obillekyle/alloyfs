@@ -9,6 +9,7 @@ mod mux;
 mod server;
 pub mod stdio;
 pub mod tcp;
+mod writer;
 
 pub use mux::{MuxConnection, TransportError};
 pub use server::{serve_connection, serve_connection_with, EventPusher, RequestHandler};
