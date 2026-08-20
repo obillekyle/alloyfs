@@ -49,11 +49,19 @@ jobs:
     # libfuse through pkg-config and a macOS runner has none. Supporting it
     # would mean installing macFUSE in CI and meaning it as a platform; the
     # README lists WinFsp and Linux and says nothing about macOS.
+    # The two musl rows are what the .deb packages are built from — static
+    # binaries with no glibc floor, so ONE package per architecture covers
+    # every Debian and Ubuntu release (and the azure deployment runs exactly
+    # this x86_64 musl artifact). The gnu row stays for anyone who wants the
+    # dynamically-linked binary; ci.yml still gates PRs on gnu + msvc only,
+    # since musl adds link-time coverage, not compile-time.
     strategy:
       fail-fast: false
       matrix:
         include:
           - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu }
+          - { os: ubuntu-latest,  target: x86_64-unknown-linux-musl,  deb_arch: amd64 }
+          - { os: ubuntu-latest,  target: aarch64-unknown-linux-musl, deb_arch: arm64 }
           - { os: windows-latest, target: x86_64-pc-windows-msvc }
     runs-on: ${{ matrix.os }}
 
@@ -62,7 +70,26 @@ jobs:
         with:
           ref: ${{ inputs.tag || github.ref_name }}
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # musl prerequisites. x86_64 links through musl-gcc (the recipe the
+      # azure deployment binary has always used); aarch64 needs no C
+      # toolchain at all — the workspace is pure Rust on Linux targets, so
+      # rust-lld links it self-contained. Both proven locally before landing
+      # here: the aarch64 artifact links, debs, and runs `--version` under
+      # qemu-aarch64.
+      - name: musl toolchain
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y musl-tools
+      - name: aarch64 linker
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS=-C linker=rust-lld" >> "$GITHUB_ENV"
 
       # The same two prerequisites ci.yml installs, and for the same reasons.
       # A release build that skipped them would fail here rather than in CI —
@@ -80,8 +107,10 @@ jobs:
 
       # `--workspace` rather than `-p alloyfs-cli`, matching ci.yml: it exercises
       # the pinned release profile across every crate, and `lto = false` there is
-      # load-bearing (see the comment in the workspace Cargo.toml).
-      - run: cargo build --workspace --release
+      # load-bearing (see the comment in the workspace Cargo.toml). `--target` is
+      # passed even where it equals the host so every row's output lands in the
+      # same target/<triple>/release layout the collect step reads.
+      - run: cargo build --workspace --release --target ${{ matrix.target }}
 
       # Every `[[bin]]` the workspace declares, asked of cargo rather than
       # written down. `--no-deps` keeps it to this workspace's own crates.
@@ -102,9 +131,20 @@ jobs:
             | jq -r '.packages[].targets[] | select(.kind[] == "bin") | .name' \
             | tr -d '\r' \
             | while read -r bin; do
-                cp "target/release/$bin$ext" "dist/$bin-${{ matrix.target }}$ext"
+                cp "target/${{ matrix.target }}/release/$bin$ext" "dist/$bin-${{ matrix.target }}$ext"
               done
           ls -l dist
+
+      # The musl rows also become .deb packages — the binary is static, so
+      # the package needs no libc dependency and one deb per arch serves
+      # every Debian/Ubuntu release. build-deb.sh owns the layout and the
+      # semver-dash → tilde version rewrite.
+      - name: Build the .deb
+        if: matrix.deb_arch != ''
+        run: |
+          packaging/deb/build-deb.sh \
+            "target/${{ matrix.target }}/release/alloyfs" "${{ matrix.deb_arch }}"
+          cp target/deb/*.deb dist/
 
       - uses: actions/upload-artifact@v4
         with:

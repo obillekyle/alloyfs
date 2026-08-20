@@ -1,0 +1,57 @@
+# Maintainer: Kyle <obillekyle@gmail.com>
+#
+# AUR-shaped PKGBUILD, kept in-repo so releases and the package recipe move
+# together. Written on the project's Windows half and untested by makepkg
+# there — treat the first Arch build as the review pass.
+#
+# pkgver tracks the workspace version with the semver dash flattened the way
+# pacman wants it: 1.0.0-alpha.32 -> 1.0.0alpha.32 (a dash in pkgver is
+# illegal, and alpha-tagged versions must still sort before the release).
+
+pkgname=alloyfs
+pkgver=1.0.0alpha.32
+pkgrel=1
+pkgdesc="Virtual drive service — mount remote folders as real drives (FUSE), with live events, caching, and wire locks"
+arch=('x86_64' 'aarch64')
+url="https://github.com/obillekyle/alloyfs"
+license=('MIT')
+depends=('gcc-libs')
+makedepends=('cargo')
+optdepends=('fuse3: mounting exports as drives (serving needs nothing)')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v${pkgver/alpha/-alpha}.tar.gz")
+sha256sums=('SKIP') # pinned per release by the publish workflow; SKIP only in-repo
+
+_srcdir() {
+	# GitHub archives unpack as alloyfs-<tag-without-v>.
+	echo "$pkgname-${pkgver/alpha/-alpha}"
+}
+
+prepare() {
+	cd "$(_srcdir)"
+	cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+	cd "$(_srcdir)"
+	# --workspace matches CI and the release pipeline: the pinned release
+	# profile (lto = false is load-bearing, see the workspace Cargo.toml)
+	# gets exercised across every crate, not just the CLI's dep-closure.
+	cargo build --workspace --release --frozen
+}
+
+check() {
+	cd "$(_srcdir)"
+	# The full suite runs minutes and spawns loopback agents; keep the
+	# package build to the compile-level checks and leave testing to CI.
+	cargo fmt --all --check
+}
+
+package() {
+	cd "$(_srcdir)"
+	install -Dm755 target/release/alloyfs "$pkgdir/usr/bin/alloyfs"
+	sed -e 's/\r$//' \
+		-e 's|^ExecStart=/usr/local/bin/alloyfs|ExecStart=/usr/bin/alloyfs|' \
+		scripts/alloyfs.service >alloyfs@.service
+	install -Dm644 alloyfs@.service "$pkgdir/usr/lib/systemd/system/alloyfs@.service"
+	install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE" 2>/dev/null || true
+}
