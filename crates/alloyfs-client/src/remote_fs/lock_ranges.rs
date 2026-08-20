@@ -92,6 +92,9 @@ impl RemoteFs {
         if fh & OVERLAY_FH_BIT != 0 {
             return Ok(()); // single-machine data: advisory lock is a no-op
         }
+        // Locks order against writes: everything acknowledged before this
+        // lock exists must be on the server before the lock is.
+        self.flush_batch();
         self.check_poisoned(fh)?;
         let server_fh = self.server_fh_for_io(fh)?;
         let req = Request::Lock {
@@ -144,6 +147,8 @@ impl RemoteFs {
         if fh & OVERLAY_FH_BIT != 0 {
             return Ok(()); // single-machine data: advisory lock is a no-op
         }
+        // Same barrier as the coarse lock: acknowledged writes precede locks.
+        self.flush_batch();
         self.check_poisoned(fh)?;
         self.require_proto(7, "byte-range lock")?;
         let server_fh = self.server_fh_for_io(fh)?;

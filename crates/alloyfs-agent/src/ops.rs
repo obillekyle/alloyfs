@@ -1055,6 +1055,99 @@ impl SessionInner {
         Ok(Response::Attr(attr_from_metadata(&md, export.bump(&path))))
     }
 
+    /// v10+: create-or-replace several WHOLE files in one exchange — the
+    /// write-side sibling of `read_many`, fed by the client's batcher.
+    ///
+    /// Entries apply in order and answer individually: one refused path must
+    /// not poison its neighbours, because the client acknowledged each of
+    /// these to its application already and needs to know exactly which
+    /// promises broke. Per entry this is `create`'s body with truncate
+    /// semantics; the mode contract is create-only (an existing file keeps
+    /// its own — `create_new` then an `AlreadyExists` fallback is what makes
+    /// that knowable on Windows, where the mode is applied post-open).
+    fn write_many(&self, files: Vec<alloyfs_proto::ManyWrite>) -> Result<Response, ErrorCode> {
+        let export = self.writable_export()?;
+        let mut out = Vec::with_capacity(files.len());
+        for f in files {
+            out.push(self.write_one_whole(&export, f));
+        }
+        Ok(Response::ManyOutcome(out))
+    }
+
+    fn write_one_whole(
+        &self,
+        export: &Export,
+        f: alloyfs_proto::ManyWrite,
+    ) -> Result<Option<Attr>, ErrorCode> {
+        f.path.validate()?;
+        let full = export.resolve_new(&f.path)?;
+        let create_attempt = {
+            let mut o = File::options();
+            o.read(true).write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                o.mode(f.mode);
+            }
+            o.open(&full)
+        };
+        let (mut file, created) = match create_attempt {
+            Ok(file) => (file, true),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let file = File::options().write(true).truncate(true).open(&full).or_code()?;
+                (file, false)
+            }
+            other => (other.or_code()?, true),
+        };
+        #[cfg(windows)]
+        if created {
+            alloyfs_common::set_mode(&file, f.mode);
+        }
+        #[cfg(not(windows))]
+        let _ = created;
+        use std::io::Write as _;
+        file.write_all(&f.data).or_code()?;
+        let md = file.metadata().or_code()?;
+        export.events.note_local_write(&f.path, self.id);
+        Ok(Some(attr_from_metadata(&md, export.bump(&f.path))))
+    }
+
+    /// v10+: several removals in one exchange, in order, answered per entry.
+    fn remove_many(&self, entries: Vec<alloyfs_proto::ManyRemove>) -> Result<Response, ErrorCode> {
+        let export = self.writable_export()?;
+        let mut out = Vec::with_capacity(entries.len());
+        for e in entries {
+            let one = (|| -> Result<Option<Attr>, ErrorCode> {
+                e.path.validate()?;
+                let full = export.resolve(&e.path)?;
+                if e.dir {
+                    std::fs::remove_dir(&full).or_code()?;
+                } else {
+                    std::fs::remove_file(&full).or_code()?;
+                }
+                export.events.note_local_write(&e.path, self.id);
+                export.forget_version(&e.path);
+                Ok(None)
+            })();
+            out.push(one);
+        }
+        Ok(Response::ManyOutcome(out))
+    }
+
+    /// v10+: several metadata changes in one exchange — `setattr2`'s body per
+    /// entry, so the readonly-onto-mode mapping stays server-side and atomic.
+    fn setattr_many(&self, entries: Vec<alloyfs_proto::ManySetattr>) -> Result<Response, ErrorCode> {
+        let mut out = Vec::with_capacity(entries.len());
+        for e in entries {
+            out.push(match self.setattr2(e.path, e.size, e.mtime, e.mode, e.readonly) {
+                Ok(Response::Attr(a)) => Ok(Some(a)),
+                Ok(_) => Err(ErrorCode::Io),
+                Err(c) => Err(c),
+            });
+        }
+        Ok(Response::ManyOutcome(out))
+    }
+
     fn unlink(&self, path: RelPath) -> Result<Response, ErrorCode> {
         let export = self.writable_export()?;
         let full = export.resolve(&path)?;
@@ -1219,6 +1312,9 @@ impl SessionInner {
             Request::Create { path, flags, mode } => self.create(path, flags, mode),
             Request::Read { fh, offset, len } => self.read(fh, offset, len),
             Request::ReadMany { paths, budget } => self.read_many(paths, budget),
+            Request::WriteMany { files } => self.write_many(files),
+            Request::RemoveMany { entries } => self.remove_many(entries),
+            Request::SetattrMany { entries } => self.setattr_many(entries),
             Request::Write {
                 fh,
                 offset,

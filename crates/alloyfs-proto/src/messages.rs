@@ -53,15 +53,22 @@ use crate::error::ErrorCode;
 /// (adds `readonly`, applied server-side against the current mode), and
 /// `Attach2`/`Attached2` (attach + mount defaults + tree token in one).
 /// All client-gated with per-feature fallbacks to the older verbs.
+///
+/// v10: `WriteMany` / `RemoveMany` / `SetattrMany` + `Response::ManyOutcome`
+/// — the mutation-side siblings of `ReadMany`, fed by the client's write
+/// batcher: a burst of small-file creates or deletes coalesces into one
+/// exchange instead of two round trips per file. Client-gated; against an
+/// older peer the batcher never engages and every mutation takes the classic
+/// per-operation path.
 pub const PROTO_VERSION_MIN: u16 = 1;
-pub const PROTO_VERSION_MAX: u16 = 9;
+pub const PROTO_VERSION_MAX: u16 = 10;
 
 /// The protocol range this build speaks, for `--version` and diagnostics —
 /// "which wire version does this release talk" should not require reading
 /// source. A literal rather than a formatted string because clap's version
 /// output needs a `&'static str`; `proto_range_matches_the_constants` is what
 /// keeps it from drifting away from the two constants above.
-pub const PROTO_RANGE: &str = "1-9";
+pub const PROTO_RANGE: &str = "1-10";
 
 /// Read/write payloads are capped to this many bytes per request so one huge
 /// file operation can never monopolize the connection (head-of-line blocking).
@@ -526,6 +533,74 @@ pub enum Request {
     Attach2 {
         export: String,
     },
+    /// v10+: create-or-replace several WHOLE small files in ONE exchange —
+    /// the write-side sibling of `ReadMany`.
+    ///
+    /// What it is for: write BURSTS. A create through the mount is two
+    /// blocking round trips at minimum (create, then the write), and an
+    /// application writing a hundred small files pays them serially —
+    /// measured at 212 ms per file on a ~100 ms link, all of it waiting.
+    /// The client's batcher coalesces such bursts and sends them here, so a
+    /// hundred files cost one or two exchanges instead of two hundred.
+    ///
+    /// Whole files only, deliberately: an entry replaces the file's entire
+    /// content (create-or-truncate + write + close in one server-side step),
+    /// which is exactly the shape a small-file burst has. Anything written
+    /// partially, randomly, or past the batcher's size cap takes the classic
+    /// per-operation path instead.
+    ///
+    /// Entries apply IN ORDER, and outcomes come back per entry — one bad
+    /// path must not poison the batch.
+    WriteMany {
+        files: Vec<ManyWrite>,
+    },
+    /// v10+: remove several entries in ONE exchange, in request order.
+    ///
+    /// The delete-side sibling of `WriteMany`, for `rm -r`-shaped bursts:
+    /// removals were already a single round trip each, but a thousand of
+    /// them is still a thousand round trips. Ordering matters and is
+    /// preserved — a batch may carry children before their parent directory,
+    /// or a removal followed (in a later batch) by a re-creation.
+    RemoveMany {
+        entries: Vec<ManyRemove>,
+    },
+    /// v10+: apply several metadata changes in ONE exchange, in order.
+    ///
+    /// The `Setattr2` shape, vectorised — what `chmod -R` and archive
+    /// extraction (a timestamp restore per file) turn into.
+    SetattrMany {
+        entries: Vec<ManySetattr>,
+    },
+}
+
+/// One `WriteMany` entry: a whole file, created or replaced.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManyWrite {
+    pub path: RelPath,
+    /// Mode for a CREATED file; an existing file keeps its own (the same
+    /// contract `Create` has — the server's umask decides, see the mount's
+    /// 0o666 note).
+    pub mode: u32,
+    pub data: Bytes,
+}
+
+/// One `RemoveMany` entry. `dir` picks rmdir semantics over unlink — the
+/// server must not guess from the path's current kind, because the batch may
+/// describe a state the filesystem has already left.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManyRemove {
+    pub path: RelPath,
+    pub dir: bool,
+}
+
+/// One `SetattrMany` entry: `Setattr2`'s fields, per path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManySetattr {
+    pub path: RelPath,
+    pub size: Option<u64>,
+    pub mtime: Option<SystemTime>,
+    pub mode: Option<u32>,
+    pub readonly: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -637,6 +712,16 @@ pub enum Response {
         auto_cache_budget: Option<u64>,
         tree_token: u64,
     },
+    /// v10+: per-entry outcomes for the bulk mutations (`WriteMany`,
+    /// `RemoveMany`, `SetattrMany`), in request order and always the SAME
+    /// length as the request — a bulk mutation is applied entirely, entry by
+    /// entry, and each entry's fate is reported rather than the batch's.
+    ///
+    /// `Ok(Some(attr))` where the operation produces attributes (writes,
+    /// setattrs — the client patches its caches from them, exactly as the
+    /// single-op replies allow); `Ok(None)` for removals; `Err` for the
+    /// entries the server refused, which must not poison their neighbours.
+    ManyOutcome(Vec<Result<Option<Attr>, ErrorCode>>),
 }
 
 /// One file in a `ReadMany` reply.

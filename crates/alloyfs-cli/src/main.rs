@@ -86,6 +86,13 @@ enum Command {
         /// sizes published by the export's `client:` config section).
         #[arg(long)]
         no_server_defaults: bool,
+        /// Every mutation blocks until the server has it (the pre-v10
+        /// contract). Without this flag, bursts of NEW small files and
+        /// removals acknowledge locally and coalesce for at most ~15 ms into
+        /// bulk exchanges; fsync, locks, renames and unmount still block for
+        /// the server either way.
+        #[arg(long)]
+        write_through: bool,
         /// Refuse to write over a file another machine changed since this
         /// mount last read it, instead of silently winning. Off by default:
         /// it trades a failed save for a lost edit, and which of those you
@@ -441,6 +448,7 @@ async fn main() -> anyhow::Result<()> {
             auto_cache_budget,
             data_dir,
             no_server_defaults,
+            write_through,
             detect_conflicts,
             token,
             backend,
@@ -456,6 +464,7 @@ async fn main() -> anyhow::Result<()> {
                 auto_cache_budget,
                 data_dir,
                 no_server_defaults,
+                write_through,
                 detect_conflicts,
                 token,
                 backend,

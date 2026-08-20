@@ -2883,6 +2883,194 @@ async fn a_create_burst_answers_its_own_negative_probes_locally() {
     );
 }
 
+// ---------------------------------------------------------- the v10 batcher
+
+fn burst_flags() -> OpenFlags {
+    OpenFlags {
+        read: true,
+        write: true,
+        excl: true,
+        ..OpenFlags::default()
+    }
+}
+
+/// A create burst coalesces into WriteMany: a hundred files cost a handful
+/// of exchanges, and the agent's disk ends up byte-identical to what the
+/// applications wrote. This is the row the WAN bench measured at 212 ms per
+/// file — the write-through floor — turned into ~one exchange per batch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_create_burst_coalesces_into_write_many() {
+    let agent = start_agent(AgentOpts::default());
+    let s = connect(&agent, ClientOptions::default()).await;
+    on_fs(&s.fs, |fs| fs.readdir(ROOT_INO)).await.unwrap();
+
+    let before = s.conn().requests_sent();
+    for i in 0..100 {
+        let name = format!("b{i:03}.bin");
+        let body = format!("burst-content-{i}").into_bytes();
+        on_fs(&s.fs, move |fs| {
+            let (_ino, fh, _attr) = fs.create(ROOT_INO, &name, 0o666, burst_flags())?;
+            fs.write_at(fh, 0, &body)?;
+            fs.release(fh);
+            Ok::<_, alloyfs_client::FsError>(())
+        })
+        .await
+        .unwrap();
+    }
+    // Unmount is the last barrier: everything still queued goes out here.
+    on_fs(&s.fs, |fs| fs.shutdown()).await;
+    let spent = s.conn().requests_sent() - before;
+    assert!(
+        spent <= 8,
+        "a 100-file burst cost {spent} exchanges — it must coalesce into \
+         a handful of WriteMany batches, not per-file round trips"
+    );
+    for i in 0..100 {
+        let on_disk = std::fs::read(agent.dir.path().join(format!("b{i:03}.bin")))
+            .unwrap_or_else(|e| panic!("b{i:03}.bin missing on the agent: {e}"));
+        assert_eq!(on_disk, format!("burst-content-{i}").into_bytes());
+    }
+}
+
+/// fsync's promise survives the batcher: when flush() returns Ok, the bytes
+/// are on the agent's disk — not in a queue, not in a window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_fsync_lands_the_pending_file_before_returning() {
+    let agent = start_agent(AgentOpts::default());
+    let s = connect(&agent, ClientOptions::default()).await;
+    on_fs(&s.fs, |fs| fs.readdir(ROOT_INO)).await.unwrap();
+
+    let dir = agent.dir.path().to_path_buf();
+    on_fs(&s.fs, move |fs| {
+        let (_ino, fh, _attr) = fs.create(ROOT_INO, "synced.txt", 0o666, burst_flags())?;
+        fs.write_at(fh, 0, b"must be durable")?;
+        fs.flush(fh)?;
+        // The ONLY ordering guarantee is the barrier that just returned:
+        // the file exists server-side before release even runs.
+        assert_eq!(
+            std::fs::read(dir.join("synced.txt")).expect("on disk after fsync"),
+            b"must be durable"
+        );
+        fs.release(fh);
+        Ok::<_, alloyfs_client::FsError>(())
+    })
+    .await
+    .unwrap();
+}
+
+/// A refused batch entry surfaces at the barrier, per path — an fsync that
+/// would have to lie returns the server's refusal instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fsync_reports_a_batch_the_server_refused() {
+    let agent = start_agent(AgentOpts {
+        read_only: true,
+        ..AgentOpts::default()
+    });
+    let s = connect(&agent, ClientOptions::default()).await;
+    on_fs(&s.fs, |fs| fs.readdir(ROOT_INO)).await.unwrap();
+
+    let refused = on_fs(&s.fs, |fs| {
+        let (_ino, fh, _attr) = fs.create(ROOT_INO, "doomed.txt", 0o666, burst_flags())?;
+        fs.write_at(fh, 0, b"never lands")?;
+        fs.flush(fh) // seals, flushes, and must carry the refusal back
+    })
+    .await;
+    match refused {
+        Err(e) => assert_eq!(
+            remote_code(e),
+            ErrorCode::ReadOnly,
+            "the refusal must be the server's"
+        ),
+        Ok(_) => panic!("fsync on a read-only export must not report success"),
+    }
+}
+
+/// Queue order is wire order: create, delete, create-again of one name must
+/// leave the SECOND content on the agent — the delete cannot jump its batch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_then_recreate_lands_the_second_content() {
+    let agent = start_agent(AgentOpts::default());
+    let s = connect(&agent, ClientOptions::default()).await;
+    on_fs(&s.fs, |fs| fs.readdir(ROOT_INO)).await.unwrap();
+
+    on_fs(&s.fs, |fs| {
+        let (_ino, fh, _) = fs.create(ROOT_INO, "twice.txt", 0o666, burst_flags())?;
+        fs.write_at(fh, 0, b"first")?;
+        fs.release(fh);
+        fs.unlink(ROOT_INO, "twice.txt")?;
+        let (_ino, fh, _) = fs.create(ROOT_INO, "twice.txt", 0o666, burst_flags())?;
+        fs.write_at(fh, 0, b"second")?;
+        fs.release(fh);
+        fs.shutdown();
+        Ok::<_, alloyfs_client::FsError>(())
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        std::fs::read(agent.dir.path().join("twice.txt")).expect("survives"),
+        b"second"
+    );
+}
+
+/// A flush that carries BOTH a path's write and its later remove must leave
+/// the listing saying GONE — and a recreate afterwards must succeed.
+///
+/// The WAN bench caught the inversion this pins: the write's settle patched
+/// its (older) attrs into the listing while the remove sat queued behind it,
+/// so the listing claimed a deleted file existed and the next create burst
+/// failed 15 of 100 files with AlreadyExists. Outcomes now patch only as a
+/// path's LAST claim.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_settled_write_does_not_resurrect_its_own_delete() {
+    let agent = start_agent(AgentOpts::default());
+    let s = connect(&agent, ClientOptions::default()).await;
+    on_fs(&s.fs, |fs| fs.readdir(ROOT_INO)).await.unwrap();
+
+    let dir = agent.dir.path().to_path_buf();
+    on_fs(&s.fs, move |fs| {
+        let (_i, fh, _) = fs.create(ROOT_INO, "cycle.bin", 0o666, burst_flags())?;
+        fs.write_at(fh, 0, b"one")?;
+        fs.release(fh);
+        fs.unlink(ROOT_INO, "cycle.bin")?;
+        // One flush carrying write-then-remove for the same path.
+        fs.shutdown();
+        // The recreate is the probe: a lying listing answers AlreadyExists.
+        let created = fs.create(ROOT_INO, "cycle.bin", 0o666, burst_flags());
+        let (_i, fh, _) = created.expect("the listing must say GONE after its own delete settled");
+        fs.write_at(fh, 0, b"two")?;
+        fs.release(fh);
+        fs.shutdown();
+        assert_eq!(std::fs::read(dir.join("cycle.bin")).expect("recreated"), b"two");
+        Ok::<_, alloyfs_client::FsError>(())
+    })
+    .await
+    .unwrap();
+}
+
+/// A v9 session never batches: every mutation blocks on the server exactly
+/// as before, because the session cannot speak WriteMany at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_v9_session_writes_through_per_operation() {
+    let agent = start_agent(AgentOpts::default());
+    let s = connect_with_max(&agent, ClientOptions::default(), 9).await;
+    on_fs(&s.fs, |fs| fs.readdir(ROOT_INO)).await.unwrap();
+
+    let dir = agent.dir.path().to_path_buf();
+    on_fs(&s.fs, move |fs| {
+        let (_ino, fh, _attr) = fs.create(ROOT_INO, "classic.txt", 0o666, burst_flags())?;
+        fs.write_at(fh, 0, b"old contract")?;
+        // No barrier, no batcher: the bytes are already on the server.
+        assert_eq!(
+            std::fs::read(dir.join("classic.txt")).expect("write-through"),
+            b"old contract"
+        );
+        fs.release(fh);
+        Ok::<_, alloyfs_client::FsError>(())
+    })
+    .await
+    .unwrap();
+}
+
 // ------------------------------------------------------------- v9 round trips
 
 /// One exchange opens a small file AND leaves its head where the first read

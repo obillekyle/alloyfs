@@ -32,9 +32,13 @@ agent over your existing SSH config and speaks the protocol on stdin/stdout.
 
 ## What it is not
 
-Not a sync service by default — a mount is write-through, so an acknowledged
-write is on the server. If you want files on local disk instead, that is
-[sync mode](#/guides/sync-mode), which is a different tool in the same binary.
+Not a sync service by default — a mount's durability point is the server.
+Writes into existing files block until the server has them; bursts of NEW
+small files and deletes coalesce for at most ~15 ms into bulk exchanges
+(`--write-through` disables even that), and `fsync`, locks, renames and
+unmount always block until everything acknowledged is server-side. If you
+want files on local disk instead, that is [sync mode](#/guides/sync-mode),
+which is a different tool in the same binary.
 
 Not quite a database host. Byte-range advisory locks are forwarded on Linux
 mounts — enough for journal-mode SQLite shared between machines — but WAL

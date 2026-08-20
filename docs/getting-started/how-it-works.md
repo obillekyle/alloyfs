@@ -36,8 +36,20 @@ translate one dialect of filesystem callbacks into `RemoteFs` calls.
 That split is deliberate. The logic that can be wrong lives in one place and is
 tested on every platform; only the driver plumbing is platform-specific.
 
-## Write-through
+## Where writes become durable
 
-A mount does not buffer your writes. When `write()` returns, the bytes are on
-the server. Losing the connection mid-write fails that operation loudly rather
-than silently discarding it later.
+Writes into an existing file are write-through: when `write()` returns, the
+bytes are on the server, and losing the connection mid-write fails that
+operation loudly rather than silently discarding it later.
+
+Bursts of NEW small files — and deletes — are different (v10+): they
+acknowledge locally and coalesce for at most ~15 ms into one bulk exchange,
+which is what makes an `npm install` or an untar onto a mount cost a handful
+of round trips instead of two per file. Three promises bound the window:
+
+- `fsync`/`flush` block until the server has everything the file was ever
+  acknowledged for — an application that syncs keeps exactly the durability
+  it asked for, and a refused write surfaces THERE as the error it is.
+- Taking a lock, renaming, opening a pending path, and unmounting all drain
+  the window first.
+- `--write-through` turns the window off entirely.

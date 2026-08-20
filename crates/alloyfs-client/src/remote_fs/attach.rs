@@ -187,6 +187,24 @@ pub(super) fn spawn_background_tasks(fs: &Arc<RemoteFs>, fetch_rx: Option<FetchQ
     if fs.dialer.is_some() {
         tokio::spawn(reconnect_supervisor(fs.clone()));
     }
+    // The batcher's age flusher: whatever the queue holds when a tick fires
+    // goes out, which bounds the ack-early window to one FLUSH_AGE whatever
+    // the workload does. Weak, so an unmounted filesystem can actually die;
+    // spawn_blocking because flushing drives the synchronous request path.
+    if fs.batch.is_some() {
+        let weak = Arc::downgrade(fs);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(crate::batcher::FLUSH_AGE);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                let Some(fs) = weak.upgrade() else { break };
+                if fs.batch.as_ref().is_some_and(|b| !b.is_empty()) {
+                    let _ = tokio::task::spawn_blocking(move || fs.flush_batch()).await;
+                }
+            }
+        });
+    }
 }
 
 /// Reconnect supervisor: when the connection dies, dial a replacement with

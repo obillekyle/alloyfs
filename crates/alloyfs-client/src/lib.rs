@@ -7,6 +7,7 @@
 //! nothing in here knows what platform it's on.
 
 mod autocache;
+mod batcher;
 mod error;
 mod events;
 mod inode;

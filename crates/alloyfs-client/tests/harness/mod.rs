@@ -532,6 +532,13 @@ pub async fn mkfile(fs: &Arc<RemoteFs>, parent_ino: u64, name: &str, data: &[u8]
         if !data.is_empty() {
             fs.write(fh, 0, &data).expect("write");
         }
+        // fsync before close: the write batcher (v10) acknowledges new files
+        // locally and lands them within its flush window — but tests built on
+        // this helper read the AGENT's disk (and server-assigned versions) as
+        // ground truth immediately after. The barrier makes that
+        // deterministic, exactly as it does for a careful application; the
+        // batched fast path has its own dedicated tests that go without it.
+        fs.flush(fh).expect("fsync");
         fs.release(fh);
         ino
     })

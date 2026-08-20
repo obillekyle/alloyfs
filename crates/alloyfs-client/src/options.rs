@@ -37,6 +37,12 @@ pub struct ClientOptions {
     pub dialer: Option<Dialer>,
     /// Ignore the server's suggested client settings entirely.
     pub no_server_defaults: bool,
+    /// Disable the v10 write batcher: every mutation blocks until the server
+    /// has it, the pre-v10 contract. The batcher is on by default because its
+    /// ack-early window is bounded to milliseconds and every barrier
+    /// (fsync/flush/locks/rename/unmount) still blocks for the server — see
+    /// batcher.rs for the exact promises.
+    pub write_through: bool,
     /// Refuse to write over a file another machine changed since this handle
     /// last saw it. Off by default: it trades "your editor's save failed" for
     /// "your colleague's edit vanished", and which of those is worse depends
@@ -63,6 +69,7 @@ impl Default for ClientOptions {
             pins: Vec::new(),
             dialer: None,
             no_server_defaults: false,
+            write_through: false,
             detect_conflicts: false,
             mount_root: None,
         }

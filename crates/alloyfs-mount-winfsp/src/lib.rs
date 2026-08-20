@@ -503,6 +503,18 @@ impl FileSystemContext for WinFspFs {
     }
 
     fn cleanup(&self, context: &FileContext, _file_name: Option<&U16CStr>, flags: u32) {
+        // Cleanup is where CloseHandle arrives; IRP_MJ_CLOSE — and with it
+        // `close()` below — can lag by MINUTES, because the memory manager
+        // keeps the file object alive after the last handle. A batched NEW
+        // file sealed only at close() therefore sealed far too late:
+        // measured on a real mount as acknowledged files that never reached
+        // the server until an unrelated fsync happened to drain the queue —
+        // while the age flusher spun over an empty queue, because unsealed
+        // files live on their handles, not in it. POSIX close semantics
+        // belong here.
+        if let Some(fh) = context.fh {
+            self.fs.seal_pending(fh);
+        }
         // Deletion is a three-stage dance on Windows: open -> set_delete (or
         // FILE_DELETE_ON_CLOSE) -> cleanup with FspCleanupDelete. Only now may
         // the file actually be removed. Cleanup cannot report failure.

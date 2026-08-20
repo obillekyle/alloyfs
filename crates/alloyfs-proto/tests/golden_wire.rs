@@ -6,8 +6,8 @@
 use std::time::{Duration, SystemTime};
 
 use alloyfs_proto::{
-    Attr, DirEntry, ErrorCode, EventKind, FileKind, Frame, FsEvent, LockKind, OpenFlags, RelPath, Request,
-    Response, TreeEntry, PROTO_VERSION_MAX, PROTO_VERSION_MIN,
+    Attr, DirEntry, ErrorCode, EventKind, FileKind, Frame, FsEvent, LockKind, ManyRemove, ManySetattr,
+    ManyWrite, OpenFlags, RelPath, Request, Response, TreeEntry, PROTO_VERSION_MAX, PROTO_VERSION_MIN,
 };
 use bytes::Bytes;
 
@@ -399,6 +399,45 @@ fn canonical() -> Vec<(&'static str, Frame)> {
                 tree_token: 0x0123_4567_89ab_cdef,
             }),
         ),
+        (
+            "req_write_many",
+            req(Request::WriteMany {
+                files: vec![ManyWrite {
+                    path: path(),
+                    mode: 0o666,
+                    data: bytes::Bytes::from_static(b"body"),
+                }],
+            }),
+        ),
+        (
+            "req_remove_many",
+            req(Request::RemoveMany {
+                entries: vec![ManyRemove {
+                    path: path(),
+                    dir: false,
+                }],
+            }),
+        ),
+        (
+            "req_setattr_many",
+            req(Request::SetattrMany {
+                entries: vec![ManySetattr {
+                    path: path(),
+                    size: Some(42),
+                    mtime: None,
+                    mode: None,
+                    readonly: Some(true),
+                }],
+            }),
+        ),
+        (
+            "resp_many_outcome",
+            ok(Response::ManyOutcome(vec![
+                Ok(Some(attr())),
+                Ok(None),
+                Err(ErrorCode::NotFound),
+            ])),
+        ),
         // --- every ErrorCode (as Err) ---
         ("err_not_found", err(ErrorCode::NotFound)),
         ("err_permission_denied", err(ErrorCode::PermissionDenied)),
@@ -489,6 +528,9 @@ fn _variant_tripwire(
         Request::OpenRead { .. } => {} // v9: golden added, PROTO_VERSION_MAX bumped
         Request::Setattr2 { .. } => {} // v9: golden added, PROTO_VERSION_MAX bumped
         Request::Attach2 { .. } => {} // v9: golden added, PROTO_VERSION_MAX bumped
+        Request::WriteMany { .. } => {} // v10: golden added, PROTO_VERSION_MAX bumped
+        Request::RemoveMany { .. } => {} // v10: golden added, PROTO_VERSION_MAX bumped
+        Request::SetattrMany { .. } => {} // v10: golden added, PROTO_VERSION_MAX bumped
     }
     match response {
         Response::AttachOk { .. } => {}
@@ -509,6 +551,7 @@ fn _variant_tripwire(
         Response::Many(..) => {}             // v8: golden added, PROTO_VERSION_MAX bumped
         Response::OpenedData { .. } => {}    // v9: golden added, PROTO_VERSION_MAX bumped
         Response::Attached2 { .. } => {}     // v9: golden added, PROTO_VERSION_MAX bumped
+        Response::ManyOutcome(..) => {}      // v10: golden added, PROTO_VERSION_MAX bumped
     }
     match code {
         ErrorCode::NotFound => {}
@@ -555,8 +598,8 @@ fn _variant_tripwire(
 /// `cargo test -p alloyfs-proto print_goldens -- --ignored --nocapture`
 #[rustfmt::skip]
 const GOLDEN: &[(&str, &str)] = &[
-    ("hello", "00010906676f6c64656e"),
-    ("hello_ack", "010906676f6c64656e"),
+    ("hello", "00010a06676f6c64656e"),
+    ("hello_ack", "010a06676f6c64656e"),
     ("ping", "0507"),
     ("pong", "0607"),
     ("compressed", "0706676f6c64656e"),
@@ -612,6 +655,10 @@ const GOLDEN: &[(&str, &str)] = &[
     ("req_attach2", "02071f04646f6373"),
     ("resp_opened_data", "0307001009002a80e2cfaa06bc99ef3a80e2cfaa06bc99ef3aa403080468656164"),
     ("resp_attached2", "0307001107002a80e2cfaa06bc99ef3a80e2cfaa06bc99ef3aa40308010c6e6f64655f6d6f64756c6573000180804000ef9bafcdf8acd19101"),
+    ("req_write_many", "020720010c6469722f66696c652e747874b60304626f6479"),
+    ("req_remove_many", "020721010c6469722f66696c652e74787400"),
+    ("req_setattr_many", "020722010c6469722f66696c652e747874012a00000101"),
+    ("resp_many_outcome", "03070012030001002a80e2cfaa06bc99ef3a80e2cfaa06bc99ef3aa4030800000100"),
     ("err_not_found", "03070100"),
     ("err_permission_denied", "03070101"),
     ("err_already_exists", "03070102"),

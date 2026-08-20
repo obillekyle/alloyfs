@@ -41,6 +41,8 @@ use attach::{build_auto_cache, build_overlay, negotiate_defaults, spawn_backgrou
 use lock_ranges::HeldRange;
 use warm::ListingPatch;
 
+use crate::batcher::{Batcher, PendingNew, PendingOp, PENDING_FILE_MAX};
+
 /// One directory's cached remote listing: (name, ino, attr) per entry.
 type DirListing = Vec<(String, u64, Attr)>;
 
@@ -93,6 +95,9 @@ pub(crate) struct OpenState {
     /// lock/flush with EIO — mutual exclusion may have been broken and the
     /// application must find out; release still works.
     pub poisoned: AtomicBool,
+    /// A batched NEW file still accumulating locally; None on every handle
+    /// the server knows about. See batcher.rs.
+    pub pending_new: Option<std::sync::Mutex<crate::batcher::PendingNew>>,
     /// Server version this handle last saw, for --detect-conflicts. Seeded at
     /// open, advanced by our own writes. 0 = unknown, which never conflicts:
     /// refusing a write because we never learned a version would be a bug
@@ -192,6 +197,10 @@ pub struct RemoteFs {
     /// cache. Combined with [`LAZY_FH_BIT`] so it cannot collide with a server
     /// handle or with the overlay's.
     next_lazy_fh: AtomicU64,
+    /// The v10 write batcher — `Some` when the session speaks v10 and the
+    /// mount did not opt out with `--write-through`. See batcher.rs for the
+    /// exact ack-early contract and its barriers.
+    pub(crate) batch: Option<Batcher>,
 }
 
 impl RemoteFs {
@@ -207,6 +216,7 @@ impl RemoteFs {
         export: &str,
         opts: ClientOptions,
     ) -> Result<Arc<Self>, FsError> {
+        let proto = conn.proto;
         // v9+: attach, mount defaults and the tree token arrive in ONE
         // exchange. The three used to be sequential round trips — attach,
         // then ask for defaults, then (in the walker) ask for the token —
@@ -279,6 +289,7 @@ impl RemoteFs {
             detect_conflicts: opts.detect_conflicts,
             mount_root: opts.mount_root.clone(),
             next_lazy_fh: AtomicU64::new(1),
+            batch: (proto >= 10 && !opts.write_through).then(Batcher::new),
         });
         spawn_background_tasks(&fs, fetch_rx);
         Ok(fs)
@@ -286,6 +297,8 @@ impl RemoteFs {
 
     /// Clean shutdown: persist the cache manifest. Call after unmount.
     pub fn shutdown(&self) {
+        // Unmount is the last barrier there will ever be.
+        self.flush_batch();
         if let Some(cache) = &self.cache {
             cache.flush_manifest();
             let (n, bytes) = cache.stats();
@@ -633,6 +646,12 @@ impl RemoteFs {
         if self.is_overlay(&path) {
             return self.overlay_ref().open(&path, flags);
         }
+        // A path the batcher still owes the server has no remote truth to
+        // open yet; the queue lands first, and its failures surface here
+        // rather than as a mystery later.
+        if self.batch.as_ref().is_some_and(|b| b.involves(&path)) {
+            self.barrier_for(&path)?;
+        }
         // Read-only, and the cache already holds this file at the version the
         // last listing reported? Then the server has nothing to add. Skipping
         // the round trip here is what makes browsing a remote tree bearable:
@@ -664,6 +683,7 @@ impl RemoteFs {
                             ra: ReadAhead::new(),
                             lock: std::sync::Mutex::new(Vec::new()),
                             poisoned: AtomicBool::new(false),
+                            pending_new: None,
                             version: AtomicU64::new(attr.version),
                         },
                     );
@@ -719,6 +739,7 @@ impl RemoteFs {
                 ra,
                 lock: std::sync::Mutex::new(Vec::new()),
                 poisoned: AtomicBool::new(false),
+                pending_new: None,
                 version: AtomicU64::new(attr.version),
             },
         );
@@ -741,11 +762,106 @@ impl RemoteFs {
         }
     }
 
+    /// A pending NEW file outgrew the batcher — a non-sequential write, or
+    /// size past the cap. Everything queued before it flushes first (order),
+    /// then the file takes the classic path: a server create, the buffered
+    /// bytes pushed through ordinary writes, and the handle rebound to the
+    /// server's. Write-through resumes for this fh from here.
+    fn materialize_pending(&self, fh: u64) -> Result<(), FsError> {
+        self.flush_batch();
+        let (path, buf, mode, cancelled) = {
+            let Some(mut e) = self.open_files.get_mut(&fh) else {
+                return Err(ErrorCode::BadHandle.into());
+            };
+            let Some(pending) = e.pending_new.take() else {
+                return Ok(());
+            };
+            let p = pending.into_inner().unwrap();
+            (e.path.clone(), p.data, p.mode, p.cancelled)
+        };
+        if cancelled {
+            // Unlinked while open, then written past the cap: the data has
+            // nowhere durable to go — POSIX would keep it in the dead inode,
+            // which this client cannot fabricate remotely. EIO over silence.
+            return Err(ErrorCode::Io.into());
+        }
+        if let Some(batch) = &self.batch {
+            batch.forget(&path);
+        }
+        let (sfh, _attr) = expect_resp!(
+            self.call(Request::Create {
+                path: path.clone(),
+                flags: OpenFlags {
+                    read: true,
+                    write: true,
+                    ..OpenFlags::default()
+                },
+                mode,
+            })?,
+            Response::Opened { fh, attr } => (fh, attr)
+        );
+        let mut off = 0u64;
+        for chunk in buf.chunks(DATA_CHUNK as usize) {
+            expect_resp!(
+                self.call(Request::Write {
+                    fh: sfh,
+                    offset: off,
+                    data: Bytes::copy_from_slice(chunk),
+                    expect_version: None,
+                })?,
+                Response::Written { .. } | Response::WrittenAttr { .. } => ()
+            );
+            off += chunk.len() as u64;
+        }
+        if let Some(e) = self.open_files.get(&fh) {
+            e.server_fh.store(sfh, Ordering::Release);
+        }
+        Ok(())
+    }
+
+    /// Seal a pending NEW file into the batcher queue, leaving the handle
+    /// alive. Returns the path when something was sealed. Shared by release
+    /// (which then drops the handle) and fsync (which then barriers).
+    pub fn seal_pending(&self, fh: u64) -> Option<RelPath> {
+        let mut e = self.open_files.get_mut(&fh)?;
+        let pending = e.pending_new.take()?;
+        let path = e.path.clone();
+        drop(e);
+        let p = pending.into_inner().unwrap();
+        if p.cancelled {
+            if let Some(b) = &self.batch {
+                b.forget(&path);
+            }
+            return None;
+        }
+        let batch = self.batch.as_ref()?;
+        batch.push(PendingOp::Write {
+            path: path.clone(),
+            mode: p.mode,
+            data: p.data,
+        });
+        // Queued claim taken; the unsealed one retires.
+        batch.forget(&path);
+        if batch.wants_flush() {
+            self.flush_batch();
+        }
+        Some(path)
+    }
+
     pub fn read(&self, fh: u64, offset: u64, size: u32) -> Result<Vec<u8>, FsError> {
         if fh & OVERLAY_FH_BIT != 0 {
             return self.overlay_ref().read(fh, offset, size);
         }
         self.check_poisoned(fh)?;
+        // A pending NEW file's truth is its local buffer.
+        if let Some(state) = self.open_files.get(&fh) {
+            if let Some(pending) = &state.pending_new {
+                let p = pending.lock().unwrap();
+                let start = (offset as usize).min(p.data.len());
+                let end = (offset.saturating_add(size as u64) as usize).min(p.data.len());
+                return Ok(p.data[start..end].to_vec());
+            }
+        }
         // Auto-cache fast path: serve from the local blob when fresh.
         if let (Some(cache), Some(state)) = (&self.cache, self.open_files.get(&fh)) {
             if state.cache_ok.load(Ordering::Relaxed) {
@@ -939,6 +1055,48 @@ impl RemoteFs {
             return self.overlay_ref().write(fh, offset, data).map(|n| (n, None));
         }
         self.check_poisoned(fh)?;
+        // A pending NEW file accumulates locally while the writes stay
+        // sequential and small; the first write that breaks either rule
+        // materializes it onto the classic path below.
+        if let Some(state) = self.open_files.get(&fh) {
+            if let Some(pending) = &state.pending_new {
+                let appended = {
+                    let mut p = pending.lock().unwrap();
+                    if offset as usize == p.data.len() && p.data.len() + data.len() <= PENDING_FILE_MAX {
+                        p.data.extend_from_slice(data);
+                        Some(p.data.len() as u64)
+                    } else {
+                        None
+                    }
+                };
+                let path = state.path.clone();
+                drop(state);
+                match appended {
+                    Some(size) => {
+                        let ino = self.ino.ino_of(&path);
+                        let now = std::time::SystemTime::now();
+                        let base = ino.and_then(|i| self.cached_attr_fresh(i));
+                        let attr = Attr {
+                            size,
+                            mtime: now,
+                            ..base.unwrap_or(Attr {
+                                kind: alloyfs_proto::FileKind::File,
+                                size,
+                                mtime: now,
+                                ctime: now,
+                                mode: 0o666,
+                                version: 0,
+                            })
+                        };
+                        if let Some(ino) = ino {
+                            self.cache_attr(ino, attr);
+                        }
+                        return Ok((data.len() as u32, Some(attr)));
+                    }
+                    None => self.materialize_pending(fh)?,
+                }
+            }
+        }
         let server_fh = self.server_fh_for_io(fh)?;
         // The version this write is allowed to overwrite. `None` when the flag
         // is off (the server then never checks) or when we never learned one.
@@ -1037,6 +1195,89 @@ impl RemoteFs {
         Ok((data.len() as u32, fresh))
     }
 
+    /// Drain the write batcher to the server and apply every outcome:
+    /// server attrs re-patch what the optimistic ack guessed, refusals
+    /// restore the caches to the server's truth and land in the damage
+    /// ledger. No-op without a batcher or with an empty queue.
+    pub(crate) fn flush_batch(&self) {
+        let Some(batch) = &self.batch else { return };
+        if batch.is_empty() {
+            return;
+        }
+        batch.flush_with(
+            |req| match self.call(req) {
+                Ok(resp) => Ok(resp),
+                Err(FsError::Remote(code)) => Err(code),
+                Err(FsError::Transport(_)) => Err(ErrorCode::Io),
+            },
+            |op, outcome, last| match (op, outcome) {
+                // Patch only as the path's LAST claim: an older write's attrs
+                // landing over a newer acknowledged remove re-inserted files
+                // the application had deleted (measured — see flush_with).
+                (PendingOp::Write { path, .. }, Ok(Some(attr))) if last => {
+                    let ino = self.ino.get_or_alloc(path.clone());
+                    self.patch_parent_dir(path, ListingPatch::Upsert(ino, *attr));
+                    self.cache_attr(ino, *attr);
+                }
+                (PendingOp::Write { .. }, Ok(_)) => {} // superseded by a newer op
+                (PendingOp::Remove { .. }, Ok(_)) => {} // patched at enqueue
+                (PendingOp::Write { path, .. }, Err(_)) | (PendingOp::Remove { path, .. }, Err(_)) => {
+                    if last {
+                        // The optimistic ack promised something the server
+                        // refused: the caches stop vouching for this path.
+                        // With a NEWER op still queued, its settle decides
+                        // instead — this outcome is already history.
+                        self.invalidate_parent_dir(path);
+                        if let Some(ino) = self.ino.ino_of(path) {
+                            self.invalidate_attr(ino);
+                        }
+                    }
+                }
+            },
+        );
+    }
+
+    /// Flush the batcher and report what broke for `path` — the fsync
+    /// promise: returning Ok means the server has everything this path was
+    /// ever acknowledged for.
+    pub(crate) fn barrier_for(&self, path: &RelPath) -> Result<(), FsError> {
+        let Some(batch) = &self.batch else {
+            return Ok(());
+        };
+        self.flush_batch();
+        match batch.take_damage(path) {
+            Some(code) => Err(code.into()),
+            None => Ok(()),
+        }
+    }
+
+    /// Does a COMPLETE cached listing of `dir` decide whether `name` exists?
+    /// `None` when no listing can vouch — the caller must ask the server.
+    fn knows_child_exists(&self, parent: u64, dir: &RelPath, name: &str) -> Option<bool> {
+        if let Some(hit) = self.dir_cache.get(&parent) {
+            let (entries, when) = &*hit;
+            if when.elapsed() < self.dir_ttl() {
+                return Some(entries.iter().any(|(n, _, _)| n == name));
+            }
+        }
+        self.warm.get(dir).map(|w| w.iter().any(|(n, _)| n == name))
+    }
+
+    /// Does a COMPLETE cached listing prove `dir` is empty? Removing a
+    /// directory optimistically is only honest when the server could not
+    /// answer NotEmpty.
+    fn knows_dir_empty(&self, path: &RelPath) -> bool {
+        if let Some(ino) = self.ino.ino_of(path) {
+            if let Some(hit) = self.dir_cache.get(&ino) {
+                let (entries, when) = &*hit;
+                if when.elapsed() < self.dir_ttl() {
+                    return entries.is_empty();
+                }
+            }
+        }
+        self.warm.get(path).map(|w| w.is_empty()).unwrap_or(false)
+    }
+
     pub fn create(
         &self,
         parent: u64,
@@ -1050,6 +1291,56 @@ impl RemoteFs {
             let (fh, attr) = self.overlay_ref().create(&path, flags, mode)?;
             let ino = self.ino.get_or_alloc(path);
             return Ok((ino, fh, attr));
+        }
+        // The batched fast path: a NEW file acknowledged locally, its bytes
+        // headed for one WriteMany entry at release. Engaged only when a
+        // COMPLETE cached listing can answer the existence question the
+        // server would have — deciding excl on a guess would invent files.
+        if let Some(batch) = &self.batch {
+            match self.knows_child_exists(parent, &dir, name) {
+                Some(true) if flags.excl => return Err(ErrorCode::AlreadyExists.into()),
+                Some(false) => {
+                    let now = std::time::SystemTime::now();
+                    let attr = Attr {
+                        kind: alloyfs_proto::FileKind::File,
+                        size: 0,
+                        mtime: now,
+                        ctime: now,
+                        mode,
+                        version: 0,
+                    };
+                    let ino = self.ino.get_or_alloc(path.clone());
+                    // Claim before patch, for the same settle race remove()
+                    // documents.
+                    batch.pending_open(&path);
+                    self.patch_parent_dir(&path, ListingPatch::Upsert(ino, attr));
+                    self.cache_attr(ino, attr);
+                    let fh = LAZY_FH_BIT | self.next_lazy_fh.fetch_add(1, Ordering::Relaxed);
+                    self.open_files.insert(
+                        fh,
+                        OpenState {
+                            path,
+                            flags,
+                            server_fh: AtomicU64::new(NO_SERVER_FH),
+                            cache_ok: AtomicBool::new(false),
+                            wrote: AtomicBool::new(true),
+                            ra: ReadAhead::new(),
+                            lock: std::sync::Mutex::new(Vec::new()),
+                            poisoned: AtomicBool::new(false),
+                            pending_new: Some(std::sync::Mutex::new(PendingNew {
+                                data: Vec::new(),
+                                mode,
+                                cancelled: false,
+                            })),
+                            version: AtomicU64::new(0),
+                        },
+                    );
+                    return Ok((ino, fh, attr));
+                }
+                // Exists (without excl) or unknowable: the classic exchange
+                // below answers both correctly.
+                _ => {}
+            }
         }
         let (fh, attr) = expect_resp!(
             self.call(Request::Create { path: path.clone(), flags, mode })?,
@@ -1073,6 +1364,7 @@ impl RemoteFs {
                 ra: ReadAhead::new(),
                 lock: std::sync::Mutex::new(Vec::new()),
                 poisoned: AtomicBool::new(false),
+                pending_new: None,
                 version: AtomicU64::new(attr.version),
             },
         );
@@ -1091,6 +1383,11 @@ impl RemoteFs {
         let ino = self.ino.get_or_alloc(path.clone());
         self.patch_parent_dir(&path, ListingPatch::Upsert(ino, attr));
         self.cache_attr(ino, attr);
+        // A just-created directory is COMPLETE and empty — seed that listing,
+        // because completeness is what lets a create burst into the new
+        // directory answer its own existence probes (and take the batched
+        // path) without a wire readdir first.
+        self.dir_cache.insert(ino, (Vec::new(), Instant::now()));
         Ok((ino, attr))
     }
 
@@ -1111,6 +1408,59 @@ impl RemoteFs {
             } else {
                 self.overlay_ref().unlink(&path)
             };
+        }
+        // The batched fast path: a removal a complete listing can vouch for
+        // acknowledges locally and rides RemoveMany. Directories need their
+        // own emptiness proven too, or the server's NotEmpty would arrive
+        // after this ack already said gone.
+        if let Some(batch) = &self.batch {
+            if self.knows_child_exists(parent, &parent_path, name) == Some(true)
+                && (!dir || self.knows_dir_empty(&path))
+            {
+                // A pending-new handle on this path dies with the name: its
+                // release must enqueue nothing (the server never heard of
+                // the file), and if nothing was ever queued for it, neither
+                // is this removal.
+                let mut never_reached_server = false;
+                for e in self.open_files.iter() {
+                    if e.path == path {
+                        if let Some(p) = &e.pending_new {
+                            p.lock().unwrap().cancelled = true;
+                            never_reached_server = true;
+                        }
+                    }
+                }
+                if never_reached_server {
+                    batch.forget(&path);
+                }
+                // Claim BEFORE patch: a concurrent flush settling this
+                // path's older write computes "am I the last claim" — if the
+                // local patch lands in the gap before the claim registers,
+                // that settle answers yes and resurrects the entry this
+                // removal just erased. Measured as sporadic AlreadyExists on
+                // recreates under the age flusher. A file created and deleted
+                // entirely inside the ack window enqueues nothing: the server
+                // owes nothing and hears nothing.
+                let enqueue = !(never_reached_server && batch.queued_count(&path) == 0);
+                if enqueue {
+                    batch.push(PendingOp::Remove {
+                        path: path.clone(),
+                        dir,
+                    });
+                }
+                self.patch_parent_dir(&path, ListingPatch::Remove);
+                self.bust_warm(&path);
+                if let Some(ino) = self.ino.ino_of(&path) {
+                    self.invalidate_attr(ino);
+                }
+                if let Some(cache) = &self.cache {
+                    cache.remove(&path);
+                }
+                if enqueue && batch.wants_flush() {
+                    self.flush_batch();
+                }
+                return Ok(());
+            }
         }
         let req = if dir {
             Request::Rmdir { path: path.clone() }
@@ -1142,6 +1492,13 @@ impl RemoteFs {
     ) -> Result<(), FsError> {
         let from = self.path_of(parent)?.join(name);
         let to = self.path_of(newparent)?.join(newname);
+        // A rename can touch names whose truth is still queued; ordering
+        // requires the queue lands first, and any damage on either endpoint
+        // belongs to this operation.
+        if self.batch.is_some() {
+            self.barrier_for(&from)?;
+            self.barrier_for(&to)?;
+        }
         match (self.is_overlay(&from), self.is_overlay(&to)) {
             (true, true) => {
                 self.overlay_ref().rename(&from, &to, replace)?;
@@ -1381,6 +1738,22 @@ impl RemoteFs {
             return self.overlay_ref().flush(fh);
         }
         self.check_poisoned(fh)?;
+        // fsync's promise is server-side bytes. A pending file seals and
+        // goes out NOW; any batched history on this path drains; and what
+        // broke for this path is THIS call's error — an Ok from here means
+        // the server has everything this path was ever acknowledged for.
+        if let Some(state) = self.open_files.get(&fh) {
+            let pending = state.pending_new.is_some();
+            let path = state.path.clone();
+            drop(state);
+            if pending {
+                self.seal_pending(fh);
+                return self.barrier_for(&path);
+            }
+            if self.batch.as_ref().is_some_and(|b| b.involves(&path)) {
+                self.barrier_for(&path)?;
+            }
+        }
         let server_fh = self.server_fh_for_io(fh)?;
         expect_resp!(self.call(Request::Flush { fh: server_fh })?, Response::Ok => ());
         Ok(())
@@ -1389,6 +1762,13 @@ impl RemoteFs {
     pub fn release(&self, fh: u64) {
         if fh & OVERLAY_FH_BIT != 0 {
             self.overlay_ref().release(fh);
+            return;
+        }
+        // A pending NEW file's close is where its one WriteMany entry is
+        // born. The server never knew this handle, so nothing else releases.
+        if self.open_files.get(&fh).is_some_and(|e| e.pending_new.is_some()) {
+            self.seal_pending(fh);
+            self.open_files.remove(&fh);
             return;
         }
         let server_fh = self.server_fh(fh);
