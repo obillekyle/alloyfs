@@ -2801,6 +2801,88 @@ async fn a_healthy_pump_extends_the_attr_ttl_and_no_pump_does_not() {
     );
 }
 
+/// A create burst answers its own existence probes locally.
+///
+/// The Windows mount probes before every create (`get_security_by_name`,
+/// then the create proper), and the probe of a MISSING name is only local
+/// while a complete parent listing is cached. Invalidation-on-create threw
+/// that listing away, so every create after the first paid a wire round
+/// trip re-learning that the name it was about to create did not exist —
+/// measured on a ~93 ms-RTT link as a third of the entire cost of writing
+/// small files (probe + create + write). Patching the listing with the
+/// reply's own attrs keeps it complete instead; this pins the request
+/// count: create + write per file, probes and releases local.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_create_burst_answers_its_own_negative_probes_locally() {
+    let agent = start_agent(AgentOpts::default());
+    let s = connect(&agent, ClientOptions::default()).await;
+    // Prime a COMPLETE root listing; the burst has to keep it serviceable.
+    on_fs(&s.fs, |fs| fs.readdir(ROOT_INO)).await.unwrap();
+
+    let before = s.conn().requests_sent();
+    for i in 0..10 {
+        let name = format!("w{i}.bin");
+        on_fs(&s.fs, move |fs| {
+            // The mount's sequence: probe, then create, then write.
+            let probe = fs.lookup(ROOT_INO, &name);
+            assert!(probe.is_err(), "{name} must not exist yet: {probe:?}");
+            let excl = OpenFlags {
+                read: true,
+                write: true,
+                excl: true,
+                ..OpenFlags::default()
+            };
+            let (_ino, fh, _attr) = fs.create(ROOT_INO, &name, 0o666, excl)?;
+            fs.write_at(fh, 0, b"payload-8k-stand-in")?;
+            fs.release(fh);
+            Ok::<_, alloyfs_client::FsError>(())
+        })
+        .await
+        .unwrap();
+    }
+    let after = s.conn().requests_sent();
+    let spent = after - before;
+    // 3 per file: create + write, which block, and the release ONEWAY, which
+    // is counted by requests_sent but never waits. Before listings were
+    // patched this measured 39 — the same three plus a remote negative probe
+    // per file after the first (whose probe hit the still-intact priming).
+    assert!(
+        spent <= 30,
+        "a 10-file create burst cost {spent} wire requests — the negative \
+         probes went remote, so the listing was dropped instead of patched"
+    );
+
+    // The patched listing must still be TRUTHFUL, not merely present: every
+    // created file listed, positive lookups local, and a re-listing agrees.
+    let entries = on_fs(&s.fs, |fs| fs.readdir(ROOT_INO)).await.unwrap();
+    for i in 0..10 {
+        let name = format!("w{i}.bin");
+        assert!(
+            entries.iter().any(|(n, _, _)| *n == name),
+            "{name} missing from the patched listing"
+        );
+    }
+
+    // ...and deletes patch the same way: burst-remove, probes stay local.
+    let before = s.conn().requests_sent();
+    for i in 0..10 {
+        let name = format!("w{i}.bin");
+        on_fs(&s.fs, move |fs| fs.unlink(ROOT_INO, &name)).await.unwrap();
+    }
+    let after = s.conn().requests_sent();
+    let spent = after - before;
+    assert!(
+        spent <= 10,
+        "a 10-file delete burst cost {spent} wire requests — removals must \
+         patch the listing, not drop it"
+    );
+    let entries = on_fs(&s.fs, |fs| fs.readdir(ROOT_INO)).await.unwrap();
+    assert!(
+        !entries.iter().any(|(n, _, _)| n.starts_with("w")),
+        "deleted files still listed: {entries:?}"
+    );
+}
+
 // ------------------------------------------------------------- v9 round trips
 
 /// One exchange opens a small file AND leaves its head where the first read

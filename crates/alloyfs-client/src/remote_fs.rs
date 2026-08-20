@@ -39,6 +39,7 @@ mod warm;
 
 use attach::{build_auto_cache, build_overlay, negotiate_defaults, spawn_background_tasks, Negotiated};
 use lock_ranges::HeldRange;
+use warm::ListingPatch;
 
 /// One directory's cached remote listing: (name, ino, attr) per entry.
 type DirListing = Vec<(String, u64, Attr)>;
@@ -1017,7 +1018,10 @@ impl RemoteFs {
         // self-origin), so cache coherence is synchronous, right here.
         if let Some(state) = self.open_files.get(&fh) {
             state.wrote.store(true, Ordering::Relaxed);
-            self.mark_path_written(&state.path);
+            self.mark_path_written(
+                &state.path,
+                fresh.zip(self.ino.ino_of(&state.path)).map(|(a, i)| (i, a)),
+            );
             // Size, mtime and version all just changed. With the reply
             // carrying them the cached attr is REPLACED rather than dropped,
             // and the next stat of this file — which every mount does
@@ -1051,10 +1055,12 @@ impl RemoteFs {
             self.call(Request::Create { path: path.clone(), flags, mode })?,
             Response::Opened { fh, attr } => (fh, attr)
         );
-        // Self-origin events are stripped server-side, so the pump will never
-        // tell us about our own create — the listing has to be busted here.
-        self.invalidate_parent_dir(&path);
         let ino = self.ino.get_or_alloc(path.clone());
+        // Self-origin events are stripped server-side, so the pump will never
+        // tell us about our own create — the listing is corrected here, with
+        // the reply's own attributes. Patched rather than busted: the next
+        // create's existence probe stays local (see patch_parent_dir).
+        self.patch_parent_dir(&path, ListingPatch::Upsert(ino, attr));
         self.cache_attr(ino, attr);
         self.open_files.insert(
             fh,
@@ -1082,8 +1088,8 @@ impl RemoteFs {
             return Ok((ino, attr));
         }
         let attr = expect_resp!(self.call(Request::Mkdir { path: path.clone(), mode })?, Response::Attr(attr) => attr);
-        self.invalidate_parent_dir(&path);
-        let ino = self.ino.get_or_alloc(path);
+        let ino = self.ino.get_or_alloc(path.clone());
+        self.patch_parent_dir(&path, ListingPatch::Upsert(ino, attr));
         self.cache_attr(ino, attr);
         Ok((ino, attr))
     }
@@ -1112,7 +1118,7 @@ impl RemoteFs {
             Request::Unlink { path: path.clone() }
         };
         expect_resp!(self.call(req)?, Response::Ok => ());
-        self.invalidate_parent_dir(&path);
+        self.patch_parent_dir(&path, ListingPatch::Remove);
         // A removed DIRECTORY's own warm listing has to go too: the path can
         // be re-created, and get_or_alloc would hand the new directory its
         // predecessor's listing. (No-op for files — they never key the map.)
@@ -1244,11 +1250,13 @@ impl RemoteFs {
         attr: Attr,
     ) -> Result<Attr, FsError> {
         // The parent's cached listing carries this entry's attributes; an
-        // explicit metadata change would otherwise show stale there for a TTL.
-        self.invalidate_parent_dir(path);
+        // explicit metadata change is patched into it from the reply.
+        self.patch_parent_dir(path, ListingPatch::Upsert(ino, attr));
         self.cache_attr(ino, attr);
         if size.is_some() {
-            self.mark_path_written(path);
+            // The patch above already corrected the listings; passing the
+            // attrs again keeps this from busting the warm tier it fixed.
+            self.mark_path_written(path, Some((ino, attr)));
         }
         Ok(attr)
     }
@@ -1265,8 +1273,8 @@ impl RemoteFs {
             }
             (false, false) => {
                 let attr = expect_resp!(self.call(Request::Link { target, link: link.clone() })?, Response::Attr(attr) => attr);
-                self.invalidate_parent_dir(&link);
-                let ino = self.ino.get_or_alloc(link);
+                let ino = self.ino.get_or_alloc(link.clone());
+                self.patch_parent_dir(&link, ListingPatch::Upsert(ino, attr));
                 self.cache_attr(ino, attr);
                 Ok((ino, attr))
             }
@@ -1326,8 +1334,8 @@ impl RemoteFs {
             })?,
             Response::Attr(attr) => attr
         );
-        self.invalidate_parent_dir(&link);
-        let ino = self.ino.get_or_alloc(link);
+        let ino = self.ino.get_or_alloc(link.clone());
+        self.patch_parent_dir(&link, ListingPatch::Upsert(ino, attr));
         self.cache_attr(ino, attr);
         Ok((ino, attr))
     }
