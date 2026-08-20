@@ -78,22 +78,31 @@ pub(crate) fn spawn(
         // (`seq`) restarts and cannot speak for a cache written by an earlier
         // mount. See the `Manifest` field comment.
         let saved_token = cache.saved_tree_token();
+        // Attach2 (v9+) already carried the token; spend it instead of
+        // asking again — take-once, so any LATER check in this task's
+        // lifetime goes back to the wire rather than trusting a value that
+        // only described the export as of attach. Taken up front because BOTH
+        // paths below want it: the skip check, and the metadata salvage on
+        // the walking path.
+        let attach_token = fs.attach_tree_token.swap(0, std::sync::atomic::Ordering::AcqRel);
+        // The export's token as of now, learned as cheaply as possible; 0
+        // while unknown. The skip check fills it from the wire when attach
+        // did not carry one.
+        let mut current_token = attach_token;
         if saved_token != 0 {
             // Captured BEFORE the token is asked for: the snapshot install
             // below must not land listings from before an invalidation that
             // happened while the answer was in flight — the same in-flight
             // re-install bug the dir_epoch guard closed for readdir.
             let warm_epoch = fs.warm_epoch_now();
-            // Attach2 (v9+) already carried the token; spend it instead of
-            // asking again — take-once, so any LATER check in this task's
-            // lifetime goes back to the wire rather than trusting a value
-            // that only described the export as of attach.
-            let attach_token = fs.attach_tree_token.swap(0, std::sync::atomic::Ordering::AcqRel);
-            let current = if attach_token != 0 {
-                Ok(Ok(Response::TreeToken { token: attach_token }))
+            let current = if current_token != 0 {
+                Ok(Ok(Response::TreeToken { token: current_token }))
             } else {
                 fs.conn().request(Request::TreeToken).await
             };
+            if let Ok(Ok(Response::TreeToken { token })) = &current {
+                current_token = *token;
+            }
             match current {
                 Ok(Ok(Response::TreeToken { token })) if token == saved_token => {
                     cache.note_walk_skipped();
@@ -137,13 +146,42 @@ pub(crate) fn spawn(
             }
         }
 
-        // Discovery is happening, so whatever metadata snapshot is on disk
-        // describes an export state this pass cannot vouch for — the token
-        // either moved, was never recorded, or could not be asked. Delete it
-        // now; a fresh one is written below only if this pass completes.
+        // Discovery is happening — but the metadata snapshot may still be
+        // salvageable. The manifest token (blob completeness) and the
+        // snapshot token (metadata completeness) are separate claims: the
+        // loader zeroes the MANIFEST token when a blob is missing or the
+        // budget evicts, and that is a statement about bytes, not listings.
+        // If the export's current token still equals the snapshot's, the
+        // listings are as token-proven as they ever were — adopt them, serve
+        // the first navigation warm, and let the walk below refill only the
+        // blobs. `adopt_meta_snapshot` discards on any mismatch, so the one
+        // call is both the salvage and the cleanup; when no current token is
+        // in hand (a pre-v9 agent with no saved manifest token), the snapshot
+        // is deleted unproven, exactly as before.
         {
             let stale = fs.clone();
-            let _ = tokio::task::spawn_blocking(move || stale.discard_meta_snapshot()).await;
+            let token = current_token;
+            let salvaged = tokio::task::spawn_blocking(move || {
+                if token != 0 {
+                    let epoch = stale.warm_epoch_now();
+                    let warmed = stale.adopt_meta_snapshot(token, epoch);
+                    if warmed == 0 {
+                        stale.discard_meta_snapshot();
+                    }
+                    warmed
+                } else {
+                    stale.discard_meta_snapshot();
+                    0
+                }
+            })
+            .await
+            .unwrap_or(0);
+            if salvaged > 0 {
+                tracing::info!(
+                    warmed_dirs = salvaged,
+                    "metadata adopted despite incomplete blobs; walking to refill content"
+                );
+            }
         }
 
         // One exchange instead of one per directory, where the agent can. The
@@ -319,7 +357,23 @@ pub(crate) fn spawn(
             // listings to install); this order is warm as well.
             if let Some(snap) = meta_snapshot.take() {
                 let snap_fs = fs.clone();
-                let _ = tokio::task::spawn_blocking(move || snap_fs.save_meta_snapshot(&snap)).await;
+                let token = complete_at_token;
+                let warmed = tokio::task::spawn_blocking(move || {
+                    snap_fs.save_meta_snapshot(&snap);
+                    // The FIRST mount deserves the warm tier too, not only the
+                    // remount that skips: the listings were just proven at
+                    // this token, and without this the mount that did all the
+                    // work navigates cold while the next one navigates warm.
+                    // The epoch is captured after the save — any event landing
+                    // in between bumps it and the install refuses, same guard,
+                    // same safe direction (a skipped install costs a cold
+                    // lookup; a stale one lies).
+                    let epoch = snap_fs.warm_epoch_now();
+                    snap_fs.adopt_meta_snapshot(token, epoch)
+                })
+                .await
+                .unwrap_or(0);
+                tracing::debug!(warmed_dirs = warmed, "fresh snapshot adopted for this mount");
             }
         }
         let (entries, bytes) = cache.stats();

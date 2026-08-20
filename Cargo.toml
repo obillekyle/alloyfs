@@ -78,6 +78,16 @@ winfsp = { version = "0.13.0", default-features = false, features = ["system", "
 [patch.crates-io]
 winfsp-sys = { path = "vendor/winfsp-sys" }
 
+# Dev builds carry line tables only, not full DWARF. Backtraces and panics
+# keep their file:line; what goes is variable-level debugger info — and with
+# it most of the target directory. Full debuginfo grew target/debug past
+# 35 GB in a day of test runs, and twice filled this disk to ZERO mid-link,
+# which surfaces as bare `exit 101` linker deaths with no diagnostic (they
+# read exactly like OOM on a 2-core box). Set `debug = 2` locally when a
+# debugger session actually needs variables.
+[profile.dev]
+debug = "line-tables-only"
+
 # Final binaries: strip debug symbols. LTO is deliberately OFF: with
 # lto = "thin", reads through a mounted drive hang hard in kernel waits,
 # while debug and non-LTO release are both fine. Bisected by toggling

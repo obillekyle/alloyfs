@@ -2586,13 +2586,23 @@ async fn a_changed_export_discards_the_snapshot_rather_than_serving_it() {
     })
     .await;
     assert!(!s2.fs.auto_cache_walk_skipped());
-    // ...and nothing was installed from the stale snapshot. Zero is the whole
-    // assertion: had the old listings been adopted, `a/deep`'s COMPLETE
-    // listing would answer a hard NotFound for four.txt.
-    assert_eq!(s2.fs.warm_dirs(), 0, "stale metadata must not be installed");
+    // ...and whatever warm listings exist are FRESH, never the stale
+    // snapshot's. `warm_dirs == 0` used to be the proxy for that, back when
+    // only the skip path installed metadata; a completed walk now adopts its
+    // own snapshot (first-mount warmth), so a nonzero count is expected and
+    // correct. The intent survives as a sharper assertion: a stale `a/deep`
+    // listing is COMPLETE and would answer a hard NotFound for four.txt, so
+    // resolving the new file THROUGH the warm tier is the proof. Wait for the
+    // walk's self-adoption, then sever so nothing can be answered by wire.
+    wait_until("the walk adopted its own fresh snapshot", 15, {
+        let fs = s2.fs.clone();
+        move || (fs.warm_dirs() > 0).then_some(())
+    })
+    .await;
+    s2.sever();
     let (_, attr) = lookup_path(&s2.fs, "a/deep/four.txt")
         .await
-        .expect("the new file resolves");
+        .expect("the new file resolves from FRESH warm metadata, wire severed");
     assert_eq!(attr.size, 9);
 
     // The walk rewrote the snapshot at the new token; snapshot-exists implies
@@ -2804,4 +2814,177 @@ async fn setattr_readonly_resolves_against_the_current_mode() {
         "clearing readonly restored owner-write: {:o}",
         b.mode
     );
+}
+
+/// The FIRST mount navigates warm too — not only the remount that skips.
+///
+/// The walk just proved every listing at the pass's token, so the mount that
+/// did the work should benefit from it. Proof by severing: after the walk
+/// completes, lookup + readdir of a nested path answer with the wire gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_first_mount_navigates_warm_after_its_walk() {
+    let agent = start_agent(AgentOpts::default());
+    let names = nested_export(&agent);
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let s = connect(&agent, cache_opts(&data_dir)).await;
+    expect_all_cached(&data_dir, &names, "first mount cached every file").await;
+    wait_until("first mount adopted its own snapshot", 10, {
+        let fs = s.fs.clone();
+        move || (fs.warm_dirs() > 0).then_some(())
+    })
+    .await;
+
+    s.sever();
+    let (ino, _) = lookup_path(&s.fs, "a/deep/three.txt").await.unwrap();
+    let attr = on_fs(&s.fs, move |fs| fs.getattr(ino)).await;
+    assert!(
+        attr.is_ok(),
+        "warm metadata should answer with the wire severed: {attr:?}"
+    );
+}
+
+/// Missing blobs do not cost the metadata. The loader zeroes the MANIFEST
+/// token when a blob is gone — a statement about bytes — but the snapshot's
+/// listings are still token-proven if the export has not moved: the remount
+/// walks to refill content while its first navigation stays warm.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn incomplete_blobs_still_adopt_matching_metadata() {
+    let agent = start_agent(AgentOpts::default());
+    let names = nested_export(&agent);
+    let data_dir = tempfile::TempDir::new().unwrap();
+    {
+        let s = connect(&agent, cache_opts(&data_dir)).await;
+        expect_all_cached(&data_dir, &names, "first mount cached every file").await;
+        on_fs(&s.fs, |fs| fs.shutdown()).await;
+    }
+
+    // Lose one blob — the crash-recovery case the loader's token-zeroing
+    // exists for. The manifest token goes 0 at the next load; the snapshot
+    // stays, and its token still matches the (unchanged) export.
+    let victim = data_dir.path().join("cache").join("t").join("a/one.txt");
+    std::fs::remove_file(&victim).unwrap();
+
+    let s2 = connect(&agent, cache_opts(&data_dir)).await;
+    // The walk must run (blob refilled)...
+    let refill = data_dir.path().join("cache").join("t").join("a/one.txt");
+    wait_until("the walk refilled the lost blob", 15, move || {
+        (std::fs::read(&refill).ok()? == b"content-1").then_some(())
+    })
+    .await;
+    assert!(
+        !s2.fs.auto_cache_walk_skipped(),
+        "a zeroed manifest token must not skip the walk"
+    );
+    // ...while the metadata was adopted rather than discarded.
+    assert!(
+        s2.fs.warm_dirs() > 0,
+        "matching metadata should have been salvaged despite the lost blob"
+    );
+}
+
+// ----------------------------------------------------------- lazy-open paths
+
+// The lazy-open trio the backlog said was only ever verified live: a cached
+// read-open takes no server handle, and the three ways reality then
+// interferes — the blob vanishing, concurrent first reads racing to
+// materialise, and a reconnect landing while the handle is still lazy.
+
+/// Eviction mid-life: the blob disappears after a lazy open, and the next
+/// read materialises a server handle and answers from the wire instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lazy_handle_survives_its_blob_vanishing() {
+    let agent = start_agent(AgentOpts::default());
+    let names = nested_export(&agent);
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let s = connect(&agent, cache_opts(&data_dir)).await;
+    expect_all_cached(&data_dir, &names, "walk cached every file").await;
+
+    let (ino, _) = lookup_path(&s.fs, "top.txt").await.unwrap();
+    let before_open = s.conn().requests_sent();
+    let fh = on_fs(&s.fs, move |fs| fs.open(ino, ro()).unwrap().0).await;
+    assert_eq!(
+        s.conn().requests_sent(),
+        before_open,
+        "a cached read-open must not touch the server"
+    );
+
+    // The eviction race: the blob is gone by the time the read runs.
+    std::fs::remove_file(data_dir.path().join("cache").join("t").join("top.txt")).unwrap();
+
+    let body = on_fs(&s.fs, move |fs| fs.read(fh, 0, 4096).unwrap()).await;
+    assert_eq!(body, b"content-0", "the wire answered once the blob was gone");
+    assert!(
+        s.conn().requests_sent() > before_open,
+        "materialisation must have reached the server"
+    );
+}
+
+/// Concurrent materialisation: many first-reads race on one lazy handle. The
+/// open is CAS'd in and losers hand their redundant server handle back — the
+/// observable contract is that every racer reads the right bytes and the
+/// handle stays usable after.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_reads_race_one_lazy_materialisation() {
+    let agent = start_agent(AgentOpts::default());
+    let names = nested_export(&agent);
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let s = connect(&agent, cache_opts(&data_dir)).await;
+    expect_all_cached(&data_dir, &names, "walk cached every file").await;
+
+    let (ino, _) = lookup_path(&s.fs, "b/two.txt").await.unwrap();
+    let fh = on_fs(&s.fs, move |fs| fs.open(ino, ro()).unwrap().0).await;
+    std::fs::remove_file(data_dir.path().join("cache").join("t").join("b/two.txt")).unwrap();
+
+    let mut racers = Vec::new();
+    for _ in 0..8 {
+        let fs = s.fs.clone();
+        racers.push(tokio::task::spawn_blocking(move || fs.read(fh, 0, 4096)));
+    }
+    for r in racers {
+        let body = r.await.unwrap().unwrap();
+        assert_eq!(body, b"content-2", "every racer sees the same correct bytes");
+    }
+    // The survivor handle still works after the losers gave theirs back.
+    let again = on_fs(&s.fs, move |fs| fs.read(fh, 0, 4096).unwrap()).await;
+    assert_eq!(again, b"content-2");
+}
+
+/// A reconnect that lands while a handle is still lazy must neither poison it
+/// nor try to replay an open the old session never had: the handle
+/// materialises on the NEW session at its first real read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lazy_handle_rides_through_a_reconnect() {
+    let agent = start_agent(AgentOpts::default());
+    let names = nested_export(&agent);
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let mut opts = cache_opts(&data_dir);
+    opts.mount_key = "t".into();
+    let s = harness::connect_reconnectable(&agent, opts).await;
+    expect_all_cached(&data_dir, &names, "walk cached every file").await;
+
+    let (ino, _) = lookup_path(&s.fs, "a/one.txt").await.unwrap();
+    let fh = on_fs(&s.fs, move |fs| fs.open(ino, ro()).unwrap().0).await;
+
+    // Kill the session under the lazy handle and let the supervisor swap in
+    // a fresh one (the same wait idiom the lock reconnect tests use).
+    let old_conn = s.fs.conn();
+    s.sever();
+    wait_until("reconnect swapped the connection", 15, {
+        let fs = s.fs.clone();
+        move || {
+            let now = fs.conn();
+            (!std::sync::Arc::ptr_eq(&old_conn, &now) && !now.is_closed()).then_some(())
+        }
+    })
+    .await;
+
+    // The blob is gone too, so the read cannot hide in the cache: it must
+    // materialise on the new session.
+    std::fs::remove_file(data_dir.path().join("cache").join("t").join("a/one.txt")).unwrap();
+    let body = on_fs(&s.fs, move |fs| fs.read(fh, 0, 4096)).await;
+    assert!(
+        body.is_ok(),
+        "a lazy handle must materialise on the new session, not fail: {body:?}"
+    );
+    assert_eq!(body.unwrap(), b"content-1");
 }
