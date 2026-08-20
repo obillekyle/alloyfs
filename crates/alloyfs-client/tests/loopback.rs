@@ -2440,3 +2440,226 @@ async fn a_changed_export_still_walks_on_remount() {
         "a moved token must not skip the walk"
     );
 }
+
+// ------------------------------------ metadata persistence across remounts
+
+/// Where `cache_opts` puts the metadata snapshot.
+fn meta_snapshot_path(data_dir: &tempfile::TempDir) -> std::path::PathBuf {
+    data_dir.path().join("cache").join("t.metadata.json")
+}
+
+/// First mount against a fresh cache dir: walk, cache everything, wait for
+/// the metadata snapshot to land, shut down cleanly.
+///
+/// The snapshot-exists wait is doing double duty. It is the obvious "don't
+/// remount before the file is written", but the walker also writes the
+/// snapshot AFTER recording the tree token, so its existence proves the
+/// token is recorded — which makes the `shutdown()` here flush a manifest
+/// the next mount can skip on, deterministically.
+async fn warm_first_mount(
+    agent: &harness::TestAgent,
+    data_dir: &tempfile::TempDir,
+    names: &[String],
+) {
+    let s = connect(agent, cache_opts(data_dir)).await;
+    expect_all_cached(data_dir, names, "first mount cached every file").await;
+    let snap = meta_snapshot_path(data_dir);
+    wait_until("first mount wrote the metadata snapshot", 15, move || {
+        snap.exists().then_some(())
+    })
+    .await;
+    on_fs(&s.fs, |fs| fs.shutdown()).await;
+}
+
+/// Remount and wait until the snapshot is adopted: walk skipped AND the warm
+/// tier populated. The two are separate steps — the skip flag is set before
+/// the install lands — so waiting on the flag alone would race the install.
+async fn warm_remount(agent: &harness::TestAgent, data_dir: &tempfile::TempDir) -> Session {
+    let s = connect(agent, cache_opts(data_dir)).await;
+    wait_until("remount adopted the metadata snapshot", 15, {
+        let fs = s.fs.clone();
+        move || (fs.auto_cache_walk_skipped() && fs.warm_dirs() > 0).then_some(())
+    })
+    .await;
+    s
+}
+
+/// A remount whose token matches serves lookup, getattr and readdir of a
+/// nested path from the metadata snapshot — proven by severing the connection
+/// first, so every answer below is one the wire could not have given.
+///
+/// This is the metadata half of the warm cold-start: the token skip already
+/// spared the remount its walk, but the first navigation still paid one
+/// Getattr per component and one Readdir per directory. Now it pays nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_matching_token_remount_serves_metadata_from_the_snapshot() {
+    let agent = start_agent(AgentOpts::default());
+    let names = nested_export(&agent);
+    let data_dir = tempfile::TempDir::new().unwrap();
+    warm_first_mount(&agent, &data_dir, &names).await;
+
+    let s2 = warm_remount(&agent, &data_dir).await;
+    s2.sever();
+
+    // lookup, component by component, three directories deep.
+    let (ino, attr) = lookup_path(&s2.fs, "a/deep/three.txt")
+        .await
+        .expect("a nested path resolves with the connection severed");
+    assert_eq!(attr.kind, FileKind::File);
+    assert_eq!(attr.size, "content-3".len() as u64);
+
+    // getattr on the resolved ino.
+    let got = on_fs(&s2.fs, move |fs| fs.getattr(ino))
+        .await
+        .expect("getattr answers locally");
+    assert_eq!(got.size, "content-3".len() as u64);
+
+    // getattr through a freshly allocated ino — the WinFsp shape, where a
+    // name is resolved by getattr with no lookup having cached its attr.
+    let fresh_ino = on_fs(&s2.fs, |fs| fs.ino.get_or_alloc(RelPath("b/two.txt".into()))).await;
+    let got = on_fs(&s2.fs, move |fs| fs.getattr(fresh_ino))
+        .await
+        .expect("getattr answers positively from the warm listing");
+    assert_eq!(got.size, "content-2".len() as u64);
+
+    // readdir of the nested directory.
+    let (deep_ino, _) = lookup_path(&s2.fs, "a/deep").await.unwrap();
+    let listing = on_fs(&s2.fs, move |fs| fs.readdir(deep_ino))
+        .await
+        .expect("readdir answers from the warm listing");
+    let listed: Vec<&str> = listing.iter().map(|(n, _, _)| n.as_str()).collect();
+    assert_eq!(listed, ["three.txt"]);
+}
+
+/// The negative half: a warm listing is complete by token proof, so a name
+/// absent from it is a local NotFound — no wire, and with the connection
+/// severed, provably none. This is the desktop.ini / resolver-probe economics
+/// of the live dir_cache, surviving a remount.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_warm_listing_answers_absent_names_without_the_wire() {
+    let agent = start_agent(AgentOpts::default());
+    let names = nested_export(&agent);
+    let data_dir = tempfile::TempDir::new().unwrap();
+    warm_first_mount(&agent, &data_dir, &names).await;
+
+    let s2 = warm_remount(&agent, &data_dir).await;
+    s2.sever();
+
+    let err = on_fs(&s2.fs, |fs| fs.lookup(ROOT_INO, "never-existed.txt"))
+        .await
+        .expect_err("an unlisted name is refused locally");
+    assert_eq!(remote_code(err), ErrorCode::NotFound);
+
+    // Nested too: each directory's own warm listing answers its own misses.
+    let (deep_ino, _) = lookup_path(&s2.fs, "a/deep").await.unwrap();
+    let err = on_fs(&s2.fs, move |fs| fs.lookup(deep_ino, "four.txt"))
+        .await
+        .expect_err("a miss in a nested warm listing is local too");
+    assert_eq!(remote_code(err), ErrorCode::NotFound);
+}
+
+/// A changed export must not serve yesterday's metadata: the moved token
+/// fails the comparison, the snapshot is deleted unserved, and the walk that
+/// follows writes a fresh one — which the NEXT remount then serves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_changed_export_discards_the_snapshot_rather_than_serving_it() {
+    // watch: true for the same reason as a_changed_export_still_walks_on_remount:
+    // the token only moves if the watcher maintains the index behind it.
+    let agent = start_agent(AgentOpts {
+        watch: true,
+        ..AgentOpts::default()
+    });
+    let names = nested_export(&agent);
+    // Let the watcher fold the setup writes into the index before the first
+    // mount reads its token, or the walk can complete against a still-moving
+    // token and (correctly) decline to write a snapshot at all — a vacuous
+    // pass for this test.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let data_dir = tempfile::TempDir::new().unwrap();
+    warm_first_mount(&agent, &data_dir, &names).await;
+
+    // The export changes while nothing is mounted.
+    std::fs::write(agent.dir.path().join("a/deep/four.txt"), b"content-4").unwrap();
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    let s2 = connect(&agent, cache_opts(&data_dir)).await;
+    // The walk finds the new file...
+    let blob = data_dir.path().join("cache").join("t").join("a/deep/four.txt");
+    wait_until("the remount walked and cached the new file", 15, move || {
+        (std::fs::read(&blob).ok()? == b"content-4").then_some(())
+    })
+    .await;
+    assert!(!s2.fs.auto_cache_walk_skipped());
+    // ...and nothing was installed from the stale snapshot. Zero is the whole
+    // assertion: had the old listings been adopted, `a/deep`'s COMPLETE
+    // listing would answer a hard NotFound for four.txt.
+    assert_eq!(s2.fs.warm_dirs(), 0, "stale metadata must not be installed");
+    let (_, attr) = lookup_path(&s2.fs, "a/deep/four.txt")
+        .await
+        .expect("the new file resolves");
+    assert_eq!(attr.size, 9);
+
+    // The walk rewrote the snapshot at the new token; snapshot-exists implies
+    // the token is recorded (write order), so shutdown persists a manifest
+    // the third mount can skip on.
+    let snap = meta_snapshot_path(&data_dir);
+    wait_until("the walk rewrote the metadata snapshot", 15, move || {
+        snap.exists().then_some(())
+    })
+    .await;
+    on_fs(&s2.fs, |fs| fs.shutdown()).await;
+
+    // A third mount is warm again — at the new token, new file included.
+    let s3 = warm_remount(&agent, &data_dir).await;
+    s3.sever();
+    let (_, attr) = lookup_path(&s3.fs, "a/deep/four.txt")
+        .await
+        .expect("the fresh snapshot knows the new file, connection severed");
+    assert_eq!(attr.size, 9);
+}
+
+/// A remote event for path P busts P's parent's warm listing — the rule the
+/// live dir_cache lives by, applied to the tier that has no TTL to grow out
+/// of. Without the busting this test never converges: the warm listing would
+/// answer a hard NotFound for the new name forever, not for five seconds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_event_busts_the_warm_listing_for_its_parent() {
+    let agent = start_agent(AgentOpts {
+        watch: true,
+        ..AgentOpts::default()
+    });
+    let names = nested_export(&agent);
+    // Same settle as above: the first mount must record a stable token or
+    // there is no snapshot to be warm from.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let data_dir = tempfile::TempDir::new().unwrap();
+    warm_first_mount(&agent, &data_dir, &names).await;
+
+    let s2 = warm_remount(&agent, &data_dir).await;
+    s2.fs.start_event_pump(|_| {}).await.unwrap();
+
+    // Warm answers the pre-change truth, including the negative for the name
+    // about to appear.
+    let (a_ino, _) = lookup_path(&s2.fs, "a").await.unwrap();
+    let err = on_fs(&s2.fs, move |fs| fs.lookup(a_ino, "new-arrival.txt"))
+        .await
+        .expect_err("not there yet");
+    assert_eq!(remote_code(err), ErrorCode::NotFound);
+
+    // Created behind the mount's back; only the watcher can deliver this.
+    std::fs::write(agent.dir.path().join("a").join("new-arrival.txt"), b"here").unwrap();
+
+    let deadline = deadline_after(10);
+    loop {
+        let found = on_fs(&s2.fs, move |fs| fs.lookup(a_ino, "new-arrival.txt")).await;
+        if let Ok((_, attr)) = found {
+            assert_eq!(attr.size, 4);
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the event never busted the warm listing; the new name still reads as NotFound"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}

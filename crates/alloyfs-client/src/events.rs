@@ -75,6 +75,14 @@ impl RemoteFs {
                     tracing::warn!("server requested resync: flushing caches");
                     self.invalidate_all();
                     self.invalidate_all_open_reads();
+                    // The on-disk snapshot claims token-proven knowledge, and
+                    // a resync means the chain of events that was keeping that
+                    // knowledge honest has a hole in it. The next mount's
+                    // token check would very likely refuse it anyway; deleting
+                    // now means nothing has to rely on "very likely". (One
+                    // unlink inline on the pump: resyncs are rare and the
+                    // invalidations around this are already the slow path.)
+                    self.discard_meta_snapshot();
                 }
                 EventKind::RenamedFrom { to } => {
                     if let Some(ino) = self.ino.ino_of(&ev.path) {
@@ -82,6 +90,10 @@ impl RemoteFs {
                     }
                     self.invalidate_parent_dir(&ev.path);
                     self.invalidate_parent_dir(to);
+                    // Path-keyed warm listings under both names are stale keys
+                    // now — see the note in `RemoteFs::rename`.
+                    self.warm_forget_subtree(&ev.path);
+                    self.warm_forget_subtree(to);
                     self.ino.rename(&ev.path, to);
                     if let Some(ino) = self.ino.ino_of(to) {
                         self.invalidate_attr(ino);
@@ -99,6 +111,9 @@ impl RemoteFs {
                     // membership is the one failure mode this cache must not
                     // have, and the busting is one map remove.
                     self.invalidate_parent_dir(&ev.path);
+                    // A Removed directory's OWN warm listing too, so a
+                    // re-created path cannot inherit it. No-op for files.
+                    self.bust_warm(&ev.path);
                     // ...and an OPEN handle's prefetched bytes are just as
                     // stale as the attrs, which is what this module's header
                     // promises and what was missing: busting the attr cache

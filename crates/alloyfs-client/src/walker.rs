@@ -5,6 +5,12 @@
 //! thousands of entries the mount may never touch), then services re-fetch
 //! requests (from events and our own writes) forever.
 //!
+//! A completed tree pass is also snapshotted as METADATA (metacache.rs): the
+//! per-directory listings, tagged with the tree token they were read at. The
+//! token-match skip path installs that snapshot into the warm tier, so a
+//! remount of an unchanged export answers its first navigation locally
+//! instead of paying one round trip per directory.
+//!
 //! Concurrency: 4 files in flight × up to 8 concurrent 128 KiB chunks each —
 //! ~32 outstanding requests. Cross-FILE parallelism is what makes small-file
 //! prefetch fast on high-RTT links; per-read chunk parallelism alone can't.
@@ -73,12 +79,30 @@ pub(crate) fn spawn(
         // mount. See the `Manifest` field comment.
         let saved_token = cache.saved_tree_token();
         if saved_token != 0 {
+            // Captured BEFORE the token is asked for: the snapshot install
+            // below must not land listings from before an invalidation that
+            // happened while the answer was in flight — the same in-flight
+            // re-install bug the dir_epoch guard closed for readdir.
+            let warm_epoch = fs.warm_epoch_now();
             match fs.conn().request(Request::TreeToken).await {
                 Ok(Ok(Response::TreeToken { token })) if token == saved_token => {
                     cache.note_walk_skipped();
+                    // The same proof that lets the blobs serve without
+                    // re-validation lets the saved LISTINGS serve: an
+                    // unchanged token means the export is still what the
+                    // metadata snapshot describes, so the first navigation
+                    // is answered locally instead of one round trip per
+                    // directory.
+                    let warm_fs = fs.clone();
+                    let warmed = tokio::task::spawn_blocking(move || {
+                        warm_fs.adopt_meta_snapshot(token, warm_epoch)
+                    })
+                    .await
+                    .unwrap_or(0);
                     tracing::info!(
                         token,
                         entries = cache.stats().0,
+                        warmed_dirs = warmed,
                         elapsed_s = started.elapsed().as_secs_f32(),
                         "auto-cache is current for this export; skipping the walk"
                     );
@@ -104,6 +128,15 @@ pub(crate) fn spawn(
             }
         }
 
+        // Discovery is happening, so whatever metadata snapshot is on disk
+        // describes an export state this pass cannot vouch for — the token
+        // either moved, was never recorded, or could not be asked. Delete it
+        // now; a fresh one is written below only if this pass completes.
+        {
+            let stale = fs.clone();
+            let _ = tokio::task::spawn_blocking(move || stale.discard_meta_snapshot()).await;
+        }
+
         // One exchange instead of one per directory, where the agent can. The
         // BFS below stays as the fallback and is still what runs against a
         // pre-v6 agent or an unindexed export.
@@ -116,7 +149,22 @@ pub(crate) fn spawn(
         } else {
             0
         };
-        if let Some(entries) = indexed {
+        let mut meta_snapshot = None;
+        if let Some((entries, pages_token)) = indexed {
+            // The metadata snapshot is built from the SAME entries the fetch
+            // pass consumes, but only trusted when the token did not move
+            // between the tree pages and the end-of-pass check — the
+            // no-stitching rule discover_by_tree applies between its own
+            // pages, extended one hop. A moved token means these listings
+            // describe a state the export has already left, and tagging them
+            // with the newer token would hand the next mount proven-looking
+            // listings of the wrong tree.
+            if pages_token == complete_at_token {
+                meta_snapshot = Some(crate::metacache::snapshot_from_tree(
+                    &entries,
+                    complete_at_token,
+                ));
+            }
             walked_dirs = entries
                 .iter()
                 .filter(|(_, a)| a.kind == alloyfs_proto::FileKind::Dir)
@@ -258,6 +306,15 @@ pub(crate) fn spawn(
         let complete = complete_at_token != 0 && ok == fetched;
         if complete {
             cache.record_tree_token(complete_at_token);
+            // The snapshot lands BEFORE the manifest flush below. The
+            // manifest's token is what lets the next mount skip its walk, so
+            // it must never reach disk ahead of the snapshot it would let
+            // that mount adopt. The reverse order is merely cold (skip, no
+            // listings to install); this order is warm as well.
+            if let Some(snap) = meta_snapshot.take() {
+                let snap_fs = fs.clone();
+                let _ = tokio::task::spawn_blocking(move || snap_fs.save_meta_snapshot(&snap)).await;
+            }
         }
         let (entries, bytes) = cache.stats();
         tracing::info!(
@@ -485,7 +542,11 @@ async fn fetch_many(fs: &Arc<RemoteFs>, cache: &Arc<AutoCache>, batch: Vec<RelPa
 /// `None` means the tree was not available and the caller should walk: an
 /// agent older than v6, or an export the server declined to index (too large
 /// for its cap, or indexing failed), which it signals with token 0.
-async fn discover_by_tree(fs: &Arc<RemoteFs>) -> Option<Vec<(RelPath, Attr)>> {
+///
+/// Returns the (nonzero) token the pages carried alongside the entries, so
+/// the caller can tell whether a token it fetches LATER still describes this
+/// same tree — the metadata snapshot hangs on that comparison.
+async fn discover_by_tree(fs: &Arc<RemoteFs>) -> Option<(Vec<(RelPath, Attr)>, u64)> {
     if fs.conn().proto < 6 {
         return None;
     }
@@ -529,7 +590,7 @@ async fn discover_by_tree(fs: &Arc<RemoteFs>) -> Option<Vec<(RelPath, Attr)>> {
         }
     }
     tracing::debug!(requests, entries = out.len(), "export tree fetched");
-    Some(out)
+    Some((out, token_seen))
 }
 
 /// The export's current tree token, or 0 when there is not one to have —

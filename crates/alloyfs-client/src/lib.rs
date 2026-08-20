@@ -10,6 +10,7 @@ mod autocache;
 mod error;
 mod events;
 mod inode;
+mod metacache;
 mod options;
 mod overlay;
 mod readahead;

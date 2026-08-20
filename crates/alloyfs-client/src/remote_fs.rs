@@ -10,6 +10,7 @@ use dashmap::DashMap;
 
 use crate::autocache::AutoCache;
 use crate::error::FsError;
+use crate::metacache::{MetaCache, MetaSnapshot};
 use crate::options::{ClientOptions, Dialer};
 use crate::overlay::{Overlay, OVERLAY_FH_BIT};
 use crate::readahead::ReadAhead;
@@ -216,6 +217,33 @@ pub struct RemoteFs {
     /// per-directory: a mutation elsewhere only costs one skipped insert,
     /// which is the safe direction to be wrong in.
     dir_epoch: AtomicU64,
+    /// Directory listings restored from the on-disk metadata snapshot
+    /// (metacache.rs), keyed by PATH because they outlive any one process's
+    /// ino numbering. Consulted where `dir_cache` misses, and it gives the
+    /// same three answers — repeat listings, positive lookups, and the hard
+    /// negative for absent names — because a warm listing is complete by the
+    /// same token proof that lets the auto-cache serve blobs without
+    /// re-validation.
+    ///
+    /// No TTL, deliberately. DIR_TTL exists because a live listing's
+    /// freshness is a bet on the event stream staying up; a warm listing's
+    /// freshness is the tree token the walker verified at mount. It stays
+    /// until an invalidation removes it, so every path that busts `dir_cache`
+    /// must bust this too — and the paths that exist because events were
+    /// MISSED (`invalidate_all` on lag, resync, reconnect) clear it outright.
+    warm: DashMap<RelPath, Vec<(String, Attr)>>,
+    /// Bumped by every warm-tier invalidation. The snapshot install at mount
+    /// captures it BEFORE the token exchange and re-checks before installing,
+    /// so listings read from disk cannot land after a mutation that would
+    /// have busted them — the in-flight-install bug `dir_epoch` closed for
+    /// readdir, at mount scope. A separate counter because plain writes bust
+    /// warm (no TTL bounds a stale size there, unlike `dir_cache`) and must
+    /// not churn the readdir-insert guard.
+    warm_epoch: AtomicU64,
+    /// The on-disk metadata snapshot. Present only when the auto-cache is:
+    /// without a walker there is no tree token, and without the token there
+    /// is no proof to serve the snapshot by.
+    meta: Option<MetaCache>,
     pub(crate) overlay: Option<Overlay>,
     pub(crate) cache: Option<Arc<AutoCache>>,
     pub(crate) open_files: DashMap<u64, OpenState>,
@@ -263,7 +291,7 @@ impl RemoteFs {
         .await;
 
         let overlay = build_overlay(&opts)?;
-        let (cache, fetch_rx) = build_auto_cache(&opts, auto_cache_max, auto_cache_budget)?;
+        let (cache, fetch_rx, meta) = build_auto_cache(&opts, auto_cache_max, auto_cache_budget)?;
 
         let (epoch_tx, _) = tokio::sync::watch::channel(0u64);
         let fs = Arc::new(Self {
@@ -274,6 +302,9 @@ impl RemoteFs {
             attr_cache: DashMap::new(),
             dir_cache: DashMap::new(),
             dir_epoch: AtomicU64::new(0),
+            warm: DashMap::new(),
+            warm_epoch: AtomicU64::new(0),
+            meta,
             overlay,
             cache,
             open_files: DashMap::new(),
@@ -365,6 +396,13 @@ impl RemoteFs {
         self.attr_cache.clear();
         self.dir_cache.clear();
         self.dir_epoch.fetch_add(1, Ordering::Release);
+        // Every caller of this is a "we may have missed events" path — lag,
+        // resync, reconnect — and missed events are the one thing the warm
+        // tier has no TTL to grow out of. It goes entirely, and it stays
+        // gone: nothing re-installs it until the next mount re-proves the
+        // token.
+        self.warm.clear();
+        self.warm_epoch.fetch_add(1, Ordering::Release);
     }
 
     /// Drop the cached listing of `path`'s PARENT. Every mutation that adds,
@@ -373,10 +411,89 @@ impl RemoteFs {
     /// through the pump and the busting has to be synchronous, right here.
     pub(crate) fn invalidate_parent_dir(&self, path: &RelPath) {
         if let Some((parent, _)) = path.split() {
+            // The warm tier is path-keyed, so it must not wait on an ino:
+            // a warm listing can exist for a directory this session has
+            // never allocated a number for.
+            self.bust_warm(&parent);
             if let Some(pino) = self.ino.ino_of(&parent) {
                 self.dir_cache.remove(&pino);
                 self.dir_epoch.fetch_add(1, Ordering::Release);
             }
+        }
+    }
+
+    /// Drop one directory's warm listing, and note the mutation so a
+    /// snapshot install in flight cannot land listings from before it.
+    pub(crate) fn bust_warm(&self, dir: &RelPath) {
+        self.warm.remove(dir);
+        self.warm_epoch.fetch_add(1, Ordering::Release);
+    }
+
+    /// Drop the warm listings of `root` and everything under it. For renames:
+    /// the warm tier is path-keyed, so a moved directory's own listing (and
+    /// its descendants') sit under keys that no longer name anything. The
+    /// ino-keyed `dir_cache` keeps a renamed directory's listing — its number
+    /// is stable and the names inside did not move — but re-keying warm to
+    /// chase that would buy little for the bookkeeping; one cold readdir
+    /// after a rename is the cheaper trade.
+    pub(crate) fn warm_forget_subtree(&self, root: &RelPath) {
+        self.warm.remove(root);
+        let prefix = format!("{}/", root.0);
+        self.warm.retain(|k, _| !k.0.starts_with(&prefix));
+        self.warm_epoch.fetch_add(1, Ordering::Release);
+    }
+
+    /// How many directories the warm tier currently answers for. Zero on any
+    /// mount that did not adopt a snapshot; what the tests (and a curious
+    /// operator) use to tell "walk skipped and metadata warm" from "walk
+    /// skipped, metadata cold".
+    pub fn warm_dirs(&self) -> usize {
+        self.warm.len()
+    }
+
+    /// The warm-invalidation epoch right now. The walker captures it BEFORE
+    /// asking the server for its tree token, for the same reason `readdir`
+    /// captures `dir_epoch` before its first page: the install that follows
+    /// a match must not land listings from before an invalidation that
+    /// happened while the answer was in flight.
+    pub(crate) fn warm_epoch_now(&self) -> u64 {
+        self.warm_epoch.load(Ordering::Acquire)
+    }
+
+    /// Install the on-disk metadata snapshot into the warm tier, when it
+    /// proves out: right token, and nothing invalidated a listing since
+    /// `epoch_at_check` was captured. Returns how many directories landed.
+    pub(crate) fn adopt_meta_snapshot(&self, token: u64, epoch_at_check: u64) -> usize {
+        let Some(meta) = &self.meta else { return 0 };
+        let Some(snap) = meta.load_for(token) else { return 0 };
+        // Same rule as readdir's insert guard, same direction of error: a
+        // mutation observed since the capture means these listings may
+        // describe the past, and a skipped install costs a cold first
+        // navigation while a stale one answers hard NotFound for a file
+        // that exists.
+        if self.warm_epoch.load(Ordering::Acquire) != epoch_at_check {
+            tracing::debug!("a mutation raced the snapshot install; serving cold instead");
+            return 0;
+        }
+        let n = snap.dirs.len();
+        for (dir, listing) in snap.dirs {
+            self.warm.insert(RelPath(dir), listing);
+        }
+        n
+    }
+
+    /// Persist a fresh metadata snapshot (walker, on a completed pass).
+    pub(crate) fn save_meta_snapshot(&self, snap: &MetaSnapshot) {
+        if let Some(meta) = &self.meta {
+            meta.save(snap);
+        }
+    }
+
+    /// Delete the metadata snapshot: it is no longer proven for whatever
+    /// happens next. Walk decisions and `ResyncRequired` land here.
+    pub(crate) fn discard_meta_snapshot(&self) {
+        if let Some(meta) = &self.meta {
+            meta.discard();
         }
     }
 
@@ -525,6 +642,22 @@ impl RemoteFs {
                     }
                 }
             }
+            // The warm tier answers BOTH halves where the live listing above
+            // answers only the negative. The positive matters here because
+            // warm listings have no TTL: an attr-cache expiry must not push a
+            // stat of a token-proven entry back onto the wire, or a remount
+            // would go cold again five seconds after it went warm.
+            if let Some(w) = self.warm.get(&parent) {
+                let found = w.iter().find(|(n, _)| n == name).map(|(_, a)| *a);
+                drop(w);
+                return match found {
+                    Some(attr) => {
+                        self.cache_attr(ino, attr);
+                        Ok(attr)
+                    }
+                    None => Err(ErrorCode::NotFound.into()),
+                };
+            }
         }
         let attr = expect_resp!(self.call(Request::Getattr { path })?, Response::Attr(attr) => attr);
         self.cache_attr(ino, attr);
@@ -554,6 +687,23 @@ impl RemoteFs {
                     None => Err(ErrorCode::NotFound.into()),
                 };
             }
+        }
+        // The warm tier gives the same two answers when no live listing
+        // does. Same completeness claim, different proof: the tree token the
+        // walker verified at mount, kept honest by events instead of a TTL.
+        // Feeding the attr cache on the way out is what lets the open that
+        // follows this lookup take the lazy no-server path.
+        if let Some(w) = self.warm.get(&dir) {
+            let found = w.iter().find(|(n, _)| n == name).map(|(_, a)| *a);
+            drop(w);
+            return match found {
+                Some(attr) => {
+                    let ino = self.ino.get_or_alloc(path);
+                    self.cache_attr(ino, attr);
+                    Ok((ino, attr))
+                }
+                None => Err(ErrorCode::NotFound.into()),
+            };
         }
         let attr =
             expect_resp!(self.call(Request::Getattr { path: path.clone() })?, Response::Attr(attr) => attr);
@@ -585,6 +735,28 @@ impl RemoteFs {
                 self.merge_overlay_children(&dir, &mut out);
                 return Ok(out);
             }
+        }
+        // The warm tier: a complete listing restored from the metadata
+        // snapshot, token-proven at mount and event-busted from then on.
+        // Filtered and merged exactly like a wire listing, because the
+        // snapshot stores the SERVER's view raw — exclude patterns are client
+        // configuration and may differ between the mount that wrote it and
+        // this one, so routing belongs to serve time, not save time.
+        if let Some(w) = self.warm.get(&dir) {
+            let listing = w.clone();
+            drop(w);
+            let mut out = Vec::with_capacity(listing.len());
+            for (name, attr) in listing {
+                let child = dir.join(&name);
+                if self.shadowed_by_overlay(&child) {
+                    continue;
+                }
+                let child_ino = self.ino.get_or_alloc(child);
+                self.cache_attr(child_ino, attr);
+                out.push((name, child_ino, attr));
+            }
+            self.merge_overlay_children(&dir, &mut out);
+            return Ok(out);
         }
         // Captured BEFORE the first page goes out. Paging is several round
         // trips, and anything that invalidates a listing in that window makes
@@ -1047,6 +1219,14 @@ impl RemoteFs {
 
     fn mark_path_written(&self, path: &RelPath) {
         self.invalidate_open_reads(path);
+        // The parent's WARM listing carries this file's size and mtime, and
+        // our own write will never echo back as an event to bust it. The live
+        // dir_cache is left alone here on purpose: its TTL bounds the stale
+        // attr to five seconds, which is the trade writes have always made,
+        // while a warm listing would serve the pre-write size forever.
+        if let Some((parent, _)) = path.split() {
+            self.bust_warm(&parent);
+        }
         if let Some(cache) = &self.cache {
             cache.invalidate(path);
         }
@@ -1132,6 +1312,10 @@ impl RemoteFs {
         };
         expect_resp!(self.call(req)?, Response::Ok => ());
         self.invalidate_parent_dir(&path);
+        // A removed DIRECTORY's own warm listing has to go too: the path can
+        // be re-created, and get_or_alloc would hand the new directory its
+        // predecessor's listing. (No-op for files — they never key the map.)
+        self.bust_warm(&path);
         if let Some(ino) = self.ino.ino_of(&path) {
             self.invalidate_attr(ino);
         }
@@ -1164,9 +1348,13 @@ impl RemoteFs {
                 );
                 // Both listings changed: one lost an entry, one gained it. The
                 // renamed directory's OWN cached listing survives — its ino is
-                // stable and the names inside it did not move.
+                // stable and the names inside it did not move. The warm tier
+                // is path-keyed, so it gets no such stability: everything
+                // under both old and new paths is forgotten.
                 self.invalidate_parent_dir(&from);
                 self.invalidate_parent_dir(&to);
+                self.warm_forget_subtree(&from);
+                self.warm_forget_subtree(&to);
                 self.ino.rename(&from, &to);
                 if let Some(cache) = &self.cache {
                     cache.rename(&from, &to);
@@ -1637,19 +1825,27 @@ fn build_overlay(opts: &ClientOptions) -> Result<Option<Overlay>, FsError> {
 /// Paths the auto-cache has decided to download, drained by the walker.
 type FetchQueue = tokio::sync::mpsc::UnboundedReceiver<RelPath>;
 
-/// The auto-download cache and the walker's fetch queue. Both are `None`
-/// unless something asks for a cache: a nonzero size limit, or a pin (which
-/// must be held locally whatever the limit says).
+/// What `build_auto_cache` hands back: the cache, the walker's fetch queue,
+/// and the metadata snapshot — all `None` together when caching is off.
+type CachePieces = (Option<Arc<AutoCache>>, Option<FetchQueue>, Option<MetaCache>);
+
+/// The auto-download cache, the walker's fetch queue, and the metadata
+/// snapshot. All are `None` unless something asks for a cache: a nonzero size
+/// limit, or a pin (which must be held locally whatever the limit says).
 fn build_auto_cache(
     opts: &ClientOptions,
     auto_cache_max: u64,
     auto_cache_budget: u64,
-) -> Result<(Option<Arc<AutoCache>>, Option<FetchQueue>), FsError> {
+) -> Result<CachePieces, FsError> {
     if auto_cache_max == 0 && opts.pins.is_empty() {
-        return Ok((None, None));
+        return Ok((None, None, None));
     }
     let root = opts.cache_dir.join(&opts.mount_key);
     let manifest = opts.cache_dir.join(format!("{}.manifest.json", opts.mount_key));
+    // The metadata snapshot lives beside the manifest — same directory, same
+    // mount key — because it lives under the same trust root: the tree token
+    // the manifest records is the only thing that can prove its listings.
+    let meta = MetaCache::new(opts.cache_dir.join(format!("{}.metadata.json", opts.mount_key)));
     let (cache, rx) = AutoCache::load(crate::autocache::AutoCacheConfig {
         max_file_size: auto_cache_max,
         budget: auto_cache_budget.max(1),
@@ -1661,7 +1857,7 @@ fn build_auto_cache(
         tracing::error!(error = %e, "auto-cache init failed");
         ErrorCode::Io
     })?;
-    Ok((Some(Arc::new(cache)), Some(rx)))
+    Ok((Some(Arc::new(cache)), Some(rx), Some(meta)))
 }
 
 /// Start the long-lived tasks, each only when its feature is configured: the
