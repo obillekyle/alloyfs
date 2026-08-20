@@ -17,7 +17,7 @@
 
 #include <linux/types.h>
 
-#define ALLOYFS_ABI_VERSION 3
+#define ALLOYFS_ABI_VERSION 4
 #define ALLOYFS_ROOT_NODEID 1ULL
 
 /* Largest payload either direction; bounds every kernel-side allocation. */
@@ -41,17 +41,21 @@ enum alloyfs_opcode {
 	ALLOYFS_OP_WRITE = 10,	/* nodeid = file, offset, payload = data */
 	ALLOYFS_OP_SETATTR = 11,	/* nodeid = target, payload = setattr_in */
 	/* --- stage 8: advisory locks, forwarded so they mean something
-	 * BETWEEN machines. Whole-file only, because that is all the wire
-	 * protocol carries; a byte range is coarsened to the whole file,
-	 * which is safe (over-locking) rather than unsafe (under-locking).
+	 * BETWEEN machines. Byte ranges since ABI 4: every lock op carries
+	 * (owner, start, len) in fcntl's own terms, so the daemon can hold,
+	 * test and release exact intervals instead of coarsening to the
+	 * whole file — which was safe for taking (over-locking) but made a
+	 * release drop every lock the handle held.
 	 */
 	ALLOYFS_OP_LOCK = 12,	/* nodeid = file, payload = lock_in */
-	ALLOYFS_OP_UNLOCK = 13,	/* nodeid = file */
+	ALLOYFS_OP_UNLOCK = 13,	/* nodeid = file, payload = unlock_in */
 	/* --- stage 9: links, and the last of the metadata ops. */
 	ALLOYFS_OP_SYMLINK = 14,	/* nodeid = parent, payload = symlink_in */
 	ALLOYFS_OP_READLINK = 15,	/* nodeid = link; reply is raw target bytes */
 	ALLOYFS_OP_LINK = 16,	/* nodeid = parent, payload = link_in + name */
 	ALLOYFS_OP_STATFS = 17,	/* no payload; reply = statfs_out */
+	/* --- ABI 4: F_GETLK, the read half of the lock API. */
+	ALLOYFS_OP_GETLK = 18,	/* nodeid = file, payload = lock_in; reply = getlk_out */
 };
 
 /*
@@ -83,9 +87,44 @@ struct alloyfs_statfs_out {
 #define ALLOYFS_LOCK_SHARED 1
 #define ALLOYFS_LOCK_EXCLUSIVE 2
 
+/*
+ * LOCK and GETLK request payload (GETLK ignores `wait`).
+ *
+ * `owner` is an opaque holder id — the kernel sends its fl_owner pointer,
+ * which tells apart processes (POSIX) or open file descriptions (flock) on
+ * this machine. The daemon forwards it verbatim and the agent scopes it by
+ * connection, so owners from different machines can never collide.
+ *
+ * The range is in fcntl's own terms: `len == 0` means "to end of file,
+ * however large it grows". flock(2) has no ranges and is sent as
+ * start = 0, len = 0 — the whole file, spelled the way fcntl spells it.
+ */
 struct alloyfs_lock_in {
 	__u32 kind;		/* ALLOYFS_LOCK_* */
 	__u32 wait;		/* non-zero = block until granted (F_SETLKW) */
+	__u64 owner;		/* opaque holder id */
+	__u64 start;		/* first byte of the range */
+	__u64 len;		/* byte count; 0 = to end of file */
+};
+
+/* UNLOCK request payload: release exactly this owner's [start, start+len),
+ * splitting held ranges where needed, and nothing else.
+ */
+struct alloyfs_unlock_in {
+	__u64 owner;
+	__u64 start;
+	__u64 len;		/* 0 = to end of file */
+};
+
+/* GETLK reply payload: the lock that would block the probe. `kind == 0`
+ * means the range is free (F_UNLCK). `pid` is 0 when unknown, which a
+ * holder on another machine always is.
+ */
+struct alloyfs_getlk_out {
+	__u64 start;
+	__u64 len;		/* 0 = to end of file */
+	__u32 kind;		/* ALLOYFS_LOCK_*, or 0 = free */
+	__u32 pid;
 };
 
 /* CREATE / MKDIR request payload, followed by the name. */

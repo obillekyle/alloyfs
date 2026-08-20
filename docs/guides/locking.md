@@ -52,12 +52,16 @@ exclude each other; two machines do not.
 It IS forwarded on `--backend kernel`, which implements both `.lock` and
 `.flock`.
 
-## `--backend kernel` is still whole-file
+## `--backend kernel` has ranges too (module ABI 4)
 
-The kernel module forwards locks but has no byte ranges yet: every lock is
-coarsened to the whole file, and `F_GETLK` returns `ENOLCK`. The partial-release
-hazard described above applies there — releasing part of a range releases all of
-it. Use `--backend fuse` for anything that locks ranges.
+The kernel module forwards byte ranges since its ABI 4: every lock op carries
+the owner and the exact `(start, len)` in fcntl's terms, `F_GETLK` asks the
+agent and reports the holder's kind and range (with `l_pid = -1`, the remote
+convention — the holder's pid means nothing on this machine), and releasing
+part of a range releases exactly that part. The same pre-v7 agent fallback
+applies as on FUSE: taking coarsens, releasing and `F_GETLK` refuse with
+`ENOLCK`. The module and daemon ship together and check the ABI at compile
+time, so mixing an old module with a new daemon is not a supported state.
 
 ## Windows forwards nothing
 

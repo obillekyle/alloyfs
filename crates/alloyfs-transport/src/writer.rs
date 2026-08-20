@@ -103,10 +103,7 @@ mod tests {
             ready
         }
 
-        fn poll_shutdown(
-            mut self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-        ) -> Poll<std::io::Result<()>> {
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
             Pin::new(&mut self.inner).poll_shutdown(cx)
         }
     }
@@ -130,7 +127,8 @@ mod tests {
 
         let (tx, rx) = mpsc::channel::<Frame>(N);
         for nonce in 0..N as u64 {
-            tx.try_send(Frame::Ping { nonce }).expect("pre-load fits the channel");
+            tx.try_send(Frame::Ping { nonce })
+                .expect("pre-load fits the channel");
         }
         drop(tx); // drain everything, then end on the closed channel
 

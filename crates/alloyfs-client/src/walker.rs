@@ -94,11 +94,10 @@ pub(crate) fn spawn(
                     // is answered locally instead of one round trip per
                     // directory.
                     let warm_fs = fs.clone();
-                    let warmed = tokio::task::spawn_blocking(move || {
-                        warm_fs.adopt_meta_snapshot(token, warm_epoch)
-                    })
-                    .await
-                    .unwrap_or(0);
+                    let warmed =
+                        tokio::task::spawn_blocking(move || warm_fs.adopt_meta_snapshot(token, warm_epoch))
+                            .await
+                            .unwrap_or(0);
                     tracing::info!(
                         token,
                         entries = cache.stats().0,
@@ -160,10 +159,7 @@ pub(crate) fn spawn(
             // with the newer token would hand the next mount proven-looking
             // listings of the wrong tree.
             if pages_token == complete_at_token {
-                meta_snapshot = Some(crate::metacache::snapshot_from_tree(
-                    &entries,
-                    complete_at_token,
-                ));
+                meta_snapshot = Some(crate::metacache::snapshot_from_tree(&entries, complete_at_token));
             }
             walked_dirs = entries
                 .iter()

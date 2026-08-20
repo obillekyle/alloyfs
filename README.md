@@ -64,9 +64,9 @@ Working today, verified on Windows 11 + Ubuntu 24.04:
   sequenced), pushed to every client; **native `ReadDirectoryChangesW`
   re-emission on Windows** (editors auto-refresh), sub-second kernel cache
   invalidation on Linux; `alloyfs events` NDJSON tail anywhere
-- Multi-client concurrency: whole-file advisory locks (fcntl forwarding on
-  Linux), sessions with heartbeats, 30 s lease reaper for dead clients,
-  write-conflict detection scaffolding
+- Multi-client concurrency: byte-range advisory locks (fcntl/flock forwarding
+  on Linux, including `F_GETLK`), sessions with heartbeats, 30 s lease reaper
+  for dead clients, write-conflict detection scaffolding
 - HTTP API on the agent: status, browse, and an SSE event stream
 - Server-side path hardening (canonicalize + escape check, watcher does not
   follow symlinks)
@@ -390,19 +390,19 @@ limitations") — and it is Linux-only. If you don't need real inotify inside
 a mount, skip `--with-module` entirely and nothing else changes.
 
 The trade runs both ways, so pick per workload rather than assuming newer is
-better. `--backend kernel` serves 13 operations; FUSE serves 21. What you gain
+better. `--backend kernel` serves 18 operations; FUSE serves 21. What you gain
 is that a remote change arrives as a real inotify event instead of a cache
-invalidation. What you give up is `statfs`, `link`, and `fcntl(F_GETLK)` —
-which returns `ENOLCK` rather than answering, because the wire protocol has no
-way to ask *who* holds a lock and a confident wrong answer is worse than none.
-Callers that get `ENOLCK` fall back to attempting the lock, which is checked
-properly.
+invalidation. What you give up is `mmap` — nothing that maps files runs on it.
+The gaps this list used to name (`statfs`, `link`, `fcntl(F_GETLK)`) have
+since been filled.
 
-Locks themselves are forwarded on both backends: `flock()` and
-`fcntl(F_SETLK/F_SETLKW)` reach the agent and exclude other machines. They are
-whole-file on the wire, so a byte range is coarsened to the whole file — safe
-(over-locking) rather than unsafe. Stage 8 of the kernel test suite mounts one
-export twice and asserts the two mounts exclude each other.
+Locks are forwarded on both backends: `flock()` and
+`fcntl(F_SETLK/F_SETLKW/F_GETLK)` reach the agent and exclude other machines.
+Since module ABI 4 the wire carries the byte range and the lock owner, so
+disjoint ranges coexist, releasing a range releases exactly that range, and
+`F_GETLK` names the holder's kind and range instead of returning `ENOLCK`.
+Stage 8 of the kernel test suite mounts one export twice and asserts the two
+mounts exclude each other — per range.
 
 With `--with-module`, the module is installed through
 [DKMS](packaging/dkms.conf) rather than as a bare `.ko`. An out-of-tree
@@ -527,12 +527,13 @@ every future DKMS rebuild is covered once the key is enrolled.
   shipped:** `--backend kernel` (the module injects genuine fsnotify, so a
   remote change is indistinguishable from a local one) and `alloyfs sync`,
   which gives you an ordinary directory that every watcher already understands.
-- **Whole-file advisory locks only.** Byte-range locks are coarsened to the
-  whole file on every backend, and `fcntl(F_GETLK)` returns `ENOLCK` on
-  `--backend kernel` because the protocol cannot ask who a holder is. Taking
-  locks works and excludes other machines on both backends. Don't host live
-  database files (SQLite/Postgres) on a shared mount regardless: they want
-  byte ranges and `F_GETLK`.
+- **Byte-range advisory locks on both Linux backends** against a v7 agent,
+  `F_GETLK` included. Against an older agent, taking a lock coarsens to the
+  whole file (claims more: safe) while releasing one or probing refuses with
+  `ENOLCK` (a coarsened release would drop every lock the handle holds).
+  Journal-mode SQLite works; WAL mode cannot across machines (it needs shared
+  memory — SQLite's constraint, not this filesystem's), and Postgres remains
+  out entirely.
 - **Symlinks can be created and read** on FUSE and `--backend kernel`; a
   target that would land outside the export is refused at creation, including
   a dangling one, and so is a target inside an excluded path. Targets are

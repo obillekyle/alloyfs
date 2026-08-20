@@ -746,18 +746,53 @@ static int alloyfs_fsync(struct file *file, loff_t start, loff_t end, int datasy
  *
  * The order below is the part worth reading. The daemon keeps one server
  * handle per nodeid and shares it between every process on this machine, so
- * the server cannot tell two local openers apart and would grant both. Local
- * exclusion therefore has to come from the VFS list, and it has to happen
- * FIRST: succeeding there is what proves we are this machine's only candidate,
- * which in turn is what makes the rollback safe. Asking the server first and
- * unlocking after a local conflict would release a lock a sibling process
- * legitimately holds, because it is the very same handle.
+ * the server alone could not tell two local openers apart. Local exclusion
+ * therefore has to come from the VFS list, and it has to happen FIRST:
+ * succeeding there is what proves we are this machine's only candidate for
+ * the range, which in turn is what makes the rollback safe. Asking the
+ * server first and unlocking after a local conflict would release a lock a
+ * sibling process legitimately holds, because it is the very same handle.
+ *
+ * Since ABI 4 every request also carries (owner, start, len): the agent
+ * holds real intervals, so two machines can lock disjoint ranges of one
+ * file, and releasing a range releases that range alone. The owner is the
+ * VFS's fl_owner, sent as an opaque id — it distinguishes this machine's
+ * openers on the shared handle; the agent scopes it by connection, so ids
+ * from different machines never collide.
  */
+
+/* fcntl speaks (start, len) with len == 0 meaning "to end of file"; the VFS
+ * speaks an inclusive [fl_start, fl_end] with OFFSET_MAX for the same idea.
+ * The wire uses fcntl's spelling, and this is the only place they convert.
+ * flock(2) needs no case of its own: flock_make_lock() builds 0..OFFSET_MAX,
+ * which lands here as start = 0, len = 0 — the whole file.
+ */
+static void alloyfs_wire_range(const struct file_lock *fl, __u64 *start, __u64 *len)
+{
+	*start = fl->fl_start;
+	*len = fl->fl_end == OFFSET_MAX ?
+		0 : (__u64)(fl->fl_end - fl->fl_start) + 1;
+}
+
+static u64 alloyfs_wire_owner(const struct file_lock *fl)
+{
+	/* Opaque on the wire: all that matters is that two local owners get
+	 * two ids. POSIX locks carry the files_struct here, flock the file —
+	 * both are only ever compared by identity, which a cast preserves.
+	 */
+	return (u64)(unsigned long)fl->c.flc_owner;
+}
+
 static void alloyfs_undo_local_lock(struct file *file, struct file_lock *fl)
 {
 	unsigned char saved = fl->c.flc_type;
 
-	/* Same request, inverted, so it matches the entry we just made. */
+	/* Same request, inverted, so it matches the entry we just made: fl
+	 * still names the owner and the exact [fl_start, fl_end] the grant
+	 * covered, so a byte-range lock rolls back as a byte-range unlock —
+	 * never the whole file, which would drop every other range this
+	 * owner holds on the handle.
+	 */
 	fl->c.flc_type = F_UNLCK;
 	locks_lock_file_wait(file, fl);
 	fl->c.flc_type = saved;
@@ -781,13 +816,18 @@ static int alloyfs_lock_common(struct file *file, struct file_lock *fl)
 		return locks_lock_file_wait(file, fl);
 
 	if (lock_is_unlock(fl)) {
+		struct alloyfs_unlock_in rel;
+
 		/* Release locally first: a close path must never leave a stuck
 		 * entry behind because an RPC failed. */
 		ret = locks_lock_file_wait(file, fl);
 		if (ret)
 			return ret;
+		memset(&rel, 0, sizeof(rel));
+		rel.owner = alloyfs_wire_owner(fl);
+		alloyfs_wire_range(fl, &rel.start, &rel.len);
 		return alloyfs_request(conn, ALLOYFS_OP_UNLOCK, inode->i_ino,
-				    0, 0, NULL, 0, NULL, 0);
+				    0, 0, &rel, sizeof(rel), NULL, 0);
 	}
 
 	ret = locks_lock_file_wait(file, fl);
@@ -797,6 +837,8 @@ static int alloyfs_lock_common(struct file *file, struct file_lock *fl)
 	memset(&in, 0, sizeof(in));
 	in.kind = lock_is_write(fl) ? ALLOYFS_LOCK_EXCLUSIVE : ALLOYFS_LOCK_SHARED;
 	in.wait = (fl->c.flc_flags & FL_SLEEP) ? 1 : 0;
+	in.owner = alloyfs_wire_owner(fl);
+	alloyfs_wire_range(fl, &in.start, &in.len);
 	ret = alloyfs_request(conn, ALLOYFS_OP_LOCK, inode->i_ino, 0, 0,
 			   &in, sizeof(in), NULL, 0);
 	if (ret < 0) {
@@ -806,16 +848,68 @@ static int alloyfs_lock_common(struct file *file, struct file_lock *fl)
 	return 0;
 }
 
+/*
+ * F_GETLK asks "who would block me?" — a question only the daemon can
+ * answer. The local list knows this machine's locks; answering from it
+ * would report "nobody" while another machine held the range, and a
+ * confident wrong answer is worse than no answer. That is why this
+ * returned a flat ENOLCK before ABI 4 grew an opcode for the question.
+ */
+static int alloyfs_getlk(struct file *file, struct file_lock *fl)
+{
+	struct inode *inode = file_inode(file);
+	struct alloyfs_conn *conn = alloyfs_conn_of(inode);
+	struct alloyfs_lock_in in;
+	struct alloyfs_getlk_out out;
+	int ret;
+
+	/* Teardown: local semantics, matching alloyfs_lock_common. */
+	if (!conn) {
+		posix_test_lock(file, fl);
+		return 0;
+	}
+
+	memset(&in, 0, sizeof(in));
+	in.kind = lock_is_write(fl) ? ALLOYFS_LOCK_EXCLUSIVE : ALLOYFS_LOCK_SHARED;
+	in.owner = alloyfs_wire_owner(fl);
+	alloyfs_wire_range(fl, &in.start, &in.len);
+
+	ret = alloyfs_request(conn, ALLOYFS_OP_GETLK, inode->i_ino, 0, 0,
+			   &in, sizeof(in), &out, sizeof(out));
+	if (ret < 0)
+		return ret;
+	if (ret < (int)sizeof(out))
+		return -EIO;
+
+	if (out.kind == 0) {
+		/* Free: F_UNLCK, with the caller's range left as it was. */
+		fl->c.flc_type = F_UNLCK;
+		return 0;
+	}
+	if (out.kind != ALLOYFS_LOCK_SHARED && out.kind != ALLOYFS_LOCK_EXCLUSIVE)
+		return -EIO;
+	/* Daemon-supplied: refuse a range loff_t cannot represent, the same
+	 * guard FUSE applies before believing a getlk reply. */
+	if (out.start > (__u64)OFFSET_MAX ||
+	    (out.len && out.len - 1 > (__u64)OFFSET_MAX - out.start))
+		return -EIO;
+
+	fl->c.flc_type = out.kind == ALLOYFS_LOCK_EXCLUSIVE ? F_WRLCK : F_RDLCK;
+	fl->fl_start = out.start;
+	fl->fl_end = out.len ? out.start + out.len - 1 : OFFSET_MAX;
+	/* The holder is a handle on (usually) another machine; its pid means
+	 * nothing in this pid namespace, and the wire reports 0 for exactly
+	 * that reason. Negative is the VFS convention for a remote holder —
+	 * locks_translate_pid passes it to userspace untranslated.
+	 */
+	fl->c.flc_pid = -1;
+	return 0;
+}
+
 static int alloyfs_file_lock(struct file *file, int cmd, struct file_lock *fl)
 {
-	/*
-	 * F_GETLK asks "who would block me?". Answering from the local list
-	 * would report "nobody" while another machine holds the file, and a
-	 * confident wrong answer is worse than no answer — callers that get
-	 * ENOLCK fall back to just trying the lock, which IS checked.
-	 */
 	if (cmd == F_GETLK)
-		return -ENOLCK;
+		return alloyfs_getlk(file, fl);
 	return alloyfs_lock_common(file, fl);
 }
 

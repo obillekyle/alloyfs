@@ -840,12 +840,38 @@ async fn two_clients() -> (tempfile::TempDir, Arc<Server>, Arc<Server>) {
     (dir, a, b)
 }
 
-/// `struct alloyfs_lock_in`, as the module writes it.
-fn lock_in(kind: u32, wait: bool) -> Vec<u8> {
+/// `struct alloyfs_lock_in`, as the module writes it. The kernel derives
+/// `owner` from fl_owner and the range from the caller's fcntl/flock request;
+/// `len == 0` is fcntl's "to end of file", and flock arrives as (0, 0).
+fn lock_in(kind: u32, wait: bool, owner: u64, start: u64, len: u64) -> Vec<u8> {
     let mut v = Vec::new();
     v.extend_from_slice(&kind.to_ne_bytes());
     v.extend_from_slice(&u32::from(wait).to_ne_bytes());
+    v.extend_from_slice(&owner.to_ne_bytes());
+    v.extend_from_slice(&start.to_ne_bytes());
+    v.extend_from_slice(&len.to_ne_bytes());
     v
+}
+
+/// `struct alloyfs_unlock_in`: release exactly this owner's range.
+fn unlock_in(owner: u64, start: u64, len: u64) -> Vec<u8> {
+    let mut v = Vec::new();
+    v.extend_from_slice(&owner.to_ne_bytes());
+    v.extend_from_slice(&start.to_ne_bytes());
+    v.extend_from_slice(&len.to_ne_bytes());
+    v
+}
+
+/// Decode a GETLK reply payload into (kind, start, len, pid).
+fn getlk_reply(r: &Reply) -> (u32, u64, u64, u32) {
+    assert_eq!(r.error, 0, "GETLK itself must succeed");
+    assert_eq!(r.payload.len(), abi::GETLK_OUT_LEN);
+    (
+        u32_at(&r.payload, 16),
+        u64_at(&r.payload, 0),
+        u64_at(&r.payload, 8),
+        u32_at(&r.payload, 20),
+    )
 }
 
 async fn lookup_ino(server: &Arc<Server>, unique: u64, name: &str) -> u64 {
@@ -876,7 +902,7 @@ async fn an_exclusive_lock_excludes_the_other_client() {
             ino_a,
             0,
             0,
-            &lock_in(abi::LOCK_EXCLUSIVE, false),
+            &lock_in(abi::LOCK_EXCLUSIVE, false, 1, 0, 0),
         ),
     )
     .await;
@@ -890,7 +916,7 @@ async fn an_exclusive_lock_excludes_the_other_client() {
             ino_b,
             0,
             0,
-            &lock_in(abi::LOCK_EXCLUSIVE, false),
+            &lock_in(abi::LOCK_EXCLUSIVE, false, 2, 0, 0),
         ),
     )
     .await;
@@ -901,7 +927,7 @@ async fn an_exclusive_lock_excludes_the_other_client() {
     );
 
     // ...and releasing it hands the lock over.
-    let freed = call_on(&a, request(abi::OP_UNLOCK, 104, ino_a, 0, 0, b"")).await;
+    let freed = call_on(&a, request(abi::OP_UNLOCK, 104, ino_a, 0, 0, &unlock_in(1, 0, 0))).await;
     assert_eq!(freed.error, 0);
     let regained = call_on(
         &b,
@@ -911,7 +937,7 @@ async fn an_exclusive_lock_excludes_the_other_client() {
             ino_b,
             0,
             0,
-            &lock_in(abi::LOCK_EXCLUSIVE, false),
+            &lock_in(abi::LOCK_EXCLUSIVE, false, 2, 0, 0),
         ),
     )
     .await;
@@ -928,13 +954,27 @@ async fn shared_locks_coexist_but_still_block_an_exclusive() {
 
     let first = call_on(
         &a,
-        request(abi::OP_LOCK, 112, ino_a, 0, 0, &lock_in(abi::LOCK_SHARED, false)),
+        request(
+            abi::OP_LOCK,
+            112,
+            ino_a,
+            0,
+            0,
+            &lock_in(abi::LOCK_SHARED, false, 1, 0, 0),
+        ),
     )
     .await;
     assert_eq!(first.error, 0);
     let second = call_on(
         &b,
-        request(abi::OP_LOCK, 113, ino_b, 0, 0, &lock_in(abi::LOCK_SHARED, false)),
+        request(
+            abi::OP_LOCK,
+            113,
+            ino_b,
+            0,
+            0,
+            &lock_in(abi::LOCK_SHARED, false, 2, 0, 0),
+        ),
     )
     .await;
     assert_eq!(second.error, 0, "two readers must both be granted");
@@ -947,7 +987,7 @@ async fn shared_locks_coexist_but_still_block_an_exclusive() {
             ino_b,
             0,
             0,
-            &lock_in(abi::LOCK_EXCLUSIVE, false),
+            &lock_in(abi::LOCK_EXCLUSIVE, false, 2, 0, 0),
         ),
     )
     .await;
@@ -972,7 +1012,7 @@ async fn a_remote_modify_does_not_steal_a_held_lock() {
                 ino_a,
                 0,
                 0,
-                &lock_in(abi::LOCK_EXCLUSIVE, false)
+                &lock_in(abi::LOCK_EXCLUSIVE, false, 1, 0, 0)
             )
         )
         .await
@@ -997,7 +1037,7 @@ async fn a_remote_modify_does_not_steal_a_held_lock() {
             ino_b,
             0,
             0,
-            &lock_in(abi::LOCK_EXCLUSIVE, false),
+            &lock_in(abi::LOCK_EXCLUSIVE, false, 2, 0, 0),
         ),
     )
     .await;
@@ -1025,7 +1065,7 @@ async fn unlocking_an_unlocked_file_succeeds() {
     .await
     .attr()
     .nodeid;
-    let r = call(&fx, request(abi::OP_UNLOCK, 131, ino, 0, 0, b"")).await;
+    let r = call(&fx, request(abi::OP_UNLOCK, 131, ino, 0, 0, &unlock_in(1, 0, 0))).await;
     assert_eq!(r.error, 0, "close-time unlock of an unlocked file must not fail");
 }
 
@@ -1044,9 +1084,206 @@ async fn a_malformed_lock_request_is_refused() {
     .attr()
     .nodeid;
 
-    let bad_kind = call(&fx, request(abi::OP_LOCK, 141, ino, 0, 0, &lock_in(99, false))).await;
+    let bad_kind = call(
+        &fx,
+        request(abi::OP_LOCK, 141, ino, 0, 0, &lock_in(99, false, 1, 0, 0)),
+    )
+    .await;
     assert_eq!(bad_kind.error, -abi::EINVAL);
 
     let truncated = call(&fx, request(abi::OP_LOCK, 142, ino, 0, 0, &[0u8; 3])).await;
     assert_eq!(truncated.error, -abi::EINVAL);
+
+    // The ABI 3 payload — kind and wait alone — is short now: a request with
+    // no range cannot be guessed into one.
+    let old_abi = call(&fx, request(abi::OP_LOCK, 143, ino, 0, 0, &[0u8; 8])).await;
+    assert_eq!(old_abi.error, -abi::EINVAL);
+
+    let short_unlock = call(&fx, request(abi::OP_UNLOCK, 144, ino, 0, 0, &[0u8; 8])).await;
+    assert_eq!(short_unlock.error, -abi::EINVAL);
+}
+
+// ------------------------------------------------------------- byte ranges
+
+/// Small helpers so the range tests read as ranges, not as argument soup.
+async fn try_lock(server: &Arc<Server>, unique: u64, ino: u64, owner: u64, start: u64, len: u64) -> i32 {
+    call_on(
+        server,
+        request(
+            abi::OP_LOCK,
+            unique,
+            ino,
+            0,
+            0,
+            &lock_in(abi::LOCK_EXCLUSIVE, false, owner, start, len),
+        ),
+    )
+    .await
+    .error
+}
+
+async fn try_unlock(server: &Arc<Server>, unique: u64, ino: u64, owner: u64, start: u64, len: u64) -> i32 {
+    call_on(
+        server,
+        request(abi::OP_UNLOCK, unique, ino, 0, 0, &unlock_in(owner, start, len)),
+    )
+    .await
+    .error
+}
+
+async fn probe(
+    server: &Arc<Server>,
+    unique: u64,
+    ino: u64,
+    kind: u32,
+    owner: u64,
+    start: u64,
+    len: u64,
+) -> (u32, u64, u64, u32) {
+    let r = call_on(
+        server,
+        request(
+            abi::OP_GETLK,
+            unique,
+            ino,
+            0,
+            0,
+            &lock_in(kind, false, owner, start, len),
+        ),
+    )
+    .await;
+    getlk_reply(&r)
+}
+
+/// The point of the ABI 4 widening: disjoint ranges coexist — across mounts
+/// AND between two owners on one mount, who share a single server handle and
+/// are told apart only by the owner id the kernel now forwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn disjoint_ranges_are_both_granted() {
+    let (dir, a, b) = two_clients().await;
+    std::fs::write(dir.path().join("shared.txt"), b"contended").unwrap();
+    let ino_a = lookup_ino(&a, 200, "shared.txt").await;
+    let ino_b = lookup_ino(&b, 201, "shared.txt").await;
+
+    assert_eq!(try_lock(&a, 202, ino_a, 1, 0, 100).await, 0);
+    assert_eq!(
+        try_lock(&b, 203, ino_b, 2, 100, 50).await,
+        0,
+        "a disjoint range on another mount must not be refused"
+    );
+
+    // Same mount, different owner, disjoint from both: the whole-file model
+    // would have refused this at the agent.
+    assert_eq!(
+        try_lock(&a, 204, ino_a, 3, 150, 10).await,
+        0,
+        "two owners through ONE daemon handle must coexist on disjoint ranges"
+    );
+
+    // And the boundaries are exact: one byte inside either range conflicts.
+    assert_eq!(try_lock(&b, 205, ino_b, 2, 99, 1).await, -abi::EAGAIN);
+    assert_eq!(try_lock(&a, 206, ino_a, 3, 149, 2).await, -abi::EAGAIN);
+}
+
+/// Overlap is what conflicts — not mere coexistence on one file.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn overlapping_ranges_conflict() {
+    let (dir, a, b) = two_clients().await;
+    std::fs::write(dir.path().join("shared.txt"), b"contended").unwrap();
+    let ino_a = lookup_ino(&a, 210, "shared.txt").await;
+    let ino_b = lookup_ino(&b, 211, "shared.txt").await;
+
+    assert_eq!(try_lock(&a, 212, ino_a, 1, 10, 20).await, 0);
+    assert_eq!(try_lock(&b, 213, ino_b, 2, 25, 20).await, -abi::EAGAIN);
+    assert_eq!(try_lock(&b, 214, ino_b, 2, 0, 11).await, -abi::EAGAIN);
+    assert_eq!(try_lock(&b, 215, ino_b, 2, 30, 10).await, 0);
+}
+
+/// Releasing the middle of a held range keeps both ends held — the exact
+/// splitting the whole-file model could not express, and the reason a
+/// coarsened release was never safe.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn partial_unlock_keeps_the_rest() {
+    let (dir, a, b) = two_clients().await;
+    std::fs::write(dir.path().join("shared.txt"), b"contended").unwrap();
+    let ino_a = lookup_ino(&a, 220, "shared.txt").await;
+    let ino_b = lookup_ino(&b, 221, "shared.txt").await;
+
+    assert_eq!(try_lock(&a, 222, ino_a, 1, 0, 100).await, 0);
+    assert_eq!(try_unlock(&a, 223, ino_a, 1, 40, 20).await, 0);
+
+    // The hole is free; the fragments on either side are not.
+    assert_eq!(try_lock(&b, 224, ino_b, 2, 40, 20).await, 0);
+    assert_eq!(try_lock(&b, 225, ino_b, 2, 0, 10).await, -abi::EAGAIN);
+    assert_eq!(try_lock(&b, 226, ino_b, 2, 80, 20).await, -abi::EAGAIN);
+}
+
+/// F_GETLK end to end: the daemon asks the agent and reports the holder's
+/// kind and exact range, or kind == 0 for free — never a local guess.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn getlk_reports_the_holder_and_free() {
+    let (dir, a, b) = two_clients().await;
+    std::fs::write(dir.path().join("shared.txt"), b"contended").unwrap();
+    let ino_a = lookup_ino(&a, 230, "shared.txt").await;
+    let ino_b = lookup_ino(&b, 231, "shared.txt").await;
+
+    assert_eq!(try_lock(&a, 232, ino_a, 1, 10, 5).await, 0);
+
+    let (kind, start, len, pid) = probe(&b, 233, ino_b, abi::LOCK_EXCLUSIVE, 2, 0, 100).await;
+    assert_eq!(kind, abi::LOCK_EXCLUSIVE, "the probe must name the holder's kind");
+    assert_eq!((start, len), (10, 5), "…and the exact range held");
+    assert_eq!(pid, 0, "a remote holder has no pid worth reporting");
+
+    // Outside the held range: free, spelled as kind == 0.
+    let (kind, ..) = probe(&b, 234, ino_b, abi::LOCK_EXCLUSIVE, 2, 50, 10).await;
+    assert_eq!(kind, 0, "an untouched range must probe free");
+
+    // A shared holder blocks a write probe but not a read probe.
+    assert_eq!(try_unlock(&a, 235, ino_a, 1, 10, 5).await, 0);
+    let r = call_on(
+        &a,
+        request(
+            abi::OP_LOCK,
+            236,
+            ino_a,
+            0,
+            0,
+            &lock_in(abi::LOCK_SHARED, false, 1, 10, 5),
+        ),
+    )
+    .await;
+    assert_eq!(r.error, 0);
+    let (kind, ..) = probe(&b, 237, ino_b, abi::LOCK_SHARED, 2, 10, 5).await;
+    assert_eq!(kind, 0, "shared does not block shared");
+    let (kind, ..) = probe(&b, 238, ino_b, abi::LOCK_EXCLUSIVE, 2, 10, 5).await;
+    assert_eq!(kind, abi::LOCK_SHARED, "…but it does block a writer");
+}
+
+/// `len == 0` is fcntl's "to end of file, however large it grows", and the
+/// spelling must survive the round trip — through the lock, through the
+/// conflict report, and back out of a getlk.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn to_eof_spelling_round_trips() {
+    let (dir, a, b) = two_clients().await;
+    std::fs::write(dir.path().join("shared.txt"), b"contended").unwrap();
+    let ino_a = lookup_ino(&a, 240, "shared.txt").await;
+    let ino_b = lookup_ino(&b, 241, "shared.txt").await;
+
+    assert_eq!(try_lock(&a, 242, ino_a, 1, 5, 0).await, 0, "lock from 5 to EOF");
+
+    // Before the range: free. Arbitrarily far past any real file size: held —
+    // that is what "to EOF" means, and an encoding that had turned it into a
+    // finite length would have an end for this probe to slip past.
+    assert_eq!(try_lock(&b, 243, ino_b, 2, 0, 5).await, 0);
+    assert_eq!(try_lock(&b, 244, ino_b, 2, 1 << 40, 1).await, -abi::EAGAIN);
+
+    let (kind, start, len, _) = probe(&b, 245, ino_b, abi::LOCK_EXCLUSIVE, 2, 1 << 40, 1).await;
+    assert_eq!(kind, abi::LOCK_EXCLUSIVE);
+    assert_eq!(start, 5);
+    assert_eq!(len, 0, "the conflict must come back in the same to-EOF spelling");
+
+    // The whole-file unlock (0, 0) — what the VFS sends on close — releases a
+    // to-EOF lock like anything else.
+    assert_eq!(try_unlock(&a, 246, ino_a, 1, 0, 0).await, 0);
+    assert_eq!(try_lock(&b, 247, ino_b, 2, 1 << 40, 1).await, 0);
 }

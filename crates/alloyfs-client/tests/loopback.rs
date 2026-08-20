@@ -2456,11 +2456,7 @@ fn meta_snapshot_path(data_dir: &tempfile::TempDir) -> std::path::PathBuf {
 /// snapshot AFTER recording the tree token, so its existence proves the
 /// token is recorded — which makes the `shutdown()` here flush a manifest
 /// the next mount can skip on, deterministically.
-async fn warm_first_mount(
-    agent: &harness::TestAgent,
-    data_dir: &tempfile::TempDir,
-    names: &[String],
-) {
+async fn warm_first_mount(agent: &harness::TestAgent, data_dir: &tempfile::TempDir, names: &[String]) {
     let s = connect(agent, cache_opts(data_dir)).await;
     expect_all_cached(data_dir, names, "first mount cached every file").await;
     let snap = meta_snapshot_path(data_dir);

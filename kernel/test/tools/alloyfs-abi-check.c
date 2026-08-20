@@ -34,7 +34,9 @@ SAME_SIZE(struct alloyfs_setattr_in, 24);	/* SETATTR_IN_LEN */
 SAME_SIZE(struct alloyfs_write_out, 8);		/* WRITE_OUT_LEN */
 SAME_SIZE(struct alloyfs_notify_entry, 32);	/* NOTIFY_ENTRY_LEN */
 SAME_SIZE(struct alloyfs_dirent, 24);		/* DIRENT_LEN */
-SAME_SIZE(struct alloyfs_lock_in, 8);		/* LOCK_IN_LEN */
+SAME_SIZE(struct alloyfs_lock_in, 32);		/* LOCK_IN_LEN */
+SAME_SIZE(struct alloyfs_unlock_in, 24);	/* UNLOCK_IN_LEN */
+SAME_SIZE(struct alloyfs_getlk_out, 24);	/* GETLK_OUT_LEN */
 SAME_SIZE(struct alloyfs_symlink_in, 8);	/* SYMLINK_IN_LEN */
 SAME_SIZE(struct alloyfs_link_in, 8);		/* LINK_IN_LEN */
 SAME_SIZE(struct alloyfs_statfs_out, 24);	/* STATFS_OUT_LEN */
@@ -80,6 +82,18 @@ SAME_OFFSET(struct alloyfs_dirent, type, 20);
 
 SAME_OFFSET(struct alloyfs_lock_in, kind, 0);
 SAME_OFFSET(struct alloyfs_lock_in, wait, 4);
+SAME_OFFSET(struct alloyfs_lock_in, owner, 8);
+SAME_OFFSET(struct alloyfs_lock_in, start, 16);
+SAME_OFFSET(struct alloyfs_lock_in, len, 24);
+
+SAME_OFFSET(struct alloyfs_unlock_in, owner, 0);
+SAME_OFFSET(struct alloyfs_unlock_in, start, 8);
+SAME_OFFSET(struct alloyfs_unlock_in, len, 16);
+
+SAME_OFFSET(struct alloyfs_getlk_out, start, 0);
+SAME_OFFSET(struct alloyfs_getlk_out, len, 8);
+SAME_OFFSET(struct alloyfs_getlk_out, kind, 16);
+SAME_OFFSET(struct alloyfs_getlk_out, pid, 20);
 
 SAME_OFFSET(struct alloyfs_symlink_in, namelen, 0);
 SAME_OFFSET(struct alloyfs_symlink_in, targetlen, 2);
@@ -98,7 +112,8 @@ _Static_assert(ALLOYFS_OP_SETATTR == 11, "opcode numbering changed");
 _Static_assert(ALLOYFS_OP_UNLOCK == 13, "opcode numbering changed");
 _Static_assert(ALLOYFS_LOCK_EXCLUSIVE == 2, "lock kind numbering changed");
 _Static_assert(ALLOYFS_OP_STATFS == 17, "opcode numbering changed");
-_Static_assert(ALLOYFS_ABI_VERSION == 3, "ABI version changed — check both ends");
+_Static_assert(ALLOYFS_OP_GETLK == 18, "opcode numbering changed");
+_Static_assert(ALLOYFS_ABI_VERSION == 4, "ABI version changed — check both ends");
 _Static_assert(ALLOYFS_NOTIFY_RENAME == 5, "notify code numbering changed");
 _Static_assert(ALLOYFS_NOTIFY_F_ISDIR == 1, "notify flags changed");
 

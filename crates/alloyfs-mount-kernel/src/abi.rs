@@ -13,7 +13,7 @@
 
 #![allow(dead_code)] // some constants exist to document the ABI, not to be used
 
-pub const ABI_VERSION: u32 = 3;
+pub const ABI_VERSION: u32 = 4;
 pub const ROOT_NODEID: u64 = 1;
 
 /// Largest payload either direction; bounds every kernel-side allocation.
@@ -53,6 +53,7 @@ pub const OP_SYMLINK: u32 = 14;
 pub const OP_READLINK: u32 = 15;
 pub const OP_LINK: u32 = 16;
 pub const OP_STATFS: u32 = 17;
+pub const OP_GETLK: u32 = 18;
 
 /// `struct alloyfs_symlink_in`: two u16 then padding.
 pub const SYMLINK_IN_LEN: usize = 8;
@@ -63,8 +64,12 @@ pub const STATFS_OUT_LEN: usize = 24;
 
 pub const LOCK_SHARED: u32 = 1;
 pub const LOCK_EXCLUSIVE: u32 = 2;
-/// `struct alloyfs_lock_in`: two u32.
-pub const LOCK_IN_LEN: usize = 8;
+/// `struct alloyfs_lock_in`: two u32, then owner/start/len as u64.
+pub const LOCK_IN_LEN: usize = 32;
+/// `struct alloyfs_unlock_in`: three u64.
+pub const UNLOCK_IN_LEN: usize = 24;
+/// `struct alloyfs_getlk_out`: two u64 then two u32.
+pub const GETLK_OUT_LEN: usize = 24;
 
 pub const SETATTR_MODE: u32 = 1 << 0;
 pub const SETATTR_SIZE: u32 = 1 << 1;
@@ -110,6 +115,7 @@ pub const EINVAL: i32 = 22;
 pub const EFBIG: i32 = 27;
 pub const EROFS: i32 = 30;
 pub const ENAMETOOLONG: i32 = 36;
+pub const ENOLCK: i32 = 37;
 pub const ENOSYS: i32 = 38;
 pub const ENOTEMPTY: i32 = 39;
 pub const EOPNOTSUPP: i32 = 95;
@@ -218,14 +224,20 @@ pub fn parse_setattr_in(payload: &[u8]) -> Option<SetattrIn> {
     })
 }
 
-/// A lock request from the kernel: which flavour, and whether to wait.
+/// A lock request from the kernel: which flavour, who is asking, over what
+/// range, and whether to wait. `len == 0` is fcntl's "to end of file".
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LockIn {
     pub kind: alloyfs_proto::LockKind,
     pub wait: bool,
+    /// The kernel's fl_owner, opaque here: forwarded so the agent can tell
+    /// this machine's lock owners apart instead of merging them into one.
+    pub owner: u64,
+    pub start: u64,
+    pub len: u64,
 }
 
-/// Decode `struct alloyfs_lock_in`.
+/// Decode `struct alloyfs_lock_in` (also the GETLK request payload).
 ///
 /// An unrecognised `kind` is refused rather than defaulted. Guessing here
 /// would mean silently taking a shared lock where the caller asked for an
@@ -242,7 +254,52 @@ pub fn parse_lock_in(payload: &[u8]) -> Option<LockIn> {
     Some(LockIn {
         kind,
         wait: u32_at(payload, 4) != 0,
+        owner: u64_at(payload, 8),
+        start: u64_at(payload, 16),
+        len: u64_at(payload, 24),
     })
+}
+
+/// An unlock request: exactly this owner's `[start, start+len)`, nothing else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnlockIn {
+    pub owner: u64,
+    pub start: u64,
+    /// 0 = to end of file.
+    pub len: u64,
+}
+
+/// Decode `struct alloyfs_unlock_in`.
+pub fn parse_unlock_in(payload: &[u8]) -> Option<UnlockIn> {
+    if payload.len() < UNLOCK_IN_LEN {
+        return None;
+    }
+    Some(UnlockIn {
+        owner: u64_at(payload, 0),
+        start: u64_at(payload, 8),
+        len: u64_at(payload, 16),
+    })
+}
+
+/// Encode `struct alloyfs_getlk_out`: the conflicting lock, or — as
+/// `kind == 0` with the rest zeroed — "the range is free" (F_UNLCK).
+pub fn getlk_out(conflict: Option<&alloyfs_proto::LockConflict>) -> Vec<u8> {
+    let mut v = Vec::with_capacity(GETLK_OUT_LEN);
+    let (start, len, kind, pid) = match conflict {
+        None => (0, 0, 0, 0),
+        Some(c) => {
+            let kind = match c.kind {
+                alloyfs_proto::LockKind::Shared => LOCK_SHARED,
+                alloyfs_proto::LockKind::Exclusive => LOCK_EXCLUSIVE,
+            };
+            (c.start, c.len, kind, c.pid)
+        }
+    };
+    v.extend_from_slice(&start.to_ne_bytes());
+    v.extend_from_slice(&len.to_ne_bytes());
+    v.extend_from_slice(&kind.to_ne_bytes());
+    v.extend_from_slice(&pid.to_ne_bytes());
+    v
 }
 
 /// Decode `struct alloyfs_symlink_in` into (name, target).
@@ -572,6 +629,65 @@ mod tests {
             name2: String::new(),
         };
         assert!(n.encode().is_none(), "the kernel rejects a zero-length name");
+    }
+
+    /// The lock structs, byte for byte as `alloyfs-abi-check.c` asserts them:
+    /// lock_in is 32 bytes (kind 0, wait 4, owner 8, start 16, len 24),
+    /// unlock_in 24 (owner 0, start 8, len 16), getlk_out 24 (start 0, len 8,
+    /// kind 16, pid 20). Encoded here by hand at those offsets so the parsers
+    /// are tested against the layout, not against themselves.
+    #[test]
+    fn lock_in_decodes_the_range() {
+        let mut p = vec![0u8; LOCK_IN_LEN];
+        p[0..4].copy_from_slice(&LOCK_EXCLUSIVE.to_ne_bytes());
+        p[4..8].copy_from_slice(&1u32.to_ne_bytes());
+        p[8..16].copy_from_slice(&0xABCDu64.to_ne_bytes());
+        p[16..24].copy_from_slice(&100u64.to_ne_bytes());
+        p[24..32].copy_from_slice(&50u64.to_ne_bytes());
+        let li = parse_lock_in(&p).unwrap();
+        assert_eq!(li.kind, alloyfs_proto::LockKind::Exclusive);
+        assert!(li.wait);
+        assert_eq!(li.owner, 0xABCD);
+        assert_eq!(li.start, 100);
+        assert_eq!(li.len, 50);
+
+        // The old 8-byte layout is short now: ABI 4 requests carry the range.
+        assert!(parse_lock_in(&p[..8]).is_none());
+        // An unrecognised kind is refused, not defaulted.
+        p[0..4].copy_from_slice(&99u32.to_ne_bytes());
+        assert!(parse_lock_in(&p).is_none());
+    }
+
+    #[test]
+    fn unlock_in_decodes() {
+        let mut p = vec![0u8; UNLOCK_IN_LEN];
+        p[0..8].copy_from_slice(&7u64.to_ne_bytes());
+        p[8..16].copy_from_slice(&4u64.to_ne_bytes());
+        p[16..24].copy_from_slice(&0u64.to_ne_bytes()); // to EOF
+        let ui = parse_unlock_in(&p).unwrap();
+        assert_eq!(ui.owner, 7);
+        assert_eq!(ui.start, 4);
+        assert_eq!(ui.len, 0);
+        assert!(parse_unlock_in(&p[..16]).is_none());
+    }
+
+    #[test]
+    fn getlk_out_encodes_free_and_held() {
+        let free = getlk_out(None);
+        assert_eq!(free.len(), GETLK_OUT_LEN);
+        assert_eq!(u32_at(&free, 16), 0, "kind 0 = free (F_UNLCK)");
+
+        let held = getlk_out(Some(&alloyfs_proto::LockConflict {
+            kind: alloyfs_proto::LockKind::Shared,
+            start: 10,
+            len: 0, // a holder whose range runs to EOF keeps that spelling
+            pid: 0,
+        }));
+        assert_eq!(held.len(), GETLK_OUT_LEN);
+        assert_eq!(u64_at(&held, 0), 10);
+        assert_eq!(u64_at(&held, 8), 0);
+        assert_eq!(u32_at(&held, 16), LOCK_SHARED);
+        assert_eq!(u32_at(&held, 20), 0);
     }
 
     /// `alloyfs-abi-check.c` asserts the C header against a literal, which

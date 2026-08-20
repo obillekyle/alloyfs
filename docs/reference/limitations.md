@@ -5,13 +5,11 @@ a bug report.
 
 ## Locking
 
-**Byte-range locks work on `--backend fuse` against a v7 agent**, including
-`F_GETLK`. Against an older agent, taking a lock coarsens to the whole file and
-releasing one refuses with `ENOLCK` — a coarsened release drops every lock the
-handle holds, which is worse than not answering.
-
-**`--backend kernel` is still whole-file**, and `F_GETLK` returns `ENOLCK`
-there. Releasing part of a range releases all of it.
+**Byte-range locks work on `--backend fuse` and `--backend kernel` against a
+v7 agent**, including `F_GETLK`. Against an older agent, taking a lock coarsens
+to the whole file and releasing one (or probing with `F_GETLK`) refuses with
+`ENOLCK` — a coarsened release drops every lock the handle holds, which is
+worse than not answering.
 
 **`flock()` is local on `--backend fuse`.** The mount advertises POSIX lock
 support but not `FUSE_FLOCK_LOCKS`, so the kernel handles it without contacting

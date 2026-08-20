@@ -13,18 +13,13 @@ use std::time::SystemTime;
 
 use alloyfs_agent::{AgentConfig, AgentSession, ExportConfig, ExportRegistry};
 use alloyfs_proto::{
-    DirEntry, ErrorCode, Frame, FrameCodec, RelPath, Request, Response, PROTO_VERSION_MAX,
-    PROTO_VERSION_MIN,
+    DirEntry, ErrorCode, Frame, FrameCodec, RelPath, Request, Response, PROTO_VERSION_MAX, PROTO_VERSION_MIN,
 };
 use alloyfs_transport::{serve_connection, RequestHandler};
 use futures::{SinkExt, StreamExt};
 use tokio_util::codec::Framed;
 
-fn registry(
-    dir: &std::path::Path,
-    tree_cap: Option<usize>,
-    exclude: Vec<String>,
-) -> Arc<ExportRegistry> {
+fn registry(dir: &std::path::Path, tree_cap: Option<usize>, exclude: Vec<String>) -> Arc<ExportRegistry> {
     let mut cfg = AgentConfig::default();
     cfg.exports.insert(
         "test".into(),
@@ -105,10 +100,7 @@ impl Peer {
             })
             .await
         {
-            Ok(Response::Dir {
-                entries,
-                next_cursor,
-            }) => (entries, next_cursor),
+            Ok(Response::Dir { entries, next_cursor }) => (entries, next_cursor),
             other => panic!("expected Dir, got {other:?}"),
         }
     }
@@ -170,7 +162,11 @@ async fn paging_matches_between_index_and_disk() {
     assert!(index_sizes.len() >= 2, "the directory must actually page");
     assert_eq!(index_sizes, disk_sizes, "page boundaries must agree");
     assert_eq!(from_index.len(), 1101, "1100 files and one subdirectory");
-    assert_eq!(names(&from_index), names(&from_disk), "names and order must agree");
+    assert_eq!(
+        names(&from_index),
+        names(&from_disk),
+        "names and order must agree"
+    );
     for (a, b) in from_index.iter().zip(&from_disk) {
         assert_eq!(a.attr, b.attr, "attrs for {:?} must agree", a.name);
     }

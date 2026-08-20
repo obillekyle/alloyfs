@@ -8,17 +8,22 @@
  * because the module implements them through different file_operations
  * hooks (->lock and ->flock) and only one of them is exercised by fcntl.
  *
- *   alloyfs-lock [-p|-f] [-s|-x] [-n] [-w MS] FILE
+ *   alloyfs-lock [-p|-f] [-s|-x] [-n] [-w MS] [-r START:LEN] [-g] FILE
  *     -p  POSIX record lock via fcntl   (default)
  *     -f  BSD lock via flock
  *     -s  shared          -x  exclusive (default)
  *     -n  non-blocking: report BUSY rather than waiting
  *     -w  hold for MS milliseconds, then release and exit
+ *     -r  POSIX only: the byte range [START, START+LEN); LEN 0 = to EOF,
+ *         which is fcntl's own spelling. Default is 0:0, the whole file.
+ *     -g  F_GETLK: probe instead of taking, and print what holds the range
  *
  * Prints exactly one of:
- *   LOCKED   acquired (and held for -w, if given)
- *   BUSY     someone else holds a conflicting lock
- *   ERR n    anything else, with the errno
+ *   LOCKED             acquired (and held for -w, if given)
+ *   BUSY               someone else holds a conflicting lock
+ *   FREE               -g: nothing would block this probe
+ *   HELD T START LEN   -g: the conflicting lock (T is S or X; LEN 0 = to EOF)
+ *   ERR n              anything else, with the errno
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -31,7 +36,8 @@
 
 int main(int argc, char **argv)
 {
-	int posix = 1, excl = 1, block = 1, hold_ms = 0;
+	int posix = 1, excl = 1, block = 1, hold_ms = 0, getlk = 0;
+	unsigned long long r_start = 0, r_len = 0;
 	const char *path = NULL;
 	int fd, rc, i;
 
@@ -46,13 +52,20 @@ int main(int argc, char **argv)
 			excl = 1;
 		else if (!strcmp(argv[i], "-n"))
 			block = 0;
+		else if (!strcmp(argv[i], "-g"))
+			getlk = 1;
 		else if (!strcmp(argv[i], "-w") && i + 1 < argc)
 			hold_ms = atoi(argv[++i]);
-		else
+		else if (!strcmp(argv[i], "-r") && i + 1 < argc) {
+			if (sscanf(argv[++i], "%llu:%llu", &r_start, &r_len) != 2) {
+				fprintf(stderr, "bad -r, want START:LEN\n");
+				return 2;
+			}
+		} else
 			path = argv[i];
 	}
 	if (!path) {
-		fprintf(stderr, "usage: alloyfs-lock [-p|-f] [-s|-x] [-n] [-w MS] FILE\n");
+		fprintf(stderr, "usage: alloyfs-lock [-p|-f] [-s|-x] [-n] [-w MS] [-r START:LEN] [-g] FILE\n");
 		return 2;
 	}
 
@@ -66,14 +79,36 @@ int main(int argc, char **argv)
 		return 3;
 	}
 
+	if (getlk) {
+		struct flock fl;
+
+		memset(&fl, 0, sizeof(fl));
+		fl.l_type = excl ? F_WRLCK : F_RDLCK;
+		fl.l_whence = SEEK_SET;
+		fl.l_start = (off_t)r_start;
+		fl.l_len = (off_t)r_len;
+		rc = fcntl(fd, F_GETLK, &fl);
+		if (rc < 0)
+			printf("ERR %d\n", errno);
+		else if (fl.l_type == F_UNLCK)
+			printf("FREE\n");
+		else
+			printf("HELD %c %lld %lld\n",
+			       fl.l_type == F_WRLCK ? 'X' : 'S',
+			       (long long)fl.l_start, (long long)fl.l_len);
+		fflush(stdout);
+		close(fd);
+		return rc < 0 ? 1 : 0;
+	}
+
 	if (posix) {
 		struct flock fl;
 
 		memset(&fl, 0, sizeof(fl));
 		fl.l_type = excl ? F_WRLCK : F_RDLCK;
 		fl.l_whence = SEEK_SET;
-		fl.l_start = 0;
-		fl.l_len = 0;	/* whole file, which is all the wire carries */
+		fl.l_start = (off_t)r_start;
+		fl.l_len = (off_t)r_len;	/* 0:0 = whole file */
 		rc = fcntl(fd, block ? F_SETLKW : F_SETLK, &fl);
 	} else {
 		rc = flock(fd, (excl ? LOCK_EX : LOCK_SH) | (block ? 0 : LOCK_NB));

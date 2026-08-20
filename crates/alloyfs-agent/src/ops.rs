@@ -637,9 +637,7 @@ impl SessionInner {
         //   indexed, path unknown to it, not a directory, a case-insensitive
         //   spelling only the volume can resolve) and falls through to disk,
         //   keeping every error identical.
-        if let Some((children, more)) =
-            export.tree.readdir_page(&path, cursor as usize, READDIR_PAGE)
-        {
+        if let Some((children, more)) = export.tree.readdir_page(&path, cursor as usize, READDIR_PAGE) {
             let entries: Vec<DirEntry> = children
                 .into_iter()
                 .map(|(name, attr)| {
@@ -667,10 +665,7 @@ impl SessionInner {
                 })
                 .collect();
             let next_cursor = more.then(|| cursor + entries.len() as u64);
-            return Ok(Response::Dir {
-                entries,
-                next_cursor,
-            });
+            return Ok(Response::Dir { entries, next_cursor });
         }
         let full = export.resolve(&path)?;
         let mut entries: Vec<DirEntry> = Vec::new();

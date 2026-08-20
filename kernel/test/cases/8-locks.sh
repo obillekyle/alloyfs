@@ -101,6 +101,38 @@ eq "reader on B joins"          "LOCKED" "$(alloyfs-lock -s -n $MNT2/lockme.txt 
 eq "writer on B still refused"  "BUSY"   "$(alloyfs-lock -x -n $MNT2/lockme.txt 2>&1)"
 wait $H2 2>/dev/null
 
+# --- byte ranges cross the mount boundary exactly (ABI 4) --------------------
+# Disjoint ranges of one file coexist — across mounts, and between two local
+# processes, which share one daemon handle and are told apart only by the
+# owner id the module now forwards. GETLK names the holder's exact range
+# instead of the flat ENOLCK it returned before the opcode existed.
+alloyfs-lock -x -r 0:100 -w 4000 $MNT/lockme.txt > /tmp/h5.log 2>&1 &
+H5=$!
+n=0; while ! grep -q . /tmp/h5.log 2>/dev/null; do
+	n=$((n + 1)); [ $n -gt 400 ] && break; sleep 0.02
+done
+eq "range holder on A"               "LOCKED" "$(cat /tmp/h5.log)"
+eq "disjoint range on B granted"     "LOCKED" "$(alloyfs-lock -x -n -r 100:50 $MNT2/lockme.txt 2>&1)"
+eq "disjoint range on A granted too" "LOCKED" "$(alloyfs-lock -x -n -r 100:50 $MNT/lockme.txt 2>&1)"
+eq "overlapping range on B busy"     "BUSY"   "$(alloyfs-lock -x -n -r 50:100 $MNT2/lockme.txt 2>&1)"
+eq "getlk on B names the range"      "HELD X 0 100" "$(alloyfs-lock -g -r 50:10 $MNT2/lockme.txt 2>&1)"
+eq "getlk on A sees its neighbour"   "HELD X 0 100" "$(alloyfs-lock -g -r 0:5 $MNT/lockme.txt 2>&1)"
+eq "getlk clear of it reports free"  "FREE"   "$(alloyfs-lock -g -r 200:10 $MNT2/lockme.txt 2>&1)"
+wait $H5 2>/dev/null
+
+# A to-EOF lock (fcntl l_len == 0) reaches to any offset, and comes back out
+# of GETLK in the same spelling rather than as some finite length.
+alloyfs-lock -x -r 10:0 -w 3000 $MNT/lockme.txt > /tmp/h6.log 2>&1 &
+H6=$!
+n=0; while ! grep -q . /tmp/h6.log 2>/dev/null; do
+	n=$((n + 1)); [ $n -gt 400 ] && break; sleep 0.02
+done
+eq "to-EOF holder on A"            "LOCKED" "$(cat /tmp/h6.log)"
+eq "before it stays free"          "LOCKED" "$(alloyfs-lock -x -n -r 0:10 $MNT2/lockme.txt 2>&1)"
+eq "far past EOF still held"       "BUSY"   "$(alloyfs-lock -x -n -r 100000:1 $MNT2/lockme.txt 2>&1)"
+eq "getlk keeps the EOF spelling"  "HELD X 10 0" "$(alloyfs-lock -g -r 100000:1 $MNT2/lockme.txt 2>&1)"
+wait $H6 2>/dev/null
+
 # --- flock(2) goes through ->flock, a different hook ------------------------
 alloyfs-lock -f -x -w 2500 $MNT/lockme.txt > /tmp/h3.log 2>&1 &
 H3=$!

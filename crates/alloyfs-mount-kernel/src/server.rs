@@ -15,12 +15,12 @@
 //!     file, not a handle. So reads and writes borrow a handle from a small
 //!     LRU cache, opening one on demand and releasing the eviction victim.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use alloyfs_client::{RemoteFs, ROOT_INO};
-use alloyfs_proto::{Attr, EventKind, FileKind, FsEvent, OpenFlags, RelPath};
+use alloyfs_client::{FsError, RemoteFs, ROOT_INO};
+use alloyfs_proto::{Attr, ErrorCode, EventKind, FileKind, FsEvent, OpenFlags, RelPath};
 
 use crate::abi::{self, InHeader, KernelAttr, Notification};
 
@@ -95,6 +95,11 @@ pub struct Server {
     /// notification about a *deleted* name can still set FS_ISDIR correctly —
     /// by then there is nothing left to stat.
     kinds: Mutex<HashMap<u64, bool>>,
+    /// Which lock owners hold something on each nodeid. This is what decides
+    /// when a handle's `locked` pin can come off: byte ranges mean one unlock
+    /// no longer implies "nothing left", so the pin drops only once every
+    /// owner has sent the whole-file release the VFS issues on close.
+    lock_owners: Mutex<HashMap<u64, HashSet<u64>>>,
 }
 
 impl Server {
@@ -104,6 +109,7 @@ impl Server {
             handles: Mutex::new(HandleCache::default()),
             dirs: Mutex::new(HashMap::new()),
             kinds: Mutex::new(HashMap::new()),
+            lock_owners: Mutex::new(HashMap::new()),
         }
     }
 
@@ -136,7 +142,8 @@ impl Server {
             abi::OP_WRITE => self.op_write(header.nodeid, header.offset, payload),
             abi::OP_SETATTR => self.op_setattr(header.nodeid, payload),
             abi::OP_LOCK => self.op_lock(header.nodeid, payload),
-            abi::OP_UNLOCK => self.op_unlock(header.nodeid),
+            abi::OP_UNLOCK => self.op_unlock(header.nodeid, payload),
+            abi::OP_GETLK => self.op_getlk(header.nodeid, payload),
             abi::OP_SYMLINK => self.op_symlink(header.nodeid, payload),
             abi::OP_READLINK => self.op_readlink(header.nodeid),
             abi::OP_LINK => self.op_link(header.nodeid, payload),
@@ -317,8 +324,10 @@ impl Server {
     }
 
     /// Forget (and release) any handle for `nodeid` — used when the file it
-    /// names is gone.
+    /// names is gone. Releasing the handle released its locks with it, so the
+    /// owner bookkeeping goes too.
     fn drop_handle(&self, nodeid: u64) {
+        self.lock_owners.lock().unwrap().remove(&nodeid);
         let h = self.handles.lock().unwrap().map.remove(&nodeid);
         if let Some(h) = h {
             self.fs.release(h.fh);
@@ -347,6 +356,7 @@ impl Server {
 
     /// Release every cached handle. Called once the mount is finished with.
     pub fn close_handles(&self) {
+        self.lock_owners.lock().unwrap().clear();
         let handles: Vec<Handle> = {
             let mut cache = self.handles.lock().unwrap();
             cache.map.drain().map(|(_, h)| h).collect()
@@ -421,8 +431,8 @@ impl Server {
 
     // ------------------------------------------------------------- locks
 
-    /// Take an advisory lock on the server, so it means something to the
-    /// other machines mounting this export.
+    /// Take an advisory byte-range lock on the server, so it means something
+    /// to the other machines mounting this export.
     ///
     /// The handle is opened for WRITE where the export allows it, even for a
     /// shared lock. That is not about access: `handle_for` upgrades a
@@ -431,6 +441,11 @@ impl Server {
     /// would drop its own lock halfway through. Taking the write handle up
     /// front means no upgrade can happen while the lock is held. A read-only
     /// export cannot be written anyway, so falling back there loses nothing.
+    ///
+    /// Against a pre-v7 agent the range op does not exist, and the TAKE
+    /// coarsens to the whole-file lock — safe, because it claims strictly
+    /// more than was asked. The release below deliberately has no such
+    /// fallback: see `op_unlock`.
     ///
     /// MAY BLOCK for as long as the caller asked it to: `wait` is F_SETLKW,
     /// and the whole point is to sleep until the holder lets go. Each request
@@ -442,24 +457,97 @@ impl Server {
             Ok(fh) => fh,
             Err(_) => self.handle_for(nodeid, false)?,
         };
-        self.fs.lock(fh, req.kind, req.wait).map_err(|e| errno_of(&e))?;
-        self.mark_locked(nodeid, true);
+        match self
+            .fs
+            .lock_range(fh, req.owner, req.kind, req.start, req.len, req.wait)
+        {
+            Ok(()) => {}
+            Err(e) if is_version_mismatch(&e) => {
+                self.fs.lock(fh, req.kind, req.wait).map_err(|e| errno_of(&e))?;
+            }
+            Err(e) => return Err(errno_of(&e)),
+        }
+        self.note_owner(nodeid, req.owner);
         Ok(Vec::new())
     }
 
-    /// Release the advisory lock on `nodeid`.
+    /// Release exactly `[start, start+len)` for one owner on `nodeid`.
     ///
     /// A missing handle is success, not an error. The VFS unlocks on close
-    /// whether or not anything was ever locked, so "no handle here" is the
+    /// whether or not this owner ever locked, so "no handle here" is the
     /// ordinary path for every file that was opened and never locked.
-    fn op_unlock(&self, nodeid: u64) -> Result<Vec<u8>, i32> {
+    ///
+    /// Against a pre-v7 agent this REFUSES with ENOLCK rather than falling
+    /// back to the whole-file unlock — the mirror image of the take-side
+    /// coarsening, and deliberately asymmetric: a coarsened take claims more
+    /// than was asked, which is safe; a coarsened release drops every lock
+    /// the handle holds, which is the bug the range ops exist to fix. The
+    /// server-side lock then stays until the handle itself is released.
+    fn op_unlock(&self, nodeid: u64, payload: &[u8]) -> Result<Vec<u8>, i32> {
+        let req = abi::parse_unlock_in(payload).ok_or(abi::EINVAL)?;
         let fh = self.handles.lock().unwrap().map.get(&nodeid).map(|h| h.fh);
         let Some(fh) = fh else {
             return Ok(Vec::new());
         };
-        self.fs.unlock(fh).map_err(|e| errno_of(&e))?;
-        self.mark_locked(nodeid, false);
+        match self.fs.unlock_range(fh, req.owner, req.start, req.len) {
+            Ok(()) => {}
+            Err(e) if is_version_mismatch(&e) => return Err(abi::ENOLCK),
+            Err(e) => return Err(errno_of(&e)),
+        }
+        // A whole-file release is how the VFS spells "this owner is done"
+        // (locks_remove_posix on close); a partial one leaves fragments, so
+        // the owner — and the handle pin — must survive it.
+        if req.start == 0 && req.len == 0 {
+            self.forget_owner(nodeid, req.owner);
+        }
         Ok(Vec::new())
+    }
+
+    /// F_GETLK: what would block this probe, if anything.
+    ///
+    /// Never answered locally, and never coarsened: a pre-v7 agent gets
+    /// ENOLCK, matching what the module itself returned before the opcode
+    /// existed. A local answer would say "free" while another machine held
+    /// the range, and callers treat ENOLCK as "try the lock instead" — which
+    /// IS checked properly.
+    fn op_getlk(&self, nodeid: u64, payload: &[u8]) -> Result<Vec<u8>, i32> {
+        let req = abi::parse_lock_in(payload).ok_or(abi::EINVAL)?;
+        let fh = self.handle_for(nodeid, false)?;
+        match self.fs.test_lock(fh, req.owner, req.kind, req.start, req.len) {
+            Ok(conflict) => Ok(abi::getlk_out(conflict.as_ref())),
+            Err(e) if is_version_mismatch(&e) => Err(abi::ENOLCK),
+            Err(e) => Err(errno_of(&e)),
+        }
+    }
+
+    /// Record that `owner` holds something on `nodeid`, pinning the cached
+    /// handle against eviction (releasing it would release the lock).
+    fn note_owner(&self, nodeid: u64, owner: u64) {
+        self.lock_owners
+            .lock()
+            .unwrap()
+            .entry(nodeid)
+            .or_default()
+            .insert(owner);
+        self.mark_locked(nodeid, true);
+    }
+
+    /// `owner` released everything it held on `nodeid`; unpin the handle once
+    /// no owner is left.
+    fn forget_owner(&self, nodeid: u64, owner: u64) {
+        let now_free = {
+            let mut owners = self.lock_owners.lock().unwrap();
+            match owners.get_mut(&nodeid) {
+                Some(set) => {
+                    set.remove(&owner);
+                    set.is_empty() && owners.remove(&nodeid).is_some()
+                }
+                None => false,
+            }
+        };
+        if now_free {
+            self.mark_locked(nodeid, false);
+        }
     }
 
     // -------------------------------------------------------- mutations
@@ -640,4 +728,10 @@ impl Server {
         }
         Some(n)
     }
+}
+
+/// Did this fail only because the agent is older than the operation needs?
+/// (The same predicate the FUSE backend keys its fallback on.)
+fn is_version_mismatch(e: &FsError) -> bool {
+    matches!(e, FsError::Remote(ErrorCode::VersionMismatch))
 }

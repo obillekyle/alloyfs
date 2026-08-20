@@ -465,7 +465,9 @@ impl RemoteFs {
     /// `epoch_at_check` was captured. Returns how many directories landed.
     pub(crate) fn adopt_meta_snapshot(&self, token: u64, epoch_at_check: u64) -> usize {
         let Some(meta) = &self.meta else { return 0 };
-        let Some(snap) = meta.load_for(token) else { return 0 };
+        let Some(snap) = meta.load_for(token) else {
+            return 0;
+        };
         // Same rule as readdir's insert guard, same direction of error: a
         // mutation observed since the capture means these listings may
         // describe the past, and a skipped install costs a cold first
