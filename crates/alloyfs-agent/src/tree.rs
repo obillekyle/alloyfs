@@ -28,7 +28,7 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use alloyfs_common::{attr_from_metadata, ExcludeSet};
-use alloyfs_proto::{Attr, RelPath};
+use alloyfs_proto::{Attr, FileKind, RelPath};
 
 /// Entries above which an export is left unindexed and clients keep using
 /// `Readdir`.
@@ -274,6 +274,61 @@ impl ExportTree {
         Some((page, more, idx.token()))
     }
 
+    /// One readdir page: the direct children of `dir`, name-ordered, from
+    /// child offset `offset`. Each entry is the child's NAME (not its full
+    /// path) plus its indexed attrs.
+    ///
+    /// `None` means "answer from disk instead" — either the export is not
+    /// indexed, or the index does not know `dir` as a directory. The second
+    /// half is deliberate: the disk path owns every error case (NotFound,
+    /// not-a-directory, the case-insensitive spellings a real volume resolves
+    /// and this byte-keyed map cannot), so the index only ever answers the
+    /// one question it answers exactly.
+    pub fn readdir_page(
+        &self,
+        dir: &RelPath,
+        offset: usize,
+        limit: usize,
+    ) -> Option<(Vec<(String, Attr)>, bool)> {
+        let st = self.state.lock().unwrap();
+        let State::Live(idx) = &*st else {
+            return None;
+        };
+        if !dir.is_root() {
+            match idx.entries.get(dir) {
+                Some(a) if a.kind == FileKind::Dir => {}
+                _ => return None,
+            }
+        }
+        let prefix = if dir.is_root() {
+            String::new()
+        } else {
+            format!("{}/", dir.0)
+        };
+        // Same seek as `page`, plus a filter: an entry is a DIRECT child
+        // exactly when nothing past the prefix contains another '/'. The map
+        // orders full paths byte-wise and siblings share the prefix, so the
+        // survivors come out in byte order of their names — the same order
+        // the disk path produces by sorting names. (Descendants interleave
+        // between siblings in the range; filtering a sorted sequence leaves
+        // the survivors sorted.)
+        let mut kids = idx
+            .entries
+            .range(RelPath(prefix.clone())..)
+            .take_while(|(p, _)| prefix.is_empty() || p.0.starts_with(&prefix))
+            .filter(|(p, _)| {
+                let rest = &p.0[prefix.len()..];
+                !rest.is_empty() && !rest.contains('/')
+            })
+            .skip(offset);
+        let mut page = Vec::with_capacity(limit.min(1024));
+        for (p, a) in kids.by_ref().take(limit) {
+            page.push((p.0[prefix.len()..].to_string(), *a));
+        }
+        let more = kids.next().is_some();
+        Some((page, more))
+    }
+
     /// Apply one observed change. Cheap enough to call per event.
     pub fn note_change(&self, root: &Path, path: &RelPath, removed: bool) {
         let mut st = self.state.lock().unwrap();
@@ -372,6 +427,55 @@ mod tests {
         idx.insert(RelPath("a".into()), attr_of(1));
         idx.insert(RelPath("b".into()), attr_of(1));
         assert_ne!(empty, idx.token());
+    }
+
+    fn dir_attr() -> Attr {
+        Attr {
+            kind: FileKind::Dir,
+            ..attr_of(0)
+        }
+    }
+
+    /// `readdir_page` must serve exactly what a disk readdir of the same map
+    /// would: direct children only, name order, offset paging — and refuse
+    /// (None) whenever the answer would need disk semantics it cannot supply.
+    #[test]
+    fn readdir_pages_direct_children_in_name_order() {
+        let mut idx = Indexed::default();
+        // "a.txt" sorts between "a" and "a/deep" in full-path byte order —
+        // the interleaving the direct-child filter has to survive.
+        idx.insert(RelPath("d".into()), dir_attr());
+        idx.insert(RelPath("d/a".into()), dir_attr());
+        idx.insert(RelPath("d/a/deep".into()), attr_of(9));
+        idx.insert(RelPath("d/a.txt".into()), attr_of(1));
+        idx.insert(RelPath("d/b".into()), attr_of(2));
+        idx.insert(RelPath("plain".into()), attr_of(3));
+
+        let tree = ExportTree::new(10);
+        *tree.state.lock().unwrap() = State::Live(idx);
+
+        let (kids, more) = tree.readdir_page(&RelPath("d".into()), 0, 100).unwrap();
+        let names: Vec<&str> = kids.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["a", "a.txt", "b"], "direct children, name-sorted");
+        assert!(!more);
+
+        // Root listing: the subtree stays out of it.
+        let (root, _) = tree.readdir_page(&RelPath(String::new()), 0, 100).unwrap();
+        let names: Vec<&str> = root.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["d", "plain"]);
+
+        // Offset paging: limit 2 leaves one more, and the cursor picks it up.
+        let (page, more) = tree.readdir_page(&RelPath("d".into()), 0, 2).unwrap();
+        assert_eq!(page.len(), 2);
+        assert!(more);
+        let (rest, more) = tree.readdir_page(&RelPath("d".into()), 2, 2).unwrap();
+        assert_eq!(rest[0].0, "b");
+        assert!(!more);
+
+        // Anything the index cannot answer exactly goes to disk: a path it
+        // does not know, and a path it knows as a file.
+        assert!(tree.readdir_page(&RelPath("missing".into()), 0, 10).is_none());
+        assert!(tree.readdir_page(&RelPath("plain".into()), 0, 10).is_none());
     }
 
     #[test]

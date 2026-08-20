@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use alloyfs_common::{attr_from_metadata, read_fully, set_mode, write_fully, ExcludeSet, OrCode};
 use alloyfs_proto::{
-    Attr, DirEntry, ErrorCode, EventKind, FsEvent, ManyEntry, OpenFlags, RelPath, Request, Response,
-    DATA_CHUNK, PROTO_VERSION_MIN,
+    Attr, DirEntry, ErrorCode, EventKind, FileKind, FsEvent, ManyEntry, OpenFlags, RelPath, Request,
+    Response, DATA_CHUNK, PROTO_VERSION_MIN,
 };
 use alloyfs_transport::{EventPusher, RequestHandler};
 use dashmap::DashMap;
@@ -617,6 +617,61 @@ impl SessionInner {
 
     fn readdir(&self, path: RelPath, cursor: u64) -> Result<Response, ErrorCode> {
         let export = self.export()?;
+        // Serve from the v6 index when it can answer exactly. The disk path
+        // below re-reads and re-stats the ENTIRE directory on every page —
+        // O(N) disk work per page and O(N²) to list a big directory in full —
+        // where the index has paid that cost once and is kept current by the
+        // watcher. Three things make the swap safe:
+        //
+        // - Excludes: the index never contains an excluded path (the build
+        //   walk filters them, and the Coalescer drops their events before
+        //   `note_change` sees them), so no re-filter here — and an excluded
+        //   directory is absent from the index, which routes it to the disk
+        //   path's NotFound, same answer as today.
+        // - Versions: the index stores attrs with version 0 (they come from
+        //   plain stats). Served as-is that would defeat client freshness
+        //   checks — autocache treats "either side 0" as unknowable — so the
+        //   live version is overlaid per entry, exactly as the disk path and
+        //   `tree()` do.
+        // - Everything the index cannot answer exactly returns None (not
+        //   indexed, path unknown to it, not a directory, a case-insensitive
+        //   spelling only the volume can resolve) and falls through to disk,
+        //   keeping every error identical.
+        if let Some((children, more)) =
+            export.tree.readdir_page(&path, cursor as usize, READDIR_PAGE)
+        {
+            let entries: Vec<DirEntry> = children
+                .into_iter()
+                .map(|(name, attr)| {
+                    let child = path.join(&name);
+                    // The index stores a link AS a link (following one during
+                    // the walk could escape the export); the disk path below
+                    // follows. Keep readdir's contract by following here —
+                    // links are rare enough to stat individually, and a broken
+                    // one keeps the link's own attrs, matching the disk path's
+                    // symlink_metadata fallback.
+                    let attr = if attr.kind == FileKind::Symlink {
+                        std::fs::metadata(export.root.join(&child.0))
+                            .map(|md| attr_from_metadata(&md, 0))
+                            .unwrap_or(attr)
+                    } else {
+                        attr
+                    };
+                    DirEntry {
+                        name,
+                        attr: Attr {
+                            version: export.version_of(&child),
+                            ..attr
+                        },
+                    }
+                })
+                .collect();
+            let next_cursor = more.then(|| cursor + entries.len() as u64);
+            return Ok(Response::Dir {
+                entries,
+                next_cursor,
+            });
+        }
         let full = export.resolve(&path)?;
         let mut entries: Vec<DirEntry> = Vec::new();
         for item in std::fs::read_dir(&full).or_code()? {
