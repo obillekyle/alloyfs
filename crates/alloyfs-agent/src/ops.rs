@@ -52,6 +52,32 @@ pub struct Export {
     /// The v6 index. Built on first request, not at startup — an export no
     /// client asks a tree of is never walked.
     pub tree: crate::tree::ExportTree,
+    /// v11 Windows attribute bits: native NTFS on a Windows agent, the
+    /// export's `.alloyfs` sidecar on Linux. See winattr.rs.
+    pub winattrs: crate::winattr::WinAttrs,
+}
+
+impl Export {
+    /// Merge the v11 bits into a served Attr. On Windows this is the
+    /// identity — `attr_from_metadata` read the bits off the metadata
+    /// already; on Linux it is the sidecar's serve-time merge. The tree
+    /// index also stores bit-less attrs on Linux, which this covers at the
+    /// same sites that overlay versions.
+    pub fn with_winattrs(&self, rel: &RelPath, attr: Attr) -> Attr {
+        #[cfg(unix)]
+        {
+            let bits = self.winattrs.get(rel);
+            if bits != 0 {
+                return Attr {
+                    mode: attr.mode | bits,
+                    ..attr
+                };
+            }
+        }
+        #[cfg(windows)]
+        let _ = rel;
+        attr
+    }
 }
 
 /// Resolved form of the config's `client:` section.
@@ -199,7 +225,7 @@ impl Export {
             let Ok(md) = md else { continue };
             entries.push(DirEntry {
                 name,
-                attr: attr_from_metadata(&md, self.version_of(&child)),
+                attr: self.with_winattrs(&child, attr_from_metadata(&md, self.version_of(&child))),
             });
         }
         entries.sort_by(|a, b| a.name.cmp(&b.name));
@@ -226,10 +252,17 @@ impl ExportRegistry {
             // user's own patterns; the built-in local artifacts are matched
             // case-insensitively regardless, since their casing is the OS's
             // choice rather than anybody's configuration.
+            // `.alloyfs` is the export's own metadata (the v11 winattr
+            // sidecar lives there): server-excluded on EVERY export, so no
+            // client ever lists, reads, or creates through it. Added on both
+            // platforms — an export served alternately by a Linux and a
+            // Windows agent must hide the same directory either way.
+            let mut patterns = vec![".alloyfs".to_string(), ".alloyfs/**".to_string()];
+            patterns.extend(ec.exclude.iter().cloned());
             let exclude = if ec.default_excludes {
-                ExcludeSet::compile_with_defaults(&ec.exclude, false)
+                ExcludeSet::compile_with_defaults(&patterns, false)
             } else {
-                ExcludeSet::compile(&ec.exclude, false)
+                ExcludeSet::compile(&patterns, false)
             }
             .map_err(|e| anyhow::anyhow!("export {name}: {e}"))?;
             // Resolve the suggested-client-config sizes at startup so a bad
@@ -264,6 +297,7 @@ impl ExportRegistry {
                 name.clone(),
                 Arc::new(Export {
                     name: name.clone(),
+                    winattrs: crate::winattr::WinAttrs::load(&root),
                     root,
                     read_only: ec.read_only,
                     versions: DashMap::new(),
@@ -533,7 +567,10 @@ impl SessionInner {
         let export = self.export()?;
         let full = export.resolve(&path)?;
         let md = std::fs::metadata(&full).or_code()?;
-        Ok(Response::Attr(attr_from_metadata(&md, export.version_of(&path))))
+        Ok(Response::Attr(export.with_winattrs(
+            &path,
+            attr_from_metadata(&md, export.version_of(&path)),
+        )))
     }
 
     /// Build the index if needed, replaying anything that changed during the
@@ -596,10 +633,13 @@ impl SessionInner {
             entries: entries
                 .into_iter()
                 .map(|(p, attr)| alloyfs_proto::TreeEntry {
-                    attr: Attr {
-                        version: export.version_of(&p),
-                        ..attr
-                    },
+                    attr: export.with_winattrs(
+                        &p,
+                        Attr {
+                            version: export.version_of(&p),
+                            ..attr
+                        },
+                    ),
                     path: p,
                 })
                 .collect(),
@@ -657,10 +697,13 @@ impl SessionInner {
                     };
                     DirEntry {
                         name,
-                        attr: Attr {
-                            version: export.version_of(&child),
-                            ..attr
-                        },
+                        attr: export.with_winattrs(
+                            &child,
+                            Attr {
+                                version: export.version_of(&child),
+                                ..attr
+                            },
+                        ),
                     }
                 })
                 .collect();
@@ -689,7 +732,7 @@ impl SessionInner {
             // on them for freshness without extra Getattrs.
             entries.push(DirEntry {
                 name,
-                attr: attr_from_metadata(&md, export.version_of(&child)),
+                attr: export.with_winattrs(&child, attr_from_metadata(&md, export.version_of(&child))),
             });
         }
         entries.sort_by(|a, b| a.name.cmp(&b.name));
@@ -732,7 +775,7 @@ impl SessionInner {
         } else {
             export.version_of(&path)
         };
-        let attr = attr_from_metadata(&md, version);
+        let attr = export.with_winattrs(&path, attr_from_metadata(&md, version));
         let fh = self.insert_handle(file, path, wants_write);
         Ok(Response::Opened { fh, attr })
     }
@@ -851,7 +894,7 @@ impl SessionInner {
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(mode);
+            opts.mode(mode & !alloyfs_proto::MODE_WIN_MASK);
         }
         let file = opts.open(&full).or_code()?;
         // Windows has no umask and no mode; `set_mode` only maps the write bit
@@ -860,7 +903,7 @@ impl SessionInner {
         alloyfs_common::set_mode(&file, mode);
         let md = file.metadata().or_code()?;
         export.events.note_local_write(&path, self.id);
-        let attr = attr_from_metadata(&md, export.bump(&path));
+        let attr = export.with_winattrs(&path, attr_from_metadata(&md, export.bump(&path)));
         let fh = self.insert_handle(file, path, true);
         Ok(Response::Opened { fh, attr })
     }
@@ -924,7 +967,7 @@ impl SessionInner {
             spent += n as u64;
             let version = export.version_of(&path);
             entries.push(ManyEntry::File {
-                attr: attr_from_metadata(&md, version),
+                attr: export.with_winattrs(&path, attr_from_metadata(&md, version)),
                 data: buf.into(),
             });
         }
@@ -992,7 +1035,7 @@ impl SessionInner {
             if let Ok(md) = of.file.metadata() {
                 return Ok(Response::WrittenAttr {
                     n,
-                    attr: attr_from_metadata(&md, new_version),
+                    attr: export.with_winattrs(&of.path, attr_from_metadata(&md, new_version)),
                 });
             }
             tracing::debug!(path = %of.path, "post-write stat failed; replying without attributes");
@@ -1043,7 +1086,10 @@ impl SessionInner {
         }
         let md = std::fs::metadata(&full).or_code()?;
         export.events.note_local_write(&path, self.id);
-        Ok(Response::Attr(attr_from_metadata(&md, export.bump(&path))))
+        Ok(Response::Attr(export.with_winattrs(
+            &path,
+            attr_from_metadata(&md, export.bump(&path)),
+        )))
     }
 
     fn mkdir(&self, path: RelPath, _mode: u32) -> Result<Response, ErrorCode> {
@@ -1052,7 +1098,10 @@ impl SessionInner {
         std::fs::create_dir(&full).or_code()?; // directory modes: server umask decides
         let md = std::fs::metadata(&full).or_code()?;
         export.events.note_local_write(&path, self.id);
-        Ok(Response::Attr(attr_from_metadata(&md, export.bump(&path))))
+        Ok(Response::Attr(export.with_winattrs(
+            &path,
+            attr_from_metadata(&md, export.bump(&path)),
+        )))
     }
 
     /// v10+: create-or-replace several WHOLE files in one exchange — the
@@ -1087,7 +1136,7 @@ impl SessionInner {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::OpenOptionsExt;
-                o.mode(f.mode);
+                o.mode(f.mode & !alloyfs_proto::MODE_WIN_MASK);
             }
             o.open(&full)
         };
@@ -1109,7 +1158,10 @@ impl SessionInner {
         file.write_all(&f.data).or_code()?;
         let md = file.metadata().or_code()?;
         export.events.note_local_write(&f.path, self.id);
-        Ok(Some(attr_from_metadata(&md, export.bump(&f.path))))
+        Ok(Some(export.with_winattrs(
+            &f.path,
+            attr_from_metadata(&md, export.bump(&f.path)),
+        )))
     }
 
     /// v10+: several removals in one exchange, in order, answered per entry.
@@ -1127,6 +1179,7 @@ impl SessionInner {
                 }
                 export.events.note_local_write(&e.path, self.id);
                 export.forget_version(&e.path);
+                export.winattrs.remove(&e.path);
                 Ok(None)
             })();
             out.push(one);
@@ -1148,12 +1201,35 @@ impl SessionInner {
         Ok(Response::ManyOutcome(out))
     }
 
+    /// v11+: change the Windows attribute bits — natively where the agent
+    /// runs on Windows, through the `.alloyfs` sidecar on Linux. `set` and
+    /// `clear` are masked intents; the reply carries the post-change attrs,
+    /// bits included (this session is v11+ by definition of having decoded
+    /// the request, so nothing strips them).
+    fn set_win_attrs(&self, path: RelPath, set: u32, clear: u32) -> Result<Response, ErrorCode> {
+        use alloyfs_proto::MODE_WIN_MASK;
+        let export = self.writable_export()?;
+        let full = export.resolve(&path)?;
+        #[cfg(windows)]
+        crate::winattr::WinAttrs::apply_native(&full, set & MODE_WIN_MASK, clear & MODE_WIN_MASK)
+            .or_code()?;
+        #[cfg(unix)]
+        export
+            .winattrs
+            .apply(&path, set & MODE_WIN_MASK, clear & MODE_WIN_MASK);
+        let md = std::fs::metadata(&full).or_code()?;
+        export.events.note_local_write(&path, self.id);
+        let attr = attr_from_metadata(&md, export.bump(&path));
+        Ok(Response::Attr(export.with_winattrs(&path, attr)))
+    }
+
     fn unlink(&self, path: RelPath) -> Result<Response, ErrorCode> {
         let export = self.writable_export()?;
         let full = export.resolve(&path)?;
         std::fs::remove_file(&full).or_code()?;
         export.events.note_local_write(&path, self.id);
         export.forget_version(&path);
+        export.winattrs.remove(&path);
         Ok(Response::Ok)
     }
 
@@ -1163,6 +1239,7 @@ impl SessionInner {
         std::fs::remove_dir(&full).or_code()?;
         export.events.note_local_write(&path, self.id);
         export.forget_version(&path);
+        export.winattrs.remove(&path);
         Ok(Response::Ok)
     }
 
@@ -1181,6 +1258,7 @@ impl SessionInner {
         export.events.note_local_write(&from, self.id);
         export.events.note_local_write(&to, self.id);
         export.rename_version(&from, &to);
+        export.winattrs.rename(&from, &to);
         Ok(Response::Ok)
     }
 
@@ -1191,7 +1269,10 @@ impl SessionInner {
         std::fs::hard_link(&target_full, &link_full).or_code()?;
         let md = std::fs::metadata(&link_full).or_code()?;
         export.events.note_local_write(&link, self.id);
-        Ok(Response::Attr(attr_from_metadata(&md, export.bump(&link))))
+        Ok(Response::Attr(export.with_winattrs(
+            &link,
+            attr_from_metadata(&md, export.bump(&link)),
+        )))
     }
 
     /// Create a symlink, refusing any that would point out of the export.
@@ -1233,7 +1314,10 @@ impl SessionInner {
 
         let md = std::fs::symlink_metadata(&link_full).or_code()?;
         export.events.note_local_write(&link, self.id);
-        Ok(Response::Attr(attr_from_metadata(&md, export.bump(&link))))
+        Ok(Response::Attr(export.with_winattrs(
+            &link,
+            attr_from_metadata(&md, export.bump(&link)),
+        )))
     }
 
     /// Read a symlink's target, verbatim.
@@ -1315,6 +1399,7 @@ impl SessionInner {
             Request::WriteMany { files } => self.write_many(files),
             Request::RemoveMany { entries } => self.remove_many(entries),
             Request::SetattrMany { entries } => self.setattr_many(entries),
+            Request::SetWinAttrs { path, set, clear } => self.set_win_attrs(path, set, clear),
             Request::Write {
                 fh,
                 offset,
@@ -1357,6 +1442,104 @@ impl SessionInner {
     }
 }
 
+/// Mask the v11 `MODE_WIN_*` bits out of every Attr a reply carries.
+///
+/// Exhaustive over `Response` on purpose: a future variant that carries an
+/// Attr must decide here whether it strips, exactly as the golden-wire test
+/// forces a decision about encoding.
+fn strip_win_bits(resp: Response) -> Response {
+    use alloyfs_proto::MODE_WIN_MASK;
+    fn clean(a: Attr) -> Attr {
+        Attr {
+            mode: a.mode & !MODE_WIN_MASK,
+            ..a
+        }
+    }
+    match resp {
+        Response::Attr(a) => Response::Attr(clean(a)),
+        Response::AttachOk { export_id, root_attr } => Response::AttachOk {
+            export_id,
+            root_attr: clean(root_attr),
+        },
+        Response::Attached2 {
+            export_id,
+            root_attr,
+            exclude,
+            pin,
+            auto_cache_max,
+            auto_cache_budget,
+            tree_token,
+        } => Response::Attached2 {
+            export_id,
+            root_attr: clean(root_attr),
+            exclude,
+            pin,
+            auto_cache_max,
+            auto_cache_budget,
+            tree_token,
+        },
+        Response::Dir {
+            mut entries,
+            next_cursor,
+        } => {
+            for e in &mut entries {
+                e.attr = clean(e.attr);
+            }
+            Response::Dir { entries, next_cursor }
+        }
+        Response::Tree {
+            mut entries,
+            next_cursor,
+            token,
+        } => {
+            for e in &mut entries {
+                e.attr = clean(e.attr);
+            }
+            Response::Tree {
+                entries,
+                next_cursor,
+                token,
+            }
+        }
+        Response::Opened { fh, attr } => Response::Opened {
+            fh,
+            attr: clean(attr),
+        },
+        Response::OpenedData { fh, attr, data } => Response::OpenedData {
+            fh,
+            attr: clean(attr),
+            data,
+        },
+        Response::WrittenAttr { n, attr } => Response::WrittenAttr { n, attr: clean(attr) },
+        Response::Many(mut entries) => {
+            for e in &mut entries {
+                if let ManyEntry::File { attr, .. } = e {
+                    *attr = clean(*attr);
+                }
+            }
+            Response::Many(entries)
+        }
+        Response::ManyOutcome(mut outcomes) => {
+            for o in &mut outcomes {
+                if let Ok(Some(attr)) = o {
+                    *attr = clean(*attr);
+                }
+            }
+            Response::ManyOutcome(outcomes)
+        }
+        // No Attr inside: pass through untouched.
+        r @ (Response::Data(_)
+        | Response::Written { .. }
+        | Response::Statfs { .. }
+        | Response::Subscribed { .. }
+        | Response::Ok
+        | Response::MountDefaults { .. }
+        | Response::Target(_)
+        | Response::TreeToken { .. }
+        | Response::LockStatus(_)) => r,
+    }
+}
+
 #[async_trait::async_trait]
 impl RequestHandler for AgentSession {
     async fn handle(&self, req: Request) -> Result<Response, ErrorCode> {
@@ -1381,7 +1564,7 @@ impl RequestHandler for AgentSession {
         // Subscribe spawns an async forwarder and Lock may await another
         // session's release — both must run here in async context; everything
         // else does blocking file I/O and moves to the blocking pool.
-        match req {
+        let resp = match req {
             Request::Subscribe { since_seq } => self.subscribe(since_seq),
             Request::Lock { fh, kind, wait } => {
                 let inner = &self.inner;
@@ -1458,7 +1641,15 @@ impl RequestHandler for AgentSession {
                     .await
                     .map_err(|_| ErrorCode::Io)?
             }
+        };
+        // The v11 gate, server half: a session below 11 must never see the
+        // MODE_WIN_* high bits — an older peer reads mode as pure POSIX
+        // permissions, and a bit it cannot name would corrupt every st_mode
+        // it fabricates. One boundary, every reply.
+        if self.inner.proto.load(Ordering::Relaxed) < 11 {
+            return resp.map(strip_win_bits);
         }
+        resp
     }
 
     async fn negotiated(&self, proto: u16) {

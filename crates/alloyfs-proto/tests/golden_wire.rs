@@ -7,7 +7,8 @@ use std::time::{Duration, SystemTime};
 
 use alloyfs_proto::{
     Attr, DirEntry, ErrorCode, EventKind, FileKind, Frame, FsEvent, LockKind, ManyRemove, ManySetattr,
-    ManyWrite, OpenFlags, RelPath, Request, Response, TreeEntry, PROTO_VERSION_MAX, PROTO_VERSION_MIN,
+    ManyWrite, OpenFlags, RelPath, Request, Response, TreeEntry, MODE_WIN_HIDDEN, MODE_WIN_SYSTEM,
+    PROTO_VERSION_MAX, PROTO_VERSION_MIN,
 };
 use bytes::Bytes;
 
@@ -431,6 +432,14 @@ fn canonical() -> Vec<(&'static str, Frame)> {
             }),
         ),
         (
+            "req_set_win_attrs",
+            req(Request::SetWinAttrs {
+                path: path(),
+                set: MODE_WIN_HIDDEN,
+                clear: MODE_WIN_SYSTEM,
+            }),
+        ),
+        (
             "resp_many_outcome",
             ok(Response::ManyOutcome(vec![
                 Ok(Some(attr())),
@@ -531,6 +540,7 @@ fn _variant_tripwire(
         Request::WriteMany { .. } => {} // v10: golden added, PROTO_VERSION_MAX bumped
         Request::RemoveMany { .. } => {} // v10: golden added, PROTO_VERSION_MAX bumped
         Request::SetattrMany { .. } => {} // v10: golden added, PROTO_VERSION_MAX bumped
+        Request::SetWinAttrs { .. } => {} // v11: golden added, PROTO_VERSION_MAX bumped
     }
     match response {
         Response::AttachOk { .. } => {}
@@ -598,8 +608,8 @@ fn _variant_tripwire(
 /// `cargo test -p alloyfs-proto print_goldens -- --ignored --nocapture`
 #[rustfmt::skip]
 const GOLDEN: &[(&str, &str)] = &[
-    ("hello", "00010a06676f6c64656e"),
-    ("hello_ack", "010a06676f6c64656e"),
+    ("hello", "00010b06676f6c64656e"),
+    ("hello_ack", "010b06676f6c64656e"),
     ("ping", "0507"),
     ("pong", "0607"),
     ("compressed", "0706676f6c64656e"),
@@ -658,6 +668,7 @@ const GOLDEN: &[(&str, &str)] = &[
     ("req_write_many", "020720010c6469722f66696c652e747874b60304626f6479"),
     ("req_remove_many", "020721010c6469722f66696c652e74787400"),
     ("req_setattr_many", "020722010c6469722f66696c652e747874012a00000101"),
+    ("req_set_win_attrs", "0207230c6469722f66696c652e74787480804080808001"),
     ("resp_many_outcome", "03070012030001002a80e2cfaa06bc99ef3a80e2cfaa06bc99ef3aa4030800000100"),
     ("err_not_found", "03070100"),
     ("err_permission_denied", "03070101"),

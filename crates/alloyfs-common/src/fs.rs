@@ -38,12 +38,29 @@ pub fn attr_from_metadata(md: &Metadata, version: u64) -> Attr {
     };
     let mtime = clamp(md.modified().unwrap_or(SystemTime::UNIX_EPOCH));
     let ctime = clamp(md.created().unwrap_or(mtime));
+    // On Windows the NTFS attribute bits are already in the metadata, so the
+    // v11 `MODE_WIN_*` high bits ride along for free — one site covers every
+    // caller, the tree index included. A Linux server has no native home for
+    // them; its agent overlays the `.alloyfs` sidecar at serve time instead.
+    #[allow(unused_mut)]
+    let mut mode = mode_of_md(md);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        let win = md.file_attributes();
+        if win & 0x2 != 0 {
+            mode |= alloyfs_proto::MODE_WIN_HIDDEN;
+        }
+        if win & 0x4 != 0 {
+            mode |= alloyfs_proto::MODE_WIN_SYSTEM;
+        }
+    }
     Attr {
         kind,
         size: md.len(),
         mtime,
         ctime,
-        mode: mode_of_md(md),
+        mode,
         version,
     }
 }

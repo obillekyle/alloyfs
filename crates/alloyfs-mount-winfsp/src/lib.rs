@@ -30,6 +30,8 @@ use winfsp::{FspError, U16CStr};
 const FILE_ATTRIBUTE_READONLY: u32 = 0x0000_0001;
 const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
 const FILE_ATTRIBUTE_ARCHIVE: u32 = 0x0000_0020;
+const FILE_ATTRIBUTE_HIDDEN: u32 = 0x0000_0002;
+const FILE_ATTRIBUTE_SYSTEM: u32 = 0x0000_0004;
 const INVALID_FILE_ATTRIBUTES: u32 = u32::MAX;
 
 /// NtCreateFile create-option: caller demands a directory.
@@ -120,7 +122,7 @@ fn from_filetime(ft: u64) -> SystemTime {
 
 /// Windows-facing attribute bits for a server `Attr`.
 fn attributes(attr: &Attr) -> u32 {
-    match attr.kind {
+    let mut bits = match attr.kind {
         FileKind::Dir => FILE_ATTRIBUTE_DIRECTORY,
         // A symlink is a file that also carries the reparse bit. Without it
         // Windows never asks for the reparse data, so the link would look
@@ -133,7 +135,17 @@ fn attributes(attr: &Attr) -> u32 {
             }
             bits
         }
+    };
+    // v11: Hidden/System travel in the mode's high bits — real NTFS state on
+    // a Windows server, the `.alloyfs` sidecar's on Linux. A pre-v11 server
+    // never sets them, so this is naturally version-gated by the data.
+    if attr.mode & alloyfs_proto::MODE_WIN_HIDDEN != 0 {
+        bits |= FILE_ATTRIBUTE_HIDDEN;
     }
+    if attr.mode & alloyfs_proto::MODE_WIN_SYSTEM != 0 {
+        bits |= FILE_ATTRIBUTE_SYSTEM;
+    }
+    bits
 }
 
 fn fill_file_info(fi: &mut FileInfo, ino: u64, attr: &Attr) {
@@ -728,6 +740,30 @@ impl FileSystemContext for WinFspFs {
             let have = cur.mode & 0o222 == 0;
             if want != have {
                 readonly = Some(want);
+            }
+        }
+        // v11: Hidden/System changes go to the server as masked intents.
+        // `attrib +h` used to be accepted-and-dropped; now it persists —
+        // natively on a Windows server, in the export's sidecar on Linux —
+        // and a pre-v11 server keeps exactly the old accepted-and-dropped
+        // behaviour because the request is never sent.
+        if file_attributes != 0 && file_attributes != INVALID_FILE_ATTRIBUTES {
+            let mut set = 0u32;
+            let mut clear = 0u32;
+            for (native, wire) in [
+                (FILE_ATTRIBUTE_HIDDEN, alloyfs_proto::MODE_WIN_HIDDEN),
+                (FILE_ATTRIBUTE_SYSTEM, alloyfs_proto::MODE_WIN_SYSTEM),
+            ] {
+                let want = file_attributes & native != 0;
+                let have = cur.mode & wire != 0;
+                match (want, have) {
+                    (true, false) => set |= wire,
+                    (false, true) => clear |= wire,
+                    _ => {}
+                }
+            }
+            if set | clear != 0 {
+                let _ = self.fs.set_win_attrs(context.ino, set, clear).map_err(fsp_err)?;
             }
         }
         // Sentinels that all mean "do not set a time": 0 is "no change",

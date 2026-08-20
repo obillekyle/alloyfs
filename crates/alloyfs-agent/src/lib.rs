@@ -10,6 +10,7 @@ mod locks;
 mod ops;
 pub mod tree;
 pub mod watch;
+mod winattr;
 
 pub use config::{AgentConfig, ClientDefaults, ExportConfig};
 pub use ops::{AgentSession, Export, ExportRegistry, MountDefaults};

@@ -3071,6 +3071,80 @@ async fn a_v9_session_writes_through_per_operation() {
     .unwrap();
 }
 
+// ------------------------------------------------------------ v11 win attrs
+
+/// Hidden/System round-trip end to end: set through the client, visible in
+/// getattr AND the parent listing, gone on clear — and `.alloyfs` (the Linux
+/// sidecar's home) never appears in any listing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn windows_attrs_persist_and_list() {
+    use alloyfs_proto::{MODE_WIN_HIDDEN, MODE_WIN_MASK};
+    let agent = start_agent(AgentOpts::default());
+    std::fs::write(agent.dir.path().join("shy.txt"), b"boo").unwrap();
+    let s = connect(&agent, ClientOptions::default()).await;
+    let (ino, before) = lookup_path(&s.fs, "shy.txt").await.unwrap();
+    assert_eq!(before.mode & MODE_WIN_MASK, 0, "starts clean");
+
+    let after = on_fs(&s.fs, move |fs| fs.set_win_attrs(ino, MODE_WIN_HIDDEN, 0))
+        .await
+        .unwrap();
+    assert_ne!(after.mode & MODE_WIN_HIDDEN, 0, "set must stick");
+
+    let entries = on_fs(&s.fs, |fs| fs.readdir(ROOT_INO)).await.unwrap();
+    let (_, _, listed) = entries.iter().find(|(n, _, _)| n == "shy.txt").unwrap();
+    assert_ne!(listed.mode & MODE_WIN_HIDDEN, 0, "the listing must carry it");
+    assert!(
+        !entries.iter().any(|(n, _, _)| n == ".alloyfs"),
+        "the sidecar directory must be invisible: {entries:?}"
+    );
+
+    // A SECOND session sees the persisted bit — it outlives the setter.
+    let s2 = connect(&agent, ClientOptions::default()).await;
+    let (_, seen) = lookup_path(&s2.fs, "shy.txt").await.unwrap();
+    assert_ne!(seen.mode & MODE_WIN_HIDDEN, 0, "persists across sessions");
+
+    let cleared = on_fs(&s.fs, move |fs| fs.set_win_attrs(ino, 0, MODE_WIN_HIDDEN))
+        .await
+        .unwrap();
+    assert_eq!(cleared.mode & MODE_WIN_MASK, 0, "clear must stick");
+}
+
+/// A v10 session never sees the high bits and never sends the request:
+/// modes stay pure POSIX, and set_win_attrs degrades to the historical
+/// accepted-and-dropped behaviour at zero wire cost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_v10_session_neither_sees_nor_sends_win_attrs() {
+    use alloyfs_proto::{MODE_WIN_HIDDEN, MODE_WIN_MASK};
+    let agent = start_agent(AgentOpts::default());
+    std::fs::write(agent.dir.path().join("shy.txt"), b"boo").unwrap();
+
+    // Set the bit through a CURRENT session first.
+    let s11 = connect(&agent, ClientOptions::default()).await;
+    let (ino11, _) = lookup_path(&s11.fs, "shy.txt").await.unwrap();
+    on_fs(&s11.fs, move |fs| fs.set_win_attrs(ino11, MODE_WIN_HIDDEN, 0))
+        .await
+        .unwrap();
+
+    // The clamped session must see a clean mode everywhere...
+    let s10 = connect_with_max(&agent, ClientOptions::default(), 10).await;
+    let (ino10, seen) = lookup_path(&s10.fs, "shy.txt").await.unwrap();
+    assert_eq!(seen.mode & MODE_WIN_MASK, 0, "v10 getattr must be stripped");
+    let entries = on_fs(&s10.fs, |fs| fs.readdir(ROOT_INO)).await.unwrap();
+    let (_, _, listed) = entries.iter().find(|(n, _, _)| n == "shy.txt").unwrap();
+    assert_eq!(listed.mode & MODE_WIN_MASK, 0, "v10 listings must be stripped");
+
+    // ...and its own set attempt costs nothing on the wire.
+    let before = s10.conn().requests_sent();
+    let out = on_fs(&s10.fs, move |fs| fs.set_win_attrs(ino10, MODE_WIN_HIDDEN, 0))
+        .await
+        .unwrap();
+    assert_eq!(out.mode & MODE_WIN_MASK, 0, "old contract: accepted, unpersisted");
+    assert!(
+        s10.conn().requests_sent() - before <= 1, // at most the getattr fallback
+        "a v10 session must never send SetWinAttrs"
+    );
+}
+
 // ------------------------------------------------------------- v9 round trips
 
 /// One exchange opens a small file AND leaves its head where the first read

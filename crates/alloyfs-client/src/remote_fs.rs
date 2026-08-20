@@ -773,6 +773,40 @@ impl RemoteFs {
         }
     }
 
+    /// v11+: change the Windows attribute bits (Hidden/System) on `ino`.
+    ///
+    /// Masked intents, resolved server-side; the reply's attrs re-patch the
+    /// caches so the next stat and the parent's listing tell the new truth.
+    /// Overlay-routed paths apply locally through their own metadata (the
+    /// overlay file IS the file). A pre-v11 server keeps the historical
+    /// accepted-and-dropped behaviour — the request is never sent.
+    pub fn set_win_attrs(&self, ino: u64, set: u32, clear: u32) -> Result<Attr, FsError> {
+        let path = self.path_of(ino)?;
+        if self.is_overlay(&path) {
+            // The overlay's local file carries real NTFS bits already;
+            // nothing to send anywhere. Serve current attrs back.
+            return self.overlay_ref().getattr(&path);
+        }
+        if self.conn().proto < 11 {
+            // The old contract, kept exactly: acknowledged, unpersisted.
+            return self.getattr(ino);
+        }
+        if self.batch.as_ref().is_some_and(|b| b.involves(&path)) {
+            self.barrier_for(&path)?;
+        }
+        let attr = expect_resp!(
+            self.call(Request::SetWinAttrs {
+                path: path.clone(),
+                set,
+                clear,
+            })?,
+            Response::Attr(attr) => attr
+        );
+        self.patch_parent_dir(&path, ListingPatch::Upsert(ino, attr));
+        self.cache_attr(ino, attr);
+        Ok(attr)
+    }
+
     /// One positional read from a retained blob handle. `None` on an I/O
     /// error — the caller treats it as "the blob stopped being the answer".
     fn blob_read(f: &std::fs::File, offset: u64, size: u32) -> Option<Vec<u8>> {

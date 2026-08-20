@@ -60,19 +60,44 @@ use crate::error::ErrorCode;
 /// exchange instead of two round trips per file. Client-gated; against an
 /// older peer the batcher never engages and every mutation takes the classic
 /// per-operation path.
+///
+/// v11: Windows attribute bits (Hidden, System) ride the HIGH bits of
+/// `Attr::mode` (`MODE_WIN_*`), plus `Request::SetWinAttrs` to change them.
+/// `Attr` itself cannot grow — it is embedded in every listing, tree page
+/// and reply, so a new field would break every older peer's decode — and
+/// the POSIX mode uses only the low bits, so the high bits are the one
+/// extension point that costs nothing. Gated on BOTH sides: a server
+/// attaches the bits only on v11+ sessions and strips them below; a client
+/// sends `SetWinAttrs` only at v11+, and masks `MODE_WIN_MASK` off before
+/// any value reaches a real chmod or st_mode. Servers store the bits
+/// natively where the filesystem has them (a Windows agent uses the real
+/// NTFS attributes) and in the export's `.alloyfs/winattrs.json` sidecar
+/// where it does not (Linux exports) — the sidecar travels with the data,
+/// and `.alloyfs` is server-excluded from every listing.
 pub const PROTO_VERSION_MIN: u16 = 1;
-pub const PROTO_VERSION_MAX: u16 = 10;
+pub const PROTO_VERSION_MAX: u16 = 11;
 
 /// The protocol range this build speaks, for `--version` and diagnostics —
 /// "which wire version does this release talk" should not require reading
 /// source. A literal rather than a formatted string because clap's version
 /// output needs a `&'static str`; `proto_range_matches_the_constants` is what
 /// keeps it from drifting away from the two constants above.
-pub const PROTO_RANGE: &str = "1-10";
+pub const PROTO_RANGE: &str = "1-11";
 
 /// Read/write payloads are capped to this many bytes per request so one huge
 /// file operation can never monopolize the connection (head-of-line blocking).
 pub const DATA_CHUNK: u32 = 128 * 1024;
+
+/// v11+: Windows attribute bits, carried in the HIGH bits of [`Attr::mode`].
+///
+/// The POSIX mode occupies the low 12 bits; these sit far above anything a
+/// chmod accepts, and every consumer masks them off (`mode & !MODE_WIN_MASK`)
+/// before a mode reaches an OS as a mode. Attached by servers only on v11+
+/// sessions and stripped below, so an older peer never sees a bit it would
+/// misread as permissions.
+pub const MODE_WIN_HIDDEN: u32 = 1 << 20;
+pub const MODE_WIN_SYSTEM: u32 = 1 << 21;
+pub const MODE_WIN_MASK: u32 = MODE_WIN_HIDDEN | MODE_WIN_SYSTEM;
 
 /// A path relative to an export root: UTF-8, `/`-separated, no leading `/`,
 /// never containing `.` or `..` components, and never containing `\` or `:`.
@@ -570,6 +595,21 @@ pub enum Request {
     /// extraction (a timestamp restore per file) turn into.
     SetattrMany {
         entries: Vec<ManySetattr>,
+    },
+    /// v11+: change the Windows attribute bits (`MODE_WIN_*`) on one path.
+    ///
+    /// `set` and `clear` are masked INTENTS applied against the file's
+    /// current bits server-side — the shape `Setattr2.readonly` uses, for
+    /// the same reason: no read-modify-write race against a concurrent
+    /// change. Answers `Response::Attr` with the post-change attributes,
+    /// high bits included. A Windows server applies them to the real NTFS
+    /// attributes; a Linux server persists them in the export's `.alloyfs`
+    /// sidecar, which is invisible to every client and travels with the
+    /// data.
+    SetWinAttrs {
+        path: RelPath,
+        set: u32,
+        clear: u32,
     },
 }
 
