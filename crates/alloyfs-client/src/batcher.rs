@@ -403,3 +403,75 @@ pub(crate) struct PendingNew {
     /// must enqueue nothing.
     pub cancelled: bool,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The barrier property, and the exact race that broke it.
+    ///
+    /// A flush DRAINS the queue and only then sends, so `is_empty()` reads
+    /// true for the whole window between the drain and the bytes landing.
+    /// `flush_batch` used to skip on that, which made every barrier —
+    /// fsync, rename, unmount — able to return while another thread was
+    /// still carrying the very writes it promised had landed. It surfaced
+    /// as a CI-only "b000.bin missing on the agent" with zero settle
+    /// failures: nothing had failed, it simply had not happened yet.
+    ///
+    /// So: a second flush must not return until the first one's send is
+    /// finished, even though the queue looks empty to it.
+    #[test]
+    fn a_second_flush_waits_for_the_one_in_flight() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let batcher = Arc::new(Batcher::new());
+        batcher.push(PendingOp::Write {
+            path: RelPath("a.bin".into()),
+            mode: 0o644,
+            data: b"payload".to_vec(),
+        });
+
+        // A ticket dispenser: each interesting moment takes the next
+        // number, so the assertions are about ORDER, not about timing.
+        let order = Arc::new(AtomicUsize::new(0));
+        let (draining_tx, draining_rx) = std::sync::mpsc::channel();
+        let sent_at = Arc::new(AtomicUsize::new(0));
+
+        let first = {
+            let (batcher, order, sent_at) = (batcher.clone(), order.clone(), sent_at.clone());
+            std::thread::spawn(move || {
+                batcher.flush_with(
+                    |_req| {
+                        // Drained, not yet sent — exactly the window.
+                        draining_tx.send(()).unwrap();
+                        std::thread::sleep(std::time::Duration::from_millis(300));
+                        sent_at.store(order.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+                        Ok(Response::ManyOutcome(vec![Ok(None)]))
+                    },
+                    |_op, _outcome, _last| {},
+                );
+            })
+        };
+
+        draining_rx.recv().unwrap();
+        assert!(
+            batcher.is_empty(),
+            "the queue really is empty mid-flush — which is why a barrier \
+             may not use that as its signal"
+        );
+
+        // The barrier: no work of its own, and it must still not return
+        // before the in-flight send completes.
+        batcher.flush_with(|_req| unreachable!("nothing left to send"), |_, _, _| {});
+        let barrier_returned = order.fetch_add(1, Ordering::SeqCst) + 1;
+
+        first.join().unwrap();
+        assert!(
+            sent_at.load(Ordering::SeqCst) < barrier_returned,
+            "the barrier returned at {barrier_returned} but the in-flight send \
+             only finished at {} — it promised bytes that were still in the air",
+            sent_at.load(Ordering::SeqCst)
+        );
+    }
+}

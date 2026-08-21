@@ -1488,12 +1488,20 @@ impl RemoteFs {
     /// Drain the write batcher to the server and apply every outcome:
     /// server attrs re-patch what the optimistic ack guessed, refusals
     /// restore the caches to the server's truth and land in the damage
-    /// ledger. No-op without a batcher or with an empty queue.
+    /// ledger. No-op without a batcher.
+    ///
+    /// This is the BARRIER primitive — fsync, flush, rename, unmount, a
+    /// cold listing and the lock ops all promise, by returning, that
+    /// everything queued before them is on the server. It therefore may
+    /// NOT skip on an empty queue: a concurrent flush (the age flusher)
+    /// empties the queue the instant it drains, a good while before those
+    /// bytes reach the wire, so `is_empty()` reads true during precisely
+    /// the window a barrier exists to cover. Taking the flush lock — which
+    /// `flush_with` holds across its send — is what makes the promise
+    /// true; an uncontended lock costs nothing next to the syscall or
+    /// round trip every one of these callers is already making.
     pub(crate) fn flush_batch(&self) {
         let Some(batch) = &self.batch else { return };
-        if batch.is_empty() {
-            return;
-        }
         batch.flush_with(
             |req| match self.call(req) {
                 Ok(resp) => Ok(resp),

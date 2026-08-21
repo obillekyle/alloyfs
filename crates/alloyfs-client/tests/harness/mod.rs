@@ -273,6 +273,69 @@ fn spawn_server_link_with(
     (client_half, server)
 }
 
+/// A handler that holds `WriteMany` on the server for a fixed spell before
+/// letting it through.
+///
+/// The batcher's barriers are promises about time — "when this returns, the
+/// bytes are on the server" — and a promise like that can only be tested by
+/// controlling how long the send takes. Everything else is passed straight
+/// down, so a session with this wrapper behaves exactly like the real agent
+/// apart from that one delay.
+struct SlowWriteMany {
+    inner: Arc<dyn RequestHandler>,
+    delay: Duration,
+}
+
+#[async_trait::async_trait]
+impl RequestHandler for SlowWriteMany {
+    async fn handle(
+        &self,
+        req: alloyfs_proto::Request,
+    ) -> Result<alloyfs_proto::Response, alloyfs_proto::ErrorCode> {
+        if matches!(req, alloyfs_proto::Request::WriteMany { .. }) {
+            tokio::time::sleep(self.delay).await;
+        }
+        self.inner.handle(req).await
+    }
+
+    async fn negotiated(&self, proto: u16) {
+        self.inner.negotiated(proto).await;
+    }
+
+    async fn connected(&self, pusher: alloyfs_transport::EventPusher) {
+        self.inner.connected(pusher).await;
+    }
+
+    async fn disconnected(&self) {
+        self.inner.disconnected().await;
+    }
+}
+
+/// `connect`, with every `WriteMany` held on the server for `delay`.
+pub async fn connect_with_slow_writes(agent: &TestAgent, opts: ClientOptions, delay: Duration) -> Session {
+    let slot: SeverSlot = Arc::new(Mutex::new(None));
+    let (client_io, server_io): (DuplexStream, DuplexStream) = tokio::io::duplex(1024 * 1024);
+    let (server_half, sever) = Severable::new(server_io);
+    let client_half = Severable::sibling(client_io, &sever);
+    *slot.lock().unwrap() = Some(sever);
+    let handler: Arc<dyn RequestHandler> = Arc::new(SlowWriteMany {
+        inner: Arc::new(AgentSession::with_token(agent.registry.clone(), None)),
+        delay,
+    });
+    let server = tokio::spawn(async move {
+        let _ = serve_connection(server_half, "test-agent", handler).await;
+    });
+    let conn = MuxConnection::establish(client_half, "test-client")
+        .await
+        .expect("handshake");
+    let fs = RemoteFs::attach_with(conn, "test", opts).await.expect("attach");
+    Session {
+        fs,
+        sever: slot,
+        _server: Some(server),
+    }
+}
+
 /// A bare authenticated-or-not `MuxConnection` against a token-protected
 /// session — no RemoteFs, so tests can poke Auth/Attach by hand.
 pub async fn connect_raw_with_server_token(agent: &TestAgent, token: &str) -> Arc<MuxConnection> {

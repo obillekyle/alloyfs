@@ -25,3 +25,6 @@ anyhow.workspace = true
 alloyfs-agent.workspace = true
 tempfile.workspace = true
 tracing-subscriber.workspace = true
+# The harness implements RequestHandler to stall one request kind, which is
+# how the batcher's barrier promises are testable at all.
+async-trait.workspace = true

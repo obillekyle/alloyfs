@@ -18,9 +18,9 @@ use alloyfs_proto::{
 use alloyfs_transport::TransportError;
 use bytes::Bytes;
 use harness::{
-    connect, connect_raw_with_server_token, connect_reconnectable, connect_with_max, deadline_after,
-    expect_event, lookup_path, mkfile, on_fs, patterned, read_all, remote_code, start_agent, wait_until,
-    AgentOpts, Session,
+    connect, connect_raw_with_server_token, connect_reconnectable, connect_with_max,
+    connect_with_slow_writes, deadline_after, expect_event, lookup_path, mkfile, on_fs, patterned, read_all,
+    remote_code, start_agent, wait_until, AgentOpts, Session,
 };
 
 fn rw() -> OpenFlags {
@@ -2935,6 +2935,55 @@ async fn a_create_burst_coalesces_into_write_many() {
             .unwrap_or_else(|e| panic!("b{i:03}.bin missing on the agent: {e}"));
         assert_eq!(on_disk, format!("burst-content-{i}").into_bytes());
     }
+}
+
+/// A barrier waits for a flush ALREADY IN FLIGHT, not just for an empty
+/// queue.
+///
+/// The regression this pins cost a CI failure and reads as impossible:
+/// `b000.bin missing on the agent` with zero settle failures — nothing had
+/// been refused, the write simply had not happened yet. A flush drains the
+/// queue and only then sends, so for the whole width of that send
+/// `is_empty()` answers true; the barrier used to take that as "nothing to
+/// do" and return, while another thread was still carrying the very bytes
+/// it had just promised were durable. Rare in life, because the window is
+/// microseconds on loopback — until a loaded 2-worker runtime stretches it.
+///
+/// Here the window is 400 ms wide by construction: the age flusher (15 ms)
+/// picks the file up, the server holds its WriteMany, and shutdown must
+/// still not return until the bytes have landed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_barrier_waits_for_a_flush_already_in_flight() {
+    let agent = start_agent(AgentOpts::default());
+    let s = connect_with_slow_writes(&agent, ClientOptions::default(), Duration::from_millis(400)).await;
+    on_fs(&s.fs, |fs| fs.readdir(ROOT_INO)).await.unwrap();
+
+    on_fs(&s.fs, |fs| {
+        let (_ino, fh, _attr) = fs.create(ROOT_INO, "inflight.bin", 0o666, burst_flags())?;
+        fs.write_at(fh, 0, b"promised durable")?;
+        fs.release(fh);
+        Ok::<_, alloyfs_client::FsError>(())
+    })
+    .await
+    .unwrap();
+
+    // Long enough for the 15 ms age flusher to have drained the queue and
+    // be sitting inside its send — which is exactly when the queue looks
+    // empty and the file is nowhere yet.
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    assert!(
+        !agent.dir.path().join("inflight.bin").exists(),
+        "precondition: the flush must still be in the air for this to test anything"
+    );
+
+    on_fs(&s.fs, |fs| fs.shutdown()).await;
+    assert_eq!(
+        std::fs::read(agent.dir.path().join("inflight.bin")).expect(
+            "the barrier returned while the write was still in flight — an empty \
+             queue is not the same as a landed write"
+        ),
+        b"promised durable",
+    );
 }
 
 /// fsync's promise survives the batcher: when flush() returns Ok, the bytes

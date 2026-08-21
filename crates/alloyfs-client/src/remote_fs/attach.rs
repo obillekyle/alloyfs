@@ -199,8 +199,17 @@ pub(super) fn spawn_background_tasks(fs: &Arc<RemoteFs>, fetch_rx: Option<FetchQ
             loop {
                 tick.tick().await;
                 let Some(fs) = weak.upgrade() else { break };
+                // An empty queue is a fine reason for the AGE FLUSHER to
+                // skip a tick — unlike a barrier, it promises nothing about
+                // a flush already in flight, and the next tick is 15 ms
+                // away. Barriers take the lock instead; see `flush_batch`.
                 if fs.batch.as_ref().is_some_and(|b| !b.is_empty()) {
-                    let _ = tokio::task::spawn_blocking(move || fs.flush_batch()).await;
+                    // A panic here would take drained-but-unsent entries
+                    // with it, so it must not be swallowed: JoinError is
+                    // the only evidence that happened.
+                    if let Err(e) = tokio::task::spawn_blocking(move || fs.flush_batch()).await {
+                        tracing::error!(error = %e, "the batch flusher died; queued writes may be lost");
+                    }
                 }
             }
         });
