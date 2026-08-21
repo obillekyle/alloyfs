@@ -638,6 +638,17 @@ impl RemoteFs {
             self.merge_overlay_children(&dir, &mut out);
             return Ok(out);
         }
+        // A WIRE listing must not describe a state older than what this
+        // client already acknowledged. The write batcher never trips this —
+        // it only acks against a live complete listing, which the branches
+        // above would have served — but a batched SETATTR acks against a
+        // cached attr alone, so a cold listing fetched here could still show
+        // the pre-chmod mode. Whatever is pending goes out first; it was due
+        // within FLUSH_AGE anyway, and cold listings are already round-trip
+        // priced.
+        if self.batch.as_ref().is_some_and(|b| !b.is_empty()) {
+            self.flush_batch();
+        }
         // Captured BEFORE the first page goes out. Paging is several round
         // trips, and anything that invalidates a listing in that window makes
         // what comes back a description of the past.
@@ -1383,9 +1394,21 @@ impl RemoteFs {
                     self.patch_parent_dir(path, ListingPatch::Upsert(ino, *attr));
                     self.cache_attr(ino, *attr);
                 }
-                (PendingOp::Write { .. }, Ok(_)) => {} // superseded by a newer op
-                (PendingOp::Remove { .. }, Ok(_)) => {} // patched at enqueue
-                (PendingOp::Write { path, .. }, Err(_)) | (PendingOp::Remove { path, .. }, Err(_)) => {
+                // The server's post-setattr attrs replace the merged local
+                // echo — the true server mtime granularity, version, and
+                // win bits land here.
+                (PendingOp::Setattr { path, .. }, Ok(Some(attr))) if last => {
+                    if let Some(ino) = self.ino.ino_of(path) {
+                        self.patch_parent_dir(path, ListingPatch::Upsert(ino, *attr));
+                        self.cache_attr(ino, *attr);
+                    }
+                }
+                (PendingOp::Setattr { .. }, Ok(_)) => {} // superseded, or no attrs
+                (PendingOp::Write { .. }, Ok(_)) => {}   // superseded by a newer op
+                (PendingOp::Remove { .. }, Ok(_)) => {}  // patched at enqueue
+                (PendingOp::Write { path, .. }, Err(_))
+                | (PendingOp::Remove { path, .. }, Err(_))
+                | (PendingOp::Setattr { path, .. }, Err(_)) => {
                     if last {
                         // The optimistic ack promised something the server
                         // refused: the caches stop vouching for this path.
@@ -1707,6 +1730,40 @@ impl RemoteFs {
         let path = self.path_of(ino)?;
         if self.is_overlay(&path) {
             return self.overlay_ref().setattr(&path, size, mtime, mode);
+        }
+        // v10 batched metadata-only setattr — the archive-extraction shape,
+        // a timestamp restore per file, each of which was a full round trip.
+        // Size stays write-through (truncation is data, not metadata), and
+        // the ack needs a cached attr to merge into: with nothing cached
+        // there is nothing honest to answer with, so that case (and an
+        // unsealed pending-new file, whose path the server cannot know yet)
+        // takes the classic path below.
+        if size.is_none() && (mtime.is_some() || mode.is_some()) {
+            if let Some(batch) = &self.batch {
+                if self.conn().proto >= 10 && !batch.has_open_pending(&path) {
+                    if let Some(hit) = self.attr_cache.get(&ino) {
+                        let (mut attr, _) = *hit;
+                        drop(hit);
+                        if let Some(mt) = mtime {
+                            attr.mtime = mt;
+                        }
+                        if let Some(md) = mode {
+                            // The win bits ride the high mode bits (v11) and a
+                            // kernel chmod never carries them: keep ours, take
+                            // the caller's permission bits.
+                            attr.mode = (attr.mode & alloyfs_proto::MODE_WIN_MASK)
+                                | (md & !alloyfs_proto::MODE_WIN_MASK);
+                        }
+                        batch.push_setattr(&path, mtime, mode);
+                        if batch.wants_flush() {
+                            self.flush_batch();
+                        }
+                        self.patch_parent_dir(&path, ListingPatch::Upsert(ino, attr));
+                        self.cache_attr(ino, attr);
+                        return Ok(attr);
+                    }
+                }
+            }
         }
         let attr = expect_resp!(
             self.call(Request::Setattr { path: path.clone(), size, mtime, mode })?,

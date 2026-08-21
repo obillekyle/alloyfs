@@ -3696,3 +3696,124 @@ async fn a_zstd_write_lands_byte_exact_and_v12_refuses_the_opt_in() {
         "below v13 the opt-in must refuse — the peer could not decode it"
     );
 }
+
+/// v10 setattr batching, the sweep shape: thirty touches of existing files
+/// collapse into ONE SetattrMany at the barrier, each ack answering with
+/// the merged attr immediately, and the server ends with the exact stamps.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_touch_sweep_batches_into_one_setattr_many() {
+    let agent = start_agent(AgentOpts::default());
+    for i in 0..30 {
+        std::fs::write(agent.dir.path().join(format!("t{i:02}.txt")), b"x").unwrap();
+    }
+    let s = connect(&agent, ClientOptions::default()).await;
+    on_fs(&s.fs, |fs| fs.readdir(ROOT_INO)).await.unwrap();
+    let mut inos = Vec::new();
+    for i in 0..30 {
+        let (ino, _) = lookup_path(&s.fs, &format!("t{i:02}.txt")).await.unwrap();
+        inos.push(ino);
+    }
+
+    let stamp = std::time::UNIX_EPOCH + Duration::from_secs(1_600_000_000);
+    let r0 = s.conn().requests_sent();
+    on_fs(&s.fs, move |fs| {
+        for ino in inos {
+            let a = fs.setattr(ino, None, Some(stamp), None)?;
+            assert_eq!(a.mtime, stamp, "the ack answers with the merged attr");
+        }
+        fs.shutdown(); // the unmount barrier drains the batch
+        Ok::<_, alloyfs_client::FsError>(())
+    })
+    .await
+    .unwrap();
+    let sweep_reqs = s.conn().requests_sent() - r0;
+    assert!(
+        (1..=2).contains(&sweep_reqs),
+        "thirty touches must batch (the 15 ms age flusher may legally cut one \
+         extra exchange under CPU contention); per-op would be 30, got {sweep_reqs}"
+    );
+    for i in 0..30 {
+        let md = std::fs::metadata(agent.dir.path().join(format!("t{i:02}.txt"))).unwrap();
+        assert_eq!(md.modified().unwrap(), stamp, "server mtime for t{i:02}");
+    }
+}
+
+/// The archive-extraction shape: write file, stamp file, next file. The
+/// pending setattrs merge in the side map and flush AFTER the writes, so
+/// the whole burst is exactly two exchanges — WriteMany then SetattrMany —
+/// and every file ends with its content AND its stamp.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_extractor_burst_is_two_exchanges() {
+    let agent = start_agent(AgentOpts::default());
+    let s = connect(&agent, ClientOptions::default()).await;
+    on_fs(&s.fs, |fs| fs.readdir(ROOT_INO)).await.unwrap();
+
+    let base = std::time::UNIX_EPOCH + Duration::from_secs(1_500_000_000);
+    let r0 = s.conn().requests_sent();
+    on_fs(&s.fs, move |fs| {
+        for i in 0..20u64 {
+            let name = format!("x{i:02}.bin");
+            let (ino, fh, _) = fs.create(ROOT_INO, &name, 0o666, burst_flags())?;
+            fs.write_at(fh, 0, format!("payload-{i}").as_bytes())?;
+            fs.release(fh);
+            fs.setattr(ino, None, Some(base + Duration::from_secs(i)), None)?;
+        }
+        fs.shutdown();
+        Ok::<_, alloyfs_client::FsError>(())
+    })
+    .await
+    .unwrap();
+    let burst_reqs = s.conn().requests_sent() - r0;
+    assert!(
+        (2..=4).contains(&burst_reqs),
+        "twenty write+touch pairs are WriteMany + SetattrMany (the 15 ms age \
+         flusher may legally split the burst under CPU contention); per-op \
+         would be 40, got {burst_reqs}"
+    );
+    for i in 0..20u64 {
+        let p = agent.dir.path().join(format!("x{i:02}.bin"));
+        assert_eq!(std::fs::read(&p).unwrap(), format!("payload-{i}").as_bytes());
+        assert_eq!(
+            std::fs::metadata(&p).unwrap().modified().unwrap(),
+            base + Duration::from_secs(i),
+            "stamp for x{i:02}"
+        );
+    }
+}
+
+/// A v9 session cannot speak SetattrMany: every touch blocks through the
+/// classic per-operation path, exactly as before v10.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_v9_session_setattrs_through_per_operation() {
+    let agent = start_agent(AgentOpts::default());
+    for i in 0..5 {
+        std::fs::write(agent.dir.path().join(format!("c{i}.txt")), b"x").unwrap();
+    }
+    let s = connect_with_max(&agent, ClientOptions::default(), 9).await;
+    on_fs(&s.fs, |fs| fs.readdir(ROOT_INO)).await.unwrap();
+    let mut inos = Vec::new();
+    for i in 0..5 {
+        let (ino, _) = lookup_path(&s.fs, &format!("c{i}.txt")).await.unwrap();
+        inos.push(ino);
+    }
+    let stamp = std::time::UNIX_EPOCH + Duration::from_secs(1_400_000_000);
+    let r0 = s.conn().requests_sent();
+    on_fs(&s.fs, move |fs| {
+        for ino in inos {
+            fs.setattr(ino, None, Some(stamp), None)?;
+        }
+        Ok::<_, alloyfs_client::FsError>(())
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        s.conn().requests_sent() - r0,
+        5,
+        "below v10 every setattr is its own round trip"
+    );
+    // And they are already on the server — no barrier was ever needed.
+    for i in 0..5 {
+        let md = std::fs::metadata(agent.dir.path().join(format!("c{i}.txt"))).unwrap();
+        assert_eq!(md.modified().unwrap(), stamp);
+    }
+}

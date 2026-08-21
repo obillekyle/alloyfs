@@ -83,6 +83,25 @@ async fn connect(handler: Arc<Echo>) -> Arc<MuxConnection> {
     connect_with(handler, PROTO_VERSION_MIN).await.expect("handshake")
 }
 
+/// The pusher, waited for: `connect()` returns on HelloAck, but
+/// `connected()` runs on the SERVER task afterwards — under load it may not
+/// have stored the pusher yet (seen flaking exactly once, under a full
+/// parallel gate on two cores). Bounded so a genuinely missing callback
+/// still fails loudly.
+async fn pusher_of(handler: &Arc<Echo>) -> EventPusher {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if let Some(p) = handler.push.lock().unwrap().clone() {
+            return p;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "connected() never delivered the pusher"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
 async fn connect_with(
     handler: Arc<Echo>,
     min_proto: u16,
@@ -225,7 +244,7 @@ async fn a_pushed_burst_arrives_complete_and_in_order() {
     let conn = connect(handler.clone()).await;
     let mut rx = conn.events();
 
-    let push = handler.push.lock().unwrap().clone().expect("connected() ran");
+    let push = pusher_of(&handler).await;
     tokio::spawn(async move {
         for seq in 0..N {
             let batch = vec![FsEvent {
@@ -292,7 +311,7 @@ async fn pushed_events_reach_the_client() {
     let conn = connect(handler.clone()).await;
     let mut rx = conn.events();
 
-    let push = handler.push.lock().unwrap().clone().expect("connected() ran");
+    let push = pusher_of(&handler).await;
     let batch = vec![FsEvent {
         seq: 7,
         kind: alloyfs_proto::EventKind::Created,

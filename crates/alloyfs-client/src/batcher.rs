@@ -56,20 +56,51 @@ const FLUSH_OPS: usize = 256;
 pub(crate) const FLUSH_AGE: std::time::Duration = std::time::Duration::from_millis(15);
 
 pub(crate) enum PendingOp {
-    Write { path: RelPath, mode: u32, data: Vec<u8> },
-    Remove { path: RelPath, dir: bool },
+    Write {
+        path: RelPath,
+        mode: u32,
+        data: Vec<u8>,
+    },
+    Remove {
+        path: RelPath,
+        dir: bool,
+    },
+    /// A metadata-only setattr (mtime/mode; never size — truncation changes
+    /// data and stays write-through). These live in the per-path SIDE MAP,
+    /// not the ordered queue: an extractor interleaves write/touch per file,
+    /// and kind-alternation would cut every order-preserving run to length
+    /// one. The map merges repeats per path and flushes AFTER the queue,
+    /// which is correct because of two rules enforced at push time: a later
+    /// write or remove on the same path DROPS the pending setattr (POSIX
+    /// gives the write's own mtime anyway), and write-then-touch therefore
+    /// always lands as WriteMany-then-SetattrMany in one flush.
+    Setattr {
+        path: RelPath,
+        mtime: Option<std::time::SystemTime>,
+        mode: Option<u32>,
+    },
 }
 
 impl PendingOp {
     fn path(&self) -> &RelPath {
         match self {
-            PendingOp::Write { path, .. } | PendingOp::Remove { path, .. } => path,
+            PendingOp::Write { path, .. }
+            | PendingOp::Remove { path, .. }
+            | PendingOp::Setattr { path, .. } => path,
         }
     }
     fn bytes(&self) -> u64 {
         match self {
             PendingOp::Write { data, .. } => data.len() as u64,
-            PendingOp::Remove { .. } => 0,
+            PendingOp::Remove { .. } | PendingOp::Setattr { .. } => 0,
+        }
+    }
+    /// Same-kind runs batch together; a kind change cuts the run.
+    fn kind(&self) -> u8 {
+        match self {
+            PendingOp::Write { .. } => 0,
+            PendingOp::Remove { .. } => 1,
+            PendingOp::Setattr { .. } => 2,
         }
     }
 }
@@ -88,6 +119,10 @@ pub(crate) struct Batcher {
     /// live on their open handles, and remote paths must barrier on them
     /// exactly as on queued ops.
     open_pending: DashMap<RelPath, ()>,
+    /// Pending metadata-only setattrs, merged per path (see
+    /// [`PendingOp::Setattr`] for why they are not in the ordered queue).
+    /// Each path here holds exactly one claim in `queued`.
+    setattrs: DashMap<RelPath, (Option<std::time::SystemTime>, Option<u32>)>,
     /// Per-path failures awaiting a barrier to claim them.
     damage: DashMap<RelPath, ErrorCode>,
     /// Serializes flushes: barriers and the age-flusher never interleave
@@ -102,6 +137,7 @@ impl Batcher {
             queued_bytes: AtomicU64::new(0),
             queued: DashMap::new(),
             open_pending: DashMap::new(),
+            setattrs: DashMap::new(),
             damage: DashMap::new(),
             flush_lock: Mutex::new(()),
         }
@@ -120,19 +156,63 @@ impl Batcher {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.queue.lock().unwrap().is_empty()
+        self.queue.lock().unwrap().is_empty() && self.setattrs.is_empty()
     }
 
     /// True when the accumulated queue wants an immediate flush.
     pub fn wants_flush(&self) -> bool {
         self.queued_bytes.load(Ordering::Relaxed) >= FLUSH_BYTES
             || self.queue.lock().unwrap().len() >= FLUSH_OPS
+            || self.setattrs.len() >= FLUSH_OPS
     }
 
     pub fn push(&self, op: PendingOp) {
+        // A write or remove supersedes the path's pending setattr: the write
+        // stamps its own server-side mtime (the POSIX answer for
+        // touch-then-write), and a removed path has nothing to stamp.
+        if self.setattrs.remove(op.path()).is_some() {
+            self.surrender_claim(op.path());
+        }
         *self.queued.entry(op.path().clone()).or_insert(0) += 1;
         self.queued_bytes.fetch_add(op.bytes(), Ordering::Relaxed);
         self.queue.lock().unwrap().push_back(op);
+    }
+
+    /// Queue a metadata-only setattr, merged per path — the second touch of
+    /// one path replaces the first's fields rather than queueing again.
+    pub fn push_setattr(&self, path: &RelPath, mtime: Option<std::time::SystemTime>, mode: Option<u32>) {
+        let mut fresh = false;
+        {
+            let mut entry = self.setattrs.entry(path.clone()).or_insert_with(|| {
+                fresh = true;
+                (None, None)
+            });
+            if mtime.is_some() {
+                entry.0 = mtime;
+            }
+            if mode.is_some() {
+                entry.1 = mode;
+            }
+        }
+        if fresh {
+            *self.queued.entry(path.clone()).or_insert(0) += 1;
+        }
+    }
+
+    /// Is there an unsealed pending-new file at `path`? Setattr batching
+    /// must refuse those: the file exists only locally, so a flushed
+    /// SetattrMany would race the seal and buy a NotFound.
+    pub fn has_open_pending(&self, path: &RelPath) -> bool {
+        self.open_pending.contains_key(path)
+    }
+
+    /// Drop one queued claim for `path` (the bookkeeping half of an op
+    /// leaving the queue outside the flush path).
+    fn surrender_claim(&self, path: &RelPath) {
+        if let Some(mut c) = self.queued.get_mut(path) {
+            *c = c.saturating_sub(1);
+        }
+        self.queued.remove_if(path, |_, c| *c == 0);
     }
 
     /// Claim (and clear) the recorded failure for `path`, if any — what a
@@ -177,11 +257,22 @@ impl Batcher {
         mut settle: impl FnMut(&PendingOp, Result<&Option<Attr>, ErrorCode>, bool),
     ) {
         let _one_at_a_time = self.flush_lock.lock().unwrap();
-        let drained: Vec<PendingOp> = {
+        let mut drained: Vec<PendingOp> = {
             let mut q = self.queue.lock().unwrap();
             self.queued_bytes.store(0, Ordering::Relaxed);
             q.drain(..).collect()
         };
+        // The merged setattrs flush AFTER the queue — the push rules make
+        // that the only order they can need (a same-path write or remove
+        // pushed later would have dropped them).
+        {
+            let keys: Vec<RelPath> = self.setattrs.iter().map(|e| e.key().clone()).collect();
+            for path in keys {
+                if let Some((_, (mtime, mode))) = self.setattrs.remove(&path) {
+                    drained.push(PendingOp::Setattr { path, mtime, mode });
+                }
+            }
+        }
         if drained.is_empty() {
             return;
         }
@@ -191,11 +282,11 @@ impl Batcher {
         // create w, delete w, create w again must land as exactly that.
         let mut i = 0;
         while i < drained.len() {
-            let writes = matches!(drained[i], PendingOp::Write { .. });
+            let kind = drained[i].kind();
             let mut j = i;
             let mut run_bytes = 0u64;
             while j < drained.len()
-                && matches!(drained[j], PendingOp::Write { .. }) == writes
+                && drained[j].kind() == kind
                 && (j - i) < FLUSH_OPS
                 && run_bytes <= FLUSH_BYTES
             {
@@ -203,8 +294,8 @@ impl Batcher {
                 j += 1;
             }
             let run = &drained[i..j];
-            let req = if writes {
-                Request::WriteMany {
+            let req = match kind {
+                0 => Request::WriteMany {
                     files: run
                         .iter()
                         .map(|op| match op {
@@ -213,12 +304,11 @@ impl Batcher {
                                 mode: *mode,
                                 data: bytes::Bytes::from(data.clone()),
                             },
-                            PendingOp::Remove { .. } => unreachable!("run is writes"),
+                            _ => unreachable!("run is writes"),
                         })
                         .collect(),
-                }
-            } else {
-                Request::RemoveMany {
+                },
+                1 => Request::RemoveMany {
                     entries: run
                         .iter()
                         .map(|op| match op {
@@ -226,10 +316,25 @@ impl Batcher {
                                 path: path.clone(),
                                 dir: *dir,
                             },
-                            PendingOp::Write { .. } => unreachable!("run is removes"),
+                            _ => unreachable!("run is removes"),
                         })
                         .collect(),
-                }
+                },
+                _ => Request::SetattrMany {
+                    entries: run
+                        .iter()
+                        .map(|op| match op {
+                            PendingOp::Setattr { path, mtime, mode } => alloyfs_proto::ManySetattr {
+                                path: path.clone(),
+                                size: None,
+                                mtime: *mtime,
+                                mode: *mode,
+                                readonly: None,
+                            },
+                            _ => unreachable!("run is setattrs"),
+                        })
+                        .collect(),
+                },
             };
             // Each op surrenders its queued claim as its outcome settles;
             // "last" is what remains for the path AFTER this surrender —
