@@ -45,9 +45,51 @@ const ATTR_TTL_POLL: Duration = Duration::from_secs(5);
 /// severity.
 const DIR_TTL_POLL: Duration = Duration::from_secs(5);
 
+/// Ceilings for the three metadata caches.
+///
+/// Under a healthy pump the TTLs are `Duration::MAX` on purpose — events,
+/// not time, are what keep these honest — so nothing but an explicit
+/// invalidation ever removed an entry and the maps could only grow. A
+/// mount that walks a large export (a search indexer, a backup pass, `ls
+/// -R`) therefore climbed for as long as it stayed mounted, with no
+/// ceiling at all.
+///
+/// Evicting is always SAFE here: every one of these caches is a
+/// performance tier over the wire, so a dropped entry costs one round
+/// trip and nothing else. That is what makes a crude bound acceptable —
+/// the failure mode of guessing the numbers slightly wrong is latency,
+/// not wrongness.
+///
+/// Attrs are small and by far the most valuable per byte; listings are
+/// larger and fewer directories matter; warm listings are the same shape
+/// as live ones. Well above any interactive working set, well below the
+/// millions an unbounded walk can reach.
+const ATTR_CACHE_CAP: usize = 200_000;
+const DIR_CACHE_CAP: usize = 20_000;
+const WARM_CACHE_CAP: usize = 20_000;
+
+/// Fraction of a full cache dropped per trim: a tenth, so the scan
+/// amortizes over the inserts that follow instead of running on every one
+/// at the ceiling — the same shape as the auto-cache's low-water eviction.
+const TRIM_DIVISOR: usize = 10;
+
 impl RemoteFs {
     pub(crate) fn cache_attr(&self, ino: u64, attr: Attr) {
+        if self.attr_cache.len() >= ATTR_CACHE_CAP {
+            // Oldest-first: `Instant` is already stored for the TTL, so
+            // recency is free here and the entries dropped are the ones
+            // least likely to be asked for next.
+            trim_oldest(&self.attr_cache, ATTR_CACHE_CAP / TRIM_DIVISOR, |v| v.1);
+        }
         self.attr_cache.insert(ino, (attr, Instant::now()));
+    }
+
+    /// Keep the listing cache under its ceiling before an insert. Called by
+    /// the two sites that add listings; oldest-first, like the attr cache.
+    pub(crate) fn bound_dir_cache(&self) {
+        if self.dir_cache.len() >= DIR_CACHE_CAP {
+            trim_oldest(&self.dir_cache, DIR_CACHE_CAP / TRIM_DIVISOR, |v| v.1);
+        }
     }
 
     /// Reports whether an entry was actually dropped — the event pump's
@@ -174,6 +216,17 @@ impl RemoteFs {
             return 0;
         }
         let n = snap.dirs.len();
+        if self.warm.len() + n >= WARM_CACHE_CAP {
+            // The warm tier stores no timestamp — its freshness is the tree
+            // token, not the clock — so there is no recency to sort by.
+            // Dropping the whole tier is the honest bound: it is installed
+            // wholesale at mount and every entry carries the same proof, so
+            // a partial one is just a smaller version of the same thing at
+            // the cost of a scan that cannot rank anything.
+            self.warm.clear();
+            self.warm_epoch.fetch_add(1, Ordering::Release);
+            tracing::debug!(cap = WARM_CACHE_CAP, "warm tier at its ceiling; serving cold");
+        }
         for (dir, mut listing) in snap.dirs {
             // Warm listings are binary-searched and partition_point-spliced,
             // so they must be name-sorted — and the snapshot's dirs arrive
@@ -374,5 +427,65 @@ impl RemoteFs {
                 tracing::debug!(parent = %parent, name, "patch_parent_dir: warm ABSENT");
             }
         }
+    }
+}
+
+/// Drop the `n` oldest entries from a cache that stores an `Instant`.
+///
+/// A partial sort would be tidier, but this runs once per tenth-of-a-cache
+/// of inserts and the map is a `DashMap`: the cost that matters is holding
+/// shard locks, not the comparison count. Collecting keys first and
+/// removing after keeps every lock brief, and a key that another thread
+/// removed in between is simply a no-op.
+fn trim_oldest<K, V>(map: &dashmap::DashMap<K, V>, n: usize, when: impl Fn(&V) -> Instant)
+where
+    K: std::hash::Hash + Eq + Clone,
+{
+    let mut ages: Vec<(Instant, K)> = map.iter().map(|e| (when(e.value()), e.key().clone())).collect();
+    ages.sort_unstable_by_key(|(t, _)| *t);
+    let dropped = ages.len().min(n);
+    for (_, key) in ages.into_iter().take(n) {
+        map.remove(&key);
+    }
+    tracing::debug!(dropped, "metadata cache trimmed at its ceiling");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The bound drops the OLDEST entries and leaves the rest — a cache
+    /// that evicted arbitrarily would still be bounded, and would still
+    /// throw away the working set someone is using right now.
+    #[test]
+    fn trimming_takes_the_oldest_first() {
+        let map: dashmap::DashMap<u64, (u32, Instant)> = dashmap::DashMap::new();
+        let base = Instant::now();
+        for i in 0..100u64 {
+            // Older entries carry earlier instants; 0 is the oldest.
+            map.insert(i, (i as u32, base + Duration::from_millis(i)));
+        }
+        trim_oldest(&map, 30, |v| v.1);
+        assert_eq!(map.len(), 70, "exactly the requested count goes");
+        for i in 0..30u64 {
+            assert!(
+                !map.contains_key(&i),
+                "{i} was among the oldest and should be gone"
+            );
+        }
+        for i in 30..100u64 {
+            assert!(map.contains_key(&i), "{i} was newer and should have stayed");
+        }
+    }
+
+    /// Asking for more than the map holds empties it rather than panicking
+    /// — the ceilings and the divisor are independent constants, and
+    /// nothing should break if they ever cross.
+    #[test]
+    fn trimming_more_than_exists_is_not_a_panic() {
+        let map: dashmap::DashMap<u64, (u32, Instant)> = dashmap::DashMap::new();
+        map.insert(1, (1, Instant::now()));
+        trim_oldest(&map, 50, |v| v.1);
+        assert!(map.is_empty());
     }
 }

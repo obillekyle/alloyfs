@@ -720,6 +720,7 @@ impl RemoteFs {
         // COMPLETE listing does not merely go stale — it answers NotFound for
         // a file that exists. Skipping the insert costs one uncached readdir.
         if self.dir_epoch.load(Ordering::Acquire) == epoch_at_start {
+            self.bound_dir_cache();
             self.dir_cache.insert(ino, (remote.clone(), Instant::now()));
         }
         let mut out = remote;
@@ -1705,6 +1706,7 @@ impl RemoteFs {
         // because completeness is what lets a create burst into the new
         // directory answer its own existence probes (and take the batched
         // path) without a wire readdir first.
+        self.bound_dir_cache();
         self.dir_cache.insert(ino, (Vec::new(), Instant::now()));
         Ok((ino, attr))
     }
