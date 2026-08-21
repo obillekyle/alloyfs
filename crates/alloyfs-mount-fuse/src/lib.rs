@@ -109,6 +109,23 @@ impl Filesystem for DsFuse {
         if let Err(unsupported) = config.add_capabilities(fuser::InitFlags::FUSE_POSIX_LOCKS) {
             tracing::warn!(?unsupported, "kernel refused POSIX lock forwarding");
         }
+        // Every op here is priced in wire round trips, so the kernel-side
+        // ceilings are the real throughput cap: max_background bounds
+        // in-flight readahead and async writes (fuser's default is 16, and
+        // 64 outstanding 128 KiB requests is only 8 MiB), and the
+        // congestion threshold is where the kernel stops pipelining
+        // rather than blocking submitters.
+        let _ = config.set_max_background(64);
+        let _ = config.set_congestion_threshold(48);
+        // Optional niceties, kernel permitting: without PARALLEL_DIROPS the
+        // kernel serializes same-directory lookups under i_rwsem — exactly
+        // the calls a remote fs wants overlapped — and CACHE_SYMLINKS lets
+        // the page cache hold link targets instead of re-asking readlink.
+        if let Err(unsupported) = config
+            .add_capabilities(fuser::InitFlags::FUSE_PARALLEL_DIROPS | fuser::InitFlags::FUSE_CACHE_SYMLINKS)
+        {
+            tracing::debug!(?unsupported, "kernel lacks optional readdir/symlink niceties");
+        }
         Ok(())
     }
 
@@ -609,6 +626,11 @@ pub fn mount(
     #[cfg(target_os = "linux")]
     {
         config.n_threads = Some(4);
+        // Four threads against ONE /dev/fuse fd still serialize on that
+        // fd's request queue; clone_fd gives each worker its own, which is
+        // the whole point of having the threads. Linux-only, like
+        // n_threads — fuser errors on it elsewhere.
+        config.clone_fd = true;
     }
     let adapter = DsFuse {
         fs,
