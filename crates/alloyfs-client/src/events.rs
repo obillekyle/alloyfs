@@ -277,10 +277,27 @@ impl RemoteFs {
                                 fs.last_event_seq
                                     .fetch_max(max, std::sync::atomic::Ordering::AcqRel);
                             }
-                            let batch = fs.filter_for_overlay(batch);
+                            let batch = std::sync::Arc::new(fs.filter_for_overlay(batch));
                             if !batch.is_empty() {
                                 let hot = fs.apply_events(&batch);
-                                fs.apply_events_to_cache(&batch);
+                                // Cache maintenance is real disk work — one
+                                // unlink per changed path, and a directory
+                                // rename moves every cached descendant — all
+                                // of it under the cache mutex. Inline, it ran
+                                // on one of the runtime's few workers, which
+                                // are shared with every connection's reader:
+                                // a change storm on a big export stalled
+                                // them. Still AWAITED, because the cursor
+                                // persisted below must never claim to cover
+                                // an invalidation that has not happened yet.
+                                let (cache_fs, cache_batch) = (fs.clone(), batch.clone());
+                                if let Err(e) = tokio::task::spawn_blocking(move || {
+                                    cache_fs.apply_events_to_cache(&cache_batch)
+                                })
+                                .await
+                                {
+                                    tracing::error!(error = %e, "cache maintenance for an event batch died");
+                                }
                                 fs.spawn_attr_rewarm(hot);
                                 on_batch(&batch);
                             }

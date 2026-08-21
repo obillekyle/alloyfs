@@ -194,10 +194,47 @@ pub(super) fn spawn_background_tasks(fs: &Arc<RemoteFs>, fetch_rx: Option<FetchQ
     if fs.batch.is_some() {
         let weak = Arc::downgrade(fs);
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(crate::batcher::FLUSH_AGE);
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // Idle mounts used to wake 66 times a second forever, each tick
+            // upgrading the Weak and taking two locks to be told there was
+            // nothing to do — idle CPU, and on a laptop blocked package
+            // C-states. Now an empty queue WAITS for a push instead of
+            // polling for one, and only paces at FLUSH_AGE while there is
+            // something to flush.
+            //
+            // The timeout on that wait is a backstop, not the mechanism.
+            // Hand-rolled sleep/wake around durability is exactly where a
+            // missed wakeup strands a write, so this is belt and braces:
+            // `notify_one` leaves a permit when nobody is waiting yet, so a
+            // push between the check and the wait returns immediately, and
+            // if a notification were ever lost anyway the queue is still
+            // drained within the second. Barriers (fsync, release, rename,
+            // unmount) flush synchronously regardless — this loop only
+            // bounds how long an ALREADY-ACKNOWLEDGED write may sit unsent.
+            const IDLE_BACKSTOP: Duration = Duration::from_secs(1);
+            let signal = match weak
+                .upgrade()
+                .and_then(|fs| fs.batch.as_ref().map(|b| b.work_signal()))
+            {
+                Some(signal) => signal,
+                None => return,
+            };
             loop {
-                tick.tick().await;
+                let idle = weak
+                    .upgrade()
+                    .and_then(|fs| fs.batch.as_ref().map(|b| b.is_empty()))
+                    .unwrap_or(true);
+                if idle {
+                    let _ = tokio::time::timeout(IDLE_BACKSTOP, signal.notified()).await;
+                }
+                // FLUSH_AGE always, waking or ticking: it is the COALESCING
+                // window, not merely a poll interval. Flushing the instant a
+                // notification arrives would send the first op of a burst on
+                // its own and defeat the batcher — and it shifts when a
+                // batched setattr reaches the server relative to the listing
+                // that must carry it, which is how the posix-modes test
+                // caught this. The window starts at the first push either
+                // way, so the ack-early bound is exactly what it was.
+                tokio::time::sleep(crate::batcher::FLUSH_AGE).await;
                 let Some(fs) = weak.upgrade() else { break };
                 // An empty queue is a fine reason for the AGE FLUSHER to
                 // skip a tick — unlike a barrier, it promises nothing about

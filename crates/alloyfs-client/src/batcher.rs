@@ -39,7 +39,7 @@
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use alloyfs_proto::{Attr, ErrorCode, ManyRemove, ManyWrite, RelPath, Request, Response};
 use dashmap::DashMap;
@@ -128,6 +128,12 @@ pub(crate) struct Batcher {
     /// Serializes flushes: barriers and the age-flusher never interleave
     /// batches, which is what keeps queue order the wire order.
     flush_lock: Mutex<()>,
+    /// Raised whenever something joins the queue, so the age flusher can
+    /// sleep instead of polling. `Arc` so that flusher can hold the signal
+    /// WITHOUT holding the filesystem: waiting on it through a strong
+    /// reference would keep an unmounted mount alive for the length of the
+    /// wait, which is exactly what its `Weak` exists to prevent.
+    work: Arc<tokio::sync::Notify>,
 }
 
 impl Batcher {
@@ -140,7 +146,18 @@ impl Batcher {
             setattrs: DashMap::new(),
             damage: DashMap::new(),
             flush_lock: Mutex::new(()),
+            work: Arc::new(tokio::sync::Notify::new()),
         }
+    }
+
+    /// The "something is queued" signal for the age flusher.
+    ///
+    /// `Notify::notify_one` leaves a permit when nobody is waiting, so a
+    /// push landing between the flusher's check and its wait is not lost —
+    /// which is the missed-wakeup hazard that makes hand-rolled sleep/wake
+    /// pairs dangerous around durability.
+    pub fn work_signal(&self) -> Arc<tokio::sync::Notify> {
+        self.work.clone()
     }
 
     /// Is anything queued, unsealed, or unreported for `path`?
@@ -183,6 +200,7 @@ impl Batcher {
         *self.queued.entry(op.path().clone()).or_insert(0) += 1;
         self.queued_bytes.fetch_add(op.bytes(), Ordering::Relaxed);
         self.queue.lock().unwrap().push_back(op);
+        self.work.notify_one();
     }
 
     /// Queue a metadata-only setattr, merged per path — the second touch of
@@ -204,6 +222,7 @@ impl Batcher {
         if fresh {
             *self.queued.entry(path.clone()).or_insert(0) += 1;
         }
+        self.work.notify_one();
     }
 
     /// Is there an unsealed pending-new file at `path`? Setattr batching
