@@ -73,6 +73,7 @@ dependencies = [
  "alloyfs-proto",
  "alloyfs-transport",
  "anyhow",
+ "async-trait",
  "bytes",
  "dashmap",
  "futures",
