@@ -48,6 +48,11 @@ pub struct SidecarMap {
     /// How many times the file has been written — what the batching test
     /// pins, so the O(n²) can never quietly return.
     saves: std::sync::atomic::AtomicU64,
+    /// Entry count, written only under the map lock. `get` runs once per
+    /// entry of every served listing, against a map that is EMPTY on
+    /// almost every real export — this is what lets it say "no" without
+    /// buying the mutex each time.
+    len: std::sync::atomic::AtomicUsize,
 }
 
 /// Suspends sidecar saves while alive; the drop performs one save if
@@ -87,6 +92,7 @@ impl SidecarMap {
         map.retain(|p, bits| root.join(p).exists() && keep(*bits));
         Self {
             file,
+            len: std::sync::atomic::AtomicUsize::new(map.len()),
             map: std::sync::Mutex::new(map),
             suspend: std::sync::atomic::AtomicU32::new(0),
             dirty: std::sync::atomic::AtomicBool::new(false),
@@ -122,6 +128,13 @@ impl SidecarMap {
     }
 
     pub fn get(&self, rel: &RelPath) -> Option<u32> {
+        // The empty-store fast path. A zero read here is exactly as fresh
+        // as taking the lock would have been: `len` only changes under the
+        // map lock, so a racing insert lands either wholly before (len
+        // visible) or wholly after (this get was ordered first anyway).
+        if self.len.load(std::sync::atomic::Ordering::Acquire) == 0 {
+            return None;
+        }
         self.map.lock().unwrap().get(&rel.0).copied()
     }
 
@@ -136,6 +149,7 @@ impl SidecarMap {
                 map.remove(&rel.0);
             }
         }
+        self.len.store(map.len(), std::sync::atomic::Ordering::Release);
         self.save_or_defer(&map);
     }
 
@@ -145,6 +159,7 @@ impl SidecarMap {
         let before = map.len();
         map.retain(|p, _| p != &rel.0 && !p.starts_with(&prefix));
         if map.len() != before {
+            self.len.store(map.len(), std::sync::atomic::Ordering::Release);
             self.save_or_defer(&map);
         }
     }
@@ -165,6 +180,7 @@ impl SidecarMap {
             let tail = &p[from.0.len()..];
             map.insert(format!("{}{}", to.0, tail), bits);
         }
+        self.len.store(map.len(), std::sync::atomic::Ordering::Release);
         self.save_or_defer(&map);
     }
 
