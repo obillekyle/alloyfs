@@ -36,6 +36,11 @@ const BATCH_MAX: usize = 512;
 const MAX_LATENCY: Duration = Duration::from_secs(1);
 /// Echo-suppression memory: how long a session "owns" a path after writing.
 const ORIGIN_TTL: Duration = Duration::from_secs(2);
+/// Sweep `recent_local` once it outgrows any plausible 2-second working
+/// set, at most every `RECENT_LOCAL_STRIDE` inserts so a hot burst pays
+/// amortized-constant time rather than a scan per write.
+const RECENT_LOCAL_SWEEP: usize = 4096;
+const RECENT_LOCAL_STRIDE: u64 = 1024;
 
 /// Per-export event state: sequence numbers, catch-up ring, live fan-out,
 /// and the recent-local-writes table used for echo suppression.
@@ -45,6 +50,8 @@ pub struct EventHub {
     log_cap: usize,
     tx: broadcast::Sender<Vec<FsEvent>>,
     recent_local: DashMap<RelPath, (u64, Instant)>,
+    /// Insert counter driving the amortized `recent_local` sweep.
+    recent_ticks: AtomicU64,
 }
 
 impl EventHub {
@@ -62,6 +69,7 @@ impl EventHub {
             log_cap,
             tx,
             recent_local: DashMap::new(),
+            recent_ticks: AtomicU64::new(0),
         })
     }
 
@@ -69,6 +77,22 @@ impl EventHub {
     /// touched `path`, so the imminent watcher echo carries its origin.
     pub fn note_local_write(&self, path: &RelPath, session: u64) {
         self.recent_local.insert(path.clone(), (session, Instant::now()));
+        // The TTL was only ever checked at read; expired entries stayed
+        // resident forever, so an untar-sized burst of unique paths parked
+        // its whole path list in memory for the process life — the same
+        // leak class `forget_version` closed for the versions map. Swept
+        // here, amortized by the stride, bounded by construction: the
+        // table can only hold what was written within one ORIGIN_TTL,
+        // plus a stride's worth of slack.
+        if self.recent_local.len() > RECENT_LOCAL_SWEEP
+            && self
+                .recent_ticks
+                .fetch_add(1, Ordering::Relaxed)
+                .is_multiple_of(RECENT_LOCAL_STRIDE)
+        {
+            self.recent_local
+                .retain(|_, (_, when)| when.elapsed() < ORIGIN_TTL);
+        }
     }
 
     pub fn last_seq(&self) -> u64 {
