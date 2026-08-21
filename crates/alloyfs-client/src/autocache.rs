@@ -525,6 +525,22 @@ impl Blob {
         let end = offset.saturating_add(size as u64).min(len) as usize;
         map[start..end].to_vec()
     }
+
+    /// [`Self::read`] straight into the caller's buffer — the mount hands
+    /// us the kernel's buffer, so the warm path is one memcpy total instead
+    /// of map→Vec→kernel. Returns bytes written; short at the mapping's
+    /// end, exactly like `read`.
+    pub fn read_into(&self, offset: u64, buf: &mut [u8]) -> usize {
+        let Some(map) = &self.map else {
+            return 0;
+        };
+        let len = map.len() as u64;
+        let start = offset.min(len) as usize;
+        let end = offset.saturating_add(buf.len() as u64).min(len) as usize;
+        let n = end - start;
+        buf[..n].copy_from_slice(&map[start..end]);
+        n
+    }
 }
 
 /// Convenience wrapper so callers get FsError-flavored IO errors.

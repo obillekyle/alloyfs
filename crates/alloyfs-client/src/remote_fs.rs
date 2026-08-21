@@ -932,6 +932,52 @@ impl RemoteFs {
         Some(path)
     }
 
+    /// `read` that fills the caller's buffer directly on the WARM paths —
+    /// a pending file's local bytes and the mapped blob copy straight into
+    /// the buffer the kernel handed the mount, skipping the Vec every warm
+    /// read otherwise allocates and copies through. Everything else falls
+    /// back to [`Self::read`]: the cold paths are round-trip-dominated and
+    /// one extra copy is invisible there. Returns bytes written; 0 at EOF.
+    pub fn read_into(&self, fh: u64, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+        if fh & OVERLAY_FH_BIT == 0 {
+            self.check_poisoned(fh)?;
+            if let Some(state) = self.open_files.get(&fh) {
+                if let Some(pending) = &state.pending_new {
+                    let p = pending.lock().unwrap();
+                    let start = (offset as usize).min(p.data.len());
+                    let end = (offset.saturating_add(buf.len() as u64) as usize).min(p.data.len());
+                    buf[..end - start].copy_from_slice(&p.data[start..end]);
+                    return Ok(end - start);
+                }
+                if self.cache.is_some() && state.cache_ok.load(Ordering::Relaxed) {
+                    {
+                        let held = state.blob.read().unwrap();
+                        if let Some(b) = held.as_ref() {
+                            return Ok(b.read_into(offset, buf));
+                        }
+                    }
+                    // No retained mapping yet: map now, serve, retain — the
+                    // same lazy path `read` takes. A vanished blob falls
+                    // through to the network exactly as it does there.
+                    if let Some(cache) = &self.cache {
+                        if let Some(b) = cache.map_blob(&state.path) {
+                            let n = b.read_into(offset, buf);
+                            *state.blob.write().unwrap() = Some(b);
+                            return Ok(n);
+                        }
+                    }
+                    state.cache_ok.store(false, Ordering::Relaxed);
+                    *state.blob.write().unwrap() = None;
+                }
+            }
+            // The shard guard is out of scope here — `read` re-acquires and
+            // may take handles out (documented as unsafe under a held guard).
+        }
+        let data = self.read(fh, offset, buf.len() as u32)?;
+        buf[..data.len()].copy_from_slice(&data);
+        Ok(data.len())
+    }
+
     pub fn read(&self, fh: u64, offset: u64, size: u32) -> Result<Vec<u8>, FsError> {
         if fh & OVERLAY_FH_BIT != 0 {
             return self.overlay_ref().read(fh, offset, size);

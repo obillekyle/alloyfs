@@ -585,12 +585,13 @@ impl FileSystemContext for WinFspFs {
                 STATUS_ACCESS_DENIED
             }));
         };
-        let data = self.fs.read(fh, offset, buffer.len() as u32).map_err(fsp_err)?;
-        if data.is_empty() && !buffer.is_empty() {
+        // read_into fills the kernel's buffer directly on the warm paths
+        // (mapped blob, pending batch) — one memcpy, no intermediate Vec.
+        let n = self.fs.read_into(fh, offset, buffer).map_err(fsp_err)?;
+        if n == 0 && !buffer.is_empty() {
             return Err(nt(STATUS_END_OF_FILE));
         }
-        buffer[..data.len()].copy_from_slice(&data);
-        Ok(data.len() as u32)
+        Ok(n as u32)
     }
 
     fn write(
@@ -1181,10 +1182,19 @@ pub fn mount(fs: Arc<RemoteFs>, mountpoint: &str, volume_label: &str) -> anyhow:
         .unicode_on_disk(true)
         .volume_creation_time(to_filetime(SystemTime::now()))
         .volume_serial_number(0x4453_594E) // "DSYN"
-        // Short kernel-side metadata cache, mirroring the FUSE backend's 1s
-        // TTL; real invalidation arrives with the event stream (the notify
-        // timer re-emits pump batches as ReadDirectoryChangesW).
-        .file_info_timeout(1000)
+        // Kernel-side metadata cache: 30 s, revoked by events. The notify
+        // timer already pushes every pump batch through FspFileSystemNotify
+        // with volume-rooted names, and the FSD's handler
+        // (FspFileNodeInvalidateCachesAndNotifyChangeByName) purges that
+        // file's cached FileInfo/security/dir-info AND the parent's listing
+        // per entry — verified in the driver source. So a server-side change
+        // reaches the kernel's caches within notify latency (~100-300 ms),
+        // and the timeout only bounds staleness if the pump dies silently —
+        // the same role the user-mode 5 s floor plays. DirInfoTimeout is
+        // deliberately not set: per fsctl.h it merely OVERRIDES this value,
+        // so listings ride the same 30 s + revocation. Repeat stats and
+        // re-listings inside the window never reach user mode at all.
+        .file_info_timeout(30_000)
         // Only post Cleanup when something actually changed (or a delete is
         // pending) — saves a callback storm on read-only workloads.
         .post_cleanup_when_modified_only(true)

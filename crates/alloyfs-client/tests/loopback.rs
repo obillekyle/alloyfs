@@ -3588,3 +3588,82 @@ async fn a_v11_session_sends_no_bulk_rewarm() {
     }
     assert_eq!(s.fs.rewarmed_paths(), 0, "v11 must never bulk re-warm");
 }
+
+/// `read_into` (the mount's zero-Vec warm read) must answer byte-for-byte
+/// what `read` answers, on every serve path it short-circuits: the mapped
+/// blob, a pending batched file, and the network fallback — including the
+/// short tail at EOF that the mount turns into STATUS_END_OF_FILE.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn read_into_matches_read_on_every_serve_path() {
+    let agent = start_agent(AgentOpts::default());
+    let content = patterned(200 * 1024);
+    std::fs::write(agent.dir.path().join("big.bin"), &content).unwrap();
+    let data_dir = tempfile::TempDir::new().unwrap();
+
+    let opts = ClientOptions {
+        data_dir: data_dir.path().to_path_buf(),
+        cache_dir: data_dir.path().join("cache"),
+        mount_key: "t".into(),
+        auto_cache_max: Some(1 << 20),
+        auto_cache_budget: Some(10 << 20),
+        ..ClientOptions::default()
+    };
+    let s = connect(&agent, opts).await;
+
+    // Blob path: wait for the walker's copy, then compare reads.
+    let blob = data_dir.path().join("cache").join("t").join("big.bin");
+    {
+        let (blob, content) = (blob.clone(), content.clone());
+        wait_until("walker caches big.bin", 10, move || {
+            (std::fs::read(&blob).ok()? == content).then_some(())
+        })
+        .await;
+    }
+    let (ino, _) = lookup_path(&s.fs, "big.bin").await.unwrap();
+    let expect = content.clone();
+    on_fs(&s.fs, move |fs| {
+        let (fh, _) = fs
+            .open(
+                ino,
+                OpenFlags {
+                    read: true,
+                    ..OpenFlags::default()
+                },
+            )
+            .unwrap();
+        let mut buf = vec![0u8; 64 * 1024];
+        // Aligned, unaligned, and the short tail past 200 KiB.
+        for offset in [0u64, 12_345, 150 * 1024] {
+            let n = fs.read_into(fh, offset, &mut buf).unwrap();
+            let via_read = fs.read(fh, offset, buf.len() as u32).unwrap();
+            assert_eq!(&buf[..n], &via_read[..], "blob path diverged at {offset}");
+            assert_eq!(&buf[..n], &expect[offset as usize..(offset as usize + n)]);
+        }
+        // Past EOF: 0 bytes, the mount's EOF signal.
+        assert_eq!(fs.read_into(fh, 300 * 1024, &mut buf).unwrap(), 0);
+        fs.release(fh);
+
+        // Pending-new path: a small batched create is served from its local
+        // buffer before the server ever hears of it.
+        let (_ino, pfh, _attr) = fs
+            .create(
+                ROOT_INO,
+                "pending.bin",
+                0o644,
+                OpenFlags {
+                    read: true,
+                    write: true,
+                    ..OpenFlags::default()
+                },
+            )
+            .unwrap();
+        fs.write(pfh, 0, b"pending-bytes").unwrap();
+        let mut small = [0u8; 64];
+        let n = fs.read_into(pfh, 0, &mut small).unwrap();
+        assert_eq!(&small[..n], b"pending-bytes");
+        let n = fs.read_into(pfh, 8, &mut small).unwrap();
+        assert_eq!(&small[..n], b"bytes");
+        fs.release(pfh);
+    })
+    .await;
+}

@@ -20,10 +20,15 @@ use fuser::{
 use alloyfs_client::{FsError, RemoteFs, ROOT_INO};
 use alloyfs_proto::{Attr, FileKind, OpenFlags};
 
-/// Kernel-side cache lifetime for attrs/entries we reply with. Short on
-/// purpose: real invalidation arrives with the event stream (the pump calls
-/// `apply_events_native` below); the TTL only bounds staleness if it hiccups.
-const KERNEL_TTL: Duration = Duration::from_secs(1);
+/// Kernel-side cache lifetime for attrs/entries we reply with: 30 s,
+/// revoked by events. The pump calls `apply_events_native` below, which
+/// pushes `inval_entry`/`inval_inode` into the kernel per changed path, so
+/// a server-side change reaches the dcache within notify latency; the TTL
+/// only bounds staleness if the pump dies silently — the same role the
+/// user-mode 5 s floor plays. Repeat stats inside the window are answered
+/// by the kernel without a round trip into this process (mirrors the
+/// WinFsp backend's FileInfoTimeout, same value, same contract).
+const KERNEL_TTL: Duration = Duration::from_secs(30);
 
 /// Shared with the kernel-module backend: one Linux errno table, not two.
 /// They had already drifted on `NoSuchExport` before this was unified.
