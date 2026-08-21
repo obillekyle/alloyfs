@@ -102,15 +102,27 @@ struct PathQuery {
 }
 
 /// GET /api/exports/{name}/file?path=… — stream the file's bytes.
+///
+/// Speaks enough HTTP to serve the callers a plain GET invites: a single
+/// `Range` for seeks and resumed downloads (the wire below was always
+/// ranged; only this surface wasn't), a weak `ETag` + `Last-Modified` pair
+/// so pollers get 304s, and a content-type from the extension so browsers
+/// render media instead of downloading it. Every response carries
+/// `nosniff` and a sandbox CSP — files people uploaded must render, but
+/// never script against this origin — and `html` deliberately maps to
+/// text/plain for the same reason.
 async fn file_get(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
     Query(q): Query<PathQuery>,
+    headers: HeaderMap,
 ) -> Result<Response, StatusCode> {
+    use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
+
     let export = state.registry.get(&name).ok_or(StatusCode::NOT_FOUND)?;
     let rel = RelPath(q.path);
     let full = export.resolve(&rel).map_err(code_to_status)?;
-    let file = tokio::fs::File::open(&full)
+    let mut file = tokio::fs::File::open(&full)
         .await
         .map_err(|_| StatusCode::NOT_FOUND)?;
     let md = file
@@ -120,13 +132,179 @@ async fn file_get(
     if md.is_dir() {
         return Err(StatusCode::BAD_REQUEST);
     }
+    let len = md.len();
+    let mtime_ms = md
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    // Weak by declaration and by construction (size + mtime, no hashing) —
+    // exactly strong enough for revalidation.
+    let etag = format!("W/\"{len:x}-{mtime_ms:x}\"");
+    let base = |b: axum::http::response::Builder| {
+        b.header("etag", etag.clone())
+            .header("last-modified", httpdate_ms(mtime_ms))
+            .header("accept-ranges", "bytes")
+            .header("x-content-type-options", "nosniff")
+            .header("content-security-policy", "sandbox")
+    };
+    if headers
+        .get("if-none-match")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.split(',').any(|t| t.trim() == etag))
+    {
+        return base(Response::builder().status(StatusCode::NOT_MODIFIED))
+            .body(axum::body::Body::empty())
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
+    }
+    let ctype = content_type_for(&full);
+
+    if let Some(spec) = headers.get("range").and_then(|v| v.to_str().ok()) {
+        match parse_range(spec, len) {
+            // Serve the slice: seek + take, still streamed.
+            Ok(Some((start, end))) => {
+                file.seek(std::io::SeekFrom::Start(start))
+                    .await
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                let stream = tokio_util::io::ReaderStream::new(file.take(end - start + 1));
+                return base(Response::builder().status(StatusCode::PARTIAL_CONTENT))
+                    .header("content-type", ctype)
+                    .header("content-length", end - start + 1)
+                    .header("content-range", format!("bytes {start}-{end}/{len}"))
+                    .body(axum::body::Body::from_stream(stream))
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
+            }
+            // Well-formed but nothing satisfiable: the dedicated status,
+            // with the total the client should retry from.
+            Err(()) => {
+                return Response::builder()
+                    .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                    .header("content-range", format!("bytes */{len}"))
+                    .body(axum::body::Body::empty())
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
+            }
+            // Malformed or multi-range: Range is advisory, the whole file
+            // is a legal answer.
+            Ok(None) => {}
+        }
+    }
+
     let stream = tokio_util::io::ReaderStream::new(file);
-    let body = axum::body::Body::from_stream(stream);
-    Response::builder()
-        .header("content-type", "application/octet-stream")
-        .header("content-length", md.len())
-        .body(body)
+    base(Response::builder())
+        .header("content-type", ctype)
+        .header("content-length", len)
+        .body(axum::body::Body::from_stream(stream))
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+/// `bytes=a-b` → the closed interval to serve. `Ok(None)` means no usable
+/// range — malformed or multi-range — and RFC 9110 makes Range advisory,
+/// so the caller serves everything. `Err(())` is well-formed but
+/// unsatisfiable: that one owes a 416.
+fn parse_range(spec: &str, len: u64) -> Result<Option<(u64, u64)>, ()> {
+    let Some(spec) = spec.strip_prefix("bytes=") else {
+        return Ok(None);
+    };
+    if spec.contains(',') {
+        return Ok(None);
+    }
+    let Some((a, b)) = spec.split_once('-') else {
+        return Ok(None);
+    };
+    let (a, b) = (a.trim(), b.trim());
+    if a.is_empty() {
+        // Suffix form `-n`: the final n bytes.
+        let n: u64 = match b.parse() {
+            Ok(n) => n,
+            Err(_) => return Ok(None),
+        };
+        if n == 0 || len == 0 {
+            return Err(());
+        }
+        return Ok(Some((len.saturating_sub(n), len - 1)));
+    }
+    let start: u64 = match a.parse() {
+        Ok(s) => s,
+        Err(_) => return Ok(None),
+    };
+    if start >= len {
+        return Err(());
+    }
+    let end = if b.is_empty() {
+        len - 1
+    } else {
+        match b.parse::<u64>() {
+            Ok(e) if e >= start => e.min(len - 1),
+            _ => return Ok(None),
+        }
+    };
+    Ok(Some((start, end)))
+}
+
+/// Extension → content-type for what a browser meaningfully renders;
+/// everything else stays an opaque download. `html` is text/plain ON
+/// PURPOSE: rendering user-uploaded markup on the API's origin would make
+/// this a script host, and the CSP sandbox is belt to this suspender.
+fn content_type_for(path: &std::path::Path) -> &'static str {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    match ext.as_deref() {
+        Some("html" | "htm" | "txt" | "log" | "md") => "text/plain; charset=utf-8",
+        Some("css") => "text/css; charset=utf-8",
+        Some("js" | "mjs") => "text/javascript; charset=utf-8",
+        Some("json") => "application/json",
+        Some("xml") => "application/xml",
+        Some("svg") => "image/svg+xml",
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("ico") => "image/x-icon",
+        Some("pdf") => "application/pdf",
+        Some("mp4" | "m4v") => "video/mp4",
+        Some("webm") => "video/webm",
+        Some("mp3") => "audio/mpeg",
+        Some("wav") => "audio/wav",
+        Some("woff2") => "font/woff2",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Milliseconds since the epoch → an RFC 9110 `IMF-fixdate`, computed the
+/// boring way (civil-from-days) rather than pulling in a date crate for
+/// one header.
+fn httpdate_ms(ms: u128) -> String {
+    let secs = (ms / 1000) as i64;
+    let days = secs.div_euclid(86_400);
+    let sod = secs.rem_euclid(86_400);
+    // Howard Hinnant's civil_from_days, the standard closed form.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    const WDAY: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
+    const MON: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    format!(
+        "{}, {:02} {} {} {:02}:{:02}:{:02} GMT",
+        WDAY[days.rem_euclid(7) as usize],
+        d,
+        MON[(m - 1) as usize],
+        y,
+        sod / 3600,
+        (sod / 60) % 60,
+        sod % 60
+    )
 }
 
 /// POST /api/exports/{name}/file?path=… — create or overwrite with the body.
@@ -148,7 +326,27 @@ async fn file_post(
     // HTTP client has no session or subscription to suppress. Every mount
     // SHOULD see these changes via the watcher — that's correct, not a gap.
     let version = tokio::task::spawn_blocking(move || -> Result<u64, ErrorCode> {
-        std::fs::write(&full, &body).map_err(|_| ErrorCode::Io)?;
+        // Land atomically: a concurrent GET must stream either the old or
+        // the new content, never a half-written truncation — which is what
+        // writing in place handed readers. Same-directory tmp + rename,
+        // the sidecar idiom; unique per request so racing posts to one
+        // path each land whole (last rename wins, none interleave). The
+        // watcher sees a dotfile create + rename pair; coalescing folds it.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let unique = format!(
+            ".{}.{}.alloyfs-post",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let tmp = full.with_file_name(match full.file_name().and_then(|n| n.to_str()) {
+            Some(n) => format!(".{n}{unique}"),
+            None => unique,
+        });
+        let landed = std::fs::write(&tmp, &body).and_then(|()| std::fs::rename(&tmp, &full));
+        if landed.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(ErrorCode::Io);
+        }
         Ok(export.bump(&rel))
     })
     .await
@@ -372,4 +570,36 @@ fn live_stream(
             }
         })
         .flatten()
+}
+
+#[cfg(test)]
+mod range_tests {
+    use super::*;
+
+    #[test]
+    fn ranges_parse_clamp_and_refuse() {
+        // Plain, open-ended, suffix — all against a 100-byte file.
+        assert_eq!(parse_range("bytes=0-49", 100), Ok(Some((0, 49))));
+        assert_eq!(parse_range("bytes=50-", 100), Ok(Some((50, 99))));
+        assert_eq!(parse_range("bytes=-10", 100), Ok(Some((90, 99))));
+        // An end past EOF clamps; a start past EOF is the 416 case.
+        assert_eq!(parse_range("bytes=90-500", 100), Ok(Some((90, 99))));
+        assert_eq!(parse_range("bytes=100-", 100), Err(()));
+        assert_eq!(parse_range("bytes=-0", 100), Err(()));
+        assert_eq!(parse_range("bytes=0-", 0), Err(()));
+        // Advisory means ignorable: malformed, inverted, multi-range, and
+        // other units all serve the whole file rather than erroring.
+        assert_eq!(parse_range("bytes=5-2", 100), Ok(None));
+        assert_eq!(parse_range("bytes=a-b", 100), Ok(None));
+        assert_eq!(parse_range("bytes=0-1,5-6", 100), Ok(None));
+        assert_eq!(parse_range("items=0-1", 100), Ok(None));
+    }
+
+    #[test]
+    fn httpdate_matches_known_instants() {
+        assert_eq!(httpdate_ms(0), "Thu, 01 Jan 1970 00:00:00 GMT");
+        // 2026-08-21 12:34:56 UTC — a Friday; the civil-from-days math and
+        // the weekday offset pin each other.
+        assert_eq!(httpdate_ms(1_787_315_696_000), "Fri, 21 Aug 2026 12:34:56 GMT");
+    }
 }
