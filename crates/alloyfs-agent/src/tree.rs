@@ -391,19 +391,7 @@ impl ExportTree {
             return;
         };
         if removed {
-            idx.remove(path);
-            // A removed directory takes its subtree with it. The watcher does
-            // not necessarily report the children.
-            let prefix = format!("{}/", path.0);
-            let doomed: Vec<RelPath> = idx
-                .entries
-                .range(RelPath(prefix.clone())..)
-                .take_while(|(p, _)| p.0.starts_with(&prefix))
-                .map(|(p, _)| p.clone())
-                .collect();
-            for p in doomed {
-                idx.remove(&p);
-            }
+            remove_with_subtree(idx, path);
             return;
         }
         match std::fs::symlink_metadata(root.join(&path.0)) {
@@ -411,6 +399,58 @@ impl ExportTree {
             // Gone between the event and the stat: treat as removed rather
             // than leaving an entry describing a file that is not there.
             Err(_) => idx.remove(path),
+        }
+    }
+
+    /// Apply a batch of observed changes in two phases: every stat runs
+    /// BEFORE the lock, then one acquisition applies the lot. The per-event
+    /// form stats under the state lock, so a debounce-sized batch was that
+    /// many disk stats serialized against every readdir and attach on the
+    /// export — and that many separate acquisitions besides.
+    pub fn note_changes(&self, root: &Path, changes: &[(RelPath, bool)]) {
+        if changes.is_empty() {
+            return;
+        }
+        // Cold index: nothing to maintain, so skip the stats too. Checked
+        // again at apply — an invalidate can land in between, and applying
+        // onto an index it doomed would resurrect exactly the staleness the
+        // invalidate was for.
+        if !matches!(&*self.state.lock().unwrap(), State::Live(_)) {
+            return;
+        }
+        enum Fate {
+            /// The event said removed: the entry goes, subtree and all —
+            /// the watcher does not necessarily report the children.
+            Gone,
+            /// Vanished between the event and the stat: the entry alone
+            /// goes, same as `note_change`'s stat-failure arm.
+            Vanished,
+            Present(Attr),
+        }
+        let stats: Vec<(&RelPath, Fate)> = changes
+            .iter()
+            .map(|(path, removed)| {
+                let fate = if *removed {
+                    Fate::Gone
+                } else {
+                    match std::fs::symlink_metadata(root.join(&path.0)) {
+                        Ok(md) => Fate::Present(attr_from_metadata(&md, 0)),
+                        Err(_) => Fate::Vanished,
+                    }
+                };
+                (path, fate)
+            })
+            .collect();
+        let mut st = self.state.lock().unwrap();
+        let State::Live(idx) = &mut *st else {
+            return;
+        };
+        for (path, fate) in stats {
+            match fate {
+                Fate::Gone => remove_with_subtree(idx, path),
+                Fate::Vanished => idx.remove(path),
+                Fate::Present(attr) => idx.insert(path.clone(), attr),
+            }
         }
     }
 
@@ -422,6 +462,22 @@ impl ExportTree {
             tracing::info!("export index dropped; will rebuild on next request");
             *st = State::Cold;
         }
+    }
+}
+
+/// Remove an entry and everything beneath it. A removed directory takes its
+/// subtree with it; the watcher does not necessarily report the children.
+fn remove_with_subtree(idx: &mut Indexed, path: &RelPath) {
+    idx.remove(path);
+    let prefix = format!("{}/", path.0);
+    let doomed: Vec<RelPath> = idx
+        .entries
+        .range(RelPath(prefix.clone())..)
+        .take_while(|(p, _)| p.0.starts_with(&prefix))
+        .map(|(p, _)| p.clone())
+        .collect();
+    for p in doomed {
+        idx.remove(&p);
     }
 }
 

@@ -265,7 +265,7 @@ async fn coalesce_loop(
                         if co.len() >= BATCH_MAX
                             || co.oldest_age().is_some_and(|age| age >= MAX_LATENCY)
                         {
-                            publish_batch(&export, &hub, co.take_batch());
+                            publish_batch(&export, &hub, co.take_batch()).await;
                         }
                     }
                     // Publish what was already coalesced first — those events
@@ -275,24 +275,26 @@ async fn coalesce_loop(
                     // ahead of the events it supersedes would be undone by
                     // them.
                     WatchSignal::Gap => {
-                        publish_batch(&export, &hub, co.take_batch());
+                        publish_batch(&export, &hub, co.take_batch()).await;
                         publish_batch(
                             &export,
                             &hub,
                             vec![(RelPath(String::new()), EventKind::ResyncRequired)],
-                        );
+                        )
+                        .await;
                     }
                     // Everything Gap does, plus a rebuild: an overflow leaves
                     // the watch armed, an error does not, and without a new
                     // watcher every change from here on would go unseen — the
                     // resync would fix the index once and it would rot again.
                     WatchSignal::Dead => {
-                        publish_batch(&export, &hub, co.take_batch());
+                        publish_batch(&export, &hub, co.take_batch()).await;
                         publish_batch(
                             &export,
                             &hub,
                             vec![(RelPath(String::new()), EventKind::ResyncRequired)],
-                        );
+                        )
+                        .await;
                         let mut delay = Duration::from_secs(1);
                         loop {
                             match build_watcher(&export.root, raw_tx.clone()) {
@@ -309,7 +311,8 @@ async fn coalesce_loop(
                                         &export,
                                         &hub,
                                         vec![(RelPath(String::new()), EventKind::ResyncRequired)],
-                                    );
+                                    )
+                                    .await;
                                     tracing::info!(export = export.name, "watcher rebuilt");
                                     break;
                                 }
@@ -332,45 +335,60 @@ async fn coalesce_loop(
                 }
             }
             _ = tokio::time::sleep(timeout) => {
-                publish_batch(&export, &hub, co.take_batch());
+                publish_batch(&export, &hub, co.take_batch()).await;
             }
             _ = stop_rx.recv() => break,
         }
     }
     // Drain on shutdown so nothing observed is silently dropped.
-    publish_batch(&export, &hub, co.take_batch());
+    publish_batch(&export, &hub, co.take_batch()).await;
 }
 
-/// Server-side effects per coalesced batch: version bookkeeping, then hub
-/// fan-out. (Watcher-observed changes bump versions too, so remote edits
-/// made directly on the server are visible to version-based caching.)
-fn publish_batch(export: &Export, hub: &EventHub, batch: Vec<(RelPath, EventKind)>) {
+/// Server-side effects per coalesced batch: version bookkeeping and index
+/// maintenance, then hub fan-out. (Watcher-observed changes bump versions
+/// too, so remote edits made directly on the server are visible to
+/// version-based caching.)
+///
+/// Runs on the BLOCKING pool: the index maintenance stats every changed
+/// path, and this loop lives beside every connection's mux reader on a
+/// runtime with very few workers — a debounce-sized batch of inline stats
+/// was the one place a slow disk stalled the readers. Awaited, so batches
+/// (and the Gap sequence "events, then resync") keep their order.
+async fn publish_batch(export: &Arc<Export>, hub: &Arc<EventHub>, batch: Vec<(RelPath, EventKind)>) {
     if batch.is_empty() {
         return;
     }
-    for (path, kind) in &batch {
-        match kind {
-            EventKind::RenamedFrom { to } => {
-                export.rename_version(path, to);
-                export.tree.note_change(&export.root, path, true);
-                export.tree.note_change(&export.root, to, false);
-            }
-            EventKind::Removed => {
-                export.tree.note_change(&export.root, path, true);
-            }
-            // A gap means the watcher stopped being able to describe what
-            // changed, so the index describes a state that may never have
-            // existed. Dropping it costs one rebuild — cheap enough that it is
-            // the whole recovery path rather than the last resort.
-            EventKind::ResyncRequired => export.tree.invalidate(),
-            _ => {
-                export.bump(path);
-                export.tree.note_change(&export.root, path, false);
+    let export = export.clone();
+    let hub = hub.clone();
+    let done = tokio::task::spawn_blocking(move || {
+        let mut changes: Vec<(RelPath, bool)> = Vec::with_capacity(batch.len() + 4);
+        for (path, kind) in &batch {
+            match kind {
+                EventKind::RenamedFrom { to } => {
+                    export.rename_version(path, to);
+                    changes.push((path.clone(), true));
+                    changes.push((to.clone(), false));
+                }
+                EventKind::Removed => changes.push((path.clone(), true)),
+                // A gap means the watcher stopped being able to describe what
+                // changed, so the index describes a state that may never have
+                // existed. Dropping it costs one rebuild — cheap enough that
+                // it is the whole recovery path rather than the last resort.
+                EventKind::ResyncRequired => export.tree.invalidate(),
+                _ => {
+                    export.bump(path);
+                    changes.push((path.clone(), false));
+                }
             }
         }
+        export.tree.note_changes(&export.root, &changes);
+        tracing::debug!(export = export.name, n = batch.len(), "event batch");
+        hub.publish(batch);
+    })
+    .await;
+    if done.is_err() {
+        tracing::warn!("event batch task panicked; the next resync re-derives the index");
     }
-    tracing::debug!(export = export.name, n = batch.len(), "event batch");
-    hub.publish(batch);
 }
 
 #[cfg(test)]
@@ -424,7 +442,7 @@ mod tests {
 
         let hub = export.events.clone();
         let mut rx = hub.subscribe(None).unwrap().1;
-        publish_batch(&export, &hub, co.take_batch());
+        publish_batch(&export, &hub, co.take_batch()).await;
         let batch = rx.try_recv().expect("one batch published");
         assert_eq!(batch.len(), 1, "exactly one event, got {batch:?}");
         assert!(
@@ -452,7 +470,7 @@ mod tests {
 
         let hub = export.events.clone();
         let mut rx = hub.subscribe(None).unwrap().1;
-        publish_batch(&export, &hub, co.take_batch());
+        publish_batch(&export, &hub, co.take_batch()).await;
         let batch = rx.try_recv().expect("one batch published");
         assert_eq!(batch.len(), 2, "rename + modify both survive: {batch:?}");
         assert!(batch
