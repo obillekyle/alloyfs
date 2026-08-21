@@ -283,6 +283,9 @@ async fn mount_fuse(
     mountpoint: PathBuf,
     export: &str,
 ) -> anyhow::Result<()> {
+    // The driver preflight with the actionable message (what to install,
+    // from where) — not just fuser's raw open("/dev/fuse") error.
+    super::service::verify_backend()?;
     let export = export.to_string();
     let (notifier_tx, notifier_rx) = tokio::sync::oneshot::channel();
     let mount_fs = fs.clone();
@@ -429,6 +432,9 @@ async fn mount_platform(
         "--backend kernel is Linux-only; Windows mounts always use WinFsp"
     );
     let mountpoint = mountpoint.to_string_lossy().into_owned();
+    // The driver preflight with the actionable message (winfsp.dev URL and
+    // all) — not the raw "WinFsp is not available" the mount host gives.
+    super::service::verify_backend()?;
     // mount() returns once the WinFsp dispatcher is running; its threads call
     // back into RemoteFs, which block_on's this runtime — so we keep the
     // runtime alive here until Ctrl-C, then unmount cleanly.

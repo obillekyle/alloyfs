@@ -48,6 +48,14 @@ use systemd as reg;
 
 pub use instance::{Instance, Scope};
 
+/// The filesystem-driver preflight, shared with `mount`. The missing-driver
+/// message — install URL included — should not depend on WHICH command
+/// discovers the driver is missing; a plain `alloyfs mount` used to surface
+/// the raw backend error instead.
+pub(crate) fn verify_backend() -> anyhow::Result<()> {
+    reg::verify_backend()
+}
+
 // ------------------------------------------------------------------ commands
 
 pub fn setup() -> anyhow::Result<()> {
