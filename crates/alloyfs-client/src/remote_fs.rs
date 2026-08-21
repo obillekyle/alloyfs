@@ -532,7 +532,11 @@ impl RemoteFs {
             if let Some(pino) = self.ino.ino_of(&parent) {
                 if let Some(hit) = self.dir_cache.get(&pino) {
                     let (entries, when) = &*hit;
-                    if when.elapsed() < self.dir_ttl() && !entries.iter().any(|(n, _, _)| n == name) {
+                    if when.elapsed() < self.dir_ttl()
+                        && entries
+                            .binary_search_by(|(n, _, _)| n.as_str().cmp(name))
+                            .is_err()
+                    {
                         tracing::debug!(path = %path, "getattr: NEGATIVE from live listing");
                         return Err(ErrorCode::NotFound.into());
                     }
@@ -544,7 +548,10 @@ impl RemoteFs {
             // stat of a token-proven entry back onto the wire, or a remount
             // would go cold again five seconds after it went warm.
             if let Some(w) = self.warm.get(&parent) {
-                let found = w.iter().find(|(n, _)| n == name).map(|(_, a)| *a);
+                let found = w
+                    .binary_search_by(|(n, _)| n.as_str().cmp(name))
+                    .ok()
+                    .map(|i| w[i].1);
                 drop(w);
                 return match found {
                     Some(attr) => {
@@ -581,9 +588,12 @@ impl RemoteFs {
         if let Some(hit) = self.dir_cache.get(&parent) {
             let (entries, when) = &*hit;
             if when.elapsed() < self.dir_ttl() {
-                return match entries.iter().find(|(n, _, _)| n == name) {
-                    Some((_, ino, attr)) => Ok((*ino, *attr)),
-                    None => Err(ErrorCode::NotFound.into()),
+                return match entries.binary_search_by(|(n, _, _)| n.as_str().cmp(name)) {
+                    Ok(i) => {
+                        let (_, ino, attr) = &entries[i];
+                        Ok((*ino, *attr))
+                    }
+                    Err(_) => Err(ErrorCode::NotFound.into()),
                 };
             }
         }
@@ -593,7 +603,10 @@ impl RemoteFs {
         // Feeding the attr cache on the way out is what lets the open that
         // follows this lookup take the lazy no-server path.
         if let Some(w) = self.warm.get(&dir) {
-            let found = w.iter().find(|(n, _)| n == name).map(|(_, a)| *a);
+            let found = w
+                .binary_search_by(|(n, _)| n.as_str().cmp(name))
+                .ok()
+                .map(|i| w[i].1);
             drop(w);
             return match found {
                 Some(attr) => {
@@ -693,6 +706,12 @@ impl RemoteFs {
                 None => break,
             }
         }
+        // Cached listings are kept name-sorted (byte order): every lookup
+        // against them binary-searches, and patch_parent_dir splices with
+        // partition_point on the same assumption. Modern agents serve pages
+        // sorted already, so this is a near-free merge pass — but the
+        // invariant is enforced HERE, not trusted to the peer.
+        remote.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         // Only cache a listing that still describes the present. A mutation
         // during the fetch means this result may already be wrong, and a wrong
         // COMPLETE listing does not merely go stale — it answers NotFound for
@@ -1479,10 +1498,12 @@ impl RemoteFs {
         if let Some(hit) = self.dir_cache.get(&parent) {
             let (entries, when) = &*hit;
             if when.elapsed() < self.dir_ttl() {
-                return Some(entries.iter().any(|(n, _, _)| n == name));
+                return Some(entries.binary_search_by(|(n, _, _)| n.as_str().cmp(name)).is_ok());
             }
         }
-        self.warm.get(dir).map(|w| w.iter().any(|(n, _)| n == name))
+        self.warm
+            .get(dir)
+            .map(|w| w.binary_search_by(|(n, _)| n.as_str().cmp(name)).is_ok())
     }
 
     /// Does a COMPLETE cached listing prove `dir` is empty? Removing a
@@ -1979,6 +2000,13 @@ impl RemoteFs {
             self.call(Request::ReadLink { path })?,
             Response::Target(t) => t
         ))
+    }
+
+    /// The session's negotiated wire protocol. Mount glue keys optional
+    /// work off it — e.g. pre-v5 servers answer writes without attributes,
+    /// so only their write path needs a stat up front.
+    pub fn server_proto(&self) -> u16 {
+        self.conn().proto
     }
 
     /// Refuse an operation the negotiated protocol cannot carry.

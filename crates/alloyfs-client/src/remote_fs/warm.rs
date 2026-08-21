@@ -174,7 +174,12 @@ impl RemoteFs {
             return 0;
         }
         let n = snap.dirs.len();
-        for (dir, listing) in snap.dirs {
+        for (dir, mut listing) in snap.dirs {
+            // Warm listings are binary-searched and partition_point-spliced,
+            // so they must be name-sorted — and the snapshot's dirs arrive
+            // in tree-page order, which nothing promises is sorted within a
+            // directory. Enforced here, at the one bulk producer.
+            listing.sort_unstable_by(|a, b| a.0.cmp(&b.0));
             self.warm.insert(RelPath(dir), listing);
         }
         n
@@ -327,35 +332,41 @@ impl RemoteFs {
         if let Some(pino) = self.ino.ino_of(&parent) {
             if let Some(mut hit) = self.dir_cache.get_mut(&pino) {
                 let (listing, _) = hit.value_mut();
+                // One binary search answers both arms: listings are kept
+                // name-sorted, so the hit index updates in place and the
+                // miss index is exactly where the new entry belongs.
                 match &patch {
                     ListingPatch::Upsert(ino, attr) => {
-                        match listing.iter_mut().find(|(n, _, _)| n == name) {
-                            Some(e) => {
-                                e.1 = *ino;
-                                e.2 = *attr;
+                        match listing.binary_search_by(|(n, _, _)| n.as_str().cmp(name)) {
+                            Ok(i) => {
+                                listing[i].1 = *ino;
+                                listing[i].2 = *attr;
                             }
-                            None => {
-                                // Listings are served name-ordered; keep them so.
-                                let at = listing.partition_point(|(n, _, _)| n.as_str() < name);
-                                listing.insert(at, (name.to_string(), *ino, *attr));
-                            }
+                            Err(at) => listing.insert(at, (name.to_string(), *ino, *attr)),
                         }
                     }
-                    ListingPatch::Remove => listing.retain(|(n, _, _)| n != name),
+                    ListingPatch::Remove => {
+                        if let Ok(i) = listing.binary_search_by(|(n, _, _)| n.as_str().cmp(name)) {
+                            listing.remove(i);
+                        }
+                    }
                 }
             }
         }
         match self.warm.get_mut(&parent) {
             Some(mut w) => {
                 match &patch {
-                    ListingPatch::Upsert(_, attr) => match w.iter_mut().find(|(n, _)| n == name) {
-                        Some(e) => e.1 = *attr,
-                        None => {
-                            let at = w.partition_point(|(n, _)| n.as_str() < name);
-                            w.insert(at, (name.to_string(), *attr));
+                    ListingPatch::Upsert(_, attr) => {
+                        match w.binary_search_by(|(n, _)| n.as_str().cmp(name)) {
+                            Ok(i) => w[i].1 = *attr,
+                            Err(at) => w.insert(at, (name.to_string(), *attr)),
                         }
-                    },
-                    ListingPatch::Remove => w.retain(|(n, _)| n != name),
+                    }
+                    ListingPatch::Remove => {
+                        if let Ok(i) = w.binary_search_by(|(n, _)| n.as_str().cmp(name)) {
+                            w.remove(i);
+                        }
+                    }
                 }
                 tracing::debug!(parent = %parent, name, "patch_parent_dir: warm PATCHED");
             }
