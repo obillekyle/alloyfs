@@ -58,6 +58,13 @@ pub struct ServerSection {
     pub http_listen: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http_token: Option<String>,
+    /// Opt this server's outgoing large frames into zstd on v13+ sessions
+    /// (mirrors the agent-level key; the client direction opts in per
+    /// mount). This key existed on AgentConfig before it existed HERE, and
+    /// deny_unknown_fields turned that gap into a crash-looping mount the
+    /// moment a config used it — the schema test now covers the mapping.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zstd: Option<bool>,
     /// Absent, null and `{}` all mean "nothing to serve".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exports: Option<BTreeMap<String, alloyfs_agent::ExportConfig>>,

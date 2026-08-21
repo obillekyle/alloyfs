@@ -144,6 +144,7 @@ pub fn from_legacy_agent(old: alloyfs_agent::AgentConfig) -> Config {
             tcp_token: old.agent.tcp_token,
             http_listen: old.agent.http_listen,
             http_token: old.agent.http_token,
+            zstd: old.agent.zstd.then_some(true),
             exports,
         }),
         client: None,
@@ -182,6 +183,7 @@ pub fn to_agent_config(config: &Config) -> alloyfs_agent::AgentConfig {
     out.agent.tcp_token = server.tcp_token.clone();
     out.agent.http_listen = server.http_listen.clone();
     out.agent.http_token = server.http_token.clone();
+    out.agent.zstd = server.zstd.unwrap_or(false);
     if let Some(exports) = &server.exports {
         for (name, export) in exports {
             // A clone, not a field-by-field rebuild. Both sides are the same
@@ -209,6 +211,25 @@ mod tests {
 
     fn shape(text: &str) -> anyhow::Result<Shape> {
         shape_of(&serde_yaml::from_str(text).unwrap())
+    }
+
+    /// The gap that crash-looped a live mount: `zstd` existed on
+    /// AgentConfig but not on the v3 ServerSection, so deny_unknown_fields
+    /// rejected the whole config the moment the key was used. Every
+    /// server-level key must parse in the v3 schema AND arrive in the
+    /// AgentConfig the agent actually reads.
+    #[test]
+    fn server_zstd_parses_and_reaches_the_agent_config() {
+        let cfg: crate::config::Config =
+            serde_yaml::from_str("version: 3\nserver:\n  zstd: true\n  exports:\n    e: { path: /x }\n")
+                .expect("the v3 schema must accept server.zstd");
+        assert_eq!(cfg.server.as_ref().unwrap().zstd, Some(true));
+        let agent = to_agent_config(&cfg);
+        assert!(agent.agent.zstd, "the flag must reach the agent config");
+        // Absent stays off.
+        let cfg: crate::config::Config =
+            serde_yaml::from_str("version: 3\nserver:\n  exports:\n    e: { path: /x }\n").unwrap();
+        assert!(!to_agent_config(&cfg).agent.zstd);
     }
 
     #[test]
