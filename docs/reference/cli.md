@@ -9,14 +9,15 @@ alloyfs <COMMAND>
 | `serve` | Publish the exports named in the config |
 | `mount` | Mount an export as a drive |
 | `start` | Run the whole config: the agent, plus every configured mount |
-| `service` | Register mounts and agents to start on their own (Windows) |
+| `service` | Register mounts and agents to start on their own (Windows SCM / systemd user units) |
 | `sync` | Keep a local directory in step with an export |
-| `cache` | Show what is cached |
-| `clear` | Drop the cache |
+| `cache` | Manage the local cache (`cache clear` drops it) |
 | `events` | Tail the change stream as NDJSON |
 | `ping` | Round-trip time to an agent |
 | `bench` | Timed pipelined read, no mount involved |
 | `stress` | Concurrent load generator |
+| `tree` | Fetch an export's tree index in one exchange — the walk diagnostic |
+| `bulk` | Compare bulk-read strategies against an export, with timings |
 | `init` | Write a config for a directory, ready to serve |
 | `update` | Update in place by re-running the installer |
 
