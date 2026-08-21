@@ -80,7 +80,16 @@ pub(crate) struct CacheState {
     pub entries: BTreeMap<RelPath, CacheEntry>,
     pub total_bytes: u64,
     tick: u64,
+    /// The manifest no longer describes what is cached: an entry was added,
+    /// replaced, evicted or renamed. Must be persisted.
     dirty: bool,
+    /// Only RECENCY moved — a hit bumped `last_used`. Worth writing at
+    /// shutdown, never worth a periodic rewrite of the whole manifest: a
+    /// read-only workload dirtied the manifest on every cache HIT, so the
+    /// 30 s flusher rewrote the entire file forever for a workload that
+    /// changed nothing. Losing recency costs slightly worse-informed first
+    /// evictions after a restart, and nothing else.
+    lru_dirty: bool,
 }
 
 pub(crate) struct AutoCache {
@@ -201,6 +210,7 @@ impl AutoCache {
                     total_bytes: total,
                     tick,
                     dirty: false,
+                    lru_dirty: false,
                 }),
                 fetch_tx,
                 seq: std::sync::atomic::AtomicU64::new(loaded_seq),
@@ -284,7 +294,10 @@ impl AutoCache {
         if fresh {
             entry.last_used = tick;
             entry.verified = true;
-            st.dirty = true;
+            // Recency only — nothing about WHAT is cached changed, so this
+            // must not drag the whole manifest to disk every 30 s for a
+            // workload that is purely reading.
+            st.lru_dirty = true;
         }
         fresh
     }
@@ -313,6 +326,18 @@ impl AutoCache {
             st.total_bytes -= old.size;
         }
         // Budget: evict least-recently-used non-pinned entries.
+        //
+        // Down to a LOW-WATER mark rather than to exactly-fits. Building and
+        // sorting the victim list is O(n log n) with a String clone per
+        // entry, under the lock every open contends on — and evicting just
+        // enough meant paying that on EVERY commit once the cache sat at
+        // budget, which is precisely the tail of a big walk. Freeing a
+        // tenth of the budget instead amortizes the sort over the many
+        // commits that follow. A cache evicting slightly more than it must
+        // is a cache; a walk that goes quadratic at the finish line is a
+        // bug. (Tiny budgets keep the old behaviour: the tenth rounds to
+        // zero and the mark collapses back onto the budget.)
+        let low_water = self.cfg.budget - self.cfg.budget / 10;
         if st.total_bytes + attr.size > self.cfg.budget {
             let mut victims: Vec<(RelPath, u64, u64)> = st
                 .entries
@@ -322,7 +347,7 @@ impl AutoCache {
                 .collect();
             victims.sort_by_key(|(_, used, _)| *used);
             for (vp, _, vsize) in victims {
-                if st.total_bytes + attr.size <= self.cfg.budget {
+                if st.total_bytes + attr.size <= low_water {
                     break;
                 }
                 st.entries.remove(&vp);
@@ -434,26 +459,43 @@ impl AutoCache {
         (st.entries.len(), st.total_bytes)
     }
 
-    /// Persist the manifest if dirty. Called by the flusher task and shutdown.
-    /// Write the manifest, if anything changed since the last write.
-    ///
-    /// The lock is what makes this a BARRIER as well as a write. `dirty` is
-    /// cleared the moment the snapshot is taken, while the serialize, the
-    /// temp write and the rename all happen after the state lock is
-    /// released — so a caller arriving during that window sees `dirty ==
-    /// false` and would conclude the manifest is safely on disk. Shutdown
-    /// is exactly that caller, and it is followed by the process exiting,
-    /// which is what turns the wrong conclusion into lost cache entries.
-    /// Same lesson as the write batcher's barrier: a cleared flag is not a
-    /// completed write.
+    /// Persist the manifest if its CONTENT changed. The flusher task's call.
     pub fn flush_manifest(&self) {
+        self.write_manifest(false);
+    }
+
+    /// The process's last write: also persists recency-only changes.
+    ///
+    /// Shutdown is the one moment when writing `last_used` is free. The
+    /// alternative is not persisting recency at all — a periodic flush that
+    /// honoured it would rewrite the entire manifest every 30 s for a
+    /// workload that is purely reading, which is what this used to do.
+    pub fn flush_manifest_final(&self) {
+        self.write_manifest(true);
+    }
+
+    /// Write the manifest, if anything worth writing changed.
+    ///
+    /// The lock is what makes this a BARRIER as well as a write. The dirty
+    /// flags are cleared the moment the snapshot is taken, while the
+    /// serialize, the temp write and the rename all happen after the state
+    /// lock is released — so a caller arriving during that window sees
+    /// them clear and would conclude the manifest is safely on disk.
+    /// Shutdown is exactly that caller, and it is followed by the process
+    /// exiting, which is what turns the wrong conclusion into lost cache
+    /// entries. Same lesson as the write batcher's barrier: a cleared flag
+    /// is not a completed write.
+    fn write_manifest(&self, include_recency: bool) {
         let _one_at_a_time = self.manifest_lock.lock().unwrap_or_else(|e| e.into_inner());
         let snapshot = {
             let mut st = self.st();
-            if !st.dirty {
+            if !(st.dirty || (include_recency && st.lru_dirty)) {
                 return;
             }
+            // Both clear: the snapshot carries whatever `last_used` values
+            // are current, so writing it persists recency either way.
             st.dirty = false;
+            st.lru_dirty = false;
             Manifest {
                 // 2 added `seq`, 3 adds `tree_token`. Neither is a breaking
                 // bump: both default to 0 on read, and an older file loads as
@@ -663,6 +705,46 @@ mod tests {
         assert_eq!(
             read_via_handle(&c, &RelPath("e/x.txt".into()), 0, 1).as_deref(),
             Some(&b"1"[..])
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Reading does not rewrite the manifest; shutdown still saves recency.
+    ///
+    /// Every cache HIT used to mark the manifest dirty, purely to record
+    /// that `last_used` had moved — so a mount doing nothing but reading
+    /// rewrote its entire manifest every 30 s, forever. Content changes
+    /// still must persist promptly; recency is worth exactly one write, at
+    /// the end.
+    #[test]
+    fn reading_does_not_dirty_the_manifest_but_shutdown_saves_recency() {
+        let dir = std::env::temp_dir().join(format!("ds-cache-lru-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (c, _rx) = cache(&dir, 1024, 10_000);
+        let p = RelPath("a.txt".into());
+        let a = attr(5, 100, 7);
+        stage_write(&c.blob_final_path(&p), b"hello").unwrap();
+        c.commit(&p, &a, false);
+        c.flush_manifest();
+        assert!(c.cfg.manifest.exists(), "a content change persists");
+
+        // Removing the file makes the next write observable: whether one
+        // happens at all is the whole question.
+        std::fs::remove_file(&c.cfg.manifest).unwrap();
+        for _ in 0..50 {
+            assert!(c.fresh_for(&p, &a), "a hit, which moves recency only");
+        }
+        c.flush_manifest();
+        assert!(
+            !c.cfg.manifest.exists(),
+            "reads alone must not rewrite the manifest — that is a whole-file \
+             write every 30 s for a workload that changed nothing"
+        );
+
+        c.flush_manifest_final();
+        assert!(
+            c.cfg.manifest.exists(),
+            "shutdown still persists recency, so the next mount evicts informed"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -342,7 +342,10 @@ impl RemoteFs {
         // Unmount is the last barrier there will ever be.
         self.flush_batch();
         if let Some(cache) = &self.cache {
-            cache.flush_manifest();
+            // The final write: the one flush that also persists which
+            // entries were hot, so the next mount's evictions start
+            // informed.
+            cache.flush_manifest_final();
             let (n, bytes) = cache.stats();
             tracing::info!(entries = n, bytes, "auto-cache manifest flushed");
         }
