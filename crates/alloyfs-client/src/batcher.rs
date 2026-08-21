@@ -173,6 +173,13 @@ impl Batcher {
         if self.setattrs.remove(op.path()).is_some() {
             self.surrender_claim(op.path());
         }
+        // The claim is what `involves`/`queued_count` answer from, and it is
+        // deliberately NOT the queue: a flush drains the queue up front and
+        // only surrenders each claim as that op settles, so a path stays
+        // "involved" for the whole width of its send. That is the invariant
+        // the queue itself lacked — sampling `is_empty()` let barriers
+        // return mid-flight (fixed there; recorded here because this map is
+        // the reason the same bug never reached the per-path questions).
         *self.queued.entry(op.path().clone()).or_insert(0) += 1;
         self.queued_bytes.fetch_add(op.bytes(), Ordering::Relaxed);
         self.queue.lock().unwrap().push_back(op);

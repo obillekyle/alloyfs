@@ -97,6 +97,12 @@ pub(crate) struct AutoCache {
     /// "Did this mount do any discovery at all" is otherwise invisible from
     /// outside, which makes both the log line and the test unfalsifiable.
     walk_skipped: std::sync::atomic::AtomicBool,
+    /// Held across a manifest write, so a caller that wants the manifest
+    /// DURABLE waits for one already in progress. `dirty` alone cannot say
+    /// that: it is cleared when the snapshot is taken, and the serialize +
+    /// write + rename that follow happen outside the state lock. See
+    /// `flush_manifest`.
+    manifest_lock: Mutex<()>,
 }
 
 pub(crate) fn mtime_ns(t: SystemTime) -> u128 {
@@ -200,6 +206,7 @@ impl AutoCache {
                 seq: std::sync::atomic::AtomicU64::new(loaded_seq),
                 tree_token: std::sync::atomic::AtomicU64::new(loaded_token),
                 walk_skipped: std::sync::atomic::AtomicBool::new(false),
+                manifest_lock: Mutex::new(()),
             },
             fetch_rx,
         ))
@@ -428,7 +435,19 @@ impl AutoCache {
     }
 
     /// Persist the manifest if dirty. Called by the flusher task and shutdown.
+    /// Write the manifest, if anything changed since the last write.
+    ///
+    /// The lock is what makes this a BARRIER as well as a write. `dirty` is
+    /// cleared the moment the snapshot is taken, while the serialize, the
+    /// temp write and the rename all happen after the state lock is
+    /// released — so a caller arriving during that window sees `dirty ==
+    /// false` and would conclude the manifest is safely on disk. Shutdown
+    /// is exactly that caller, and it is followed by the process exiting,
+    /// which is what turns the wrong conclusion into lost cache entries.
+    /// Same lesson as the write batcher's barrier: a cleared flag is not a
+    /// completed write.
     pub fn flush_manifest(&self) {
+        let _one_at_a_time = self.manifest_lock.lock().unwrap_or_else(|e| e.into_inner());
         let snapshot = {
             let mut st = self.st();
             if !st.dirty {
@@ -644,6 +663,56 @@ mod tests {
         assert_eq!(
             read_via_handle(&c, &RelPath("e/x.txt".into()), 0, 1).as_deref(),
             Some(&b"1"[..])
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A manifest flush is a BARRIER as well as a write.
+    ///
+    /// `dirty` is cleared when the snapshot is taken, while the serialize,
+    /// the temp write and the rename all happen after the state lock is
+    /// released — so a caller arriving mid-write saw `dirty == false` and
+    /// concluded the manifest was on disk. Shutdown is that caller, and
+    /// the process exit right behind it is what turned the wrong
+    /// conclusion into lost cache entries. Same family as the write
+    /// batcher's barrier bug, one layer up.
+    ///
+    /// Made reproducible the only way a unit test can make a write slow:
+    /// enough entries that serializing them takes real time, flushed from
+    /// another thread, with the shutdown-shaped flush racing it.
+    #[test]
+    fn a_manifest_flush_waits_for_one_already_writing() {
+        let dir = std::env::temp_dir().join(format!("ds-manifest-barrier-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (c, _rx) = cache(&dir, 1024, 100_000_000);
+        // Entries only — no blobs. The manifest write is what has to take
+        // measurable time here, and staging thousands of one-byte files
+        // would cost seconds of unrelated disk work.
+        for i in 0..30_000 {
+            c.commit(&RelPath(format!("dir/f{i:06}.bin")), &attr(1, 100, 1), false);
+        }
+        let manifest = c.cfg.manifest.clone();
+        assert!(!manifest.exists(), "nothing written yet");
+
+        let cache_ref = std::sync::Arc::new(c);
+        let writer = {
+            let cache_ref = cache_ref.clone();
+            std::thread::spawn(move || cache_ref.flush_manifest())
+        };
+        // Let the writer take the snapshot and clear `dirty` — that is the
+        // state the barrier has to survive, so waiting for it is the point
+        // rather than a way of hiding a race.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        // The shutdown-shaped call: pre-fix it saw the cleared `dirty` and
+        // returned while the writer was still serializing.
+        cache_ref.flush_manifest();
+        let landed = manifest.exists()
+            && serde_json::from_str::<Manifest>(&std::fs::read_to_string(&manifest).unwrap()).is_ok();
+        writer.join().unwrap();
+        assert!(
+            landed,
+            "flush_manifest returned before the manifest was on disk — a \
+             cleared dirty flag is not a completed write"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
