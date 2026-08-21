@@ -149,14 +149,44 @@ where
     // writer::drain) — one flush per burst, not one per frame.
     let mut write_task = tokio::spawn(crate::writer::drain(writer, out_rx));
 
+    // In-flight cap, per connection. Every non-lock request pins a
+    // spawn_blocking thread on the agent plus its response buffer; without
+    // a bound, one greedy peer — a deep readahead window and a WriteMany
+    // flush at once — could park hundreds of ~128 KiB responses and
+    // threads on a sub-gigabyte box. Waiting on a permit pauses THIS
+    // connection's read loop, which is exactly TCP backpressure, and
+    // never touches other clients. Lock traffic is exempt: a blocking
+    // LockRange legally waits minutes, and the unlock that frees it
+    // arrives on this same connection — counting locks would let 64
+    // waiters starve the read loop of the very frame that releases them.
+    let inflight = std::sync::Arc::new(tokio::sync::Semaphore::new(64));
+    let is_lock = |body: &Request| {
+        matches!(
+            body,
+            Request::Lock { .. }
+                | Request::Unlock { .. }
+                | Request::LockRange { .. }
+                | Request::UnlockRange { .. }
+                | Request::TestLock { .. }
+        )
+    };
+
     let result = loop {
         match reader.next().await {
             Some(Ok(Frame::Request { id, body })) => {
+                let permit = if is_lock(&body) {
+                    None
+                } else {
+                    // acquire_owned only errors on a closed semaphore, and
+                    // nothing here closes it.
+                    inflight.clone().acquire_owned().await.ok()
+                };
                 let handler = handler.clone();
                 let out_tx = out_tx.clone();
                 tokio::spawn(async move {
                     let body = handler.handle(body).await;
                     let _ = out_tx.send(Frame::Response { id, body }).await;
+                    drop(permit);
                 });
             }
             Some(Ok(Frame::Ping { nonce })) => {

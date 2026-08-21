@@ -426,8 +426,25 @@ enum CacheCmd {
     },
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    // Not #[tokio::main]: the defaults are sized for servers with memory to
+    // burn — up to 512 blocking threads at 2 MiB of stack apiece. Every
+    // filesystem request the agent serves funnels through spawn_blocking,
+    // so one burst (a client's multi-stream readahead plus a WriteMany
+    // flush) could materialize hundreds of OS threads on the sub-gigabyte
+    // boxes agents actually run on. 32 blocking threads is already past
+    // the useful disk parallelism of those machines, and 1 MiB of stack
+    // clears every path here — shallow fs syscalls, tracing, postcard's
+    // iterative codec — with room to spare.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .max_blocking_threads(32)
+        .thread_stack_size(1024 * 1024)
+        .build()?;
+    rt.block_on(async_main())
+}
+
+async fn async_main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
