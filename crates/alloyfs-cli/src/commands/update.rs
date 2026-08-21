@@ -29,22 +29,45 @@ pub fn run(channel: Option<String>, dry_run: bool) -> anyhow::Result<()> {
         ),
     };
 
+    // The installers honor ALLOYFS_INSTALL; without it they place the binary
+    // at their platform default — which is NOT necessarily where THIS binary
+    // lives. An update that lands beside a stale copy still winning on PATH
+    // is worse than no update (a sudo run on the azure box put the new
+    // binary in root's ~/.local/bin exactly this way). The running binary's
+    // own directory is the one destination that is right by definition.
+    let install_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(std::path::Path::to_path_buf));
+
     println!("current: {}", env!("CARGO_PKG_VERSION"));
     match &version {
         Some(v) => println!("target:  {v}"),
         None => println!("target:  the latest release"),
     }
+    if let Some(dir) = &install_dir {
+        println!("into:    {}", dir.display());
+    }
 
     let (program, args) = installer_command(version.as_deref());
 
     if dry_run {
-        println!("\nwould run:\n  {program} {}", args.join(" "));
+        let env_note = install_dir
+            .as_ref()
+            .map(|d| format!("ALLOYFS_INSTALL={} ", d.display()))
+            .unwrap_or_default();
+        println!("\nwould run:\n  {env_note}{program} {}", args.join(" "));
         return Ok(());
     }
 
     println!("\nrunning the installer from {BASE}\n");
-    let status = Command::new(&program)
-        .args(&args)
+    let mut cmd = Command::new(&program);
+    cmd.args(&args);
+    if let Some(dir) = &install_dir {
+        // Through the environment, not the command string: the child shells
+        // inherit it, and a path never has to survive quoting.
+        cmd.env("ALLOYFS_INSTALL", dir);
+    }
+    let status = cmd
         .status()
         .map_err(|e| anyhow::anyhow!("could not run {program}: {e}"))?;
 
