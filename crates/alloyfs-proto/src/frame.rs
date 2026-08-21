@@ -30,7 +30,7 @@ const LEN_PREFIX: usize = 4;
 /// lz4's place under the same rules. The decoder always unwraps both
 /// wrappers regardless of any flag; every version gate lives on the
 /// sending side.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct FrameCodec {
     pub compress: bool,
     /// Shared and atomic because the codec moves into the writer task at
@@ -38,6 +38,23 @@ pub struct FrameCodec {
     /// zstd — the connection keeps a clone and flips it after the
     /// handshake. Never set below v13.
     pub zstd: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Reused zstd contexts. `zstd::bulk::compress`/`decompress` build a
+    /// full CCtx/DCtx — hundreds of KB of tables at level 3 — on every
+    /// call, which at one call per 128 KiB frame was a measurable slice of
+    /// a 2-core agent's CPU. Each codec half is owned by exactly one task,
+    /// so plain fields need no synchronization; lazy so `Default` stays
+    /// derivable and a codec that never sees zstd allocates nothing.
+    cctx: Option<zstd::bulk::Compressor<'static>>,
+    dctx: Option<zstd::bulk::Decompressor<'static>>,
+}
+
+impl std::fmt::Debug for FrameCodec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FrameCodec")
+            .field("compress", &self.compress)
+            .field("zstd", &self.zstd.load(std::sync::atomic::Ordering::Relaxed))
+            .finish_non_exhaustive()
+    }
 }
 
 impl Decoder for FrameCodec {
@@ -88,7 +105,15 @@ impl Decoder for FrameCodec {
                 if claimed > MAX_FRAME_LEN {
                     return Err(ProtoError::FrameTooLarge(claimed));
                 }
-                let inner = zstd::bulk::decompress(&data[4..], claimed)
+                let dctx = match &mut self.dctx {
+                    Some(c) => c,
+                    None => self.dctx.insert(
+                        zstd::bulk::Decompressor::new()
+                            .map_err(|e| ProtoError::Compression(e.to_string()))?,
+                    ),
+                };
+                let inner = dctx
+                    .decompress(&data[4..], claimed)
                     .map_err(|e| ProtoError::Compression(e.to_string()))?;
                 match postcard::from_bytes(&inner)? {
                     Frame::Compressed(_) | Frame::Zstd(_) => {
@@ -109,9 +134,17 @@ impl Encoder<&Frame> for FrameCodec {
         let mut payload = postcard::to_stdvec(frame)?;
         let wrapper = matches!(frame, Frame::Compressed(_) | Frame::Zstd(_));
         if self.zstd.load(std::sync::atomic::Ordering::Relaxed) && payload.len() >= COMPRESS_MIN && !wrapper {
+            // A context that fails to build skips compression for this frame
+            // — the same silent fallback a failed compress always took.
+            let cctx = match &mut self.cctx {
+                Some(c) => Some(c),
+                None => zstd::bulk::Compressor::new(ZSTD_LEVEL)
+                    .ok()
+                    .map(|c| self.cctx.insert(c)),
+            };
             // Same only-when-smaller rule as lz4: incompressible payloads
             // (already-compressed file data) pass through untouched.
-            if let Ok(squeezed) = zstd::bulk::compress(&payload, ZSTD_LEVEL) {
+            if let Some(Ok(squeezed)) = cctx.map(|c| c.compress(&payload)) {
                 if squeezed.len() + 4 < payload.len() {
                     let mut framed = Vec::with_capacity(squeezed.len() + 4);
                     framed.extend_from_slice(&(payload.len() as u32).to_le_bytes());
