@@ -1339,63 +1339,125 @@ impl RemoteFs {
         } else {
             None
         };
-        // The last chunk's reply describes the file as it now stands; earlier
-        // chunks' attributes are already superseded by the time the loop ends.
+        // The freshest reply's attributes describe the file as it now
+        // stands; whichever branch below runs leaves them here for the
+        // shared cache maintenance after it.
         let mut fresh: Option<Attr> = None;
-        let mut pos = 0usize;
-        while pos < data.len() {
-            let chunk = &data[pos..(pos + DATA_CHUNK as usize).min(data.len())];
-            let written = match self.call(Request::Write {
-                fh: server_fh,
-                offset: offset + pos as u64,
-                data: Bytes::copy_from_slice(chunk),
-                expect_version: expect,
-            }) {
-                Ok(resp) => resp,
-                // A conflict is a refusal now, not a flag on a write that has
-                // already happened: nothing was written for this chunk.
-                // Earlier chunks of a large write may have landed, which is
-                // the same partial-write hazard any interrupted write-through
-                // has — worth logging the offset so it is diagnosable.
-                Err(FsError::Remote(ErrorCode::Conflict)) => {
-                    tracing::warn!(
-                        fh,
-                        offset = offset + pos as u64,
-                        bytes_already_written = pos,
-                        "refused: the file changed on another machine (--detect-conflicts)"
-                    );
-                    return Err(ErrorCode::Conflict.into());
-                }
-                Err(e) => return Err(e),
-            };
-            // Both shapes are legal: v5+ servers answer with the attributes,
-            // everything older with the byte count and version alone. The
-            // version means the same thing in both — `Attr::version` IS what
-            // `Written::new_version` carried.
-            let (n, new_version) = match written {
-                Response::Written { n, new_version, .. } => {
-                    fresh = None;
-                    (n, new_version)
-                }
-                Response::WrittenAttr { n, attr } => {
-                    let version = attr.version;
-                    fresh = Some(attr);
-                    (n, version)
-                }
-                other => {
-                    tracing::error!(?other, "unexpected response variant");
+        if expect.is_none() && data.len() > DATA_CHUNK as usize {
+            // No expectation to thread means the chunks are independent:
+            // one fh, disjoint ranges. Sending them one blocking RTT at a
+            // time priced a 1 MiB cache-manager write at 8 serial round
+            // trips while the read side kept a 32-block window in flight —
+            // this is the write side getting the same treatment, with the
+            // cold-read fallback's join_all idiom. The failure shape moves
+            // with it, deliberately: a connection dying mid-write can now
+            // leave holes where the serial loop left a clean prefix. A
+            // torn write-through was always unspecified; --detect-conflicts
+            // keeps the serial loop below.
+            let conn = self.conn();
+            let replies = self.rt.block_on(async {
+                futures::future::join_all(data.chunks(DATA_CHUNK as usize).enumerate().map(|(i, chunk)| {
+                    conn.request(Request::Write {
+                        fh: server_fh,
+                        offset: offset + (i as u64) * u64::from(DATA_CHUNK),
+                        data: Bytes::copy_from_slice(chunk),
+                        expect_version: None,
+                    })
+                }))
+                .await
+            });
+            // The server may process the chunks in any order, but versions
+            // are monotonic per path — the highest version marks the reply
+            // that observed the youngest state among ours. One guard on its
+            // attrs: an earlier-processed chunk's size must never be served
+            // as final, so size is raised to at least this write's own end
+            // (concurrent growth by another writer can only agree or
+            // exceed; nothing here truncates).
+            let mut latest_version = 0u64;
+            for (resp, chunk) in replies.into_iter().zip(data.chunks(DATA_CHUNK as usize)) {
+                let (n, new_version, attr) = match resp?? {
+                    Response::Written { n, new_version, .. } => (n, new_version, None),
+                    Response::WrittenAttr { n, attr } => (n, attr.version, Some(attr)),
+                    other => {
+                        tracing::error!(?other, "unexpected response variant");
+                        return Err(ErrorCode::Io.into());
+                    }
+                };
+                if (n as usize) < chunk.len() {
+                    // The agent writes whole chunks or errors; a short count
+                    // would leave a mid-buffer hole no retry here can see.
+                    tracing::error!(fh, n, want = chunk.len(), "server short-wrote a chunk");
                     return Err(ErrorCode::Io.into());
                 }
-            };
+                if new_version > latest_version {
+                    latest_version = new_version;
+                    fresh = attr;
+                }
+            }
+            fresh = fresh.map(|mut a| {
+                a.size = a.size.max(offset + data.len() as u64);
+                a
+            });
             if let Some(state) = self.open_files.get(&fh) {
-                state.version.store(new_version, Ordering::Relaxed);
+                state.version.store(latest_version, Ordering::Relaxed);
             }
-            if expect.is_some() {
-                expect = Some(new_version);
-            }
-            pos += n as usize;
-            if n == 0 {
-                return Err(ErrorCode::Io.into());
+        } else {
+            let mut pos = 0usize;
+            while pos < data.len() {
+                let chunk = &data[pos..(pos + DATA_CHUNK as usize).min(data.len())];
+                let written = match self.call(Request::Write {
+                    fh: server_fh,
+                    offset: offset + pos as u64,
+                    data: Bytes::copy_from_slice(chunk),
+                    expect_version: expect,
+                }) {
+                    Ok(resp) => resp,
+                    // A conflict is a refusal now, not a flag on a write that
+                    // has already happened: nothing was written for this
+                    // chunk. Earlier chunks of a large write may have landed,
+                    // which is the same partial-write hazard any interrupted
+                    // write-through has — worth logging the offset so it is
+                    // diagnosable.
+                    Err(FsError::Remote(ErrorCode::Conflict)) => {
+                        tracing::warn!(
+                            fh,
+                            offset = offset + pos as u64,
+                            bytes_already_written = pos,
+                            "refused: the file changed on another machine (--detect-conflicts)"
+                        );
+                        return Err(ErrorCode::Conflict.into());
+                    }
+                    Err(e) => return Err(e),
+                };
+                // Both shapes are legal: v5+ servers answer with the
+                // attributes, everything older with the byte count and
+                // version alone. The version means the same thing in both —
+                // `Attr::version` IS what `Written::new_version` carried.
+                let (n, new_version) = match written {
+                    Response::Written { n, new_version, .. } => {
+                        fresh = None;
+                        (n, new_version)
+                    }
+                    Response::WrittenAttr { n, attr } => {
+                        let version = attr.version;
+                        fresh = Some(attr);
+                        (n, version)
+                    }
+                    other => {
+                        tracing::error!(?other, "unexpected response variant");
+                        return Err(ErrorCode::Io.into());
+                    }
+                };
+                if let Some(state) = self.open_files.get(&fh) {
+                    state.version.store(new_version, Ordering::Relaxed);
+                }
+                if expect.is_some() {
+                    expect = Some(new_version);
+                }
+                pos += n as usize;
+                if n == 0 {
+                    return Err(ErrorCode::Io.into());
+                }
             }
         }
         // Our own writes never come back as events (server strips
@@ -2007,6 +2069,23 @@ impl RemoteFs {
     /// so only their write path needs a stat up front.
     pub fn server_proto(&self) -> u16 {
         self.conn().proto
+    }
+
+    /// The kernel is done with this inode number: drop the table entry AND
+    /// the per-ino caches. `InodeTable::forget` alone left `attr_cache` and
+    /// `dir_cache` entries for the number unreachable but immortal — and
+    /// the WinFsp backend forgets on every failed resolve, i.e. on every
+    /// probe of a missing name, which Windows issues relentlessly. On a
+    /// long-lived mount over a big export that was monotonic growth with
+    /// no ceiling. Mounts call this instead of reaching for `.ino` — the
+    /// table alone is not the whole story of an ino.
+    pub fn forget(&self, ino: u64) {
+        if ino == crate::inode::ROOT_INO {
+            return;
+        }
+        self.attr_cache.remove(&ino);
+        self.dir_cache.remove(&ino);
+        self.ino.forget(ino);
     }
 
     /// Refuse an operation the negotiated protocol cannot carry.

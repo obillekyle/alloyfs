@@ -3702,6 +3702,50 @@ async fn a_zstd_write_lands_byte_exact_and_v12_refuses_the_opt_in() {
     );
 }
 
+/// Windowed write-through: a multi-chunk write to an EXISTING file flies
+/// its chunks concurrently (conflict detection off, the default) and still
+/// lands byte-exact — patterned bytes, so a swapped, shifted or missing
+/// chunk cannot pass — with the returned attrs never under-reporting the
+/// write's own end even though replies arrive in any order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_windowed_write_lands_byte_exact() {
+    let agent = start_agent(AgentOpts::default());
+    std::fs::write(agent.dir.path().join("big.bin"), b"old").unwrap();
+    let s = connect(&agent, ClientOptions::default()).await;
+    let (ino, _) = lookup_path(&s.fs, "big.bin").await.unwrap();
+
+    let chunk = alloyfs_proto::DATA_CHUNK as usize;
+    let len = chunk * 3 + 4321;
+    let body: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+    let at = 7u64; // past the old EOF: the prefix and the hole must survive too
+    let sent = body.clone();
+    let (n, attr) = on_fs(&s.fs, move |fs| {
+        let (fh, _) = fs.open(ino, rw())?;
+        let out = fs.write_at(fh, at, &sent)?;
+        fs.release(fh);
+        Ok::<_, alloyfs_client::FsError>(out)
+    })
+    .await
+    .unwrap();
+    assert_eq!(n as usize, len, "every chunk's bytes are accounted for");
+    let a = attr.expect("a v5+ session answers writes with attributes");
+    assert!(
+        a.size >= at + len as u64,
+        "no reply-ordering accident may under-report the size ({} < {})",
+        a.size,
+        at + len as u64
+    );
+
+    let mut want = vec![0u8; at as usize + len];
+    want[..3].copy_from_slice(b"old");
+    want[at as usize..].copy_from_slice(&body);
+    assert_eq!(
+        std::fs::read(agent.dir.path().join("big.bin")).unwrap(),
+        want,
+        "concurrent chunks must reassemble byte-exact on the server's disk"
+    );
+}
+
 /// v10 setattr batching, the sweep shape: thirty touches of existing files
 /// collapse into ONE SetattrMany at the barrier, each ack answering with
 /// the merged attr immediately, and the server ends with the exact stamps.
