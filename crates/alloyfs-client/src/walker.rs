@@ -178,6 +178,18 @@ pub(crate) fn spawn(fs: Arc<RemoteFs>, cache: Arc<AutoCache>, fetch_rx: mpsc::Un
             }
         }
 
+        // Captured BEFORE the discovery whose entries become the snapshot:
+        // the walk-end install's guard must span the whole period the
+        // snapshot's CONTENT describes, not the milliseconds between save
+        // and install. It was captured at install time, and a mkdir landing
+        // mid-walk (bun init's first act, during the ~30 s first-mount walk)
+        // bumped the epoch BEFORE the too-late capture — so the guard
+        // blessed an install of pre-mkdir listings, and the warm tier then
+        // answered a hard NotFound for a directory this mount had just
+        // created. bun reported ENOENT for package.json; the healing only
+        // came from unrelated busts.
+        let content_epoch = fs.warm_epoch_now();
+
         // One exchange instead of one per directory, where the agent can. The
         // BFS below stays as the fallback and is still what runs against a
         // pre-v6 agent or an unindexed export.
@@ -339,12 +351,13 @@ pub(crate) fn spawn(fs: Arc<RemoteFs>, cache: Arc<AutoCache>, fetch_rx: mpsc::Un
                     // remount that skips: the listings were just proven at
                     // this token, and without this the mount that did all the
                     // work navigates cold while the next one navigates warm.
-                    // The epoch is captured after the save — any event landing
-                    // in between bumps it and the install refuses, same guard,
-                    // same safe direction (a skipped install costs a cold
-                    // lookup; a stale one lies).
-                    let epoch = snap_fs.warm_epoch_now();
-                    snap_fs.adopt_meta_snapshot(token, epoch)
+                    // The guard epoch is the one captured BEFORE discovery —
+                    // any local mutation during the walk bumps it and the
+                    // install refuses, same guard, same safe direction (a
+                    // skipped install costs a cold lookup; a stale one
+                    // answers hard NotFound for a file that exists, which is
+                    // exactly what it did to bun init's fresh directory).
+                    snap_fs.adopt_meta_snapshot(token, content_epoch)
                 })
                 .await
                 .unwrap_or(0);

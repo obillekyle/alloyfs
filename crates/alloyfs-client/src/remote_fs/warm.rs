@@ -345,16 +345,22 @@ impl RemoteFs {
                 }
             }
         }
-        if let Some(mut w) = self.warm.get_mut(&parent) {
-            match &patch {
-                ListingPatch::Upsert(_, attr) => match w.iter_mut().find(|(n, _)| n == name) {
-                    Some(e) => e.1 = *attr,
-                    None => {
-                        let at = w.partition_point(|(n, _)| n.as_str() < name);
-                        w.insert(at, (name.to_string(), *attr));
-                    }
-                },
-                ListingPatch::Remove => w.retain(|(n, _)| n != name),
+        match self.warm.get_mut(&parent) {
+            Some(mut w) => {
+                match &patch {
+                    ListingPatch::Upsert(_, attr) => match w.iter_mut().find(|(n, _)| n == name) {
+                        Some(e) => e.1 = *attr,
+                        None => {
+                            let at = w.partition_point(|(n, _)| n.as_str() < name);
+                            w.insert(at, (name.to_string(), *attr));
+                        }
+                    },
+                    ListingPatch::Remove => w.retain(|(n, _)| n != name),
+                }
+                tracing::debug!(parent = %parent, name, "patch_parent_dir: warm PATCHED");
+            }
+            None => {
+                tracing::debug!(parent = %parent, name, "patch_parent_dir: warm ABSENT");
             }
         }
     }

@@ -533,6 +533,7 @@ impl RemoteFs {
                 if let Some(hit) = self.dir_cache.get(&pino) {
                     let (entries, when) = &*hit;
                     if when.elapsed() < self.dir_ttl() && !entries.iter().any(|(n, _, _)| n == name) {
+                        tracing::debug!(path = %path, "getattr: NEGATIVE from live listing");
                         return Err(ErrorCode::NotFound.into());
                     }
                 }
@@ -550,7 +551,10 @@ impl RemoteFs {
                         self.cache_attr(ino, attr);
                         Ok(attr)
                     }
-                    None => Err(ErrorCode::NotFound.into()),
+                    None => {
+                        tracing::debug!(path = %path, "getattr: NEGATIVE from warm tier");
+                        Err(ErrorCode::NotFound.into())
+                    }
                 };
             }
         }

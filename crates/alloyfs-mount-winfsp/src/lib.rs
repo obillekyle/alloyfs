@@ -81,7 +81,7 @@ fn nt(code: i32) -> FspError {
 
 /// Map wire/transport errors onto NTSTATUS.
 fn fsp_err(e: FsError) -> FspError {
-    tracing::trace!(error = %e, "op failed");
+    tracing::debug!(error = %e, "op failed");
     let code = match e {
         FsError::Remote(code) => match code {
             ErrorCode::NotFound => STATUS_OBJECT_NAME_NOT_FOUND,
@@ -376,13 +376,21 @@ impl FileSystemContext for WinFspFs {
     fn open(
         &self,
         file_name: &U16CStr,
-        _create_options: u32,
+        create_options: u32,
         granted_access: u32,
         file_info: &mut OpenFileInfo,
     ) -> winfsp::Result<FileContext> {
         let path = rel_path(file_name)?;
-        tracing::trace!(path = %path, granted_access = format_args!("{granted_access:#x}"), "open");
-        let (ino, mut attr) = self.resolve(&path).map_err(fsp_err)?;
+        tracing::trace!(
+            path = %path,
+            granted_access = format_args!("{granted_access:#x}"),
+            create_options = format_args!("{create_options:#x}"),
+            "open"
+        );
+        let (ino, mut attr) = self.resolve(&path).map_err(|e| {
+            tracing::debug!(path = %path, error = %e, "open FAILED at resolve");
+            fsp_err(e)
+        })?;
         let is_dir = attr.kind == FileKind::Dir;
 
         let mut fh = None;
@@ -508,10 +516,11 @@ impl FileSystemContext for WinFspFs {
         _extra_buffer: Option<&[u8]>,
         file_info: &mut FileInfo,
     ) -> winfsp::Result<()> {
-        let attr = self
-            .fs
-            .setattr(context.ino, Some(0), None, None)
-            .map_err(fsp_err)?;
+        tracing::trace!(ino = context.ino, "overwrite");
+        let attr = self.fs.setattr(context.ino, Some(0), None, None).map_err(|e| {
+            tracing::debug!(ino = context.ino, error = %e, "overwrite FAILED at truncate");
+            fsp_err(e)
+        })?;
         fill_file_info(file_info, context.ino, &attr);
         Ok(())
     }
@@ -605,6 +614,13 @@ impl FileSystemContext for WinFspFs {
         constrained_io: bool,
         file_info: &mut FileInfo,
     ) -> winfsp::Result<u32> {
+        tracing::trace!(
+            ino = context.ino,
+            offset,
+            len = buffer.len(),
+            write_to_eof,
+            "write"
+        );
         let Some(fh) = context.fh else {
             // Mirror NTFS: writes to a directory handle are invalid device
             // requests, not bad handles (see read()).
@@ -614,7 +630,10 @@ impl FileSystemContext for WinFspFs {
                 STATUS_ACCESS_DENIED
             }));
         };
-        let attr = self.fs.getattr(context.ino).map_err(fsp_err)?;
+        let attr = self.fs.getattr(context.ino).map_err(|e| {
+            tracing::debug!(ino = context.ino, error = %e, "write FAILED at getattr");
+            fsp_err(e)
+        })?;
 
         let (offset, data) = if write_to_eof {
             (attr.size, buffer)
@@ -630,7 +649,10 @@ impl FileSystemContext for WinFspFs {
             (offset, buffer)
         };
 
-        let (n, written_attr) = self.fs.write_at(fh, offset, data).map_err(fsp_err)?;
+        let (n, written_attr) = self.fs.write_at(fh, offset, data).map_err(|e| {
+            tracing::debug!(ino = context.ino, offset, error = %e, "write FAILED at write_at");
+            fsp_err(e)
+        })?;
 
         // Windows wants the file's post-write state in the reply to the write
         // itself, which is why this used to be the point where a Getattr was
@@ -718,6 +740,7 @@ impl FileSystemContext for WinFspFs {
         _last_change_time: u64,
         file_info: &mut FileInfo,
     ) -> winfsp::Result<()> {
+        tracing::trace!(ino = context.ino, "set_basic_info");
         let cur = self.fs.getattr(context.ino).map_err(fsp_err)?;
 
         // 0 / INVALID_FILE_ATTRIBUTES mean "leave attributes alone"; the only
@@ -821,6 +844,7 @@ impl FileSystemContext for WinFspFs {
         set_allocation_size: bool,
         file_info: &mut FileInfo,
     ) -> winfsp::Result<()> {
+        tracing::trace!(ino = context.ino, new_size, set_allocation_size, "set_file_size");
         let attr = if set_allocation_size {
             // Allocation-size changes only ever shrink the visible file; a
             // larger allocation is a reservation we don't track server-side.
