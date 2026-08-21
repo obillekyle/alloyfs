@@ -429,3 +429,38 @@ async fn a_request_after_the_peer_leaves_fails_promptly() {
     );
     assert!(conn.is_closed());
 }
+
+/// Dropping the last handle of a HEALTHY connection must end the transport.
+/// It didn't: the reader task blocked in next() forever holding the read
+/// half of the split stream, so no close ever reached the peer — the stream
+/// pool's idle reaper dropped live lanes and their sessions accumulated as
+/// zombies on the agent (observed live: 3 lanes surviving 25+ minutes).
+/// Reconnects never caught it because their sockets were already dead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dropped_healthy_connection_closes_its_transport() {
+    let handler = Arc::new(Echo::default());
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let h: Arc<dyn RequestHandler> = handler.clone();
+    let serve = tokio::spawn(async move {
+        let _ = serve_connection(server_io, "test-agent", h).await;
+    });
+    let conn = MuxConnection::establish(client_io, "test-client")
+        .await
+        .expect("handshake");
+    // Prove it is healthy, then drop it.
+    assert!(matches!(
+        conn.request(Request::Getattr {
+            path: RelPath("1".into())
+        })
+        .await,
+        Ok(Ok(Response::Attr(_)))
+    ));
+    drop(conn);
+    // The serve loop must see the close and RETURN — bounded, because the
+    // pre-fix behavior was precisely "hangs forever".
+    tokio::time::timeout(Duration::from_secs(5), serve)
+        .await
+        .expect("the server never saw the dropped connection close")
+        .expect("serve task join");
+    assert!(handler.disconnected.load(Ordering::SeqCst), "disconnected() ran");
+}

@@ -207,7 +207,15 @@ impl StreamPool {
             if idle >= IDLE_DROP {
                 // Dropping the entries drops their connections; the agent
                 // sessions end and release every handle they held.
-                pool.conns.lock().unwrap().clear();
+                let mut conns = pool.conns.lock().unwrap();
+                for e in conns.iter() {
+                    tracing::debug!(
+                        entry_refs = Arc::strong_count(e),
+                        conn_refs = Arc::strong_count(&e.conn),
+                        "reap: dropping idle pool lane"
+                    );
+                }
+                conns.clear();
             }
         }
     }

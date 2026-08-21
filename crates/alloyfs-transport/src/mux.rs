@@ -57,8 +57,29 @@ pub struct MuxConnection {
     closed_rx: watch::Receiver<bool>,
     /// The outgoing codec's zstd switch; see [`Self::enable_zstd`].
     zstd_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The I/O tasks, owned so [`Drop`] can end them. Without this, dropping
+    /// a HEALTHY connection leaked its whole transport: the reader task
+    /// blocks in `next()` forever holding the read half of the split
+    /// stream, so no FIN is ever sent and the server keeps the session
+    /// alive indefinitely. Reconnects never noticed — their sockets were
+    /// already dead, which ended the reader — the stream pool's idle reaper
+    /// was the first caller to drop live connections, and its lanes
+    /// accumulated as zombie sessions on the server.
+    reader_task: tokio::task::JoinHandle<()>,
+    writer_task: tokio::task::JoinHandle<()>,
     pub server_name: String,
     pub proto: u16,
+}
+
+/// Dropping the last handle ends the transport: both I/O tasks abort, both
+/// halves of the stream drop, the peer sees the close. Nothing can be
+/// awaiting this connection when its strong count reaches zero, so nothing
+/// is lost that anyone could still ask for.
+impl Drop for MuxConnection {
+    fn drop(&mut self) {
+        self.reader_task.abort();
+        self.writer_task.abort();
+    }
 }
 
 impl MuxConnection {
@@ -121,22 +142,19 @@ impl MuxConnection {
 
         // Writer task: sole owner of the outgoing half. Batches flushes when
         // several frames are already queued (see writer::drain).
-        tokio::spawn(crate::writer::drain(writer, out_rx));
+        let writer_task = tokio::spawn(crate::writer::drain(writer, out_rx));
 
-        // Reader task: routes every incoming frame to its waiter.
-        let conn = Arc::new(Self {
-            next_id: AtomicU64::new(1),
-            requests_sent: AtomicU64::new(0),
-            tx,
-            inflight: inflight.clone(),
-            pings: pings.clone(),
-            events_tx: events_tx.clone(),
-            closed_rx,
-            zstd_flag,
-            server_name,
-            proto,
-        });
-        tokio::spawn(async move {
+        // Reader task: routes every incoming frame to its waiter. Spawned
+        // before the connection exists so its handle can be OWNED by it —
+        // Drop aborts these tasks, which is what actually closes the
+        // transport (see the field).
+        let reader_inflight = inflight.clone();
+        let reader_pings = pings.clone();
+        let reader_events = events_tx.clone();
+        let reader_task = tokio::spawn(async move {
+            let inflight = reader_inflight;
+            let pings = reader_pings;
+            let events_tx = reader_events;
             while let Some(frame) = reader.next().await {
                 match frame {
                     Ok(Frame::Response { id, body }) => {
@@ -170,6 +188,21 @@ impl MuxConnection {
             let _ = closed_tx.send(true);
             inflight.clear();
             pings.clear();
+        });
+
+        let conn = Arc::new(Self {
+            next_id: AtomicU64::new(1),
+            requests_sent: AtomicU64::new(0),
+            tx,
+            inflight,
+            pings,
+            events_tx,
+            closed_rx,
+            zstd_flag,
+            reader_task,
+            writer_task,
+            server_name,
+            proto,
         });
 
         // Heartbeat: one ping every 10 s keeps the server's lease for this
