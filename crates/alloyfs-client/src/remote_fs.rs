@@ -872,6 +872,21 @@ impl RemoteFs {
         Ok(attr)
     }
 
+    /// Materialize the OPEN pending-new file at `path`, if one exists — the
+    /// prologue for operations that need the server to KNOW the path while
+    /// its handle is still accumulating locally (rename endpoints). A
+    /// no-op for everything else.
+    fn materialize_open_pending(&self, path: &RelPath) -> Result<(), FsError> {
+        let fh = self
+            .open_files
+            .iter()
+            .find_map(|e| (e.value().path == *path && e.value().pending_new.is_some()).then(|| *e.key()));
+        match fh {
+            Some(fh) => self.materialize_pending(fh),
+            None => Ok(()),
+        }
+    }
+
     /// A pending NEW file outgrew the batcher — a non-sequential write, or
     /// size past the cap. Everything queued before it flushes first (order),
     /// then the file takes the classic path: a server create, the buffered
@@ -1700,7 +1715,20 @@ impl RemoteFs {
         // A rename can touch names whose truth is still queued; ordering
         // requires the queue lands first, and any damage on either endpoint
         // belongs to this operation.
+        //
+        // Queued is not enough, though: an OPEN pending-new file exists only
+        // on its handle — it seals into the queue at first close, so the
+        // barrier below cannot land it. bun's atomic save is exactly that
+        // shape: write .lock-*.tmp, rename it over the target WHILE THE
+        // HANDLE IS STILL OPEN (the POSIX rename-while-open this mount
+        // advertises support for), close after. The server had never heard
+        // of the tmp, answered NotFound, and bun reported ENOENT for a file
+        // it had just written — reproduced 100% with `bun init` on the
+        // mount, stranded tmp and all. Materialize open-pending endpoints
+        // first; the barrier then handles the queued world as before.
         if self.batch.is_some() {
+            self.materialize_open_pending(&from)?;
+            self.materialize_open_pending(&to)?;
             self.barrier_for(&from)?;
             self.barrier_for(&to)?;
         }

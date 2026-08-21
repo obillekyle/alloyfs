@@ -3895,3 +3895,48 @@ async fn a_reconnect_bulk_validates_vanished_handles() {
     let gone = on_fs(&s.fs, move |fs| fs.read(dead, 0, 16)).await;
     assert!(gone.is_err(), "a vanished file's handle must error, got {gone:?}");
 }
+
+/// bun's atomic save, exactly: write a tmp file, rename it over the target
+/// WHILE THE HANDLE IS STILL OPEN (POSIX rename-while-open), close after.
+/// The tmp is a batched pending-new file living only on its handle — the
+/// rename barrier drains the QUEUE, which cannot land it, so the server
+/// answered NotFound for a file the application had just written (bun
+/// reported ENOENT from `bun init`, 100% reproducible, stranded tmp and
+/// all). Rename endpoints now materialize open-pending files first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pending_file_renamed_while_open_lands_atomically() {
+    let agent = start_agent(AgentOpts::default());
+    let s = connect(&agent, ClientOptions::default()).await;
+    on_fs(&s.fs, |fs| fs.readdir(ROOT_INO)).await.unwrap();
+
+    let dir = agent.dir.path().to_path_buf();
+    on_fs(&s.fs, move |fs| {
+        let (_ino, fh, _) = fs.create(ROOT_INO, ".lock-abc123.tmp", 0o644, burst_flags())?;
+        fs.write_at(fh, 0, b"{\"name\":\"repro\"}")?;
+        // Rename BEFORE release — the handle is open, the file pending.
+        fs.rename(ROOT_INO, ".lock-abc123.tmp", ROOT_INO, "package.json", true)
+            .expect("rename of an open pending file must land, not ENOENT");
+        fs.release(fh);
+        fs.shutdown();
+        Ok::<_, alloyfs_client::FsError>(())
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        std::fs::read(dir.join("package.json")).expect("the target must exist server-side"),
+        b"{\"name\":\"repro\"}",
+        "the renamed bytes are the written bytes"
+    );
+    assert!(
+        !dir.join(".lock-abc123.tmp").exists(),
+        "the tmp must not be resurrected by the later close/seal"
+    );
+    // And the mount's own view agrees.
+    let (all, _) = {
+        let entries = on_fs(&s.fs, |fs| fs.readdir(ROOT_INO)).await.unwrap();
+        (entries, ())
+    };
+    assert!(all.iter().any(|(n, _, _)| n == "package.json"));
+    assert!(!all.iter().any(|(n, _, _)| n == ".lock-abc123.tmp"));
+}
