@@ -3,6 +3,8 @@
 
 use std::sync::Arc;
 
+use anyhow::Context as _;
+
 use alloyfs_transport::{stdio, tcp, MuxConnection};
 
 pub enum Target {
@@ -50,19 +52,37 @@ pub async fn connect_target(
     token: Option<&str>,
 ) -> anyhow::Result<(Arc<MuxConnection>, Option<String>)> {
     let (target, export) = parse_url(url)?;
+    // The most-hit failure in the whole tool is "the other end isn't
+    // there", and a bare `os error 10061` names neither the address nor
+    // the likely fix — so both arms say where they were going and what to
+    // check first.
     let conn = match target {
-        Target::Tcp { addr } => tcp::connect(&addr, client).await?,
+        Target::Tcp { addr } => tcp::connect(&addr, client).await.with_context(|| {
+            format!(
+                "could not reach the agent at tcp://{addr} — is `alloyfs serve` \
+                 running there, and does its `server.tcp_listen` cover this address?"
+            )
+        })?,
         Target::Ssh { host, port } => {
             let mut args: Vec<String> = Vec::new();
             if let Some(p) = port {
                 args.push("-p".into());
                 args.push(p.to_string());
             }
+            let shown = host.clone();
             args.push(host);
             args.push(remote_cmd.into());
             args.push("serve".into());
             args.push("--stdio".into());
-            stdio::connect_command("ssh", &args, client).await?
+            stdio::connect_command("ssh", &args, client)
+                .await
+                .with_context(|| {
+                    format!(
+                        "could not start the agent over `ssh {shown}` — check that plain \
+                     `ssh {shown}` works, and that `{remote_cmd}` is on the remote's \
+                     NON-interactive PATH (`ssh {shown} which {remote_cmd}`)"
+                    )
+                })?
         }
     };
     if let Some(token) = token {
