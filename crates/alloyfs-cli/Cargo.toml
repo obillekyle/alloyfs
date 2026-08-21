@@ -45,3 +45,7 @@ winfsp.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# `test-util` for `start_paused`: the restart supervisor's backoff ladder is
+# measured in tens of seconds, and a test may not spend them. Dev-only, and
+# resolver 2 keeps the feature out of the real binary.
+tokio = { workspace = true, features = ["test-util"] }

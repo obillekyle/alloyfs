@@ -14,6 +14,21 @@ use crate::config::{Config, ResolvedMount};
 /// mounting anyway.
 const AGENT_READY_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Restart backoff for a unit that died: doubling from here...
+const RESTART_MIN: Duration = Duration::from_secs(1);
+/// ...to at most this, so a permanently broken unit costs one line a
+/// half-minute instead of a spin.
+const RESTART_MAX: Duration = Duration::from_secs(30);
+/// A unit that stayed up this long before dying is a fresh incident rather
+/// than a crash loop, so its next restart starts the ladder over.
+const STABLE_AFTER: Duration = Duration::from_secs(60);
+
+/// One restartable thing: the agent, or a mount. A factory rather than a
+/// future, because a supervisor has to be able to start it again.
+type Unit = Box<
+    dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send>> + Send + Sync,
+>;
+
 pub async fn run(config: Option<PathBuf>, server_only: bool, mounts_only: bool) -> anyhow::Result<()> {
     let cfg = crate::config::load_or_default(config.clone())?;
 
@@ -43,14 +58,18 @@ pub async fn run(config: Option<PathBuf>, server_only: bool, mounts_only: bool) 
         return Ok(());
     }
 
-    let mut tasks: Vec<(String, tokio::task::JoinHandle<anyhow::Result<()>>)> = Vec::new();
+    let mut tasks: Vec<(String, tokio::task::JoinHandle<()>)> = Vec::new();
 
     if serve_wanted {
         let listen = agent_listen_addr(&cfg);
         let cfg_path = config.clone();
+        let unit: Unit = Box::new(move || {
+            let cfg_path = cfg_path.clone();
+            Box::pin(async move { super::serve::run(None, false, cfg_path, Vec::new()).await })
+        });
         tasks.push((
             "agent".to_string(),
-            tokio::spawn(async move { super::serve::run(None, false, cfg_path, Vec::new()).await }),
+            tokio::spawn(supervise("agent".to_string(), unit)),
         ));
         println!("serving {} export(s) on {listen}", export_count(&cfg));
 
@@ -70,19 +89,24 @@ pub async fn run(config: Option<PathBuf>, server_only: bool, mounts_only: bool) 
         // as the same number rather than as two spellings.
         let cache_max = mount
             .auto_cache_max
+            .clone()
             .map(|s| s.to_bytes())
             .transpose()
             .map_err(|e| anyhow::anyhow!("mount {label}: auto_cache_max: {e}"))?
             .map(|b| b.to_string());
         let cache_budget = mount
             .auto_cache_budget
+            .clone()
             .map(|s| s.to_bytes())
             .transpose()
             .map_err(|e| anyhow::anyhow!("mount {label}: auto_cache_budget: {e}"))?
             .map(|b| b.to_string());
-        tasks.push((
-            name,
-            tokio::spawn(async move {
+        let unit: Unit = Box::new(move || {
+            // Cloned per attempt: a restart must hand `mount::run` the same
+            // arguments the first try got.
+            let mount = mount.clone();
+            let (cache_max, cache_budget) = (cache_max.clone(), cache_budget.clone());
+            Box::pin(async move {
                 super::mount::run(
                     mount.url,
                     mount.at,
@@ -103,14 +127,15 @@ pub async fn run(config: Option<PathBuf>, server_only: bool, mounts_only: bool) 
                     super::mount::Backend::default(),
                 )
                 .await
-            }),
-        ));
+            })
+        });
+        tasks.push((name, tokio::spawn(supervise(label.clone(), unit))));
         println!("mounting {label}");
     }
 
-    // Ctrl-C, or the first task to fall over. Neither ends the others: an
-    // unreachable host must not take the agent down, and a failed mount must
-    // not take the working ones with it.
+    // Ctrl-C, or every unit having finished for good. Neither ends the
+    // others: an unreachable host must not take the agent down, and a failed
+    // mount must not take the working ones with it.
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
             println!();
@@ -119,15 +144,16 @@ pub async fn run(config: Option<PathBuf>, server_only: bool, mounts_only: bool) 
         () = watch_for_exits(&mut tasks) => {}
     }
 
-    // Collect what failed. The exit code says something went wrong; the output
-    // says which one, because "start failed" about a five-mount config is not
-    // a useful thing to be told.
+    // What reaches here is a supervisor that PANICKED — ordinary failures
+    // are logged and retried by `supervise` instead of waiting silently for
+    // the last unit to finish. The exit code still says something went
+    // wrong, and the output still says which one, because "start failed"
+    // about a five-mount config is not a useful thing to be told.
     let mut failed = Vec::new();
     for (name, handle) in tasks {
         if handle.is_finished() {
             match handle.await {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => failed.push(format!("{name}: {e}")),
+                Ok(()) => {}
                 Err(e) if e.is_cancelled() => {}
                 Err(e) => failed.push(format!("{name}: {e}")),
             }
@@ -139,11 +165,54 @@ pub async fn run(config: Option<PathBuf>, server_only: bool, mounts_only: bool) 
     Ok(())
 }
 
+/// Keep one unit running for as long as this command does.
+///
+/// A returning unit is either done (`Ok` — unmounted, or the process is
+/// stopping) or dead (`Err`), and dead is the case that used to vanish:
+/// failures were collected only after EVERY task had finished, so one dead
+/// mount out of three printed nothing, was never retried, and left the
+/// process alive — which also meant systemd's `Restart=on-failure` never
+/// fired, because nothing ever exited. The drive was simply absent, with no
+/// trace anywhere. Now the death is logged where it happens and the unit
+/// comes back on a backoff ladder.
+///
+/// No attempt cap, deliberately: the outage this exists to survive is a
+/// server that is down for a few minutes, and a cap would give up on
+/// precisely that. The DELAY is capped instead.
+async fn supervise(name: String, run: Unit) {
+    let mut delay = RESTART_MIN;
+    let mut attempt = 0u32;
+    loop {
+        let started = tokio::time::Instant::now();
+        match run().await {
+            Ok(()) => return,
+            Err(e) => {
+                let ran_for = started.elapsed();
+                if ran_for >= STABLE_AFTER {
+                    delay = RESTART_MIN;
+                    attempt = 0;
+                }
+                attempt += 1;
+                tracing::error!(
+                    unit = %name,
+                    error = %e,
+                    ran_for_s = ran_for.as_secs(),
+                    attempt,
+                    retry_in_s = delay.as_secs(),
+                    "unit stopped; restarting"
+                );
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(RESTART_MAX);
+            }
+        }
+    }
+}
+
 /// Resolve after every task has either finished or been cancelled.
 ///
 /// Returning on the FIRST failure would defeat the point: the remaining mounts
 /// are still working and their owner still wants them.
-async fn watch_for_exits(tasks: &mut [(String, tokio::task::JoinHandle<anyhow::Result<()>>)]) {
+async fn watch_for_exits(tasks: &mut [(String, tokio::task::JoinHandle<()>)]) {
     loop {
         if tasks.iter().all(|(_, h)| h.is_finished()) {
             return;
@@ -192,4 +261,55 @@ async fn wait_until_listening(listen: &str) {
         listen,
         "the local agent is not accepting connections yet; mounting anyway"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
+
+    /// A unit that keeps failing is restarted, not abandoned — and the
+    /// wait between tries grows instead of spinning. Time is paused, so
+    /// this asserts the ladder rather than the wall clock.
+    #[tokio::test(start_paused = true)]
+    async fn a_failing_unit_is_restarted_with_growing_delay() {
+        let attempts = Arc::new(AtomicU32::new(0));
+        let seen = attempts.clone();
+        let unit: Unit = Box::new(move || {
+            let seen = seen.clone();
+            Box::pin(async move {
+                seen.fetch_add(1, Ordering::Relaxed);
+                anyhow::bail!("nope")
+            })
+        });
+        let task = tokio::spawn(supervise("t".into(), unit));
+
+        // 1s + 2s + 4s + 8s of backoff covers five attempts and not a sixth
+        // (the next one waits until t=16s).
+        tokio::time::sleep(Duration::from_millis(15_500)).await;
+        assert_eq!(
+            attempts.load(Ordering::Relaxed),
+            5,
+            "the ladder must double, not spin"
+        );
+        task.abort();
+    }
+
+    /// A unit that finishes cleanly is done: the supervisor returns rather
+    /// than restarting something nobody asked to keep.
+    #[tokio::test(start_paused = true)]
+    async fn a_clean_exit_is_not_restarted() {
+        let attempts = Arc::new(AtomicU32::new(0));
+        let seen = attempts.clone();
+        let unit: Unit = Box::new(move || {
+            let seen = seen.clone();
+            Box::pin(async move {
+                seen.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            })
+        });
+        supervise("t".into(), unit).await;
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
+    }
 }
