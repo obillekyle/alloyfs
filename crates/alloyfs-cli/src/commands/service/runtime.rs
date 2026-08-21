@@ -135,7 +135,7 @@ fn supervise(id: &str) -> anyhow::Result<()> {
         // at boot the service starts before anyone logs in, and the right
         // behaviour is to wait quietly for one.
         if child.is_none() {
-            match spawn::spawn_in_console_session(&exe, &argv) {
+            match spawn::spawn_in_console_session(&exe, &argv, id) {
                 Ok(handle) => {
                     child = Some(handle);
                     started_at = std::time::Instant::now();

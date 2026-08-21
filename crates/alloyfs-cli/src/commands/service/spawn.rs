@@ -247,12 +247,46 @@ fn quote(arg: &str) -> String {
     format!("\"{}\"", arg.replace('"', "\\\""))
 }
 
+/// Copy a Windows environment block, appending `VAR=VALUE`.
+///
+/// A block is not a list of pointers — it is one buffer of NUL-terminated
+/// UTF-16 strings laid end to end, closed by an *empty* string (so it ends
+/// with two NULs). Walking to that terminator gives the length to copy;
+/// the new variable and a fresh terminator go on the end.
+///
+/// # Safety
+/// `block` must be a valid, doubly-NUL-terminated environment block — here,
+/// one `CreateEnvironmentBlock` just produced.
+unsafe fn env_block_with(block: *const u16, var: &str, value: &str) -> Vec<u16> {
+    let mut end = 0usize;
+    // An empty entry (a NUL where an entry would start) is the terminator.
+    while *block.add(end) != 0 {
+        while *block.add(end) != 0 {
+            end += 1;
+        }
+        end += 1; // step over this entry's own NUL
+    }
+    let mut out = std::slice::from_raw_parts(block, end).to_vec();
+    out.extend(format!("{var}={value}").encode_utf16());
+    out.push(0); // ends the appended entry
+    out.push(0); // ...and the block
+    out
+}
+
 /// Start `exe args...` as the console user, in their session, with no window.
 ///
 /// Returns the child's process handle so the caller can wait on it: a mount
 /// that exits is a mount that needs restarting, and the service is the only
 /// thing positioned to notice.
-pub fn spawn_in_console_session(exe: &std::path::Path, args: &[String]) -> Result<Handle, SpawnError> {
+///
+/// `log_name` reaches the child through its environment rather than its
+/// argv, so the command line stays exactly what a person would have typed —
+/// which is what `service list` shows and what the instance file documents.
+pub fn spawn_in_console_session(
+    exe: &std::path::Path,
+    args: &[String],
+    log_name: &str,
+) -> Result<Handle, SpawnError> {
     let token = console_user_token()?;
     let primary = as_primary(&token).map_err(SpawnError::from)?;
 
@@ -266,6 +300,11 @@ pub fn spawn_in_console_session(exe: &std::path::Path, args: &[String]) -> Resul
 
     let cwd = start_dir(env);
     let cwd_ptr = cwd.as_ref().map_or(std::ptr::null(), |dir| dir.as_ptr());
+
+    // The child has no console — this is the only way its output is ever
+    // readable. SAFETY: `env` is the block CreateEnvironmentBlock just
+    // returned, and it is still alive (destroyed below, after the spawn).
+    let mut child_env = unsafe { env_block_with(env as *const u16, "ALLOYFS_LOG_NAME", log_name) };
 
     let mut cmdline = quote(&exe.display().to_string());
     for arg in args {
@@ -292,7 +331,7 @@ pub fn spawn_in_console_session(exe: &std::path::Path, args: &[String]) -> Resul
             std::ptr::null(),
             0,
             CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
-            env,
+            child_env.as_mut_ptr() as *mut c_void,
             cwd_ptr,
             &si,
             &mut pi,

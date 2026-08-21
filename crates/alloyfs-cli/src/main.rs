@@ -3,6 +3,7 @@
 
 mod commands;
 mod config;
+mod logfile;
 mod urls;
 
 use std::path::PathBuf;
@@ -264,6 +265,17 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Read what a long-running command logged. No name lists what is there.
+    Logs {
+        /// Log name: a service id, or `serve` / `mount` / `start`.
+        name: Option<String>,
+        /// Keep printing as the file grows.
+        #[arg(short, long)]
+        follow: bool,
+        /// Trailing lines to print first.
+        #[arg(short = 'n', long, default_value_t = 200)]
+        lines: usize,
+    },
 }
 
 #[derive(Subcommand)]
@@ -444,15 +456,58 @@ fn main() -> anyhow::Result<()> {
     rt.block_on(async_main())
 }
 
-async fn async_main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .with_writer(std::io::stderr) // stdout stays clean: --stdio transport uses it
-        .init();
+/// The log file this run writes to, or `None` for commands that finish
+/// while their terminal is still open.
+///
+/// Only the long-running ones earn a file: those are the commands whose
+/// story outlives the session that started them, and the ones a service
+/// runs with no console at all.
+fn log_name(command: &Command) -> Option<String> {
+    if let Some(name) = logfile::name_override() {
+        return Some(name);
+    }
+    match command {
+        Command::Serve { .. } => Some("serve".into()),
+        Command::Mount { .. } => Some("mount".into()),
+        Command::Start { .. } => Some("start".into()),
+        Command::Sync { .. } => Some("sync".into()),
+        // The Windows supervisor's own diagnostics — the backoff messages
+        // that used to go nowhere at all.
+        Command::Service {
+            cmd: ServiceCmd::Run { id },
+        } => Some(id.clone()),
+        _ => None,
+    }
+}
 
-    match Cli::parse().command {
+fn init_tracing(log_name: Option<String>) {
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::util::SubscriberInitExt as _;
+
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
+    // stdout stays clean: the --stdio transport uses it.
+    let terminal = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);
+    // No ANSI in the file: `alloyfs logs` prints it verbatim, and escape
+    // codes in a log someone pastes into an issue help nobody.
+    let file = log_name.map(|name| {
+        tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(logfile::open(&name))
+    });
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(terminal)
+        .with(file)
+        .init();
+}
+
+async fn async_main() -> anyhow::Result<()> {
+    // Parsed before logging is set up: the command decides whether this run
+    // keeps a log file, and clap's own errors need no subscriber.
+    let command = Cli::parse().command;
+    init_tracing(log_name(&command));
+
+    match command {
         Command::Serve {
             tcp,
             stdio,
@@ -617,5 +672,6 @@ async fn async_main() -> anyhow::Result<()> {
             force,
         } => commands::init::run(dir, name, global, force),
         Command::Update { channel, dry_run } => commands::update::run(channel, dry_run),
+        Command::Logs { name, follow, lines } => commands::logs::run(name, follow, lines).await,
     }
 }
