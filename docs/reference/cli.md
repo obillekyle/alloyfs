@@ -13,6 +13,7 @@ alloyfs <COMMAND>
 | `sync` | Keep a local directory in step with an export |
 | `cache` | Manage the local cache (`cache clear` drops it) |
 | `events` | Tail the change stream as NDJSON |
+| `logs` | Read what a long-running command logged |
 | `ping` | Round-trip time to an agent |
 | `bench` | Timed pipelined read, no mount involved |
 | `stress` | Concurrent load generator |
@@ -164,6 +165,27 @@ Re-runs the installer from `alloy.okyle.dev` rather than replacing the binary
 itself — one implementation of download-verify-install instead of two. On
 Windows the installer renames the running executable aside before writing the
 new one, which is the only way to replace a binary that is currently executing.
+
+## logs
+
+```bash
+alloyfs logs                # what has been logged, newest first
+alloyfs logs webdav -f      # follow one, Ctrl-C to stop
+alloyfs logs start -n 500   # more history than the default 200 lines
+```
+
+The commands that run for hours — `serve`, `mount`, `start`, `sync`, and any
+service instance — tee their output to `~/.alloyfs/logs/<name>.log` as well as
+to the terminal. That file is the only record a Windows service instance has:
+it runs with no console, so its stderr goes nowhere.
+
+A service instance logs under its own id, and its supervisor writes to the same
+file — so a mount that keeps dying and the backoff messages about it are read
+together. Files rotate at 8 MiB, keeping one previous generation
+(`<name>.log.1`). On Linux, `journalctl --user -u alloyfs-<id>` has the same
+output.
+
+`RUST_LOG` sets the level for both destinations: `RUST_LOG=debug alloyfs start`.
 
 ## bench and ping
 
