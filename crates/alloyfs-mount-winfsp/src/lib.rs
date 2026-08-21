@@ -630,23 +630,36 @@ impl FileSystemContext for WinFspFs {
                 STATUS_ACCESS_DENIED
             }));
         };
-        let attr = self.fs.getattr(context.ino).map_err(|e| {
-            tracing::debug!(ino = context.ino, error = %e, "write FAILED at getattr");
-            fsp_err(e)
-        })?;
-
-        let (offset, data) = if write_to_eof {
-            (attr.size, buffer)
-        } else if constrained_io {
-            // Paging I/O must never extend the file.
-            if offset >= attr.size {
-                fill_file_info(file_info, context.ino, &attr);
-                return Ok(0);
-            }
-            let max = (attr.size - offset) as usize;
-            (offset, &buffer[..buffer.len().min(max)])
+        // The pre-write attr is consumed by exactly three paths: append
+        // needs the size to write at, constrained (paging) I/O needs it to
+        // clamp, and a pre-v5 agent answers the write without attributes so
+        // the reply must be extrapolated from it. The PLAIN offset write
+        // against a v5+ agent — the overwhelmingly common shape — needs
+        // nothing up front: the reply carries the post-write attributes.
+        // This getattr used to run unconditionally, and because `write_at`
+        // drops the attr entry it patches, a sequential write stream
+        // alternated invalidate → getattr on every call.
+        let pre_attr = if write_to_eof || constrained_io || self.fs.server_proto() < 5 {
+            Some(self.fs.getattr(context.ino).map_err(|e| {
+                tracing::debug!(ino = context.ino, error = %e, "write FAILED at getattr");
+                fsp_err(e)
+            })?)
         } else {
-            (offset, buffer)
+            None
+        };
+
+        let (offset, data) = match pre_attr {
+            Some(attr) if write_to_eof => (attr.size, buffer),
+            Some(attr) if constrained_io => {
+                // Paging I/O must never extend the file.
+                if offset >= attr.size {
+                    fill_file_info(file_info, context.ino, &attr);
+                    return Ok(0);
+                }
+                let max = (attr.size - offset) as usize;
+                (offset, &buffer[..buffer.len().min(max)])
+            }
+            _ => (offset, buffer),
         };
 
         let (n, written_attr) = self.fs.write_at(fh, offset, data).map_err(|e| {
@@ -655,19 +668,22 @@ impl FileSystemContext for WinFspFs {
         })?;
 
         // Windows wants the file's post-write state in the reply to the write
-        // itself, which is why this used to be the point where a Getattr was
-        // unavoidable — and why it was skipped, by extrapolating the size and
-        // leaving the mtime at its pre-write value.
-        //
-        // Protocol v5 sends the real attributes back with the write, so there
-        // is nothing left to guess. Against an older agent the extrapolation
+        // itself. Protocol v5 sends the real attributes back with the write;
+        // against an older agent the extrapolation from the pre-write attr
         // stands, and the cache entry has already been dropped by `write_at`
         // — the next stat pays for the truth.
-        let new_attr = written_attr.unwrap_or_else(|| {
-            let mut guessed = attr;
-            guessed.size = attr.size.max(offset + u64::from(n));
-            guessed
-        });
+        let new_attr = match (written_attr, pre_attr) {
+            (Some(attr), _) => attr,
+            (None, Some(attr)) => {
+                let mut guessed = attr;
+                guessed.size = attr.size.max(offset + u64::from(n));
+                guessed
+            }
+            // Unreachable by construction — a missing reply attr means a
+            // pre-v5 session, and those always fetched above — but kept
+            // total: a getattr here beats a panic across the FFI boundary.
+            (None, None) => self.fs.getattr(context.ino).map_err(fsp_err)?,
+        };
         fill_file_info(file_info, context.ino, &new_attr);
         Ok(n)
     }
@@ -1231,6 +1247,26 @@ pub fn mount(fs: Arc<RemoteFs>, mountpoint: &str, volume_label: &str) -> anyhow:
         .supports_posix_unlink_rename(true);
     // Volume prefix stays empty: this is a "disk" filesystem, so plain drive
     // letter mounts work without the network-provider machinery.
+
+    // The most common mount failure is the letter being taken, and WinFsp
+    // reports that as a raw NTSTATUS — after the dispatcher is already up.
+    // Checking first names the problem and starts nothing. One bitmask read
+    // is not worth a windows-sys dependency (the winattr sidecar set the
+    // direct-extern precedent), and fn-scoped keeps it beside its one use.
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetLogicalDrives() -> u32;
+    }
+    if mountpoint.len() == 2 && mountpoint.ends_with(':') && mountpoint.as_bytes()[0].is_ascii_alphabetic() {
+        let bit = 1u32 << (mountpoint.as_bytes()[0].to_ascii_uppercase() - b'A');
+        if unsafe { GetLogicalDrives() } & bit != 0 {
+            anyhow::bail!(
+                "{mountpoint} is already in use — pick a free letter, or unmount \
+                 whatever holds it (`net use` lists network mappings, `mountvol` \
+                 the rest)"
+            );
+        }
+    }
 
     let pending = Arc::new(std::sync::Mutex::new(Vec::new()));
     let context = WinFspFs {
