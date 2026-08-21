@@ -150,6 +150,13 @@ pub struct RemoteFs {
     /// Paths the event pump's bulk re-warm has re-seeded — observability
     /// for tests and diagnostics, like `requests_sent` on the mux.
     pub(crate) rewarmed: AtomicU64,
+    /// Batched mutations the server refused (per-entry Err at settle).
+    /// Damage is reported at barriers, but a failure nobody barriers on
+    /// was only a dropped tracing line — and tests run without a
+    /// subscriber, which hid a WSL-gate flake behind "file missing" with
+    /// no cause. Now every settle failure counts, and the batcher tests
+    /// assert this stays zero.
+    pub(crate) settle_failures: AtomicU64,
     /// Bumped by every listing invalidation, so a `readdir` that started
     /// before a mutation cannot install its now-stale result after it.
     ///
@@ -297,6 +304,7 @@ impl RemoteFs {
             attr_cache: DashMap::new(),
             attr_epoch: AtomicU64::new(0),
             rewarmed: AtomicU64::new(0),
+            settle_failures: AtomicU64::new(0),
             dir_cache: DashMap::new(),
             dir_epoch: AtomicU64::new(0),
             warm: DashMap::new(),
@@ -358,6 +366,13 @@ impl RemoteFs {
     /// below wire v12 — the pin the gating test uses.
     pub fn rewarmed_paths(&self) -> u64 {
         self.rewarmed.load(Ordering::Relaxed)
+    }
+
+    /// Batched mutations the server refused so far. The batcher tests pin
+    /// this at zero — a refused entry is otherwise only a barrier report
+    /// or a dropped tracing line. See the field.
+    pub fn batch_settle_failures(&self) -> u64 {
+        self.settle_failures.load(Ordering::Relaxed)
     }
 
     /// The reconnect epoch right now. Capture it BEFORE doing work whose
@@ -1409,6 +1424,7 @@ impl RemoteFs {
                 (PendingOp::Write { path, .. }, Err(_))
                 | (PendingOp::Remove { path, .. }, Err(_))
                 | (PendingOp::Setattr { path, .. }, Err(_)) => {
+                    self.settle_failures.fetch_add(1, Ordering::Relaxed);
                     if last {
                         // The optimistic ack promised something the server
                         // refused: the caches stop vouching for this path.

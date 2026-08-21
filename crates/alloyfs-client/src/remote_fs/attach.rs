@@ -256,6 +256,42 @@ async fn reconnect_supervisor(fs: Arc<RemoteFs>) {
         // right after its re-open (it needs the fresh server_fh); all of it
         // happens BEFORE the conn swap so lock state is settled by the time
         // the new connection is observable.
+        // v12 bulk pre-validation: one GetattrMany declares vanished files
+        // dead BEFORE the serial re-open loop. Every serial Open below
+        // extends the outage window by a round trip, and a vanished file's
+        // Open buys nothing but its own failure — on a WAN, dozens of dead
+        // handles used to cost dozens of blocking round trips. Only a
+        // NotFound verdict is trusted; any other answer (and a failed bulk
+        // wholesale) leaves the Open to decide, so correctness never leans
+        // on this pass.
+        let mut dead: std::collections::HashSet<RelPath> = std::collections::HashSet::new();
+        if new_conn.proto >= 12 {
+            let mut candidates: Vec<RelPath> = fs
+                .open_files
+                .iter()
+                .filter(|e| e.value().server_fh.load(Ordering::Acquire) != NO_SERVER_FH)
+                .map(|e| e.value().path.clone())
+                .collect();
+            candidates.sort();
+            candidates.dedup();
+            for chunk in candidates.chunks(128) {
+                let resp = new_conn
+                    .request(Request::GetattrMany {
+                        paths: chunk.to_vec(),
+                    })
+                    .await;
+                if let Ok(Ok(Response::ManyOutcome(out))) = resp {
+                    if out.len() == chunk.len() {
+                        for (p, v) in chunk.iter().zip(out) {
+                            if matches!(v, Err(alloyfs_proto::ErrorCode::NotFound)) {
+                                dead.insert(p.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         let mut reopened = 0usize;
         let mut failed = 0usize;
         let mut locks_restored = 0usize;
@@ -272,6 +308,18 @@ async fn reconnect_supervisor(fs: Arc<RemoteFs>) {
                 continue;
             }
             let held: Vec<HeldRange> = state.lock.lock().unwrap().clone();
+            // Pre-declared dead: exactly the failure arm below, minus its
+            // round trip. A file that reappears in the gap re-opens lazily
+            // on the next cache-escaping read, like any lazy handle.
+            if dead.contains(&state.path) {
+                failed += 1;
+                state.server_fh.store(NO_SERVER_FH, Ordering::Release);
+                if !held.is_empty() {
+                    locks_lost += 1;
+                    state.poisoned.store(true, Ordering::Release);
+                }
+                continue;
+            }
             let req = Request::Open {
                 path: state.path.clone(),
                 flags: state.flags,
@@ -307,10 +355,18 @@ async fn reconnect_supervisor(fs: Arc<RemoteFs>) {
                     }
                 }
                 _ => {
-                    // File may be gone; subsequent ops get BadHandle → EBADF —
-                    // unless it held a lock, which makes the loss a mutual-
-                    // exclusion break: poison so it surfaces as EIO.
+                    // File may be gone. The handle goes back to LAZY, never
+                    // left holding the dead session's fh NUMBER: the new
+                    // session hands out the same small numbers, so a stale
+                    // fh can collide with another handle's re-open and read
+                    // the WRONG FILE (caught by the bulk-validate test — the
+                    // vanished handle served a survivor's bytes). Lazy means
+                    // the next op re-opens: a vanished file fails there with
+                    // the honest NotFound, a recreated one serves fresh. A
+                    // lost lock still poisons — that loss is a mutual-
+                    // exclusion break, not a freshness question.
                     failed += 1;
+                    state.server_fh.store(NO_SERVER_FH, Ordering::Release);
                     if !held.is_empty() {
                         locks_lost += 1;
                         state.poisoned.store(true, Ordering::Release);

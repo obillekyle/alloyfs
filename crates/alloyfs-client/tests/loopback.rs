@@ -2920,6 +2920,11 @@ async fn a_create_burst_coalesces_into_write_many() {
     // Unmount is the last barrier: everything still queued goes out here.
     on_fs(&s.fs, |fs| fs.shutdown()).await;
     let spent = s.conn().requests_sent() - before;
+    assert_eq!(
+        s.fs.batch_settle_failures(),
+        0,
+        "the server refused batched entries — the damage was previously a dropped tracing line"
+    );
     assert!(
         spent <= 8,
         "a 100-file burst cost {spent} exchanges — it must coalesce into \
@@ -3726,6 +3731,7 @@ async fn a_touch_sweep_batches_into_one_setattr_many() {
     })
     .await
     .unwrap();
+    assert_eq!(s.fs.batch_settle_failures(), 0, "no refused touches");
     let sweep_reqs = s.conn().requests_sent() - r0;
     assert!(
         (1..=2).contains(&sweep_reqs),
@@ -3763,6 +3769,7 @@ async fn an_extractor_burst_is_two_exchanges() {
     })
     .await
     .unwrap();
+    assert_eq!(s.fs.batch_settle_failures(), 0, "no refused entries");
     let burst_reqs = s.conn().requests_sent() - r0;
     assert!(
         (2..=4).contains(&burst_reqs),
@@ -3816,4 +3823,75 @@ async fn a_v9_session_setattrs_through_per_operation() {
         let md = std::fs::metadata(agent.dir.path().join(format!("c{i}.txt"))).unwrap();
         assert_eq!(md.modified().unwrap(), stamp);
     }
+}
+
+/// Reconnect with vanished files: one GetattrMany declares them dead
+/// instead of one failed Open round trip EACH — the outage window stops
+/// scaling with the number of dead handles. Pinned by request count on the
+/// fresh session and by behavior: survivors work, the vanished handle
+/// errors, and nothing hangs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reconnect_bulk_validates_vanished_handles() {
+    let agent = start_agent(AgentOpts::default());
+    for i in 0..6 {
+        std::fs::write(agent.dir.path().join(format!("h{i}.txt")), format!("body-{i}")).unwrap();
+    }
+    let s = harness::connect_reconnectable(&agent, ClientOptions::default()).await;
+
+    // Six real server handles (reads force server_fh out of lazy).
+    let mut fhs = Vec::new();
+    for i in 0..6 {
+        let (ino, _) = lookup_path(&s.fs, &format!("h{i}.txt")).await.unwrap();
+        let fh = on_fs(&s.fs, move |fs| {
+            let (fh, _) = fs
+                .open(
+                    ino,
+                    OpenFlags {
+                        read: true,
+                        ..OpenFlags::default()
+                    },
+                )
+                .unwrap();
+            fs.read(fh, 0, 16).unwrap();
+            fh
+        })
+        .await;
+        fhs.push(fh);
+    }
+
+    // Five of the six vanish server-side, then the session dies.
+    for i in 0..5 {
+        std::fs::remove_file(agent.dir.path().join(format!("h{i}.txt"))).unwrap();
+    }
+    let old_conn = s.fs.conn();
+    s.sever();
+    wait_until("reconnect swapped the connection", 15, {
+        let fs = s.fs.clone();
+        move || {
+            let now = fs.conn();
+            (!std::sync::Arc::ptr_eq(&old_conn, &now) && !now.is_closed()).then_some(())
+        }
+    })
+    .await;
+
+    // The request-count pin: attach + ONE GetattrMany + ONE Open (the
+    // survivor) + the event resubscribe — five dead handles must not have
+    // cost five Opens. Generous headroom for incidental traffic (pings are
+    // not requests; a stray getattr is), but well under the +5 a per-open
+    // discovery would add.
+    let spent = s.fs.conn().requests_sent();
+    assert!(
+        spent <= 6,
+        "the fresh session spent {spent} requests; five dead handles must \
+         collapse into one GetattrMany, not five failed Opens"
+    );
+
+    // Behavior: the survivor serves; a vanished handle errors instead of
+    // hanging or lying.
+    let alive = fhs[5];
+    let body = on_fs(&s.fs, move |fs| fs.read(alive, 0, 16)).await.unwrap();
+    assert_eq!(body, b"body-5");
+    let dead = fhs[0];
+    let gone = on_fs(&s.fs, move |fs| fs.read(dead, 0, 16)).await;
+    assert!(gone.is_err(), "a vanished file's handle must error, got {gone:?}");
 }
