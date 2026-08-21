@@ -138,7 +138,7 @@ impl Filesystem for DsFuse {
     }
 
     fn forget(&self, _req: &FuseRequest, ino: INodeNo, _nlookup: u64) {
-        self.fs.ino.forget(ino.0);
+        self.fs.forget(ino.0);
     }
 
     fn getattr(&self, _req: &FuseRequest, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {

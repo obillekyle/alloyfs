@@ -305,7 +305,7 @@ impl WinFspFs {
             Ok(attr) => Ok((ino, attr)),
             Err(e) => {
                 if existing.is_none() {
-                    self.fs.ino.forget(ino);
+                    self.fs.forget(ino);
                 }
                 Err(e)
             }
@@ -561,7 +561,7 @@ impl FileSystemContext for WinFspFs {
             self.fs.unlink(parent_ino, name)
         };
         match result {
-            Ok(()) => self.fs.ino.forget(context.ino),
+            Ok(()) => self.fs.forget(context.ino),
             Err(e) => tracing::warn!(path = %path, error = %e, "delete-on-cleanup failed"),
         }
     }
