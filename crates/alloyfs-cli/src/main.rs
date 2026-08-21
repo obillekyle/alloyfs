@@ -93,6 +93,11 @@ enum Command {
         /// the server either way.
         #[arg(long)]
         write_through: bool,
+        /// Compress this mount's outgoing large frames with zstd instead of
+        /// the default lz4 (needs a v13+ server; silently stays lz4 below).
+        /// The server's own direction opts in via its config (`zstd: true`).
+        #[arg(long)]
+        zstd: bool,
         /// Refuse to write over a file another machine changed since this
         /// mount last read it, instead of silently winning. Off by default:
         /// it trades a failed save for a lost edit, and which of those you
@@ -449,6 +454,7 @@ async fn main() -> anyhow::Result<()> {
             data_dir,
             no_server_defaults,
             write_through,
+            zstd,
             detect_conflicts,
             token,
             backend,
@@ -465,6 +471,7 @@ async fn main() -> anyhow::Result<()> {
                 data_dir,
                 no_server_defaults,
                 write_through,
+                zstd,
                 detect_conflicts,
                 token,
                 backend,

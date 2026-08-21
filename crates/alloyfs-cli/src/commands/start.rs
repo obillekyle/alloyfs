@@ -97,6 +97,7 @@ pub async fn run(config: Option<PathBuf>, server_only: bool, mounts_only: bool) 
                     // Config-driven mounts keep the batched default; the
                     // opt-out is a CLI decision until a config key earns it.
                     false,
+                    mount.zstd,
                     mount.detect_conflicts,
                     mount.token,
                     super::mount::Backend::default(),

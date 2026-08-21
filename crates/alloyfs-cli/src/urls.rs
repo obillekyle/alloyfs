@@ -95,6 +95,7 @@ pub fn dialer_for(
     remote_cmd: &str,
     client: &str,
     token: Option<String>,
+    zstd: bool,
 ) -> alloyfs_client::Dialer {
     let url = url.to_string();
     let remote_cmd = remote_cmd.to_string();
@@ -104,6 +105,12 @@ pub fn dialer_for(
             (url.clone(), remote_cmd.clone(), client.clone(), token.clone());
         Box::pin(async move {
             let (conn, _) = connect_target(&url, &remote_cmd, &client, token.as_deref()).await?;
+            // The mount's compression choice survives reconnects (and the
+            // stream pool's extra data connections, which dial through this
+            // too). enable_zstd is a no-op below v13.
+            if zstd {
+                conn.enable_zstd();
+            }
             Ok(conn)
         })
     })

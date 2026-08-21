@@ -21,6 +21,7 @@ pub async fn serve<F>(
     addr: &str,
     server_name: String,
     min_proto: u16,
+    zstd: bool,
     make_handler: F,
 ) -> Result<(), TransportError>
 where
@@ -36,7 +37,7 @@ where
         tokio::spawn(async move {
             tracing::info!(%peer, "connection accepted");
             if let Err(e) =
-                crate::server::serve_connection_with(stream, &server_name, handler, min_proto).await
+                crate::server::serve_connection_with(stream, &server_name, handler, min_proto, zstd).await
             {
                 tracing::warn!(%peer, error = %e, "connection ended with error");
             } else {

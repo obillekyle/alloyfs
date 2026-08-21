@@ -40,6 +40,7 @@ pub async fn run_cli(
     data_dir: Option<PathBuf>,
     no_server_defaults: bool,
     write_through: bool,
+    zstd: bool,
     detect_conflicts: bool,
     token: Option<String>,
     backend: Backend,
@@ -57,6 +58,7 @@ pub async fn run_cli(
             data_dir,
             no_server_defaults,
             write_through,
+            zstd,
             detect_conflicts,
             token,
             backend,
@@ -100,6 +102,7 @@ pub async fn run_cli(
         data_dir.or(mount.data_dir),
         no_server_defaults || mount.no_server_defaults,
         write_through,
+        zstd || mount.zstd,
         detect_conflicts || mount.detect_conflicts,
         token.or(mount.token),
         backend,
@@ -170,6 +173,7 @@ pub async fn run(
     data_dir: Option<PathBuf>,
     no_server_defaults: bool,
     write_through: bool,
+    zstd: bool,
     detect_conflicts: bool,
     token: Option<String>,
     backend: Backend,
@@ -211,6 +215,9 @@ pub async fn run(
 
     let (conn, export) = connect_target(&url, &remote_cmd, &whoami(), token.as_deref()).await?;
     let export = require_export(export, &url)?;
+    if zstd && !conn.enable_zstd() {
+        tracing::warn!(proto = conn.proto, "--zstd needs a v13+ server; staying on lz4");
+    }
     tracing::info!(server = conn.server_name, proto = conn.proto, "connected");
 
     // ~/.alloyfs/{data,cache}/<host>/, with --data-dir overriding the root.
@@ -241,7 +248,7 @@ pub async fn run(
         mount_root: Some(mountpoint.to_string_lossy().into_owned()),
         // Survive connection loss: re-dial, re-attach, re-open handles,
         // resubscribe events. Locks do not survive (documented).
-        dialer: Some(dialer_for(&url, &remote_cmd, &whoami(), token)),
+        dialer: Some(dialer_for(&url, &remote_cmd, &whoami(), token, zstd)),
         // Cold sequential streams stripe across extra connections — 4 lanes
         // with the primary, rclone's stream count. Lazy: nothing dials until
         // a big cold read qualifies (see stream_pool.rs).

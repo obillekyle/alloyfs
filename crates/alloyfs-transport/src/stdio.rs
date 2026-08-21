@@ -47,12 +47,19 @@ pub async fn connect_command(
 }
 
 /// Server side: serve exactly one session over this process's own stdio,
-/// returning when the peer disconnects.
-pub async fn serve(server_name: &str, handler: Arc<dyn RequestHandler>) -> Result<(), TransportError> {
-    crate::server::serve_connection(
+/// returning when the peer disconnects. `zstd` opts this side's outgoing
+/// large frames into v13 zstd (see serve_connection_with).
+pub async fn serve(
+    server_name: &str,
+    handler: Arc<dyn RequestHandler>,
+    zstd: bool,
+) -> Result<(), TransportError> {
+    crate::server::serve_connection_with(
         tokio::io::join(tokio::io::stdin(), tokio::io::stdout()),
         server_name,
         handler,
+        alloyfs_proto::PROTO_VERSION_MIN,
+        zstd,
     )
     .await
 }

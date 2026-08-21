@@ -3667,3 +3667,32 @@ async fn read_into_matches_read_on_every_serve_path() {
     })
     .await;
 }
+
+/// v13 zstd, end to end: the client opts its outgoing frames in, pushes a
+/// large compressible write through the live session, and the agent (which
+/// decodes both algorithms unconditionally) lands exactly those bytes on
+/// disk. Below v13 the opt-in must refuse, so an old agent can never see
+/// the variant.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_zstd_write_lands_byte_exact_and_v12_refuses_the_opt_in() {
+    let agent = start_agent(AgentOpts::default());
+    let s = connect(&agent, ClientOptions::default()).await;
+    assert!(s.conn().enable_zstd(), "a v13 session accepts the opt-in");
+
+    // 96 KiB of repetitive-but-not-constant text: compresses hard, so this
+    // write genuinely rides Frame::Zstd (COMPRESS_MIN is 512 bytes).
+    let body: Vec<u8> = b"alloyfs zstd smoke line\n".repeat(4096);
+    let ino = mkfile(&s.fs, ROOT_INO, "z.txt", &body).await;
+    assert_eq!(read_all(&s.fs, ino).await, body, "bytes must survive the wire");
+    assert_eq!(
+        std::fs::read(agent.dir.path().join("z.txt")).unwrap(),
+        body,
+        "and land byte-exact on the server's disk"
+    );
+
+    let clamped = connect_with_max(&agent, ClientOptions::default(), 12).await;
+    assert!(
+        !clamped.conn().enable_zstd(),
+        "below v13 the opt-in must refuse — the peer could not decode it"
+    );
+}

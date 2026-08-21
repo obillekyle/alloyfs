@@ -55,6 +55,8 @@ pub struct MuxConnection {
     pings: Arc<DashMap<u64, oneshot::Sender<()>>>,
     events_tx: broadcast::Sender<Vec<FsEvent>>,
     closed_rx: watch::Receiver<bool>,
+    /// The outgoing codec's zstd switch; see [`Self::enable_zstd`].
+    zstd_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub server_name: String,
     pub proto: u16,
 }
@@ -106,6 +108,9 @@ impl MuxConnection {
         }
         // v3+: both sides may compress large frames from here on.
         writer.encoder_mut().compress = proto >= 3;
+        // Kept out so zstd can be flipped AFTER the writer task owns the
+        // codec — the caller's config isn't known here (see enable_zstd).
+        let zstd_flag = writer.encoder().zstd.clone();
 
         let (tx, out_rx) = mpsc::channel::<Frame>(256);
         let inflight: Arc<DashMap<u64, oneshot::Sender<Result<Response, ErrorCode>>>> =
@@ -127,6 +132,7 @@ impl MuxConnection {
             pings: pings.clone(),
             events_tx: events_tx.clone(),
             closed_rx,
+            zstd_flag,
             server_name,
             proto,
         });
@@ -188,6 +194,19 @@ impl MuxConnection {
     /// Requests sent so far; see the field for what this is for.
     pub fn requests_sent(&self) -> u64 {
         self.requests_sent.load(Ordering::Relaxed)
+    }
+
+    /// Opt this side's OUTGOING large frames into zstd (v13). Returns
+    /// whether it took: refused below v13, because the peer could not
+    /// decode the variant — the caller never needs its own version check.
+    /// Each direction decides independently; decode always accepts both
+    /// algorithms regardless of this switch.
+    pub fn enable_zstd(&self) -> bool {
+        if self.proto < 13 {
+            return false;
+        }
+        self.zstd_flag.store(true, Ordering::Relaxed);
+        true
     }
 
     /// Send one request and await its response, bounded by REQUEST_TIMEOUT.

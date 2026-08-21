@@ -13,6 +13,11 @@ pub const MAX_FRAME_LEN: usize = 1024 * 1024;
 /// the `Compressed` wrapper would eat most of the win.
 const COMPRESS_MIN: usize = 512;
 
+/// zstd level for `Frame::Zstd`. 3 is the crate default and the sweet spot
+/// for a 28 Mbit/s-class link on this CPU class: substantially better
+/// ratio than lz4 while still compressing far faster than the link drains.
+const ZSTD_LEVEL: i32 = 3;
+
 const LEN_PREFIX: usize = 4;
 
 /// Wire format: `u32 little-endian payload length` + `postcard(Frame)`.
@@ -20,12 +25,19 @@ const LEN_PREFIX: usize = 4;
 /// With `compress` on (both peers negotiated protocol v3+), outgoing frames
 /// of COMPRESS_MIN+ bytes are lz4-compressed and wrapped in
 /// `Frame::Compressed` — but only when that actually made them smaller, so
-/// already-compressed file data passes through untouched. The decoder always
-/// unwraps `Compressed` regardless of the flag; the version gate lives on
-/// the sending side.
+/// already-compressed file data passes through untouched. With `zstd` also
+/// flipped (negotiated v13+ AND the sender's config opted in), zstd takes
+/// lz4's place under the same rules. The decoder always unwraps both
+/// wrappers regardless of any flag; every version gate lives on the
+/// sending side.
 #[derive(Debug, Default)]
 pub struct FrameCodec {
     pub compress: bool,
+    /// Shared and atomic because the codec moves into the writer task at
+    /// establish time, before the sender knows whether ITS config wants
+    /// zstd — the connection keeps a clone and flips it after the
+    /// handshake. Never set below v13.
+    pub zstd: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Decoder for FrameCodec {
@@ -60,7 +72,28 @@ impl Decoder for FrameCodec {
                 let inner = lz4_flex::decompress_size_prepended(&data)
                     .map_err(|e| ProtoError::Compression(e.to_string()))?;
                 match postcard::from_bytes(&inner)? {
-                    Frame::Compressed(_) => Err(ProtoError::Compression("nested Compressed frame".into())),
+                    Frame::Compressed(_) | Frame::Zstd(_) => {
+                        Err(ProtoError::Compression("nested compressed frame".into()))
+                    }
+                    frame => Ok(Some(frame)),
+                }
+            }
+            Frame::Zstd(data) => {
+                // Same prepended-size layout and the same bomb guard as lz4;
+                // the size here is also the exact decompression budget.
+                if data.len() < 4 {
+                    return Err(ProtoError::Compression("zstd frame too short".into()));
+                }
+                let claimed = u32::from_le_bytes(data[..4].try_into().unwrap()) as usize;
+                if claimed > MAX_FRAME_LEN {
+                    return Err(ProtoError::FrameTooLarge(claimed));
+                }
+                let inner = zstd::bulk::decompress(&data[4..], claimed)
+                    .map_err(|e| ProtoError::Compression(e.to_string()))?;
+                match postcard::from_bytes(&inner)? {
+                    Frame::Compressed(_) | Frame::Zstd(_) => {
+                        Err(ProtoError::Compression("nested compressed frame".into()))
+                    }
                     frame => Ok(Some(frame)),
                 }
             }
@@ -74,7 +107,19 @@ impl Encoder<&Frame> for FrameCodec {
 
     fn encode(&mut self, frame: &Frame, dst: &mut BytesMut) -> Result<(), ProtoError> {
         let mut payload = postcard::to_stdvec(frame)?;
-        if self.compress && payload.len() >= COMPRESS_MIN && !matches!(frame, Frame::Compressed(_)) {
+        let wrapper = matches!(frame, Frame::Compressed(_) | Frame::Zstd(_));
+        if self.zstd.load(std::sync::atomic::Ordering::Relaxed) && payload.len() >= COMPRESS_MIN && !wrapper {
+            // Same only-when-smaller rule as lz4: incompressible payloads
+            // (already-compressed file data) pass through untouched.
+            if let Ok(squeezed) = zstd::bulk::compress(&payload, ZSTD_LEVEL) {
+                if squeezed.len() + 4 < payload.len() {
+                    let mut framed = Vec::with_capacity(squeezed.len() + 4);
+                    framed.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+                    framed.extend_from_slice(&squeezed);
+                    payload = postcard::to_stdvec(&Frame::Zstd(Bytes::from(framed)))?;
+                }
+            }
+        } else if self.compress && payload.len() >= COMPRESS_MIN && !wrapper {
             let squeezed = lz4_flex::compress_prepend_size(&payload);
             if squeezed.len() < payload.len() {
                 payload = postcard::to_stdvec(&Frame::Compressed(Bytes::from(squeezed)))?;
@@ -183,7 +228,10 @@ mod tests {
 
     #[test]
     fn compression_roundtrips_and_shrinks() {
-        let mut tx = FrameCodec { compress: true };
+        let mut tx = FrameCodec {
+            compress: true,
+            ..FrameCodec::default()
+        };
         let mut rx = FrameCodec::default(); // decode side needs no flag
         let data = Bytes::from(vec![0x42u8; 128 * 1024]); // maximally compressible
         let frame = Frame::Response {
@@ -221,7 +269,10 @@ mod tests {
             body: Ok(Response::Data(Bytes::from(noise.clone()))),
         };
         let plain_len = postcard::to_stdvec(&frame).unwrap().len();
-        let mut tx = FrameCodec { compress: true };
+        let mut tx = FrameCodec {
+            compress: true,
+            ..FrameCodec::default()
+        };
         let mut buf = BytesMut::new();
         tx.encode(&frame, &mut buf).unwrap();
         assert_eq!(
@@ -354,6 +405,88 @@ mod tests {
                 RelPath(ok.into()),
                 "decode rejected {ok:?}"
             );
+        }
+    }
+
+    fn zstd_codec() -> FrameCodec {
+        let c = FrameCodec {
+            compress: true, // both flags on, like a real v13 opted-in sender
+            ..FrameCodec::default()
+        };
+        c.zstd.store(true, std::sync::atomic::Ordering::Relaxed);
+        c
+    }
+
+    /// The zstd mirror of `compression_roundtrips_and_shrinks`, plus the
+    /// preference rule: with both flags on, zstd is what goes out.
+    #[test]
+    fn zstd_roundtrips_shrinks_and_wins_over_lz4() {
+        let mut tx = zstd_codec();
+        let mut rx = FrameCodec::default(); // decode side needs no flag
+        let data = Bytes::from(vec![0x42u8; 128 * 1024]);
+        let frame = Frame::Response {
+            id: 7,
+            body: Ok(Response::Data(data.clone())),
+        };
+        let mut buf = BytesMut::new();
+        tx.encode(&frame, &mut buf).unwrap();
+        assert!(
+            buf.len() < data.len() / 10,
+            "128K of constant bytes should shrink dramatically, got {}",
+            buf.len()
+        );
+        // The wire must carry the Zstd variant, not lz4's Compressed — peek
+        // by decoding the OUTER frame without unwrapping.
+        let outer: Frame = postcard::from_bytes(&buf[LEN_PREFIX..]).unwrap();
+        assert!(matches!(outer, Frame::Zstd(_)), "zstd must take precedence");
+        match rx.decode(&mut buf).unwrap().unwrap() {
+            Frame::Response {
+                id: 7,
+                body: Ok(Response::Data(got)),
+            } => assert_eq!(got, data),
+            other => panic!("wrong frame after decompression: {other:?}"),
+        }
+    }
+
+    /// Same only-when-smaller rule as lz4: noise passes through plain.
+    #[test]
+    fn zstd_incompressible_passes_through_uncompressed() {
+        let mut noise = vec![0u8; 64 * 1024];
+        let mut state = 0x12345678u32;
+        for b in noise.iter_mut() {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            *b = (state >> 24) as u8;
+        }
+        let frame = Frame::Response {
+            id: 1,
+            body: Ok(Response::Data(Bytes::from(noise.clone()))),
+        };
+        let plain_len = postcard::to_stdvec(&frame).unwrap().len();
+        let mut tx = zstd_codec();
+        let mut buf = BytesMut::new();
+        tx.encode(&frame, &mut buf).unwrap();
+        assert_eq!(
+            buf.len(),
+            LEN_PREFIX + plain_len,
+            "must not wrap when zstd doesn't win"
+        );
+    }
+
+    /// The bomb guard: a Zstd frame whose prepended size exceeds the frame
+    /// cap is refused before any allocation, exactly like lz4's.
+    #[test]
+    fn zstd_bomb_claim_is_refused() {
+        let mut inner = Vec::new();
+        inner.extend_from_slice(&(MAX_FRAME_LEN as u32 + 1).to_le_bytes());
+        inner.extend_from_slice(b"whatever");
+        let hostile = Frame::Zstd(Bytes::from(inner));
+        let payload = postcard::to_stdvec(&hostile).unwrap();
+        let mut buf = BytesMut::new();
+        buf.put_u32_le(payload.len() as u32);
+        buf.put_slice(&payload);
+        match FrameCodec::default().decode(&mut buf) {
+            Err(ProtoError::FrameTooLarge(n)) => assert!(n > MAX_FRAME_LEN),
+            other => panic!("bomb claim must be refused, got {other:?}"),
         }
     }
 }

@@ -9,6 +9,7 @@ repository.workspace = true
 serde.workspace = true
 postcard.workspace = true
 lz4_flex.workspace = true
+zstd.workspace = true
 bytes.workspace = true
 thiserror.workspace = true
 tokio-util.workspace = true

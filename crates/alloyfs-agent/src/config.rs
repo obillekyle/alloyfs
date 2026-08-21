@@ -36,6 +36,13 @@ pub struct AgentSection {
     /// Bearer token required on every /api request (`Authorization: Bearer …`).
     /// Mandatory when http_listen is not loopback; optional on localhost.
     pub http_token: Option<String>,
+    /// Opt this server's OUTGOING large frames into zstd on v13+ sessions
+    /// — better ratio than the always-on lz4 where it matters, the
+    /// bandwidth-bound link serving compressible trees. Off by default;
+    /// each direction opts in independently (clients use `--zstd`), and a
+    /// v13 peer decodes both algorithms regardless of its own setting.
+    #[serde(default)]
+    pub zstd: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

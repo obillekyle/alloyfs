@@ -51,7 +51,7 @@ pub async fn run(
         sync_key: format!("{}-{dir_tag}", export_key(&export)),
         debounce: std::time::Duration::from_millis(debounce_ms),
         conflict_policy: policy,
-        dialer: Some(dialer_for(&url, &remote_cmd, &whoami(), token)),
+        dialer: Some(dialer_for(&url, &remote_cmd, &whoami(), token, false)),
         one_shot,
     };
     let engine = alloyfs_client::SyncEngine::start(conn, &export, &dir, opts).await?;

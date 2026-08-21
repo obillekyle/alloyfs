@@ -42,7 +42,7 @@ pub async fn run(
         // tried to bind the configured HTTP port — so each mount logged a
         // bind failure once a resident agent held it. The API belongs to the
         // long-running server, not to a mount's transport.
-        stdio::serve(&name, Arc::new(AgentSession::new(registry))).await?;
+        stdio::serve(&name, Arc::new(AgentSession::new(registry)), cfg.agent.zstd).await?;
     } else {
         if let Some(http) = cfg.agent.http_listen.clone() {
             let registry = registry.clone();
@@ -73,7 +73,7 @@ pub async fn run(
         } else {
             alloyfs_proto::PROTO_VERSION_MIN
         };
-        tcp::serve(&listen, name, min_proto, move || {
+        tcp::serve(&listen, name, min_proto, cfg.agent.zstd, move || {
             Arc::new(AgentSession::with_token(registry.clone(), token.clone())) as Arc<dyn RequestHandler>
         })
         .await?;

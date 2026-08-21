@@ -69,7 +69,7 @@ pub async fn serve_connection<S>(
 where
     S: AsyncRead + AsyncWrite + Send + 'static,
 {
-    serve_connection_with(stream, server_name, handler, PROTO_VERSION_MIN).await
+    serve_connection_with(stream, server_name, handler, PROTO_VERSION_MIN, false).await
 }
 
 /// `serve_connection` that additionally requires the negotiated version to
@@ -81,6 +81,7 @@ pub async fn serve_connection_with<S>(
     server_name: &str,
     handler: Arc<dyn RequestHandler>,
     min_proto: u16,
+    zstd: bool,
 ) -> Result<(), TransportError>
 where
     S: AsyncRead + AsyncWrite + Send + 'static,
@@ -117,6 +118,14 @@ where
                 .await?;
             // v3+: both sides may compress large frames from here on.
             writer.encoder_mut().compress = hi >= 3;
+            // v13+ AND this server opted in: OUR outgoing large frames use
+            // zstd. Independent per direction; decode always accepts both.
+            if zstd && hi >= 13 {
+                writer
+                    .encoder()
+                    .zstd
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
             hi
         }
         Some(Ok(other)) => {

@@ -90,7 +90,7 @@ async fn connect_with(
     let (client_io, server_io) = tokio::io::duplex(64 * 1024);
     let h: Arc<dyn RequestHandler> = handler;
     tokio::spawn(async move {
-        let _ = serve_connection_with(server_io, "test-agent", h, min_proto).await;
+        let _ = serve_connection_with(server_io, "test-agent", h, min_proto, false).await;
     });
     MuxConnection::establish(client_io, "test-client").await
 }

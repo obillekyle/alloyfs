@@ -101,6 +101,10 @@ fn canonical() -> Vec<(&'static str, Frame)> {
         // VARIANT encoding; the lz4 block format itself is frozen by the
         // compression roundtrip tests in alloyfs-proto/src/frame.rs.
         ("compressed", Frame::Compressed(Bytes::from_static(b"golden"))),
+        // Fixed bytes for the same reason as `compressed`: this freezes the
+        // VARIANT encoding; zstd's own format is frozen by the roundtrip
+        // tests in frame.rs.
+        ("zstd", Frame::Zstd(Bytes::from_static(b"golden"))),
         // --- every Request variant ---
         (
             "req_attach",
@@ -509,6 +513,7 @@ fn _variant_tripwire(
         Frame::Ping { .. } => {}
         Frame::Pong { .. } => {}
         Frame::Compressed(..) => {} // v3: golden added, PROTO_VERSION_MAX bumped
+        Frame::Zstd(..) => {}       // v13: golden added, PROTO_VERSION_MAX bumped
     }
     match request {
         Request::Attach { .. } => {}
@@ -615,11 +620,12 @@ fn _variant_tripwire(
 /// `cargo test -p alloyfs-proto print_goldens -- --ignored --nocapture`
 #[rustfmt::skip]
 const GOLDEN: &[(&str, &str)] = &[
-    ("hello", "00010c06676f6c64656e"),
-    ("hello_ack", "010c06676f6c64656e"),
+    ("hello", "00010d06676f6c64656e"),
+    ("hello_ack", "010d06676f6c64656e"),
     ("ping", "0507"),
     ("pong", "0607"),
     ("compressed", "0706676f6c64656e"),
+    ("zstd", "0806676f6c64656e"),
     ("req_attach", "0207000870726f6a65637473"),
     ("req_getattr", "0207010c6469722f66696c652e747874"),
     ("req_readdir", "0207020c6469722f66696c652e7478742a"),

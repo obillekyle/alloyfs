@@ -81,15 +81,22 @@ use crate::error::ErrorCode;
 /// gated: sent only on v12+ sessions (an older server would kill the
 /// connection decoding an unknown variant); nothing to gate in the reply
 /// direction, `ManyOutcome` has existed since v10.
+///
+/// v13: `Frame::Zstd` — the zstd sibling of v3's lz4 `Compressed`, for the
+/// bandwidth-bound cold link: same prepended-size layout, better ratio on
+/// compressible payloads. Sender-gated twice — negotiated version >= 13
+/// AND the sender's own config opt-in (each direction independent); every
+/// v13 build decodes it unconditionally, so no capability exchange is
+/// needed beyond the version.
 pub const PROTO_VERSION_MIN: u16 = 1;
-pub const PROTO_VERSION_MAX: u16 = 12;
+pub const PROTO_VERSION_MAX: u16 = 13;
 
 /// The protocol range this build speaks, for `--version` and diagnostics —
 /// "which wire version does this release talk" should not require reading
 /// source. A literal rather than a formatted string because clap's version
 /// output needs a `&'static str`; `proto_range_matches_the_constants` is what
 /// keeps it from drifting away from the two constants above.
-pub const PROTO_RANGE: &str = "1-12";
+pub const PROTO_RANGE: &str = "1-13";
 
 /// Read/write payloads are capped to this many bytes per request so one huge
 /// file operation can never monopolize the connection (head-of-line blocking).
@@ -847,6 +854,13 @@ pub enum Frame {
     /// prepended uncompressed size). Senders use it for large compressible
     /// frames when the negotiated version is >= 3; nesting is forbidden.
     Compressed(Bytes),
+    /// v13+: `Compressed`'s zstd sibling — same prepended-uncompressed-size
+    /// layout, same nesting rule, better ratio on the source trees a WAN
+    /// link actually carries. Sender-gated twice: the negotiated version
+    /// must be >= 13 AND the sender's own config must ask for it (each
+    /// direction decides independently); every v13 build decodes it
+    /// unconditionally.
+    Zstd(Bytes),
 }
 
 #[cfg(test)]

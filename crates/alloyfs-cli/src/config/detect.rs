@@ -164,6 +164,7 @@ pub fn from_legacy_mount(old: MountConfig) -> Config {
             data_dir: old.data_dir,
             no_server_defaults: old.no_server_defaults.then_some(true),
             detect_conflicts: old.detect_conflicts.then_some(true),
+            zstd: None, // predates the key; the default (off) is the old behavior
             token: old.token,
             mounts: None,
         }),

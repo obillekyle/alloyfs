@@ -83,6 +83,8 @@ pub struct ClientSection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detect_conflicts: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zstd: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
     /// Absent, null and `{}` all mean "no mounts".
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -114,6 +116,8 @@ pub struct MountEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detect_conflicts: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zstd: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
 }
 
@@ -136,6 +140,7 @@ pub struct ResolvedMount {
     pub data_dir: Option<PathBuf>,
     pub no_server_defaults: bool,
     pub detect_conflicts: bool,
+    pub zstd: bool,
     pub token: Option<String>,
 }
 
@@ -166,6 +171,7 @@ impl ClientSection {
                 .or(self.no_server_defaults)
                 .unwrap_or(false),
             detect_conflicts: entry.detect_conflicts.or(self.detect_conflicts).unwrap_or(false),
+            zstd: entry.zstd.or(self.zstd).unwrap_or(false),
             token: entry.token.clone().or_else(|| self.token.clone()),
         }
     }
