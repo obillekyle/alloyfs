@@ -256,9 +256,42 @@ pub async fn run(
         data_dir,
     };
     let fs = alloyfs_client::RemoteFs::attach_with(conn, &export, opts).await?;
+
+    // Publish what this mount is doing, so `alloyfs status` has something to
+    // read — every counter it reports was previously visible only to tests.
+    // See status.rs for why it is a file rather than an endpoint. Here rather
+    // than inside a platform's mount function so both backends get it from
+    // one place; each of those moves `fs` and `mountpoint`, so the ticker
+    // takes its copies first.
+    let status_name = crate::logfile::name_override().unwrap_or_else(|| status_name_for(&mountpoint));
+    let status_ticker = tokio::spawn({
+        let (fs, url, at, name) = (
+            fs.clone(),
+            url.clone(),
+            mountpoint.to_string_lossy().into_owned(),
+            status_name.clone(),
+        );
+        let started = std::time::SystemTime::now();
+        async move {
+            let mut tick = tokio::time::interval(crate::status::INTERVAL);
+            loop {
+                tick.tick().await;
+                crate::status::write(&crate::status::capture(&fs, &name, &url, &at, started));
+            }
+        }
+    });
+
     // Each platform starts the event pump itself, wiring server events into
     // its native notification mechanism.
-    mount_platform(fs, mountpoint, &export, backend).await
+    let result = mount_platform(fs, mountpoint, &export, backend).await;
+
+    status_ticker.abort();
+    // A deliberate unmount leaves no snapshot: a drive that is gone on
+    // purpose should not linger in `status` as a stale row somebody has to
+    // work out the meaning of. A crash leaves its last one, which is the
+    // case where the file earns its keep.
+    crate::status::clear(&status_name);
+    result
 }
 
 #[cfg(unix)]
@@ -422,6 +455,25 @@ async fn mount_kernel(
     result?;
     fs.shutdown(); // persist the auto-cache manifest
     Ok(())
+}
+
+/// A file-name-safe identity for a mount that has no service id.
+///
+/// The mountpoint is what a person recognizes it by — `P:` or
+/// `/mnt/projects` — so it is the name, with the characters a filesystem
+/// would object to folded to `-`.
+fn status_name_for(mountpoint: &std::path::Path) -> String {
+    let cleaned: String = mountpoint
+        .to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let trimmed = cleaned.trim_matches('-').to_string();
+    if trimmed.is_empty() {
+        "mount".into()
+    } else {
+        trimmed
+    }
 }
 
 #[cfg(windows)]

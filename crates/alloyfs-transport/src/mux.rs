@@ -242,6 +242,17 @@ impl MuxConnection {
         true
     }
 
+    /// Is this direction actually sending zstd? Read-only, unlike
+    /// [`Self::enable_zstd`], which sets it.
+    ///
+    /// Which algorithm a session settled on was decided once at startup,
+    /// printed once, and then unanswerable for the life of the mount — so
+    /// `alloyfs status` reports it from here rather than from configuration,
+    /// which is a statement of intent and not of fact.
+    pub fn zstd_enabled(&self) -> bool {
+        self.zstd_flag.load(Ordering::Relaxed)
+    }
+
     /// Send one request and await its response, bounded by REQUEST_TIMEOUT.
     /// Cancel-safe: dropping the future abandons the slot; a late response is
     /// discarded by the reader.

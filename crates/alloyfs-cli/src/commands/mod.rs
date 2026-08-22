@@ -8,5 +8,6 @@ pub mod mount;
 pub mod serve;
 pub mod service;
 pub mod start;
+pub mod status_cmd;
 pub mod sync;
 pub mod update;

@@ -23,6 +23,7 @@ alloyfs <COMMAND>
 | `tree` | Fetch an export's tree index in one exchange — the walk diagnostic |
 | `bulk` | Compare bulk-read strategies against an export, with timings |
 | `init` | Write a config for a directory, ready to serve |
+| `status` | What every mount on this machine is doing |
 | `update` | Update in place by re-running the installer |
 
 ## serve
@@ -348,6 +349,40 @@ together. Files rotate at 8 MiB, keeping one previous generation
 output.
 
 `RUST_LOG` sets the level for both destinations: `RUST_LOG=debug alloyfs start`.
+
+## status
+
+```bash
+alloyfs status          # a row per mount
+alloyfs status --json   # the snapshots as they are on disk
+```
+
+```
+NAME             AT               PROTO  COMPR  UPTIME    CACHE          STATE
+work             P:               v14    zstd   3h12m     8421 files 1.9G running
+                 ssh://azure/projects
+                 214 warm dirs, 3 open, 4 stream conns
+```
+
+Every number here was previously visible only to the test suite: the
+protocol version, which compression the session actually settled on (not
+what the config asked for), warm-tier size, auto-cache occupancy, re-warmed
+paths, stream-pool connections, and batcher settle failures. The last of
+those is the one that is bad news rather than trivia — a batched mutation
+the server refused after the client had already acknowledged it locally —
+so it prints in capitals and only when non-zero.
+
+Each mount writes a small JSON snapshot to `~/.alloyfs/status/` every five
+seconds. That is deliberately a file and not an endpoint: no port, no named
+pipe, no question about who may connect to a mount running as a service
+under another account — and, unlike a socket, **it survives the process**. A
+mount that died at 3am leaves its last known state behind, which is when
+somebody wants it.
+
+The cost is staleness, so staleness is shown rather than hidden. A snapshot
+nobody has refreshed reads as `STALE (26s ago)` with its last numbers,
+never as current. A clean unmount removes its file, so only a crash leaves
+one behind.
 
 ## bench and ping
 

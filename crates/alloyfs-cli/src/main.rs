@@ -5,6 +5,7 @@ mod commands;
 mod config;
 mod exit;
 mod logfile;
+mod status;
 mod urls;
 
 use std::path::PathBuf;
@@ -197,6 +198,18 @@ enum Command {
         /// One JSON document instead of the summary. An unindexed export is
         /// `indexed: false` rather than an error — it is a legitimate
         /// configuration, not a failure.
+        #[arg(long)]
+        json: bool,
+    },
+    /// What every mount on this machine is doing.
+    ///
+    /// Reads the snapshot each running mount publishes every few seconds:
+    /// protocol version, the compression the session actually settled on,
+    /// uptime, cache occupancy, and the counters that were previously
+    /// visible only to tests. A mount that stopped writing shows as STALE
+    /// with its last known numbers rather than as current.
+    Status {
+        /// The snapshots as JSON, exactly as they are on disk.
         #[arg(long)]
         json: bool,
     },
@@ -768,6 +781,7 @@ async fn async_main() -> anyhow::Result<()> {
             token,
             json,
         } => commands::diag::tree(url, remote_cmd, token, json).await,
+        Command::Status { json } => commands::status_cmd::run(json),
         Command::Ping {
             url,
             count,

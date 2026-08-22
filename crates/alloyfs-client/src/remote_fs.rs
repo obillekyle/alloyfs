@@ -410,6 +410,15 @@ impl RemoteFs {
         self.stream_pool.as_ref().map_or(0, |p| p.established())
     }
 
+    /// Files the auto-cache holds and the bytes they occupy, or `None` on a
+    /// mount running without one.
+    ///
+    /// The numbers existed and were logged exactly once, at shutdown, which
+    /// is the one moment nobody is looking. `alloyfs status` asks here.
+    pub fn cache_stats(&self) -> Option<(usize, u64)> {
+        self.cache.as_ref().map(|c| c.stats())
+    }
+
     /// Paths the event pump's bulk re-warm has re-seeded so far. 0 forever
     /// below wire v12 — the pin the gating test uses.
     pub fn rewarmed_paths(&self) -> u64 {
