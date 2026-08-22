@@ -15,12 +15,14 @@
 /// is one whose every key reached a struct — and that is what people want
 /// to know after an edit.
 pub fn validate(path: Option<std::path::PathBuf>) -> anyhow::Result<()> {
-    let (found, cfg) = crate::config::load_with_path(path)?;
+    let (found, cfg) = crate::config::load_with_path(path)
+        .map_err(|e| crate::exit::Fatal::err(crate::exit::CONFIG, format!("{e:#}")))?;
     let Some(found) = found else {
-        anyhow::bail!(
+        return Err(crate::exit::Fatal::err(
+            crate::exit::CONFIG,
             "no config found.\n\n  \
-             `alloyfs init` writes one, or pass --config <path>."
-        );
+             `alloyfs init` writes one, or pass --config <path>.",
+        ));
     };
     let exports = cfg
         .server
@@ -52,9 +54,13 @@ pub fn validate(path: Option<std::path::PathBuf>) -> anyhow::Result<()> {
 /// comparing this against a running mount needs to know which layer is
 /// missing.
 pub fn print(path: Option<std::path::PathBuf>, mount: Option<String>) -> anyhow::Result<()> {
-    let (found, cfg) = crate::config::load_with_path(path)?;
+    let (found, cfg) = crate::config::load_with_path(path)
+        .map_err(|e| crate::exit::Fatal::err(crate::exit::CONFIG, format!("{e:#}")))?;
     let Some(found) = found else {
-        anyhow::bail!("no config found. `alloyfs init` writes one, or pass --config <path>.");
+        return Err(crate::exit::Fatal::err(
+            crate::exit::CONFIG,
+            "no config found. `alloyfs init` writes one, or pass --config <path>.",
+        ));
     };
     println!("# from {}", found.display());
 

@@ -191,6 +191,34 @@ fn completions_generate_for_every_shell() {
     }
 }
 
+/// Failures answer in DISTINCT exit codes.
+///
+/// Everything used to be 1, so a wrapper script could tell "it worked"
+/// from "it did not" and nothing else — "the server is down for a minute"
+/// and "this config can never work" were the same number, though one is
+/// worth retrying and the other never is.
+#[test]
+fn failures_have_distinct_exit_codes() {
+    let dir = tmp();
+
+    // Port 1 is reserved and never listening: the transient failure.
+    let o = alloyfs(dir.path(), &["ping", "tcp://127.0.0.1:1/x"]);
+    assert_eq!(o.status.code(), Some(4), "unreachable:\n{}", out(&o));
+
+    // No config anywhere (HOME points at an empty temp dir): the one that
+    // never becomes correct by retrying.
+    let o = alloyfs(dir.path(), &["config", "validate"]);
+    assert_eq!(o.status.code(), Some(3), "config:\n{}", out(&o));
+
+    // clap's own, untouched — a usage error is not ours to renumber.
+    let o = alloyfs(dir.path(), &["--nosuchflag"]);
+    assert_eq!(o.status.code(), Some(2), "usage:\n{}", out(&o));
+
+    // And success is still success.
+    let o = alloyfs(dir.path(), &["--version"]);
+    assert_eq!(o.status.code(), Some(0), "{}", out(&o));
+}
+
 /// Every file under `root`, so a test can assert that nothing was created.
 fn walk(root: &Path) -> Vec<String> {
     let mut found = Vec::new();

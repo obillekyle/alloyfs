@@ -3,6 +3,7 @@
 
 mod commands;
 mod config;
+mod exit;
 mod logfile;
 mod urls;
 
@@ -482,7 +483,7 @@ enum CacheCmd {
     },
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() -> std::process::ExitCode {
     // Not #[tokio::main]: the defaults are sized for servers with memory to
     // burn — up to 512 blocking threads at 2 MiB of stack apiece. Every
     // filesystem request the agent serves funnels through spawn_blocking,
@@ -492,12 +493,28 @@ fn main() -> anyhow::Result<()> {
     // the useful disk parallelism of those machines, and 1 MiB of stack
     // clears every path here — shallow fs syscalls, tracing, postcard's
     // iterative codec — with room to spare.
-    let rt = tokio::runtime::Builder::new_multi_thread()
+    let rt = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .max_blocking_threads(32)
         .thread_stack_size(1024 * 1024)
-        .build()?;
-    rt.block_on(async_main())
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("Error: could not start the runtime: {e}");
+            return std::process::ExitCode::from(exit::GENERAL as u8);
+        }
+    };
+    match rt.block_on(async_main()) {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            // `{:#}` is anyhow's one-line chain — the same text the default
+            // handler prints, minus the backtrace nobody reads off a
+            // terminal. The code comes from the chain; see `exit`.
+            eprintln!("Error: {e:#}");
+            std::process::ExitCode::from(exit::code_of(&e) as u8)
+        }
+    }
 }
 
 /// The log file this run writes to, or `None` for commands that finish

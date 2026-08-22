@@ -88,7 +88,7 @@ pub(crate) fn instance_summary() -> anyhow::Result<String> {
 // ------------------------------------------------------------------ commands
 
 pub fn setup() -> anyhow::Result<()> {
-    reg::preflight()?;
+    reg::preflight().map_err(|e| crate::exit::Fatal::err(crate::exit::PRIVILEGE, format!("{e:#}")))?;
     reg::verify_supervisor()?;
 
     let dir = instance::store_dir();
@@ -119,7 +119,7 @@ pub fn setup() -> anyhow::Result<()> {
 }
 
 pub fn add(id: String, instance: Instance, start_now: bool) -> anyhow::Result<()> {
-    reg::preflight()?;
+    reg::preflight().map_err(|e| crate::exit::Fatal::err(crate::exit::PRIVILEGE, format!("{e:#}")))?;
     instance::validate_id(&id)?;
     if let Instance::Mount { name, .. } = &instance {
         instance::validate_mount_name(name)?;
@@ -164,7 +164,7 @@ pub fn add(id: String, instance: Instance, start_now: bool) -> anyhow::Result<()
 }
 
 pub fn remove(id: String) -> anyhow::Result<()> {
-    reg::preflight()?;
+    reg::preflight().map_err(|e| crate::exit::Fatal::err(crate::exit::PRIVILEGE, format!("{e:#}")))?;
     instance::validate_id(&id)?;
     let _ = reg::stop(&id);
     // Best-effort, and the definition goes either way. A registration that is
@@ -188,7 +188,7 @@ pub fn remove(id: String) -> anyhow::Result<()> {
 /// `start`, `stop` and `restart` all fan out the same way: one id, or every
 /// instance when none is given.
 pub fn control(action: &str, id: Option<String>) -> anyhow::Result<()> {
-    reg::preflight()?;
+    reg::preflight().map_err(|e| crate::exit::Fatal::err(crate::exit::PRIVILEGE, format!("{e:#}")))?;
     let ids = match id {
         Some(one) => {
             instance::validate_id(&one)?;
@@ -276,7 +276,7 @@ pub fn list() -> anyhow::Result<()> {
 }
 
 pub fn reset(confirm: bool) -> anyhow::Result<()> {
-    reg::preflight()?;
+    reg::preflight().map_err(|e| crate::exit::Fatal::err(crate::exit::PRIVILEGE, format!("{e:#}")))?;
     let ids = instance::list_ids();
     if !confirm {
         println!("This removes every AlloyFS service and its definition:");

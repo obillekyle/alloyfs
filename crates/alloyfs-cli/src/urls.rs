@@ -3,8 +3,6 @@
 
 use std::sync::Arc;
 
-use anyhow::Context as _;
-
 use alloyfs_transport::{stdio, tcp, MuxConnection};
 
 pub enum Target {
@@ -57,10 +55,18 @@ pub async fn connect_target(
     // the likely fix — so both arms say where they were going and what to
     // check first.
     let conn = match target {
-        Target::Tcp { addr } => tcp::connect(&addr, client).await.with_context(|| {
-            format!(
-                "could not reach the agent at tcp://{addr} — is `alloyfs serve` \
-                 running there, and does its `server.tcp_listen` cover this address?"
+        // UNREACHABLE rather than a general failure: this is the transient
+        // one. A host rebooting or a link that is down lands here, and a
+        // supervisor seeing this code should retry — where a config error
+        // never becomes correct by trying again.
+        Target::Tcp { addr } => tcp::connect(&addr, client).await.map_err(|e| {
+            crate::exit::Fatal::err(
+                crate::exit::UNREACHABLE,
+                format!(
+                    "could not reach the agent at tcp://{addr} — is `alloyfs serve` \
+                         running there, and does its `server.tcp_listen` cover this \
+                         address? ({e})"
+                ),
             )
         })?,
         Target::Ssh { host, port } => {
@@ -74,15 +80,16 @@ pub async fn connect_target(
             args.push(remote_cmd.into());
             args.push("serve".into());
             args.push("--stdio".into());
-            stdio::connect_command("ssh", &args, client)
-                .await
-                .with_context(|| {
+            stdio::connect_command("ssh", &args, client).await.map_err(|e| {
+                crate::exit::Fatal::err(
+                    crate::exit::UNREACHABLE,
                     format!(
                         "could not start the agent over `ssh {shown}` — check that plain \
-                     `ssh {shown}` works, and that `{remote_cmd}` is on the remote's \
-                     NON-interactive PATH (`ssh {shown} which {remote_cmd}`)"
-                    )
-                })?
+                             `ssh {shown}` works, and that `{remote_cmd}` is on the remote's \
+                             NON-interactive PATH (`ssh {shown} which {remote_cmd}`) ({e})"
+                    ),
+                )
+            })?
         }
     };
     if let Some(token) = token {

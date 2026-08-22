@@ -285,7 +285,8 @@ async fn mount_fuse(
 ) -> anyhow::Result<()> {
     // The driver preflight with the actionable message (what to install,
     // from where) — not just fuser's raw open("/dev/fuse") error.
-    super::service::verify_backend()?;
+    super::service::verify_backend()
+        .map_err(|e| crate::exit::Fatal::err(crate::exit::DRIVER, format!("{e:#}")))?;
     let export = export.to_string();
     let (notifier_tx, notifier_rx) = tokio::sync::oneshot::channel();
     let mount_fs = fs.clone();
@@ -318,7 +319,10 @@ async fn mount_fuse(
     });
     let result = mount_task.await?;
     on_signal.abort();
-    result?;
+    // Same reasoning as the WinFsp side: the driver was checked above, so
+    // what is left here is the mountpoint itself — missing, not empty, or
+    // still holding a stale mount from a session that died.
+    result.map_err(|e| crate::exit::Fatal::err(crate::exit::MOUNTPOINT, format!("{e:#}")))?;
     fs.shutdown(); // persist the auto-cache manifest
     Ok(())
 }
@@ -434,11 +438,17 @@ async fn mount_platform(
     let mountpoint = mountpoint.to_string_lossy().into_owned();
     // The driver preflight with the actionable message (winfsp.dev URL and
     // all) — not the raw "WinFsp is not available" the mount host gives.
-    super::service::verify_backend()?;
+    super::service::verify_backend()
+        .map_err(|e| crate::exit::Fatal::err(crate::exit::DRIVER, format!("{e:#}")))?;
     // mount() returns once the WinFsp dispatcher is running; its threads call
     // back into RemoteFs, which block_on's this runtime — so we keep the
     // runtime alive here until Ctrl-C, then unmount cleanly.
-    let drive = alloyfs_mount_winfsp::mount(fs.clone(), &mountpoint, export)?;
+    // Whatever went wrong here is about the MOUNTPOINT: the driver was
+    // checked above, so what remains is a letter in use, a reserved name,
+    // or the Mount Manager refusing. A distinct code lets a wrapper script
+    // pick another letter instead of guessing from the message.
+    let drive = alloyfs_mount_winfsp::mount(fs.clone(), &mountpoint, export)
+        .map_err(|e| crate::exit::Fatal::err(crate::exit::MOUNTPOINT, format!("{e:#}")))?;
     // Server events → cache invalidation (in the pump) → the notify timer
     // re-emits them as real ReadDirectoryChangesW notifications.
     let sink = drive.event_sink();

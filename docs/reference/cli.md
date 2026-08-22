@@ -199,6 +199,24 @@ Generated from the same definition the binary parses with, so a new command
 or flag is completable the moment it exists — there is no second list to keep
 in step. Writes to stdout; where it goes from there is your shell's business.
 
+## Exit codes
+
+| Code | Meaning |
+|---|---|
+| 0 | Success |
+| 1 | Something went wrong, with no more specific code |
+| 2 | Usage error (clap's own — a bad flag or a missing argument) |
+| 3 | The config is missing, unreadable, or describes something impossible |
+| 4 | The server could not be reached |
+| 5 | The mountpoint cannot be used (letter in use, directory not empty) |
+| 6 | The filesystem driver is missing (WinFsp / FUSE) |
+| 7 | Wrong privileges (needs elevation on Windows; must *not* be sudo on Linux) |
+
+The distinction that matters for anything automated is 4 against 3: an
+unreachable server is transient and worth retrying, while a config error never
+becomes correct by trying again. `alloyfs update --check` also uses 1 to mean
+"an update is available", which is an ordinary answer rather than a fault.
+
 ## Environment
 
 | Variable | What it does |
