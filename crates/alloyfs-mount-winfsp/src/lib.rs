@@ -341,6 +341,45 @@ impl WinFspFs {
 impl FileSystemContext for WinFspFs {
     type FileContext = FileContext;
 
+    /// One named entry out of a directory, without enumerating the rest.
+    ///
+    /// A wildcard-free `QueryDirectory` — `dir file.txt`, and anything
+    /// built on `FindFirstFile` with a full name, which is most installers
+    /// and build tools — used to make the FSD open the parent and pull the
+    /// ENTIRE listing through `read_directory`, clone every entry and
+    /// re-encode every name to UTF-16, all to hand back one. This answers
+    /// the question that was actually asked.
+    ///
+    /// Cheap by construction: the name resolves through the same attr and
+    /// listing caches every other path does, so in a directory this mount
+    /// has already looked at it costs no round trip at all.
+    fn get_dir_info_by_name(
+        &self,
+        context: &Self::FileContext,
+        file_name: &U16CStr,
+        out_dir_info: &mut DirInfo,
+    ) -> winfsp::Result<()> {
+        let parent = self
+            .fs
+            .ino
+            .path_of(context.ino)
+            .ok_or_else(|| nt(STATUS_OBJECT_NAME_NOT_FOUND))?;
+        let name = file_name
+            .to_string()
+            .map_err(|_| nt(STATUS_OBJECT_NAME_NOT_FOUND))?;
+        let (ino, attr) = self.resolve(&parent.join(&name)).map_err(fsp_err)?;
+        out_dir_info.reset();
+        // set_name_raw for the same reason the enumeration path uses it:
+        // set_name appends a NUL and counts it, which breaks end-anchored
+        // kernel pattern matching.
+        let wide: Vec<u16> = name.encode_utf16().collect();
+        out_dir_info
+            .set_name_raw(wide.as_slice())
+            .map_err(|_| nt(STATUS_OBJECT_NAME_NOT_FOUND))?;
+        fill_file_info(out_dir_info.file_info_mut(), ino, &attr);
+        Ok(())
+    }
+
     fn get_security_by_name(
         &self,
         file_name: &U16CStr,
@@ -1244,7 +1283,13 @@ pub fn mount(fs: Arc<RemoteFs>, mountpoint: &str, volume_label: &str) -> anyhow:
         // Modern tooling (bun's atomic lockfile replace, Node 20+, git) uses
         // FILE_RENAME_POSIX_SEMANTICS; without this flag WinFsp rejects those
         // with EINVAL. Our server is POSIX underneath, so semantics match.
-        .supports_posix_unlink_rename(true);
+        .supports_posix_unlink_rename(true)
+        // Hand single-name directory queries to `get_dir_info_by_name`
+        // instead of making the FSD enumerate a whole directory to answer
+        // one of them. The pattern flag stays OFF (see the comment there):
+        // this passes the NAME for a wildcard-free query, which is a
+        // lookup, not the wildcard matching NT would want us to reimplement.
+        .pass_query_directory_filename(true);
     // Volume prefix stays empty: this is a "disk" filesystem, so plain drive
     // letter mounts work without the network-provider machinery.
 
@@ -1277,7 +1322,13 @@ pub fn mount(fs: Arc<RemoteFs>, mountpoint: &str, volume_label: &str) -> anyhow:
     // new_with_timer: a 100 ms poll drains pending_events into
     // FspFileSystemNotify, which fans out to ReadDirectoryChangesW watchers.
     let mut host = FileSystemHost::<WinFspFs>::new_with_timer::<Vec<alloyfs_proto::FsEvent>, 100>(
-        winfsp::host::FileSystemParams::default_params(params),
+        winfsp::host::FileSystemParams {
+            // The other half of `pass_query_directory_filename`: without
+            // this the driver never calls `get_dir_info_by_name`, and the
+            // flag above would only have changed what it passes.
+            use_dir_info_by_name: true,
+            ..winfsp::host::FileSystemParams::default_params(params)
+        },
         context,
     )
     .map_err(|e| anyhow::anyhow!("creating WinFsp filesystem failed: {e}"))?;
