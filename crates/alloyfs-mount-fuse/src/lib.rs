@@ -44,10 +44,29 @@ fn file_type(kind: FileKind) -> FileType {
     }
 }
 
+/// One directory's entries, materialized once for the life of a handle.
+type DirSnapshot = Arc<Vec<(u64, FileType, String)>>;
+
 struct DsFuse {
     fs: Arc<RemoteFs>,
     uid: u32,
     gid: u32,
+    /// Open directory handles → the listing they are enumerating.
+    ///
+    /// The kernel reads a directory one ~4 KB page at a time, and each page
+    /// used to re-fetch the WHOLE listing (a deep clone of every name out
+    /// of the client's cache), rebuild it, and then throw away the entries
+    /// it had already returned. That is O(n²) allocations to enumerate a
+    /// directory once — for a 10k-entry directory, roughly a hundred pages
+    /// each cloning ten thousand strings.
+    ///
+    /// Holding the listing on the HANDLE also fixes a smaller correctness
+    /// wart: re-fetching per page meant a directory changing mid-walk could
+    /// shift entries under the kernel's offset and duplicate or skip names.
+    /// A snapshot is what POSIX readdir semantics allow and what every
+    /// local filesystem gives.
+    dirs: std::sync::Mutex<std::collections::HashMap<u64, DirSnapshot>>,
+    next_dir_fh: std::sync::atomic::AtomicU64,
 }
 
 impl DsFuse {
@@ -71,6 +90,18 @@ impl DsFuse {
             blksize: 4096,
             flags: 0,
         }
+    }
+
+    /// Build one directory's full entry list, `.` and `..` included.
+    fn materialize_dir(&self, ino: u64) -> Result<DirSnapshot, FsError> {
+        let entries = self.fs.readdir(ino)?;
+        let mut all: Vec<(u64, FileType, String)> = Vec::with_capacity(entries.len() + 2);
+        all.push((ino, FileType::Directory, ".".into()));
+        all.push((ROOT_INO, FileType::Directory, "..".into()));
+        for (name, child_ino, attr) in entries {
+            all.push((child_ino, file_type(attr.kind), name));
+        }
+        Ok(Arc::new(all))
     }
 
     fn open_flags(flags: FuseOpenFlags) -> OpenFlags {
@@ -176,31 +207,59 @@ impl Filesystem for DsFuse {
         }
     }
 
+    fn opendir(&self, _req: &FuseRequest, ino: INodeNo, _flags: FuseOpenFlags, reply: ReplyOpen) {
+        match self.materialize_dir(ino.0) {
+            Ok(snapshot) => {
+                let fh = self
+                    .next_dir_fh
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    + 1;
+                self.dirs.lock().unwrap().insert(fh, snapshot);
+                reply.opened(FileHandle(fh), FopenFlags::empty())
+            }
+            Err(e) => reply.error(errno(&e)),
+        }
+    }
+
+    fn releasedir(
+        &self,
+        _req: &FuseRequest,
+        _ino: INodeNo,
+        fh: FileHandle,
+        _flags: FuseOpenFlags,
+        reply: ReplyEmpty,
+    ) {
+        self.dirs.lock().unwrap().remove(&fh.0);
+        reply.ok();
+    }
+
     fn readdir(
         &self,
         _req: &FuseRequest,
         ino: INodeNo,
-        _fh: FileHandle,
+        fh: FileHandle,
         offset: u64,
         mut reply: ReplyDirectory,
     ) {
-        let entries = match self.fs.readdir(ino.0) {
-            Ok(e) => e,
-            Err(e) => {
-                reply.error(errno(&e));
-                return;
-            }
+        // The snapshot `opendir` took. Rebuilding when it is missing is not
+        // dead code: fuser's default `opendir` hands out fh 0 without one,
+        // so any path that reaches readdir without our opendir — an old
+        // kernel, a handle we never saw — still enumerates correctly, just
+        // at the old cost.
+        let snapshot = match self.dirs.lock().unwrap().get(&fh.0).cloned() {
+            Some(s) => s,
+            None => match self.materialize_dir(ino.0) {
+                Ok(s) => s,
+                Err(e) => {
+                    reply.error(errno(&e));
+                    return;
+                }
+            },
         };
         // The kernel's offset counts entries (incl. "." / "..") it already got.
-        let mut all: Vec<(u64, FileType, String)> = Vec::with_capacity(entries.len() + 2);
-        all.push((ino.0, FileType::Directory, ".".into()));
-        all.push((ROOT_INO, FileType::Directory, "..".into()));
-        for (name, child_ino, attr) in entries {
-            all.push((child_ino, file_type(attr.kind), name));
-        }
-        for (i, (child_ino, ft, name)) in all.into_iter().enumerate().skip(offset as usize) {
+        for (i, (child_ino, ft, name)) in snapshot.iter().enumerate().skip(offset as usize) {
             // add() returns true when the reply buffer is full.
-            if reply.add(INodeNo(child_ino), (i + 1) as u64, ft, &name) {
+            if reply.add(INodeNo(*child_ino), (i + 1) as u64, *ft, name) {
                 break;
             }
         }
@@ -677,6 +736,8 @@ pub fn mount(
         // SAFETY: geteuid/getegid are always safe to call.
         uid: unsafe { libc::geteuid() },
         gid: unsafe { libc::getegid() },
+        dirs: std::sync::Mutex::new(std::collections::HashMap::new()),
+        next_dir_fh: std::sync::atomic::AtomicU64::new(0),
     };
     tracing::info!(mountpoint = %mountpoint.display(), "mounting (fuse)");
     // Session (not mount2) so we can hand out the notifier for cache
