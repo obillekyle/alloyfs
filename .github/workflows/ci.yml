@@ -69,6 +69,13 @@ jobs:
       # them covered, and dropping it would silently stop checking every
       # example in the public API docs.
       - run: cargo test --workspace --doc
+      # The one optional feature, checked on one platform. An off-by-default
+      # feature that nothing builds is an off-by-default feature that stops
+      # compiling, and the person who finds out is whoever turns it on to
+      # take a measurement — exactly when they wanted an answer, not a build
+      # error. Ubuntu only: this is a cfg-shape check, not a platform one.
+      - run: cargo check -p alloyfs-cli --features mimalloc
+        if: runner.os == 'Linux'
       # Exercises the pinned profile as-is (lto=false is load-bearing; see
       # the comment in the workspace Cargo.toml — do not override profiles).
       - run: cargo build --workspace --release

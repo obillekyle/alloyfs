@@ -523,6 +523,23 @@ enum CacheCmd {
     },
 }
 
+/// Optional allocator swap, behind `--features mimalloc`, OFF by default.
+///
+/// The workload looks like a good candidate — DashMap entries and `Bytes`
+/// churning at a high rate — and on this machine it did not pay. Measured on
+/// a 200 MB loopback read, three rounds per arm alternating: at the depth the
+/// client actually reads with, the two arms' ranges overlap almost entirely.
+/// mimalloc can also hold more RSS than the system allocator (it retains
+/// segments), which on a small server is a real cost against no measured
+/// gain.
+///
+/// It stays available because the answer is machine-specific: a build on a
+/// box with different allocator behaviour can turn it on and measure, which
+/// is a different thing from it being on by default and unmeasured.
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() -> std::process::ExitCode {
     // Not #[tokio::main]: the defaults are sized for servers with memory to
     // burn — up to 512 blocking threads at 2 MiB of stack apiece. Every

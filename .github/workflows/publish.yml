@@ -110,7 +110,21 @@ jobs:
       # load-bearing (see the comment in the workspace Cargo.toml). `--target` is
       # passed even where it equals the host so every row's output lands in the
       # same target/<triple>/release layout the collect step reads.
+      #
+      # `codegen-units = 1` is set HERE and not in the workspace profile.
+      # Measured on a 200 MB loopback read, three rounds per arm alternating:
+      # at the depth the client actually reads with, it is worth +0.9% —
+      # noise, with the two arms' ranges overlapping almost entirely. What it
+      # reliably does is make the binary 19% smaller (9.29 MB → 7.52 MB),
+      # which is worth having on something people download. It costs roughly
+      # 3x the release build time, and that is why it does not go in the
+      # profile: `scripts/verify.sh` ends with a release build, and tripling
+      # the slowest step of the local gate to shrink a binary nobody
+      # downloads from a dev machine is the wrong trade. Artifacts are built
+      # here; developers are not.
       - run: cargo build --workspace --release --target ${{ matrix.target }}
+        env:
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: 1
 
       # Every `[[bin]]` the workspace declares, asked of cargo rather than
       # written down. `--no-deps` keeps it to this workspace's own crates.

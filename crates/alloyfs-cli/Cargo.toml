@@ -27,6 +27,7 @@ serde_json.workspace = true
 serde.workspace = true
 schemars.workspace = true
 serde_yaml.workspace = true
+mimalloc = { version = "0.1", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 alloyfs-mount-fuse.workspace = true
@@ -51,3 +52,10 @@ tempfile.workspace = true
 # measured in tens of seconds, and a test may not spend them. Dev-only, and
 # resolver 2 keeps the feature out of the real binary.
 tokio = { workspace = true, features = ["test-util"] }
+
+[features]
+default = []
+# Swap the system allocator for mimalloc. Off by default until a measurement
+# on the target machine says otherwise — see the note at the global_allocator
+# in main.rs.
+mimalloc = ["dep:mimalloc"]
