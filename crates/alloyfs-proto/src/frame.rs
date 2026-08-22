@@ -130,40 +130,73 @@ impl Decoder for FrameCodec {
 impl Encoder<&Frame> for FrameCodec {
     type Error = ProtoError;
 
+    /// Serialize STRAIGHT INTO the output buffer, with the length written
+    /// afterwards over a placeholder.
+    ///
+    /// The frame's bytes are unchanged — the golden vectors say so — but
+    /// the trip they take is shorter. Every frame used to be serialized to
+    /// its own `Vec` and then copied into `dst`; a compressed one was
+    /// serialized, compressed, copied into a size-prefixed `Vec`, then
+    /// serialized AGAIN through postcard purely to prepend a variant tag
+    /// and a length, and finally copied into `dst`. For a 128 KiB read
+    /// reply — the shape the agent sends most — that was up to five passes
+    /// over the payload. Now it is one for a plain frame and three for a
+    /// compressed one, and the intermediate `Vec` per frame is gone.
     fn encode(&mut self, frame: &Frame, dst: &mut BytesMut) -> Result<(), ProtoError> {
-        let mut payload = postcard::to_stdvec(frame)?;
+        let start = dst.len();
+        dst.put_u32_le(0); // length placeholder, backfilled below
+        if let Err(e) = postcard::to_io(frame, (&mut *dst).writer()) {
+            dst.truncate(start); // never leave half a frame behind
+            return Err(e.into());
+        }
+        let plain_len = dst.len() - start - LEN_PREFIX;
+
         let wrapper = matches!(frame, Frame::Compressed(_) | Frame::Zstd(_));
-        if self.zstd.load(std::sync::atomic::Ordering::Relaxed) && payload.len() >= COMPRESS_MIN && !wrapper {
-            // A context that fails to build skips compression for this frame
-            // — the same silent fallback a failed compress always took.
-            let cctx = match &mut self.cctx {
-                Some(c) => Some(c),
-                None => zstd::bulk::Compressor::new(ZSTD_LEVEL)
-                    .ok()
-                    .map(|c| self.cctx.insert(c)),
+        let zstd_on = self.zstd.load(std::sync::atomic::Ordering::Relaxed);
+        if !wrapper && plain_len >= COMPRESS_MIN {
+            // Compress out of the bytes already in `dst`, then replace them
+            // with the wrapper only if that actually won.
+            let squeezed = if zstd_on {
+                // A context that fails to build skips compression for this
+                // frame — the same silent fallback a failed compress took.
+                let cctx = match &mut self.cctx {
+                    Some(c) => Some(c),
+                    None => zstd::bulk::Compressor::new(ZSTD_LEVEL)
+                        .ok()
+                        .map(|c| self.cctx.insert(c)),
+                };
+                let plain = &dst[start + LEN_PREFIX..];
+                // Same layout as lz4's: the uncompressed size, prepended.
+                cctx.and_then(|c| c.compress(plain).ok())
+                    .filter(|s| s.len() + 4 < plain.len())
+                    .map(|s| {
+                        let mut framed = Vec::with_capacity(s.len() + 4);
+                        framed.extend_from_slice(&(plain.len() as u32).to_le_bytes());
+                        framed.extend_from_slice(&s);
+                        Frame::Zstd(Bytes::from(framed))
+                    })
+            } else if self.compress {
+                let plain = &dst[start + LEN_PREFIX..];
+                let s = lz4_flex::compress_prepend_size(plain);
+                (s.len() < plain.len()).then(|| Frame::Compressed(Bytes::from(s)))
+            } else {
+                None
             };
-            // Same only-when-smaller rule as lz4: incompressible payloads
-            // (already-compressed file data) pass through untouched.
-            if let Some(Ok(squeezed)) = cctx.map(|c| c.compress(&payload)) {
-                if squeezed.len() + 4 < payload.len() {
-                    let mut framed = Vec::with_capacity(squeezed.len() + 4);
-                    framed.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-                    framed.extend_from_slice(&squeezed);
-                    payload = postcard::to_stdvec(&Frame::Zstd(Bytes::from(framed)))?;
+            if let Some(wrapped) = squeezed {
+                dst.truncate(start + LEN_PREFIX);
+                if let Err(e) = postcard::to_io(&wrapped, (&mut *dst).writer()) {
+                    dst.truncate(start);
+                    return Err(e.into());
                 }
             }
-        } else if self.compress && payload.len() >= COMPRESS_MIN && !wrapper {
-            let squeezed = lz4_flex::compress_prepend_size(&payload);
-            if squeezed.len() < payload.len() {
-                payload = postcard::to_stdvec(&Frame::Compressed(Bytes::from(squeezed)))?;
-            }
         }
-        if payload.len() > MAX_FRAME_LEN {
-            return Err(ProtoError::FrameTooLarge(payload.len()));
+
+        let payload_len = dst.len() - start - LEN_PREFIX;
+        if payload_len > MAX_FRAME_LEN {
+            dst.truncate(start);
+            return Err(ProtoError::FrameTooLarge(payload_len));
         }
-        dst.reserve(LEN_PREFIX + payload.len());
-        dst.put_u32_le(payload.len() as u32);
-        dst.put_slice(&payload);
+        dst[start..start + LEN_PREFIX].copy_from_slice(&(payload_len as u32).to_le_bytes());
         Ok(())
     }
 }
