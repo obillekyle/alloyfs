@@ -211,6 +211,10 @@ pub type Page = (Vec<(RelPath, Attr)>, bool, u64);
 enum State {
     /// Never asked for. Nothing has been walked.
     Cold,
+    /// A walk is in progress on some other thread. Nobody waits for it:
+    /// "not indexed" is an answer this protocol already has, and clients
+    /// fall back to `Readdir` for the moment rather than blocking.
+    Building,
     /// Walked and maintained.
     Live(Indexed),
     /// Walked, and the export was too big. Clients keep using `Readdir`; the
@@ -223,14 +227,51 @@ pub struct ExportTree {
     state: Mutex<State>,
     cap: usize,
     source: Box<dyn TreeSource>,
+    /// Bumped by every `invalidate`. A build captures it before walking and
+    /// refuses to install if it moved — which is what keeps dropping the
+    /// lock across the walk honest. Holding the lock made this impossible
+    /// by brute force; an invalidate landing mid-walk now means the walk
+    /// describes a state the watcher has already declared unknowable, and
+    /// installing it anyway would resurrect exactly the staleness the
+    /// invalidate exists to prevent.
+    build_epoch: std::sync::atomic::AtomicU64,
+}
+
+/// Returns `Building` to `Cold` unless the build got far enough to install.
+///
+/// Without this, a panic anywhere in the walk would strand the export in
+/// `Building` for the life of the process — never indexed, never retried,
+/// with every client silently downgraded to `Readdir` forever.
+struct BuildGuard<'a> {
+    state: &'a Mutex<State>,
+    armed: bool,
+}
+
+impl Drop for BuildGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if matches!(&*st, State::Building) {
+                *st = State::Cold;
+            }
+        }
+    }
 }
 
 impl ExportTree {
     pub fn new(cap: usize) -> Self {
+        Self::with_source(cap, Box::new(WalkSource))
+    }
+
+    /// The seam the `TreeSource` trait exists for. Tests use it to control
+    /// how long a walk takes, which is the only way to observe what other
+    /// callers see WHILE one is running.
+    pub fn with_source(cap: usize, source: Box<dyn TreeSource>) -> Self {
         Self {
             state: Mutex::new(State::Cold),
             cap,
-            source: Box::new(WalkSource),
+            source,
+            build_epoch: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -242,14 +283,47 @@ impl ExportTree {
     /// tree, so a change landing mid-walk is either seen by the walk or
     /// present in the replay, and applying it twice is harmless because both
     /// paths are idempotent overwrites of one path's entry.
+    /// The walk itself runs with NO lock held.
+    ///
+    /// It used to run under the state lock, which meant the first client to
+    /// ask for a tree on a cold export stopped everything that touches the
+    /// index for the length of a full walk: `readdir`'s serve path, the
+    /// token check, `attach2`, and every watcher event. At the 200k cap on
+    /// a cold page cache that is seconds of a wholly unrelated stall for
+    /// every other client.
     pub fn ensure(&self, root: &Path, exclude: &ExcludeSet) -> u64 {
-        let mut st = self.state.lock().unwrap();
-        match &*st {
-            State::Live(idx) => return idx.token(),
-            State::TooLarge => return 0,
-            State::Cold => {}
+        {
+            let mut st = self.state.lock().unwrap();
+            match &*st {
+                State::Live(idx) => return idx.token(),
+                State::TooLarge => return 0,
+                // Someone else is walking. Nobody queues behind it: token 0
+                // means "not indexed, use readdir", which is a first-class
+                // answer here, and a client served promptly by the slower
+                // path beats one blocked on a walk it never asked for.
+                State::Building => return 0,
+                State::Cold => {}
+            }
+            *st = State::Building;
         }
-        match self.source.enumerate(root, exclude, self.cap) {
+        let mut guard = BuildGuard {
+            state: &self.state,
+            armed: true,
+        };
+        let epoch = self.build_epoch.load(std::sync::atomic::Ordering::Acquire);
+        let walked = self.source.enumerate(root, exclude, self.cap);
+
+        let mut st = self.state.lock().unwrap();
+        guard.armed = false; // from here every path assigns a final state
+                             // An invalidate during the walk means the watcher can no longer
+                             // vouch for what was walked. Back to Cold: the next ask rebuilds,
+                             // which at ~33 ms for a real export is the whole recovery story.
+        if self.build_epoch.load(std::sync::atomic::Ordering::Acquire) != epoch {
+            tracing::info!("index invalidated while building; discarding the walk");
+            *st = State::Cold;
+            return 0;
+        }
+        match walked {
             Ok(Some(entries)) => {
                 let mut idx = Indexed::default();
                 for (path, attr) in entries {
@@ -457,6 +531,12 @@ impl ExportTree {
     /// Drop the index. The next request walks again — which at 33 ms is the
     /// whole of the recovery story for a watcher that overflowed.
     pub fn invalidate(&self) {
+        // Bumped unconditionally, and BEFORE the state is touched: a walk
+        // in flight compares this to decide whether its result may still be
+        // installed, and an invalidate that only spoke for the Live case
+        // would be silently lost against a build in progress.
+        self.build_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
         let mut st = self.state.lock().unwrap();
         if matches!(&*st, State::Live(_)) {
             tracing::info!("export index dropped; will rebuild on next request");
@@ -736,5 +816,134 @@ mod tests {
         let sub_names: Vec<&str> = sub.iter().map(|(p, _)| p.0.as_str()).collect();
         assert_eq!(sub_names, ["sub/deep.txt"]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod build_concurrency_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    /// A source whose walk takes as long as the test wants, and which
+    /// counts how many walks actually happened.
+    struct SlowSource {
+        walks: Arc<AtomicU64>,
+        started: Arc<std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>>,
+        delay: std::time::Duration,
+    }
+
+    impl TreeSource for SlowSource {
+        fn enumerate(
+            &self,
+            _root: &Path,
+            _exclude: &ExcludeSet,
+            _cap: usize,
+        ) -> std::io::Result<Option<Vec<(RelPath, Attr)>>> {
+            self.walks.fetch_add(1, Ordering::SeqCst);
+            if let Some(tx) = self.started.lock().unwrap().take() {
+                let _ = tx.send(());
+            }
+            std::thread::sleep(self.delay);
+            let attr = Attr {
+                kind: FileKind::File,
+                size: 1,
+                mtime: std::time::UNIX_EPOCH,
+                ctime: std::time::UNIX_EPOCH,
+                mode: 0o644,
+                version: 0,
+            };
+            Ok(Some(vec![(RelPath("a.txt".into()), attr)]))
+        }
+    }
+
+    fn slow_tree(delay_ms: u64) -> (Arc<ExportTree>, Arc<AtomicU64>, std::sync::mpsc::Receiver<()>) {
+        let walks = Arc::new(AtomicU64::new(0));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let source = SlowSource {
+            walks: walks.clone(),
+            started: Arc::new(std::sync::Mutex::new(Some(tx))),
+            delay: std::time::Duration::from_millis(delay_ms),
+        };
+        (
+            Arc::new(ExportTree::with_source(1000, Box::new(source))),
+            walks,
+            rx,
+        )
+    }
+
+    /// A build in flight must not block everyone else.
+    ///
+    /// The walk used to run under the state lock, so the first ask on a
+    /// cold export froze `readdir`'s serve path, the token check, attach
+    /// and every watcher event until it finished. Now other callers are
+    /// answered immediately with "not indexed" — token 0, which this
+    /// protocol has always meant "use readdir" — and exactly one walk runs.
+    #[test]
+    fn a_build_in_flight_blocks_nobody() {
+        let (tree, walks, started) = slow_tree(400);
+        let ex = ExcludeSet::compile(&[], false).unwrap();
+        let builder = {
+            let tree = tree.clone();
+            std::thread::spawn(move || {
+                tree.ensure(
+                    Path::new("/nonexistent"),
+                    &ExcludeSet::compile(&[], false).unwrap(),
+                )
+            })
+        };
+        started.recv().unwrap(); // the walk is running
+
+        // Both of these took the lock the builder was holding, for as long
+        // as the walk took.
+        let t0 = std::time::Instant::now();
+        assert_eq!(tree.token(), 0, "not indexed yet, and said so at once");
+        assert_eq!(
+            tree.ensure(Path::new("/nonexistent"), &ex),
+            0,
+            "no queueing behind the walk"
+        );
+        assert!(
+            t0.elapsed() < std::time::Duration::from_millis(200),
+            "answering took {:?} — that is the walk being waited on",
+            t0.elapsed()
+        );
+
+        assert_ne!(builder.join().unwrap(), 0, "the builder still installs its index");
+        assert_eq!(
+            walks.load(Ordering::SeqCst),
+            1,
+            "exactly one walk, not one per asker"
+        );
+        assert_ne!(tree.token(), 0, "and the index is live afterwards");
+    }
+
+    /// An invalidate landing DURING a build discards that build.
+    ///
+    /// Holding the lock across the walk made this impossible by brute
+    /// force. Without the epoch check it becomes silent staleness: the
+    /// watcher declares what it knows unknowable, and a walk that started
+    /// earlier installs itself anyway as if it were proof.
+    #[test]
+    fn an_invalidate_during_a_build_discards_it() {
+        let (tree, walks, started) = slow_tree(300);
+        let ex = ExcludeSet::compile(&[], false).unwrap();
+        let builder = {
+            let tree = tree.clone();
+            std::thread::spawn(move || {
+                tree.ensure(
+                    Path::new("/nonexistent"),
+                    &ExcludeSet::compile(&[], false).unwrap(),
+                )
+            })
+        };
+        started.recv().unwrap();
+        tree.invalidate(); // the watcher lost track mid-walk
+
+        assert_eq!(builder.join().unwrap(), 0, "the build refuses to install");
+        assert_eq!(tree.token(), 0, "nothing stale was left behind");
+        // ...and the export is not stuck: the next ask walks again.
+        assert_ne!(tree.ensure(Path::new("/nonexistent"), &ex), 0);
+        assert_eq!(walks.load(Ordering::SeqCst), 2);
     }
 }
