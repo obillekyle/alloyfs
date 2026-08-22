@@ -4033,3 +4033,69 @@ async fn a_pending_file_renamed_while_open_lands_atomically() {
     assert!(all.iter().any(|(n, _, _)| n == "package.json"));
     assert!(!all.iter().any(|(n, _, _)| n == ".lock-abc123.tmp"));
 }
+
+/// v14 server-side copy: the bytes never cross the wire.
+///
+/// A copy inside the mounted export otherwise reads every byte down and
+/// writes every byte back up — twice the file over the link, for data that
+/// never leaves the server's disk. This pins the three things that make
+/// the fast path usable: the range lands byte-exact, a partial range
+/// copies only what was asked, and a pre-v14 session REFUSES rather than
+/// silently doing something else (EOPNOTSUPP is what tells a kernel to
+/// fall back to reading and writing).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_server_side_copy_moves_no_bytes_over_the_wire() {
+    let agent = start_agent(AgentOpts::default());
+    let body = patterned(40_000);
+    std::fs::write(agent.dir.path().join("src.bin"), &body).unwrap();
+    std::fs::write(agent.dir.path().join("dst.bin"), vec![0u8; 40_000]).unwrap();
+    let s = connect(&agent, ClientOptions::default()).await;
+    on_fs(&s.fs, |fs| fs.readdir(ROOT_INO)).await.unwrap();
+    let (src_ino, _) = lookup_path(&s.fs, "src.bin").await.unwrap();
+    let (dst_ino, _) = lookup_path(&s.fs, "dst.bin").await.unwrap();
+
+    // Whole file, and the payload must not appear in the request count:
+    // one exchange carries a range, not 40 KB.
+    let before = s.conn().requests_sent();
+    let n = on_fs(&s.fs, move |fs| fs.copy_range(src_ino, 0, dst_ino, 0, 40_000))
+        .await
+        .unwrap();
+    let spent = s.conn().requests_sent() - before;
+    assert_eq!(n as usize, body.len(), "the whole range reports copied");
+    assert!(
+        spent <= 2,
+        "a copy is one exchange, not one per chunk (spent {spent})"
+    );
+    assert_eq!(
+        std::fs::read(agent.dir.path().join("dst.bin")).unwrap(),
+        body,
+        "and the destination is byte-exact on the server's disk"
+    );
+
+    // A partial range writes only its own span, at its own offset.
+    std::fs::write(agent.dir.path().join("dst.bin"), vec![7u8; 40_000]).unwrap();
+    let n = on_fs(&s.fs, move |fs| fs.copy_range(src_ino, 100, dst_ino, 8, 64))
+        .await
+        .unwrap();
+    assert_eq!(n, 64);
+    let got = std::fs::read(agent.dir.path().join("dst.bin")).unwrap();
+    assert_eq!(&got[8..72], &body[100..164], "the span lands where it was asked");
+    assert!(got[..8].iter().all(|b| *b == 7), "bytes before it are untouched");
+    assert!(got[72..].iter().all(|b| *b == 7), "bytes after it are untouched");
+
+    // Below v14 it must refuse, not improvise.
+    let old = connect_with_max(&agent, ClientOptions::default(), 13).await;
+    on_fs(&old.fs, |fs| fs.readdir(ROOT_INO)).await.unwrap();
+    let (s2, d2) = (
+        lookup_path(&old.fs, "src.bin").await.unwrap().0,
+        lookup_path(&old.fs, "dst.bin").await.unwrap().0,
+    );
+    let err = on_fs(&old.fs, move |fs| fs.copy_range(s2, 0, d2, 0, 64))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        alloyfs_client::posix_errno(&err),
+        95,
+        "a pre-v14 server answers EOPNOTSUPP, which is a kernel's cue to copy it itself"
+    );
+}

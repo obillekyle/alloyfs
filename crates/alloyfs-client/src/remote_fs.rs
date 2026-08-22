@@ -1802,6 +1802,72 @@ impl RemoteFs {
         Ok(())
     }
 
+    /// Copy a file within the export, server-side (wire v14).
+    ///
+    /// The whole point is that no bytes cross the link: a copy inside the
+    /// mounted export otherwise reads every byte down and writes every
+    /// byte back up, twice the file over the wire for data that never
+    /// leaves the server's disk.
+    ///
+    /// Refused rather than emulated when it cannot be done server-side, and
+    /// the refusal says WHICH reason. An old server is `VersionMismatch`,
+    /// which is already EOPNOTSUPP to the kernel — precisely the "do it
+    /// yourself" answer `copy_file_range` is specified to fall back from.
+    /// An endpoint in the local overlay is `CrossDevice`, which is what it
+    /// literally is: one side lives on this machine and the server has no
+    /// copy of the data to duplicate. Emulating either here with a read
+    /// and a write would work and would hide the fact that the fast path
+    /// never happened.
+    pub fn copy_range(
+        &self,
+        ino_in: u64,
+        offset_in: u64,
+        ino_out: u64,
+        offset_out: u64,
+        len: u64,
+    ) -> Result<u32, FsError> {
+        let from = self.path_of(ino_in)?;
+        let to = self.path_of(ino_out)?;
+        if self.is_overlay(&from) || self.is_overlay(&to) {
+            return Err(ErrorCode::CrossDevice.into());
+        }
+        self.require_proto(14, "server-side copy")?;
+        // Same ordering duty as rename: the source's queued (or still
+        // open-pending) truth has to be on the server before it can copy
+        // it, and the destination must not be shadowed by queued work
+        // either. Without this a copy could read a file the server has
+        // never seen and answer zero bytes.
+        if self.batch.is_some() {
+            self.materialize_open_pending(&from)?;
+            self.materialize_open_pending(&to)?;
+            self.barrier_for(&from)?;
+            self.barrier_for(&to)?;
+        }
+        let (n, new_version) = expect_resp!(
+            self.call(Request::Copy {
+                from,
+                from_offset: offset_in,
+                to: to.clone(),
+                to_offset: offset_out,
+                len,
+            })?,
+            Response::Written { n, new_version, .. } => (n, new_version)
+        );
+        // The destination changed size and mtime and we do not know the
+        // new values — the reply carries a count, not attributes. Drop
+        // what is cached rather than guess: a stale size here would be
+        // served to the next stat as truth.
+        if let Some(ino) = self.ino.ino_of(&to) {
+            self.invalidate_attr(ino);
+            if let Some(state) = self.open_files.get(&ino_out) {
+                state.version.store(new_version, Ordering::Relaxed);
+            }
+        }
+        self.invalidate_parent_dir(&to);
+        self.invalidate_open_reads(&to);
+        Ok(n)
+    }
+
     pub fn rename(
         &self,
         parent: u64,

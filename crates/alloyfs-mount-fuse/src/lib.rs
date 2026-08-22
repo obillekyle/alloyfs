@@ -288,6 +288,46 @@ impl Filesystem for DsFuse {
         }
     }
 
+    /// `copy_file_range(2)` — server-side copy, wire v14.
+    ///
+    /// This is what `cp` and the coreutils reach for first, and it is the
+    /// whole reason the wire op exists: without it a copy inside the
+    /// mounted export reads every byte down and writes every byte back up,
+    /// twice the file over the link for data that never leaves the
+    /// server's disk.
+    ///
+    /// Every refusal here is a FALLBACK, not a failure. An old server
+    /// answers EOPNOTSUPP and an overlay endpoint EXDEV; both tell the
+    /// kernel to do the copy itself with reads and writes, which is
+    /// exactly what it did before this existed.
+    #[allow(clippy::too_many_arguments)]
+    fn copy_file_range(
+        &self,
+        _req: &FuseRequest,
+        ino_in: INodeNo,
+        _fh_in: FileHandle,
+        offset_in: u64,
+        ino_out: INodeNo,
+        fh_out: FileHandle,
+        offset_out: u64,
+        len: u64,
+        _flags: fuser::CopyFileRangeFlags,
+        reply: ReplyWrite,
+    ) {
+        match self
+            .fs
+            .copy_range(ino_in.0, offset_in, ino_out.0, offset_out, len)
+        {
+            Ok(n) => {
+                // The destination handle's cached reads are stale now, and
+                // it is the handle the caller will read back through.
+                self.fs.invalidate_read_cache(fh_out.0);
+                reply.written(n)
+            }
+            Err(e) => reply.error(errno(&e)),
+        }
+    }
+
     fn flush(
         &self,
         _req: &FuseRequest,

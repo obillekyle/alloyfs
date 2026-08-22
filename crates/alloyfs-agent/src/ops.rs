@@ -110,6 +110,27 @@ impl Export {
         self.posix_modes.remove(rel);
     }
 
+    /// Every sidecar's view of a copy: the destination inherits the
+    /// source's out-of-band metadata.
+    ///
+    /// What the filesystem copy already carries is left alone — POSIX mode
+    /// bits on unix, the NTFS attributes `CopyFileEx` brings on Windows.
+    /// What it cannot carry is exactly what lives in a sidecar, because a
+    /// sidecar exists for metadata the host filesystem has no place for.
+    fn sidecars_copy(&self, from: &RelPath, to: &RelPath) {
+        #[cfg(unix)]
+        {
+            let bits = self.winattrs.get(from);
+            if bits != 0 {
+                self.winattrs.apply(to, bits, 0);
+            }
+        }
+        #[cfg(windows)]
+        if let Some(mode) = self.posix_modes.get(from) {
+            self.posix_modes.put(to, Some(mode));
+        }
+    }
+
     /// Every sidecar's view of a rename.
     fn sidecars_rename(&self, from: &RelPath, to: &RelPath) {
         self.winattrs.rename(from, to);
@@ -1405,6 +1426,66 @@ impl SessionInner {
         Ok(Response::Ok)
     }
 
+    /// v14: copy a byte range between two files in the export, without the
+    /// bytes leaving it.
+    ///
+    /// Both files must already exist — this writes INTO the destination at
+    /// an offset, which is `copy_file_range`'s contract and keeps the op
+    /// clear of the mode, umask and exclusion questions `Create` answers.
+    ///
+    /// The copy itself is a plain bounded read/write loop. A Linux fast
+    /// path through `libc::copy_file_range` (where the kernel may reflink
+    /// instead of moving anything) is a refinement worth measuring later;
+    /// the win being banked here is the WAN round trip, which is orders of
+    /// magnitude larger than the local memcpy either way.
+    fn copy(
+        &self,
+        from: RelPath,
+        from_offset: u64,
+        to: RelPath,
+        to_offset: u64,
+        len: u64,
+    ) -> Result<Response, ErrorCode> {
+        /// Cap per request, so one call cannot park the server for minutes
+        /// or answer with a count that will not fit. Short counts are legal
+        /// here, so the caller simply asks again from where this stopped.
+        const COPY_MAX: u64 = 64 * 1024 * 1024;
+
+        let export = self.writable_export()?;
+        let from_full = export.resolve(&from)?;
+        let to_full = export.resolve(&to)?;
+        let src = std::fs::File::open(&from_full).or_code()?;
+        if src.metadata().or_code()?.is_dir() {
+            return Err(ErrorCode::IsADirectory);
+        }
+        let dst = std::fs::OpenOptions::new().write(true).open(&to_full).or_code()?;
+        if dst.metadata().or_code()?.is_dir() {
+            return Err(ErrorCode::IsADirectory);
+        }
+
+        let mut buf = vec![0u8; DATA_CHUNK as usize];
+        let mut copied = 0u64;
+        let want = len.min(COPY_MAX);
+        while copied < want {
+            let chunk = ((want - copied) as usize).min(buf.len());
+            let n = read_fully(&src, &mut buf[..chunk], from_offset + copied).or_code()?;
+            if n == 0 {
+                break; // source ended: a short count, which the caller expects
+            }
+            write_fully(&dst, &buf[..n], to_offset + copied).or_code()?;
+            copied += n as u64;
+        }
+        dst.sync_data().or_code()?;
+
+        export.events.note_local_write(&to, self.id);
+        export.sidecars_copy(&from, &to);
+        Ok(Response::Written {
+            n: copied as u32,
+            new_version: export.bump(&to),
+            conflict: false,
+        })
+    }
+
     fn link(&self, target: RelPath, link: RelPath) -> Result<Response, ErrorCode> {
         let export = self.writable_export()?;
         let target_full = export.resolve(&target)?;
@@ -1569,6 +1650,13 @@ impl SessionInner {
             Request::Unlink { path } => self.unlink(path),
             Request::Rmdir { path } => self.rmdir(path),
             Request::Rename { from, to, replace } => self.rename(from, to, replace),
+            Request::Copy {
+                from,
+                from_offset,
+                to,
+                to_offset,
+                len,
+            } => self.copy(from, from_offset, to, to_offset, len),
             Request::Link { target, link } => self.link(target, link),
             Request::Symlink { target, link } => self.symlink(target, link),
             Request::ReadLink { path } => self.readlink(path),

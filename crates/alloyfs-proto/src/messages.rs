@@ -88,15 +88,22 @@ use crate::error::ErrorCode;
 /// AND the sender's own config opt-in (each direction independent); every
 /// v13 build decodes it unconditionally, so no capability exchange is
 /// needed beyond the version.
+///
+/// v14: `Request::Copy` — a byte range copied WITHIN one export,
+/// server-side, so the bytes never cross the wire in either direction.
+/// Shaped after `copy_file_range(2)`, which is what reaches it in
+/// practice; answered with the existing `Response::Written`. Client-gated
+/// like every appended variant: an older server cannot decode it and would
+/// drop the connection.
 pub const PROTO_VERSION_MIN: u16 = 1;
-pub const PROTO_VERSION_MAX: u16 = 13;
+pub const PROTO_VERSION_MAX: u16 = 14;
 
 /// The protocol range this build speaks, for `--version` and diagnostics —
 /// "which wire version does this release talk" should not require reading
 /// source. A literal rather than a formatted string because clap's version
 /// output needs a `&'static str`; `proto_range_matches_the_constants` is what
 /// keeps it from drifting away from the two constants above.
-pub const PROTO_RANGE: &str = "1-13";
+pub const PROTO_RANGE: &str = "1-14";
 
 /// Read/write payloads are capped to this many bytes per request so one huge
 /// file operation can never monopolize the connection (head-of-line blocking).
@@ -639,6 +646,40 @@ pub enum Request {
     /// trip instead of one lazy Getattr per future stat.
     GetattrMany {
         paths: Vec<RelPath>,
+    },
+    /// v14+: copy a byte range from one file to another WITHIN one export,
+    /// server-side.
+    ///
+    /// The bytes never cross the wire. A copy inside the mounted export
+    /// otherwise reads every byte down and writes every byte back up —
+    /// twice the file over the link, for data that never leaves the
+    /// server's disk.
+    ///
+    /// Shaped after `copy_file_range(2)`, because that is what actually
+    /// calls it: `cp` and coreutils reach this through FUSE's hook, which
+    /// speaks in ranges over open files rather than whole paths. A
+    /// whole-file copy is just this with both offsets at zero. Paths
+    /// rather than handles because the server resolves and confines paths
+    /// on every other mutation too, and a handle would add a second
+    /// lifetime to reason about for no gain.
+    ///
+    /// Deliberately NOT a create: the destination must exist, and the
+    /// range is written INTO it, extending it if the range runs past its
+    /// end. That is `copy_file_range`'s contract, and it keeps this op
+    /// away from mode, umask and exclusion questions that `Create`
+    /// already answers.
+    ///
+    /// Answered with the existing [`Response::Written`] — bytes actually
+    /// copied plus the destination's new version. A short count is legal
+    /// and expected (the source ended early, or the server capped the
+    /// request); the caller resumes at the new offset, exactly as it would
+    /// with the syscall.
+    Copy {
+        from: RelPath,
+        from_offset: u64,
+        to: RelPath,
+        to_offset: u64,
+        len: u64,
     },
 }
 
