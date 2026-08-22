@@ -402,6 +402,28 @@ impl ExportTree {
     /// not-a-directory, the case-insensitive spellings a real volume resolves
     /// and this byte-keyed map cannot), so the index only ever answers the
     /// one question it answers exactly.
+    /// One path's attributes, if the index holds them exactly.
+    ///
+    /// `None` for everything it cannot answer with certainty — not indexed,
+    /// path unknown to it, or a spelling only the volume could resolve —
+    /// which routes the caller to the disk, keeping the answer identical.
+    /// The root is deliberately absent: nothing walks it into the index, and
+    /// stat-ing one directory is not what this exists to save.
+    ///
+    /// Attributes come out exactly as stored: version 0, symlinks as links.
+    /// The caller overlays the live version and decides what to do about a
+    /// link, the same way `readdir_all`'s caller does.
+    pub fn get(&self, path: &RelPath) -> Option<Attr> {
+        if path.is_root() {
+            return None;
+        }
+        let st = self.state.lock().unwrap();
+        let State::Live(idx) = &*st else {
+            return None;
+        };
+        idx.entries.get(path).copied()
+    }
+
     pub fn readdir_all(&self, dir: &RelPath) -> Option<(Vec<(String, Attr)>, u64)> {
         let st = self.state.lock().unwrap();
         let State::Live(idx) = &*st else {

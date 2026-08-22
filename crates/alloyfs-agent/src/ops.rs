@@ -644,6 +644,44 @@ impl SessionInner {
     /// The single-path core `Getattr` and `GetattrMany` share, so a bulk
     /// entry can never answer differently from the lone request it replaces.
     fn getattr_one(export: &Arc<Export>, path: &RelPath) -> Result<Attr, ErrorCode> {
+        // From the v6 index when it can answer exactly, on the same terms
+        // `readdir` already serves from it — and for the same reason: the
+        // disk path costs TWO full walks of the path, a `canonicalize` and
+        // then a `metadata`, and on Windows the canonicalize is a CreateFile
+        // plus GetFinalPathNameByHandle plus CloseHandle. A `GetattrMany`
+        // over N paths pays 2N of them.
+        //
+        // What makes the swap safe is what makes it safe in `readdir`:
+        //
+        // - Excludes: the index never contains an excluded path, so a hit
+        //   means "not excluded". A request spelled in a case only the
+        //   volume can resolve misses the index and takes the disk path,
+        //   where `resolve` re-checks the on-disk name — so the
+        //   case-insensitive exclude bypass stays closed.
+        // - Versions: the index stores version 0 (its attrs come from plain
+        //   stats), so the live version is overlaid exactly as the disk path
+        //   and `readdir` do.
+        // - Symlinks are NOT answered from here. The index stores a link as
+        //   a link, while `getattr` must report the target — and following it
+        //   is precisely what `resolve`'s canonicalize-then-check exists to
+        //   police. Links are rare; a lone stat for each is the right price
+        //   for not moving that check.
+        // - Anything else the index cannot answer exactly returns None and
+        //   falls through, so every error stays identical.
+        //
+        // The freshness this accepts is the freshness `readdir` already
+        // accepts and documents: the index trails the watcher's debounce.
+        if let Some(attr) = export.tree.get(path) {
+            if attr.kind != FileKind::Symlink {
+                return Ok(export.with_winattrs(
+                    path,
+                    Attr {
+                        version: export.version_of(path),
+                        ..attr
+                    },
+                ));
+            }
+        }
         let full = export.resolve(path)?;
         let md = std::fs::metadata(&full).or_code()?;
         Ok(export.with_winattrs(path, attr_from_metadata(&md, export.version_of(path))))
