@@ -151,11 +151,51 @@ fn do_mount(fd: libc::c_int, target: &CString) -> io::Result<()> {
     Ok(())
 }
 
+/// How many request buffers to keep for reuse. Each is `READ_BUF_LEN`
+/// (~128 KiB), so this caps the pool's resident cost at about 2 MB; anything
+/// beyond it is freed rather than held. Sixteen covers the in-flight depth of
+/// any real workload — past that the wire, not the allocator, is the limit.
+const BUF_POOL_MAX: usize = 16;
+
+/// Recycled request buffers.
+///
+/// The read loop cannot hand the kernel's bytes to a worker without giving up
+/// the buffer they landed in, and the answer used to be to copy them out —
+/// up to `READ_BUF_LEN` per request, on every single WRITE, purely to cross a
+/// task boundary. Instead the loop takes a buffer from here, reads into it,
+/// hands it over, and the worker drops it back when the request is served.
+///
+/// Buffers are allocated zeroed once and then reused indefinitely, which is
+/// what keeps this out of `unsafe`: the zeroing cost is paid once per buffer
+/// rather than once per request, and nothing ever observes a byte the kernel
+/// did not write, since `handle` is only shown `&buf[..n]`.
+#[derive(Clone, Default)]
+struct BufPool(Arc<std::sync::Mutex<Vec<Vec<u8>>>>);
+
+impl BufPool {
+    fn take(&self) -> Vec<u8> {
+        self.0
+            .lock()
+            .ok()
+            .and_then(|mut pool| pool.pop())
+            .unwrap_or_else(|| vec![0u8; abi::READ_BUF_LEN])
+    }
+
+    fn put(&self, buf: Vec<u8>) {
+        if let Ok(mut pool) = self.0.lock() {
+            if pool.len() < BUF_POOL_MAX {
+                pool.push(buf);
+            }
+        }
+    }
+}
+
 /// Read requests, serve each on the blocking pool, write each answer back.
 /// Answers may overtake each other — the kernel matches on `unique`, so a slow
 /// read never blocks a fast getattr queued behind it.
 fn serve_loop(dev: Arc<Dev>, server: Arc<Server>, rt: tokio::runtime::Handle, stop: Arc<AtomicBool>) {
-    let mut buf = vec![0u8; abi::READ_BUF_LEN];
+    let pool = BufPool::default();
+    let mut buf = pool.take();
     while !stop.load(Ordering::Relaxed) {
         match dev.wait_readable(200) {
             Ok(false) => continue,
@@ -187,18 +227,28 @@ fn serve_loop(dev: Arc<Dev>, server: Arc<Server>, rt: tokio::runtime::Handle, st
                 tracing::warn!(n, "short request from the kernel; ignored");
                 continue;
             }
-            let req = buf[..n].to_vec();
+            // Hand the buffer over rather than copying out of it, and pick up
+            // the next one from the pool.
+            let req = std::mem::replace(&mut buf, pool.take());
             let server = server.clone();
             let dev = dev.clone();
-            rt.spawn_blocking(move || match server.handle(&req) {
-                Some(resp) => {
-                    if let Err(e) = dev.write_frame(&resp) {
-                        // ENOENT here is benign: the caller was killed and the
-                        // kernel already abandoned the request.
-                        tracing::debug!(error = %e, "response not delivered");
+            let pool = pool.clone();
+            rt.spawn_blocking(move || {
+                let resp = server.handle(&req[..n]);
+                // Back to the pool the moment it is no longer needed — before
+                // the write, which is the slow part, and on the malformed path
+                // too.
+                pool.put(req);
+                match resp {
+                    Some(resp) => {
+                        if let Err(e) = dev.write_frame(&resp) {
+                            // ENOENT here is benign: the caller was killed and
+                            // the kernel already abandoned the request.
+                            tracing::debug!(error = %e, "response not delivered");
+                        }
                     }
+                    None => tracing::warn!("malformed request from the kernel; dropped"),
                 }
-                None => tracing::warn!("malformed request from the kernel; dropped"),
             });
         }
     }

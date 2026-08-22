@@ -316,10 +316,30 @@ impl Filesystem for DsFuse {
         _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
-        match self.fs.read(fh.0, offset, size) {
-            Ok(data) => reply.data(&data),
-            Err(e) => reply.error(errno(&e)),
+        // Read straight into a buffer this dispatch thread already owns.
+        // `RemoteFs::read` would allocate a fresh Vec per call — up to a
+        // 128 KiB allocation, and the page faults to first-touch it, on the
+        // hottest operation there is. fuser copies out of whatever slice it
+        // is handed either way, so the copy was never the avoidable part; the
+        // allocation was. A thread-local suits the shape exactly: fuser
+        // dispatches on a fixed set of threads, so each one settles on one
+        // buffer and keeps it.
+        //
+        // Only `&buf[..n]` is ever exposed, so a short read cannot show the
+        // caller bytes left over from a previous one.
+        thread_local! {
+            static READ_BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
         }
+        READ_BUF.with(|cell| {
+            let mut buf = cell.borrow_mut();
+            if buf.len() < size as usize {
+                buf.resize(size as usize, 0);
+            }
+            match self.fs.read_into(fh.0, offset, &mut buf[..size as usize]) {
+                Ok(n) => reply.data(&buf[..n]),
+                Err(e) => reply.error(errno(&e)),
+            }
+        });
     }
 
     fn write(

@@ -8,7 +8,6 @@
 //! root). Errors travel back as NTSTATUS via `FspError::NTSTATUS`.
 #![cfg(windows)]
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -286,10 +285,6 @@ pub struct FileContext {
     is_dir: bool,
     /// Driver-managed enumeration buffer (interior-mutable by design).
     dir_buffer: DirBuffer,
-    /// Set by `set_delete`; the actual unlink happens in `cleanup` when the
-    /// FSD passes `FspCleanupDelete` (which it also does for
-    /// FILE_DELETE_ON_CLOSE opens that never called `set_delete`).
-    delete_pending: AtomicBool,
 }
 
 /// Adapter: implements the WinFsp callbacks on top of `Arc<RemoteFs>`.
@@ -469,12 +464,24 @@ impl FileSystemContext for WinFspFs {
             // Metadata-only opens (attribute queries, delete, rename) skip the
             // server round-trip and get no data handle.
             if wants_read || wants_write {
+                // `read: true` regardless of what was granted, and that is
+                // deliberate: the FSD's cached paging I/O reads through a
+                // write-only handle whenever a write is not page-aligned, and
+                // a server handle opened without read permission would refuse
+                // it. What the granted access DOES tell us is whether anyone
+                // means to read the contents, which is a different question
+                // and the one the head prefetch should be answering.
                 let flags = OpenFlags {
                     read: true,
                     write: wants_write,
                     ..OpenFlags::default()
                 };
-                let (h, a) = self.fs.open(ino, flags).map_err(fsp_err)?;
+                let opened = if wants_read {
+                    self.fs.open(ino, flags)
+                } else {
+                    self.fs.open_no_head(ino, flags)
+                };
+                let (h, a) = opened.map_err(fsp_err)?;
                 fh = Some(h);
                 attr = a;
             }
@@ -486,7 +493,6 @@ impl FileSystemContext for WinFspFs {
             fh,
             is_dir,
             dir_buffer: DirBuffer::new(),
-            delete_pending: AtomicBool::new(false),
         })
     }
 
@@ -532,7 +538,6 @@ impl FileSystemContext for WinFspFs {
                 fh: None,
                 is_dir: true,
                 dir_buffer: DirBuffer::new(),
-                delete_pending: AtomicBool::new(false),
             })
         } else {
             // WinFsp only routes true creations here (open-or-create
@@ -568,7 +573,6 @@ impl FileSystemContext for WinFspFs {
                 fh: Some(fh),
                 is_dir: false,
                 dir_buffer: DirBuffer::new(),
-                delete_pending: AtomicBool::new(false),
             })
         }
     }
@@ -925,9 +929,11 @@ impl FileSystemContext for WinFspFs {
         if delete_file && context.is_dir && !self.fs.dir_is_empty(context.ino).map_err(fsp_err)? {
             return Err(nt(STATUS_DIRECTORY_NOT_EMPTY));
         }
-        // Record intent only: actual removal happens in cleanup, keyed off the
-        // FspCleanupDelete flag the FSD passes there.
-        context.delete_pending.store(delete_file, Ordering::Relaxed);
+        // Nothing to record: the unlink happens in `cleanup`, keyed off the
+        // FspCleanupDelete flag the FSD passes there — which it sets from its
+        // own disposition state, and also for FILE_DELETE_ON_CLOSE opens that
+        // never reach this callback at all. A `delete_pending` flag lived here
+        // for a long time and was never once read.
         Ok(())
     }
 
@@ -1323,6 +1329,18 @@ pub fn mount(fs: Arc<RemoteFs>, mountpoint: &str, volume_label: &str) -> anyhow:
         // FILE_RENAME_POSIX_SEMANTICS; without this flag WinFsp rejects those
         // with EINVAL. Our server is POSIX underneath, so semantics match.
         .supports_posix_unlink_rename(true)
+        // Let the FSD settle disposition on plain files by itself. Our
+        // `set_delete` has exactly one job — refuse to delete a non-empty
+        // directory — and for anything that is not a directory it returned
+        // success without looking at anything, so the callback was a
+        // kernel↔user round trip per unlink that could only say yes. With
+        // this flag WinFsp still posts for directories and for files
+        // carrying READONLY (fsctl.h: "post Disposition for dirs or READONLY
+        // attr check"), which is precisely the set where the answer is not
+        // automatic, so the empty-directory check is untouched. Deletion
+        // itself never went through that callback anyway: it happens in
+        // cleanup, keyed off the FSD's own FspCleanupDelete flag.
+        .post_disposition_only_when_necessary(true)
         // Hand single-name directory queries to `get_dir_info_by_name`
         // instead of making the FSD enumerate a whole directory to answer
         // one of them. The pattern flag stays OFF (see the comment there):

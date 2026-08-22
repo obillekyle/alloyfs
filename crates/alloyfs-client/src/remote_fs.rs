@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use alloyfs_proto::{Attr, ErrorCode, OpenFlags, RelPath, Request, Response, DATA_CHUNK};
 use alloyfs_transport::{MuxConnection, TransportError};
@@ -58,6 +58,17 @@ type DirListing = Vec<(String, u64, Attr)>;
 ///
 /// `u64::MAX` rather than 0 because 0 is a perfectly good server handle.
 const NO_SERVER_FH: u64 = u64::MAX;
+
+/// Block size, total blocks, free blocks — what [`RemoteFs::statfs`] reports.
+type SpaceInfo = (u32, u64, u64);
+
+/// How long a free-space answer is served from memory. See [`RemoteFs::statfs`].
+///
+/// Two seconds: long enough that a file manager's capacity bar, or `df` in a
+/// loop, stops generating traffic, and short enough that free space still
+/// visibly moves while a large copy is running — which is the one moment
+/// anybody actually watches it.
+const STATFS_TTL: Duration = Duration::from_secs(2);
 
 /// Marks a handle the CLIENT invented because the open never reached the
 /// server. Distinct from `OVERLAY_FH_BIT` (1 << 63), and above anything the
@@ -155,6 +166,8 @@ pub struct RemoteFs {
     /// so local overlay activity never needs to invalidate this, and lookups
     /// for overlay-routed names branch away before ever consulting it.
     dir_cache: DashMap<u64, (DirListing, Instant)>,
+    /// The last free-space answer, and when it was fetched. See `statfs`.
+    statfs_cache: std::sync::Mutex<Option<(SpaceInfo, Instant)>>,
     /// Bumped by every attr invalidation. An in-flight bulk re-warm
     /// (events.rs) compares it before seeding, so a `GetattrMany` reply can
     /// never re-install attributes over a newer invalidation. Global on
@@ -320,6 +333,7 @@ impl RemoteFs {
             rewarmed: AtomicU64::new(0),
             settle_failures: AtomicU64::new(0),
             dir_cache: DashMap::new(),
+            statfs_cache: std::sync::Mutex::new(None),
             dir_epoch: AtomicU64::new(0),
             warm: DashMap::new(),
             warm_epoch: AtomicU64::new(0),
@@ -825,6 +839,24 @@ impl RemoteFs {
     }
 
     pub fn open(&self, ino: u64, flags: OpenFlags) -> Result<(u64, Attr), FsError> {
+        self.open_hinted(ino, flags, true)
+    }
+
+    /// `open` for a caller that knows nobody is about to read this file.
+    ///
+    /// Windows is why this exists. The FSD's cached paging I/O may issue a
+    /// Read against a handle the application opened write-only — an unaligned
+    /// write is a read-modify-write of a page — so the mount cannot simply
+    /// clear `flags.read`: the server would refuse exactly those reads. What
+    /// it can say is that no read is *intended*, which is the only thing the
+    /// head prefetch was ever keyed off. Without it, opening a file to
+    /// overwrite it pulled 128 KiB of the contents about to be replaced
+    /// across the wire, to drop them on the floor.
+    pub fn open_no_head(&self, ino: u64, flags: OpenFlags) -> Result<(u64, Attr), FsError> {
+        self.open_hinted(ino, flags, false)
+    }
+
+    fn open_hinted(&self, ino: u64, flags: OpenFlags, may_read: bool) -> Result<(u64, Attr), FsError> {
         let path = self.path_of(ino)?;
         if self.is_overlay(&path) {
             return self.overlay_ref().open(&path, flags);
@@ -883,7 +915,10 @@ impl RemoteFs {
         // for opens that will read: head bytes for a write-only or truncating
         // open would be fetched to be thrown away. `len == 0` spells exactly
         // that on the wire.
-        let wants_head = flags.read && !flags.truncate;
+        // `may_read` is the caller's own statement of intent, which on Windows
+        // is strictly better information than `flags.read` — see
+        // `open_no_head`.
+        let wants_head = may_read && flags.read && !flags.truncate;
         let (fh, attr, head) = if self.conn().proto >= 9 {
             let len = if wants_head { DATA_CHUNK } else { 0 };
             let resp = self.call(Request::OpenRead {
@@ -2386,11 +2421,38 @@ impl RemoteFs {
             .block_on(self.conn().send_oneway(Request::Release { fh: server_fh }));
     }
 
-    pub fn statfs(&self) -> Result<(u32, u64, u64), FsError> {
+    /// Block size, total blocks, free blocks — cached for [`STATFS_TTL`].
+    ///
+    /// Nothing above this caches free space. Linux does not cache statfs at
+    /// all, so every `df`, every file-manager window that shows a capacity
+    /// bar, and every `statvfs` in a build script was a full round trip made
+    /// from inside a kernel callback; a file manager left open polls it on a
+    /// timer forever. All three mount backends come through here, so one TTL
+    /// covers them.
+    ///
+    /// Staleness is the right trade because free space on a shared export is
+    /// advisory no matter how it is fetched: another client can consume the
+    /// space between the reply and the caller acting on it. A few seconds of
+    /// age adds nothing to a number that was never a promise.
+    pub fn statfs(&self) -> Result<SpaceInfo, FsError> {
+        if let Ok(guard) = self.statfs_cache.lock() {
+            if let Some((out, when)) = &*guard {
+                if when.elapsed() < STATFS_TTL {
+                    return Ok(*out);
+                }
+            }
+        }
+        // The lock is NOT held across the call. Two threads arriving on a
+        // cold cache both ask, which costs one redundant round trip; holding
+        // it would instead park a kernel callback behind another callback's
+        // network I/O.
         let out = expect_resp!(
             self.call(Request::Statfs)?,
             Response::Statfs { block_size, blocks, blocks_free } => (block_size, blocks, blocks_free)
         );
+        if let Ok(mut guard) = self.statfs_cache.lock() {
+            *guard = Some((out, Instant::now()));
+        }
         Ok(out)
     }
 }
