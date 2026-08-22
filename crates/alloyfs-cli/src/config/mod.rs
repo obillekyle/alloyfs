@@ -41,10 +41,8 @@ pub use alloyfs_common::parse_size;
 pub fn load(path: &Path) -> anyhow::Result<Config> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("reading config {}: {e}", path.display()))?;
-    let value: serde_yaml::Value = serde_yaml::from_str(&text)
-        .map_err(|e| anyhow::anyhow!("config {} is not valid YAML: {e}", path.display()))?;
     let (mut config, shape) =
-        detect::from_value(value).map_err(|e| anyhow::anyhow!("config {}: {e}", path.display()))?;
+        detect::from_str(&text).map_err(|e| anyhow::anyhow!("config {}: {e}", path.display()))?;
 
     if shape != Shape::V3 {
         config.version = Some(CURRENT_VERSION);

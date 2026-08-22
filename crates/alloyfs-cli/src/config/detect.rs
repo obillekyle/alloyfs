@@ -99,11 +99,24 @@ pub fn shape_of(value: &serde_yaml::Value) -> anyhow::Result<Shape> {
 }
 
 /// Parse a document of any known shape into the current one.
-pub fn from_value(value: serde_yaml::Value) -> anyhow::Result<(Config, Shape)> {
+///
+/// Takes the TEXT, not a parsed `Value`, and that is the whole point: a
+/// `serde_yaml::Error` carries a line and column only when it came from
+/// deserializing a string. Going through `from_value` — which is what this
+/// did — threw the location away before the error existed, so every type
+/// mismatch in a config was reported as a bare "invalid type: string" with
+/// nothing to say where. The shape probe still needs a `Value`, so the
+/// document is parsed twice: microseconds for a config file, in exchange for
+/// every error naming its line.
+pub fn from_str(text: &str) -> anyhow::Result<(Config, Shape)> {
+    let value: serde_yaml::Value =
+        serde_yaml::from_str(text).map_err(|e| anyhow::anyhow!("{}", located(text, &e)))?;
     let shape = shape_of(&value)?;
+    drop(value);
     let config = match shape {
         Shape::V3 => {
-            let config: Config = serde_yaml::from_value(value)?;
+            let config: Config =
+                serde_yaml::from_str(text).map_err(|e| anyhow::anyhow!("{}", located(text, &e)))?;
             // Trust an explicit version over the shape. A file written for a
             // future version must fail loudly rather than be half-read: its
             // keys would parse as unknown and the operator would be told
@@ -119,15 +132,38 @@ pub fn from_value(value: serde_yaml::Value) -> anyhow::Result<(Config, Shape)> {
             config
         }
         Shape::LegacyAgent => {
-            let agent: alloyfs_agent::AgentConfig = serde_yaml::from_value(value)?;
+            let agent: alloyfs_agent::AgentConfig =
+                serde_yaml::from_str(text).map_err(|e| anyhow::anyhow!("{}", located(text, &e)))?;
             from_legacy_agent(agent)
         }
         Shape::LegacyMount => {
-            let mount: MountConfig = serde_yaml::from_value(value)?;
+            let mount: MountConfig =
+                serde_yaml::from_str(text).map_err(|e| anyhow::anyhow!("{}", located(text, &e)))?;
             from_legacy_mount(mount)
         }
     };
     Ok((config, shape))
+}
+
+/// A YAML error with the line it happened on, and a caret under the column.
+///
+/// serde_yaml's own message ends at "at line 7 column 12", which means
+/// counting lines in an editor to find out what it is talking about. Showing
+/// the line removes that step, and the caret disambiguates the several values
+/// a dense line can hold.
+fn located(text: &str, e: &serde_yaml::Error) -> String {
+    let Some(loc) = e.location() else {
+        return e.to_string();
+    };
+    let Some(line) = text.lines().nth(loc.line().saturating_sub(1)) else {
+        return e.to_string();
+    };
+    let gutter = format!("{} | ", loc.line());
+    // The column is 1-based and counts characters, so the caret is placed by
+    // character count rather than byte offset — a non-ASCII value earlier on
+    // the line would otherwise push it sideways.
+    let pad = " ".repeat(gutter.len() + loc.column().saturating_sub(1));
+    format!("{e}\n{gutter}{line}\n{pad}^")
 }
 
 /// `agent:` + `exports:` becomes `server:`.
@@ -272,13 +308,41 @@ mod tests {
 
     #[test]
     fn a_future_version_fails_loudly() {
-        let value = serde_yaml::from_str("version: 99\nserver: {}\n").unwrap();
-        let err = from_value(value).unwrap_err().to_string();
+        let err = from_str("version: 99\nserver: {}\n").unwrap_err().to_string();
         assert!(err.contains("99"), "{err}");
         assert!(
             err.contains("version 3"),
             "should name what it does support: {err}"
         );
+    }
+
+    /// A type mismatch names its line, shows it, and points at the column.
+    ///
+    /// This is what routing through the text rather than a parsed `Value`
+    /// buys: `from_value` has no spans to report from, so the same mistake
+    /// used to come out as "invalid type: string, expected u16" with nothing
+    /// to say which of a hundred lines it meant.
+    #[test]
+    fn a_type_error_names_and_shows_its_line() {
+        let text = "version: 3\nserver:\n  tcp_listen: 7440\n  http_listen: [not, a, string]\n";
+        let err = from_str(text).unwrap_err().to_string();
+        assert!(err.contains("line 4"), "must locate the mistake: {err}");
+        assert!(
+            err.contains("http_listen: [not, a, string]"),
+            "must show the offending line so nobody counts lines by hand: {err}"
+        );
+        assert!(err.contains('^'), "must point at the column: {err}");
+    }
+
+    /// A malformed document — not merely a wrong type — gets the same
+    /// treatment, since that error arrives from the first parse rather than
+    /// the second.
+    #[test]
+    fn a_syntax_error_is_located_too() {
+        let err = from_str("server:\n  exports:\n   - [unclosed\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("line"), "{err}");
     }
 
     /// A legacy agent config has to produce exactly the AgentConfig it always
@@ -289,7 +353,7 @@ mod tests {
                     exports:\n  projects:\n    path: /srv/projects\n    read_only: true\n\
                     \x20   exclude: ['**/.git']\n";
         let direct: alloyfs_agent::AgentConfig = serde_yaml::from_str(text).unwrap();
-        let (config, shape) = from_value(serde_yaml::from_str(text).unwrap()).unwrap();
+        let (config, shape) = from_str(text).unwrap();
         assert_eq!(shape, Shape::LegacyAgent);
 
         let round_tripped = to_agent_config(&config);
@@ -323,7 +387,7 @@ mod tests {
                             exclude: [node_modules]\n        \
                             pin: [\"*.lock\"]\n        \
                             auto_cache_max: 2M\n";
-        let (config, shape) = from_value(serde_yaml::from_str(text).unwrap()).unwrap();
+        let (config, shape) = from_str(text).unwrap();
         assert_eq!(shape, Shape::V3);
 
         let agent = to_agent_config(&config);
@@ -342,7 +406,7 @@ mod tests {
     #[test]
     fn a_legacy_mount_config_becomes_client_defaults() {
         let text = "exclude: [node_modules]\nauto_cache_max: 2M\ndetect_conflicts: true\n";
-        let (config, shape) = from_value(serde_yaml::from_str(text).unwrap()).unwrap();
+        let (config, shape) = from_str(text).unwrap();
         assert_eq!(shape, Shape::LegacyMount);
         let client = config.client.unwrap();
         assert_eq!(client.exclude.unwrap(), ["node_modules"]);
@@ -355,7 +419,7 @@ mod tests {
     /// so it cannot override a value set somewhere else later.
     #[test]
     fn legacy_false_flags_do_not_become_explicit() {
-        let (config, _) = from_value(serde_yaml::from_str("exclude: [x]\n").unwrap()).unwrap();
+        let (config, _) = from_str("exclude: [x]\n").unwrap();
         let client = config.client.unwrap();
         assert_eq!(client.detect_conflicts, None);
         assert_eq!(client.no_server_defaults, None);
@@ -365,7 +429,7 @@ mod tests {
     /// in it, rather than failing — `serve` then reports having nothing to do.
     #[test]
     fn a_client_only_config_yields_an_empty_agent_config() {
-        let (config, _) = from_value(serde_yaml::from_str("client:\n  mounts: {}\n").unwrap()).unwrap();
+        let (config, _) = from_str("client:\n  mounts: {}\n").unwrap();
         let agent = to_agent_config(&config);
         assert!(agent.exports.is_empty());
         assert!(agent.agent.tcp_listen.is_none());
@@ -373,7 +437,7 @@ mod tests {
 
     #[test]
     fn a_null_server_section_converts_without_panicking() {
-        let (config, _) = from_value(serde_yaml::from_str("version: 3\nserver:\n").unwrap()).unwrap();
+        let (config, _) = from_str("version: 3\nserver:\n").unwrap();
         assert!(to_agent_config(&config).exports.is_empty());
     }
 }

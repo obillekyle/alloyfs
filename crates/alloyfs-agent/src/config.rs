@@ -45,15 +45,98 @@ pub struct AgentSection {
     pub zstd: bool,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+/// Hand-written so that an export may be written either way — see the type's
+/// documentation. `Serialize` stays derived, and always emits the table.
+impl<'de> Deserialize<'de> for ExportConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        // Mirrors `ExportConfig`'s fields because serde cannot derive the
+        // table form and the untagged wrapper on the same type. Both ends are
+        // built exhaustively below — no `..` — so adding a field to
+        // `ExportConfig` fails to compile here rather than silently becoming
+        // unreadable from a config file.
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Table {
+            path: PathBuf,
+            #[serde(default)]
+            read_only: bool,
+            #[serde(default)]
+            exclude: Vec<String>,
+            #[serde(default = "default_true")]
+            default_excludes: bool,
+            #[serde(default)]
+            client: Option<ClientDefaults>,
+            #[serde(default)]
+            tree_max_entries: Option<usize>,
+        }
+        // A visitor rather than an untagged enum, and the difference is the
+        // error message. Untagged tries each variant and reports only that
+        // nothing matched, so a typo in the table form came out as "data did
+        // not match any variant of untagged enum" pointing at the export's
+        // name — strictly worse than the "unknown field `read_onyl`" it
+        // replaced. Dispatching on the input's own shape means the table's
+        // branch reports the table's own errors, unchanged.
+        struct ExportVisitor;
+        impl<'de> serde::de::Visitor<'de> for ExportVisitor {
+            type Value = ExportConfig;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a path, or a table with a `path` key")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<ExportConfig, E> {
+                // Through `Default` rather than field by field: it is already
+                // hand-written to get `default_excludes` right, and spelling
+                // the defaults out again is how the two would drift apart.
+                Ok(ExportConfig {
+                    path: PathBuf::from(v),
+                    ..ExportConfig::default()
+                })
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(self, map: A) -> Result<ExportConfig, A::Error> {
+                let t = Table::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
+                Ok(ExportConfig {
+                    path: t.path,
+                    read_only: t.read_only,
+                    exclude: t.exclude,
+                    default_excludes: t.default_excludes,
+                    client: t.client,
+                    tree_max_entries: t.tree_max_entries,
+                })
+            }
+        }
+        d.deserialize_any(ExportVisitor)
+    }
+}
+
+/// An export, written either as a bare path or as a table of settings.
+///
+/// ```yaml
+/// exports:
+///   docs: /srv/docs              # everything default
+///   projects:                    # the same export, with settings
+///     path: /home/you/projects
+///     read_only: true
+/// ```
+///
+/// The short form exists because it is what people write: it is the shape
+/// `--export NAME=PATH` takes on the command line, and it is what every other
+/// tool with a name→path map accepts. Until it was allowed, the natural
+/// spelling failed with "invalid type: string, expected struct
+/// ExportConfig". Serializing always emits the table, so a config the CLI
+/// rewrites comes back in one shape rather than two.
+///
+/// `Deserialize` is therefore hand-written below; the `serde(default)`
+/// attributes that would normally carry the defaults live in its inner
+/// mirror struct instead. What stays here is `skip_serializing_if`, which is
+/// the derived `Serialize`'s business.
+#[derive(Debug, Clone, Serialize)]
 pub struct ExportConfig {
     pub path: PathBuf,
-    #[serde(default)]
     pub read_only: bool,
     /// Gitignore-flavored globs. Matching paths exist on the server but are
     /// never listed, resolvable, or event-broadcast to any client.
-    #[serde(default)]
     pub exclude: Vec<String>,
     /// Also hide the OS bookkeeping in `alloyfs_common::LOCAL_ARTIFACTS`
     /// (`System Volume Information`, recycle bins, `.DS_Store`, …). On by
@@ -62,7 +145,6 @@ pub struct ExportConfig {
     ///
     /// Set false only when the export IS a whole volume being backed up and
     /// those directories are part of what you meant to copy.
-    #[serde(default = "default_true")]
     pub default_excludes: bool,
     /// Suggested CLIENT settings, sent to v2+ mounts at attach time. The
     /// client unions the lists with its own and uses the sizes only where it
@@ -137,5 +219,83 @@ impl AgentConfig {
                     .map_err(|te| anyhow::anyhow!("config parses as neither YAML ({ye}) nor TOML ({te})"))
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Both spellings of an export mean the same thing, and the short one
+    /// takes every default the long one would.
+    #[test]
+    fn an_export_may_be_a_bare_path_or_a_table() {
+        let both: BTreeMap<String, ExportConfig> =
+            serde_yaml::from_str("short: /srv/docs\nlong:\n  path: /srv/docs\n  read_only: true\n")
+                .expect("both forms parse");
+
+        let short = &both["short"];
+        assert_eq!(short.path, PathBuf::from("/srv/docs"));
+        assert!(!short.read_only, "defaults to writable");
+        assert!(
+            short.default_excludes,
+            "the short form must not quietly turn OFF a default-on setting"
+        );
+        assert!(short.exclude.is_empty());
+        assert!(short.client.is_none());
+        assert!(short.tree_max_entries.is_none());
+
+        assert_eq!(both["long"].path, short.path);
+        assert!(both["long"].read_only);
+    }
+
+    /// A misspelled key still names itself.
+    ///
+    /// This is the assertion that keeps the two-forms support from costing
+    /// more than it gives: an untagged enum accepts both shapes just as well,
+    /// but reports a typo as "data did not match any variant of untagged
+    /// enum" against the export's NAME — throwing away both the field and the
+    /// line. Dispatching on the input's shape keeps serde's own message.
+    #[test]
+    fn an_unknown_key_in_the_table_form_names_the_key() {
+        let err = serde_yaml::from_str::<BTreeMap<String, ExportConfig>>(
+            "docs:\n  path: /srv/docs\n  read_onyl: true\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("read_onyl"),
+            "the message must name the misspelled key, not just refuse: {err}"
+        );
+        assert!(
+            err.contains("line 3"),
+            "and must still locate it, which untagged also loses: {err}"
+        );
+    }
+
+    /// The short form is a string, and anything that is neither a string nor
+    /// a table says what it wanted rather than what it saw.
+    #[test]
+    fn a_nonsense_export_explains_both_forms() {
+        let err = serde_yaml::from_str::<BTreeMap<String, ExportConfig>>("docs: [1, 2]\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("path"), "{err}");
+    }
+
+    /// Serialization is always the table form, so a config the CLI rewrites
+    /// comes back in one shape rather than two.
+    #[test]
+    fn serializing_always_writes_the_table_form() {
+        let cfg = ExportConfig {
+            path: PathBuf::from("/srv/docs"),
+            read_only: false,
+            exclude: Vec::new(),
+            default_excludes: true,
+            client: None,
+            tree_max_entries: None,
+        };
+        let out = serde_yaml::to_string(&cfg).unwrap();
+        assert!(out.contains("path:"), "must round-trip as a table: {out}");
     }
 }

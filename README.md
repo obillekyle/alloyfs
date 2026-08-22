@@ -208,6 +208,9 @@ agent:
   tcp_token: "change-me"
   http_listen: "127.0.0.1:7441"
 exports:
+  # An export with nothing to configure is just its path.
+  docs: /srv/docs
+  # The same thing written out, for when there is more to say.
   projects:
     path: /home/you/projects
     exclude:
