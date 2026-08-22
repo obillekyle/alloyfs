@@ -64,7 +64,13 @@ jobs:
       # through scripts/verify.sh, which uses nextest only if it is installed.
       - run: cargo nextest run --workspace --profile ci
         env:
-          ALLOYFS_TEST_DEADLINE_MULT: "3" # generous event-timing ceilings on shared runners
+          # Generous event-timing ceilings on shared runners — and nextest
+          # needs them more than `cargo test` did: it runs one process per
+          # logical CPU rather than one per binary, so every settle deadline
+          # got tighter in practice without any of them changing. It has to
+          # be set here rather than in .config/nextest.toml, which has no way
+          # to set an environment variable for the test process.
+          ALLOYFS_TEST_DEADLINE_MULT: "3"
       # nextest does not run doctests; this is the documented way to keep
       # them covered, and dropping it would silently stop checking every
       # example in the public API docs.

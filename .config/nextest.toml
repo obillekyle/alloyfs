@@ -2,6 +2,14 @@
 # back to `cargo test` when it is not, so nothing here is load-bearing — it
 # only decides what nextest does with a suite it is already running.
 
+# The test deadlines are NOT set here. nextest 0.9 has no way to set an
+# environment variable for the test process from this file — `[env]` and
+# `[profile.default.env]` are both ignored, the first with a warning and the
+# second silently — so `scripts/verify.sh` and the CI workflow set
+# ALLOYFS_TEST_DEADLINE_MULT on the invocation instead. Verified by printing
+# the variable from inside a test and finding it absent, which is the only
+# way that distinguishes "configured" from "configured and ignored".
+
 [profile.default]
 # A test that has not finished in 60 s has almost certainly deadlocked rather
 # than got slow: the whole loopback battery runs in seconds, and its longest

@@ -22,7 +22,17 @@ run cargo clippy --workspace --all-targets -- -D warnings
 # Kept optional on purpose: a fresh clone must be able to run this gate with
 # nothing but a Rust toolchain.
 if command -v cargo-nextest >/dev/null 2>&1; then
-  run cargo nextest run --workspace # unit + loopback battery
+  # Doubled event-settle deadlines, for the same reason CI triples them.
+  # nextest runs each test in its own process and starts one per logical CPU;
+  # on a 2-core/4-thread laptop that is four concurrent processes, each with
+  # a tokio runtime, an agent and an event pump. `cargo test` put a whole
+  # binary's tests in one process and oversubscribed far less, so adopting
+  # nextest tightened every settle deadline without changing any of them.
+  # Measured: local_changes_pushed_live blew its 15 s ceiling once in a full
+  # 382-test run, passed the retry in 2.5 s, then passed 20 of 20 on its own.
+  # This raises ceilings and slows nothing down — a test that genuinely hangs
+  # still fails, at 30 s instead of 15.
+  run env ALLOYFS_TEST_DEADLINE_MULT=2 cargo nextest run --workspace
   # nextest deliberately does not run doctests; `cargo test --doc` is the
   # documented way to keep covering them, and this workspace has them.
   run cargo test --workspace --doc

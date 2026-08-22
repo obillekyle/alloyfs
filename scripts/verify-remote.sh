@@ -66,7 +66,7 @@ run_there "cd $dest && . ~/.cargo/env 2>/dev/null; \
   cargo fmt --all --check && \
   cargo clippy --workspace --all-targets -- -D warnings && \
   if command -v cargo-nextest >/dev/null 2>&1; then \
-    cargo nextest run --workspace && cargo test --workspace --doc; \
+    ALLOYFS_TEST_DEADLINE_MULT=2 cargo nextest run --workspace && cargo test --workspace --doc; \
   else \
     cargo test --workspace; \
   fi"
