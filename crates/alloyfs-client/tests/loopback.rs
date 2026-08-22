@@ -3579,12 +3579,21 @@ async fn an_event_batch_bulk_rewarms_the_attrs_it_dropped() {
     let (ino2, a2) = lookup_path(&s.fs, "two.txt").await.expect("two");
     assert_eq!((a1.size, a2.size), (1, 2));
 
+    // The watcher has been running since `start_agent`, so the SETUP writes
+    // above produced events and re-warms of their own. Let those drain and
+    // take the count as a baseline — waiting for an absolute `>= 2` could
+    // be satisfied entirely by them, and then the assertions below would
+    // read attrs from before the writes this test is about. CI caught
+    // exactly that, reporting two.txt's pre-write size.
+    tokio::time::sleep(Duration::from_millis(400)).await; // debounce is 100 ms
+    let rewarmed_before = s.fs.rewarmed_paths();
+
     // Both change behind the mount's back; the watcher's batch drops both
     // warm entries and the pump re-warms them in bulk.
     std::fs::write(agent.dir.path().join("one.txt"), b"one-grew").unwrap();
     std::fs::write(agent.dir.path().join("two.txt"), b"two-grew!").unwrap();
     wait_until("bulk re-warm lands", 10, || {
-        (s.fs.rewarmed_paths() >= 2).then_some(())
+        (s.fs.rewarmed_paths() >= rewarmed_before + 2).then_some(())
     })
     .await;
 
