@@ -69,27 +69,38 @@ fn render(name: &str, path: &Path) -> String {
 # cargo finds Cargo.toml. Elsewhere, pass --config, or keep the per-user one
 # at ~/.alloyfs/config.yml. The agent logs which config it loaded on startup.
 
-agent:
+version: 3
+
+# What this machine offers to others.
+server:
   # A non-loopback address REQUIRES tcp_token; the agent refuses to start
   # without one rather than exposing every export to the network.
   tcp_listen: \"127.0.0.1:7440\"
   # tcp_token: \"change-me\"
   # http_listen: \"127.0.0.1:7441\"
   # http_token: \"change-me\"
-
-exports:
-  {name}:
-    path: \"{path}\"
-    read_only: false
-    exclude:
-      - \"**/.git\"
-    # Settings suggested to anyone who mounts this export. Clients merge them
-    # under their own, and may ignore them with --no-server-defaults.
-    client:
+  exports:
+    {name}:
+      path: \"{path}\"
+      read_only: false
       exclude:
-        - node_modules
-        - target
-      auto_cache_max: 2M
+        - \"**/.git\"
+      # Settings suggested to anyone who mounts this export. Clients merge
+      # them under their own, and may ignore them with
+      # --no-server-defaults.
+      client:
+        exclude:
+          - node_modules
+          - target
+        auto_cache_max: 2M
+
+# What this machine mounts from others. `alloyfs start` runs every entry.
+#
+# client:
+#   mounts:
+#     work:
+#       url: ssh://somehost/{name}
+#       at: \"/mnt/work\"          # or a drive letter on Windows: \"W:\"
 "
     )
 }
@@ -183,15 +194,37 @@ mod tests {
         assert!(!out.contains(r"C:\Users"));
         let parsed: serde_yaml::Value = serde_yaml::from_str(&out).expect("valid YAML");
         assert_eq!(
-            parsed["exports"]["proj"]["path"].as_str(),
+            parsed["server"]["exports"]["proj"]["path"].as_str(),
             Some("C:/Users/Kyle/projects")
         );
     }
 
+    /// What `init` writes must be what the loader ACCEPTS AS-IS.
+    ///
+    /// It used to render the pre-v3 layout, so the very next command that
+    /// read the file classified it as legacy, upgraded it in place, left a
+    /// `.bak`, and prepended an "upgraded automatically" header — throwing
+    /// away the comments `init` had just written to explain the file. The
+    /// blessed way to start produced a file the tool immediately rewrote.
     #[test]
-    fn the_rendered_config_round_trips_through_the_real_loader() {
+    fn the_rendered_config_is_already_v3_and_needs_no_upgrade() {
         let out = render("projects", Path::new("/home/you/projects"));
-        let cfg: alloyfs_agent::AgentConfig = serde_yaml::from_str(&out).expect("loads");
-        assert!(cfg.exports.contains_key("projects"));
+        let value: serde_yaml::Value = serde_yaml::from_str(&out).expect("valid YAML");
+        assert!(
+            matches!(
+                crate::config::detect::shape_of(&value).expect("a recognised shape"),
+                crate::config::detect::Shape::V3
+            ),
+            "init must write v3, or the next load rewrites the file it just wrote"
+        );
+        // ...and it is the real schema, not merely v3-shaped: an unknown key
+        // is a hard error here, so this also proves every key is one the
+        // loader knows.
+        let cfg: crate::config::Config = serde_yaml::from_value(value).expect("loads as v3");
+        let exports = cfg
+            .server
+            .and_then(|s| s.exports)
+            .expect("the template defines an export");
+        assert!(exports.contains_key("projects"));
     }
 }

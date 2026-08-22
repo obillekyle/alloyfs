@@ -5,7 +5,7 @@
 //! which one is in front of it and converts; everything above this module sees
 //! only [`schema::Config`].
 
-mod detect;
+pub(crate) mod detect;
 mod legacy;
 mod schema;
 

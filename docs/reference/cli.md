@@ -185,6 +185,16 @@ itself — one implementation of download-verify-install instead of two. On
 Windows the installer renames the running executable aside before writing the
 new one, which is the only way to replace a binary that is currently executing.
 
+## Environment
+
+| Variable | What it does |
+|---|---|
+| `RUST_LOG` | Log level and filter, for the terminal *and* the log file. `RUST_LOG=debug alloyfs start`, or narrow it: `RUST_LOG=alloyfs_client=debug`. Default is `info`. |
+| `ALLOYFS_INSTALL` | Where `install.sh` / `install.ps1` place the binary. `alloyfs update` sets it to the running binary's own directory, so an update lands where the thing being updated already is. |
+| `ALLOYFS_VERSION` | Pin the installers to a tag instead of the latest release. |
+| `ALLOYFS_READ_STATS` | Set to anything to log read-ahead statistics — window hits, retained hits, synchronous fetches, tolerated out-of-order reads. For diagnosing read throughput, not for normal use. |
+| `ALLOYFS_LOG_NAME` | The log file name for this process. Set by a service supervisor for its child, so both write to one file; rarely useful by hand. |
+
 ## config
 
 ```bash

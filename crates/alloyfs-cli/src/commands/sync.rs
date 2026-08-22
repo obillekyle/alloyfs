@@ -61,6 +61,27 @@ pub async fn run(
         while !engine.is_quiescent() {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
+        // Say what happened. A one-shot sync used to finish in total
+        // silence, so a script had no signal at all and a person had no
+        // way to tell "nothing needed doing" from "it did not run" — and
+        // CONFLICTS, which rename a file to `.sync-conflict-<ts>` behind
+        // your back, were the most important thing it declined to mention.
+        let s = &engine.stats;
+        use std::sync::atomic::Ordering::Relaxed;
+        let (pulls, pushes) = (s.pulls.load(Relaxed), s.pushes.load(Relaxed));
+        let (del_local, del_remote) = (s.deletes_local.load(Relaxed), s.deletes_remote.load(Relaxed));
+        let conflicts = s.conflicts.load(Relaxed);
+        if pulls + pushes + del_local + del_remote + conflicts == 0 {
+            println!("already in sync.");
+        } else {
+            println!("pulled {pulls}, pushed {pushes}, deleted {del_local} local / {del_remote} remote");
+        }
+        if conflicts > 0 {
+            println!(
+                "{conflicts} conflict(s): the local copy was kept beside the remote one \
+                 as `<name>.sync-conflict-<timestamp>`"
+            );
+        }
         engine.shutdown();
         return Ok(());
     }
