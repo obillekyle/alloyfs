@@ -3731,6 +3731,141 @@ async fn read_into_matches_read_on_every_serve_path() {
     .await;
 }
 
+/// The same equivalence, on the path the other test never reaches.
+///
+/// `read_into_matches_read_on_every_serve_path` covers the blob and
+/// pending-file serves, both of which answer before the block assembly runs.
+/// This one runs with no auto-cache at all, so every read goes to the server
+/// and comes back through the DATA_CHUNK block machinery — the code that
+/// decides where each block's bytes belong in the answer.
+///
+/// The offsets are chosen to hit each way that placement can go wrong: the
+/// start of a block, the middle of one, a window straddling a boundary, the
+/// last partial block, and past the end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn read_into_matches_read_over_the_network() {
+    const CHUNK: usize = 128 * 1024;
+    let agent = start_agent(AgentOpts::default());
+    // Two and a half blocks, so the tail block is short.
+    let content = patterned(CHUNK * 2 + CHUNK / 2);
+    std::fs::write(agent.dir.path().join("net.bin"), &content).unwrap();
+
+    // No auto-cache: nothing may answer locally.
+    let s = connect(&agent, ClientOptions::default()).await;
+    let (ino, _) = lookup_path(&s.fs, "net.bin").await.unwrap();
+    let expect = content.clone();
+    on_fs(&s.fs, move |fs| {
+        let (fh, _) = fs
+            .open(
+                ino,
+                OpenFlags {
+                    read: true,
+                    ..OpenFlags::default()
+                },
+            )
+            .unwrap();
+        let cases: [(u64, usize); 8] = [
+            (0, 4096),                      // block start, small
+            (0, CHUNK),                     // exactly one block
+            (777, 4096),                    // mid-block, small
+            (CHUNK as u64 - 100, 4096),     // straddles the first boundary
+            (CHUNK as u64, CHUNK),          // second block, aligned
+            (12_345, CHUNK * 2),            // unaligned across three blocks
+            (CHUNK as u64 * 2 + 10, CHUNK), // into the short tail block
+            (content_len(&expect), 4096),   // exactly at EOF
+        ];
+        for (offset, size) in cases {
+            let mut buf = vec![0u8; size];
+            let n = fs.read_into(fh, offset, &mut buf).unwrap();
+            let via_read = fs.read(fh, offset, size as u32).unwrap();
+            assert_eq!(
+                &buf[..n],
+                &via_read[..],
+                "read_into and read disagree at offset {offset} size {size}"
+            );
+            let start = (offset as usize).min(expect.len());
+            let end = (start + size).min(expect.len());
+            assert_eq!(
+                &buf[..n],
+                &expect[start..end],
+                "wrong bytes at offset {offset} size {size}"
+            );
+        }
+        // Well past the end is zero bytes, not an error.
+        let mut buf = vec![0u8; 4096];
+        assert_eq!(fs.read_into(fh, 10 * CHUNK as u64, &mut buf).unwrap(), 0);
+        fs.release(fh);
+    })
+    .await;
+}
+
+fn content_len(v: &[u8]) -> u64 {
+    v.len() as u64
+}
+
+/// The path→handles index must describe `open_files` exactly, through every
+/// way a handle is born and dies.
+///
+/// It exists so that an event about one path does not have to walk every open
+/// handle, and it is the kind of optimization that fails silently: an entry
+/// missing from the index means an invalidation never reaches the handle
+/// reading that file, and the mount goes on serving bytes it should have
+/// dropped. Nothing else in the suite would notice.
+///
+/// So this drives the four ways a handle is created — a cold open, a warm
+/// open answered from cache, a create, and a batched pending create — plus
+/// both release paths, interleaving them so the index is never simply empty.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_open_path_index_tracks_every_handle() {
+    let agent = start_agent(AgentOpts::default());
+    std::fs::write(agent.dir.path().join("a.txt"), b"aaaa").unwrap();
+    std::fs::write(agent.dir.path().join("b.txt"), b"bbbb").unwrap();
+    let s = connect(&agent, ClientOptions::default()).await;
+
+    let (a, _) = lookup_path(&s.fs, "a.txt").await.unwrap();
+    let (b, _) = lookup_path(&s.fs, "b.txt").await.unwrap();
+    on_fs(&s.fs, move |fs| {
+        let ro = OpenFlags {
+            read: true,
+            ..OpenFlags::default()
+        };
+        let rw = OpenFlags {
+            read: true,
+            write: true,
+            ..OpenFlags::default()
+        };
+        assert!(fs.open_index_is_consistent(), "clean before anything opens");
+
+        // Several handles on ONE path: the index entry is a list, and
+        // dropping one handle must not unregister its siblings.
+        let h1 = fs.open(a, ro).unwrap().0;
+        let h2 = fs.open(a, ro).unwrap().0;
+        let h3 = fs.open(b, ro).unwrap().0;
+        assert!(fs.open_index_is_consistent(), "three handles, two paths");
+
+        fs.release(h2);
+        assert!(fs.open_index_is_consistent(), "one of a pair released");
+
+        // A create, and a batched pending create that never reaches the
+        // server before its release seals it — different release paths.
+        let (_, c1, _) = fs.create(ROOT_INO, "made.txt", 0o644, rw).unwrap();
+        let (_, c2, _) = fs.create(ROOT_INO, "pending.txt", 0o644, rw).unwrap();
+        fs.write(c2, 0, b"held locally").unwrap();
+        assert!(fs.open_index_is_consistent(), "two creates open");
+
+        fs.release(c1);
+        fs.release(c2);
+        fs.release(h1);
+        fs.release(h3);
+        assert!(fs.open_index_is_consistent(), "everything released");
+
+        // And the index is genuinely empty rather than merely consistent —
+        // a leak here would grow forever on a long-lived mount.
+        assert_eq!(fs.open_handle_count(), 0, "no handle outlived its release");
+    })
+    .await;
+}
+
 /// v13 zstd, end to end: the client opts its outgoing frames in, pushes a
 /// large compressible write through the live session, and the agent (which
 /// decodes both algorithms unconditionally) lands exactly those bytes on

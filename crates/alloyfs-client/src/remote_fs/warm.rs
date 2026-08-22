@@ -305,11 +305,11 @@ impl RemoteFs {
     /// for the life of the descriptor. `tail -f` across two machines is the
     /// ordinary way to meet it.
     pub(crate) fn invalidate_open_reads(&self, path: &RelPath) {
-        for entry in self.open_files.iter() {
-            if entry.value().path == *path {
-                entry.value().cache_ok.store(false, Ordering::Relaxed);
-                entry.value().ra.clear();
-                *entry.value().blob.write().unwrap() = None;
+        for fh in self.handles_on(path) {
+            if let Some(state) = self.open_files.get(&fh) {
+                state.cache_ok.store(false, Ordering::Relaxed);
+                state.ra.clear();
+                *state.blob.write().unwrap() = None;
             }
         }
     }

@@ -227,6 +227,22 @@ pub struct RemoteFs {
     pub(crate) overlay: Option<Overlay>,
     pub(crate) cache: Option<Arc<AutoCache>>,
     pub(crate) open_files: DashMap<u64, OpenState>,
+    /// Which handles are open on each path — `open_files` read the other way
+    /// round.
+    ///
+    /// Three hot operations ask "what is open on THIS path": an incoming
+    /// event about it, a rename (twice, for both ends), and a batched unlink.
+    /// Each used to walk every open handle to find out, so a change storm on
+    /// a mount with many files open cost handles × events for answers that
+    /// were almost always "none".
+    ///
+    /// Maintained only by `track_open` and `untrack_open`, which are the only
+    /// two functions permitted to touch `open_files`'s membership. Neither
+    /// ever holds a guard on both maps at once, so the pair cannot deadlock
+    /// against itself. `OpenState::path` is never rewritten in place — a
+    /// rename leaves an open handle pointing at the name it was opened under
+    /// — so no entry here ever needs retargeting.
+    open_by_path: DashMap<RelPath, Vec<u64>>,
     export: String,
     pub(crate) dialer: Option<Dialer>,
     /// Extra data connections for cold sequential streams; None unless a
@@ -333,6 +349,7 @@ impl RemoteFs {
             rewarmed: AtomicU64::new(0),
             settle_failures: AtomicU64::new(0),
             dir_cache: DashMap::new(),
+            open_by_path: DashMap::new(),
             statfs_cache: std::sync::Mutex::new(None),
             dir_epoch: AtomicU64::new(0),
             warm: DashMap::new(),
@@ -887,7 +904,7 @@ impl RemoteFs {
             if let Some(attr) = self.cached_attr_fresh(ino) {
                 if self.cache.as_ref().is_some_and(|c| c.fresh_for(&path, &attr)) {
                     let fh = LAZY_FH_BIT | self.next_lazy_fh.fetch_add(1, Ordering::Relaxed);
-                    self.open_files.insert(
+                    self.track_open(
                         fh,
                         OpenState {
                             path,
@@ -948,7 +965,7 @@ impl RemoteFs {
                 ra.retain(0, data);
             }
         }
-        self.open_files.insert(
+        self.track_open(
             fh,
             OpenState {
                 path,
@@ -1022,11 +1039,76 @@ impl RemoteFs {
     /// prologue for operations that need the server to KNOW the path while
     /// its handle is still accumulating locally (rename endpoints). A
     /// no-op for everything else.
+    /// Register an open handle, keeping [`Self::open_by_path`] in step.
+    ///
+    /// The guard from each map is released before the other is touched, so
+    /// the two are never held together and the pair cannot deadlock.
+    pub(crate) fn track_open(&self, fh: u64, state: OpenState) {
+        let path = state.path.clone();
+        self.open_files.insert(fh, state);
+        self.open_by_path.entry(path).or_default().push(fh);
+    }
+
+    /// Drop an open handle and its index entry, returning the state the way
+    /// `DashMap::remove` would.
+    pub(crate) fn untrack_open(&self, fh: u64) -> Option<OpenState> {
+        let (_, state) = self.open_files.remove(&fh)?;
+        let empty = match self.open_by_path.get_mut(&state.path) {
+            Some(mut handles) => {
+                handles.retain(|&h| h != fh);
+                handles.is_empty()
+            }
+            None => false,
+        };
+        // Only after the guard above is gone: removing the entry while
+        // holding a reference into it would wait on this same shard.
+        if empty {
+            self.open_by_path.remove(&state.path);
+        }
+        Some(state)
+    }
+
+    /// Does the path index still describe `open_files` exactly?
+    ///
+    /// A test and debug aid, not part of the working API. It is exposed
+    /// because the index is an optimization that turns into a correctness bug
+    /// the moment it drifts: a missing entry means an event about a file
+    /// silently fails to invalidate the handle reading it, and stale bytes get
+    /// served with no error anywhere. Anything that changes how handles are
+    /// added or dropped should assert this afterwards. O(handles), so it is
+    /// checked at the end of a test rather than inside the code under test.
+    pub fn open_index_is_consistent(&self) -> bool {
+        let indexed: usize = self.open_by_path.iter().map(|e| e.value().len()).sum();
+        if indexed != self.open_files.len() {
+            return false;
+        }
+        self.open_files
+            .iter()
+            .all(|e| self.handles_on(&e.value().path).contains(e.key()))
+    }
+
+    /// How many handles are open right now. Test and debug aid, alongside
+    /// [`Self::open_index_is_consistent`]: a release path that forgets to
+    /// remove its entry leaks silently, and this is what makes that visible.
+    pub fn open_handle_count(&self) -> usize {
+        self.open_files.len()
+    }
+
+    /// The handles currently open on `path`, as an owned list.
+    ///
+    /// Owned rather than a guard because every caller then reaches back into
+    /// `open_files`, and copying a handful of `u64`s is a far cheaper way to
+    /// keep the two maps' locks from ever overlapping than reasoning about
+    /// which order they are taken in.
+    pub(crate) fn handles_on(&self, path: &RelPath) -> Vec<u64> {
+        self.open_by_path.get(path).map(|e| e.clone()).unwrap_or_default()
+    }
+
     fn materialize_open_pending(&self, path: &RelPath) -> Result<(), FsError> {
         let fh = self
-            .open_files
-            .iter()
-            .find_map(|e| (e.value().path == *path && e.value().pending_new.is_some()).then(|| *e.key()));
+            .handles_on(path)
+            .into_iter()
+            .find(|fh| self.open_files.get(fh).is_some_and(|e| e.pending_new.is_some()));
         match fh {
             Some(fh) => self.materialize_pending(fh),
             None => Ok(()),
@@ -1157,9 +1239,19 @@ impl RemoteFs {
                     *state.blob.write().unwrap() = None;
                 }
             }
-            // The shard guard is out of scope here — `read` re-acquires and
-            // may take handles out (documented as unsafe under a held guard).
+            // The shard guard is out of scope here — the network path
+            // re-acquires and may take handles out (documented as unsafe
+            // under a held guard).
+            //
+            // Straight to the block assembly rather than back through `read`:
+            // everything `read` would do before reaching it — the poisoned
+            // check, the pending-file buffer, the auto-cache — has just been
+            // done above, and going through `read` would mean assembling into
+            // a fresh `Vec` only to copy it in here.
+            return self.read_blocks_into(fh, offset, buf);
         }
+        // Overlay handles keep the old route: their bytes come off the local
+        // filesystem, where one more copy is not what the read costs.
         let data = self.read(fh, offset, buf.len() as u32)?;
         buf[..data.len()].copy_from_slice(&data);
         Ok(data.len())
@@ -1200,15 +1292,41 @@ impl RemoteFs {
                 *state.blob.write().unwrap() = None;
             }
         }
-        // Past the cache, so this read genuinely needs the server. If the open
-        // never took a handle out, take one now — this is the eviction-race and
-        // partial-blob path, not the common one, and it must not be reached
-        // while holding a shard guard.
+        // Past the cache, so this read genuinely needs the server.
+        let mut out = vec![0u8; size as usize];
+        let n = self.read_blocks_into(fh, offset, &mut out)?;
+        out.truncate(n);
+        Ok(out)
+    }
+
+    /// The network half of [`Self::read`], writing straight into `buf`.
+    ///
+    /// Split out so that a caller who already owns a buffer — which is every
+    /// mount backend, since the kernel hands one down — can have the blocks
+    /// land in it directly. Assembling a read used to copy three times: each
+    /// block into a scratch `Vec` sized for the WHOLE block range, then the
+    /// requested window out of that into a second `Vec`, then that into the
+    /// caller's buffer. A 1 MiB read moved 3 MiB. Now each block's
+    /// contribution is copied once, into its final place.
+    ///
+    /// Returns bytes written, which is short at EOF and 0 past it.
+    ///
+    /// Callers must already have cleared the overlay, pending-file and
+    /// auto-cache paths — `read` and `read_into` both do, in that order,
+    /// before reaching here.
+    fn read_blocks_into(&self, fh: u64, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+        let size = buf.len() as u32;
+        // If the open never took a handle out, take one now — this is the
+        // eviction-race and partial-blob path, not the common one, and it must
+        // not be reached while holding a shard guard.
         if self.server_fh(fh) == NO_SERVER_FH {
             self.server_fh_for_io(fh)?;
         }
         let Some(state) = self.open_files.get(&fh) else {
-            return self.read_blocks_direct(fh, offset, size); // untracked fh (walker)
+            // Untracked fh (walker): no readahead state to assemble from.
+            let data = self.read_blocks_direct(fh, offset, size)?;
+            buf[..data.len()].copy_from_slice(&data);
+            return Ok(data.len());
         };
         let server_fh = state.server_fh.load(Ordering::Acquire);
         let prefetch = state.ra.observe(offset, size);
@@ -1322,9 +1440,11 @@ impl RemoteFs {
                 }
             }
         }
-        // Assemble contiguous bytes from first_block onward; a short block is
-        // EOF and ends the file.
-        let mut assembled: Vec<u8> = Vec::with_capacity(((last_block - first_block + 1) * chunk) as usize);
+        // Copy each block's contribution straight into the caller's buffer,
+        // walking the absolute file offset forward as we go. A short block is
+        // EOF and ends the read.
+        let mut written = 0usize;
+        let mut pos = offset;
         for b in first_block..=last_block {
             // Every block in the range was fetched above or the read already
             // failed — but this runs on a mount dispatcher thread, where a
@@ -1333,24 +1453,28 @@ impl RemoteFs {
                 tracing::error!(block = b, "readahead invariant broken: block missing");
                 return Err(ErrorCode::Io.into());
             };
-            assembled.extend_from_slice(data);
-            if data.len() < DATA_CHUNK as usize {
-                break; // EOF inside this block
+            // Where this read starts inside this block: the requested offset
+            // for the first block, and zero for every one after it.
+            let within = (pos - b * chunk) as usize;
+            if within < data.len() {
+                let take = (data.len() - within).min(buf.len() - written);
+                buf[written..written + take].copy_from_slice(&data[within..within + take]);
+                written += take;
+                pos += take as u64;
+            }
+            // A short block is the end of the file; a full buffer is the end
+            // of what was asked for.
+            if data.len() < DATA_CHUNK as usize || written == buf.len() {
+                break;
             }
         }
-        let skip = (offset - first_block * chunk) as usize;
-        let out = if skip >= assembled.len() {
-            Vec::new() // read past EOF
-        } else {
-            assembled[skip..(skip + size as usize).min(assembled.len())].to_vec()
-        };
 
         // Retain this read's blocks: the next sub-chunk kernel read of the
         // same 128 KiB block must not pay a fresh RTT for bytes we had.
         for (b, data) in ready {
             state.ra.retain(b, data);
         }
-        Ok(out)
+        Ok(written)
     }
 
     /// The pre-readahead read path, kept for fhs we don't track (the cache
@@ -1768,7 +1892,7 @@ impl RemoteFs {
                     self.patch_parent_dir(&path, ListingPatch::Upsert(ino, attr));
                     self.cache_attr(ino, attr);
                     let fh = LAZY_FH_BIT | self.next_lazy_fh.fetch_add(1, Ordering::Relaxed);
-                    self.open_files.insert(
+                    self.track_open(
                         fh,
                         OpenState {
                             path,
@@ -1807,7 +1931,7 @@ impl RemoteFs {
         // create's existence probe stays local (see patch_parent_dir).
         self.patch_parent_dir(&path, ListingPatch::Upsert(ino, attr));
         self.cache_attr(ino, attr);
-        self.open_files.insert(
+        self.track_open(
             fh,
             OpenState {
                 path,
@@ -1879,8 +2003,8 @@ impl RemoteFs {
                 // the file), and if nothing was ever queued for it, neither
                 // is this removal.
                 let mut never_reached_server = false;
-                for e in self.open_files.iter() {
-                    if e.path == path {
+                for fh in self.handles_on(&path) {
+                    if let Some(e) = self.open_files.get(&fh) {
                         if let Some(p) = &e.pending_new {
                             p.lock().unwrap().cancelled = true;
                             never_reached_server = true;
@@ -2362,11 +2486,11 @@ impl RemoteFs {
         // born. The server never knew this handle, so nothing else releases.
         if self.open_files.get(&fh).is_some_and(|e| e.pending_new.is_some()) {
             self.seal_pending(fh);
-            self.open_files.remove(&fh);
+            self.untrack_open(fh);
             return;
         }
         let server_fh = self.server_fh(fh);
-        if let Some((_, state)) = self.open_files.remove(&fh) {
+        if let Some(state) = self.untrack_open(fh) {
             // Pool sessions opened their own handles for this file's stream;
             // close them with it so long-lived pool connections don't
             // accumulate handles (and Windows-server share locks).
