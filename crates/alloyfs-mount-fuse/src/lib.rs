@@ -186,6 +186,32 @@ impl Filesystem for DsFuse {
         ) {
             tracing::debug!(?unsupported, "kernel lacks optional readdir/symlink niceties");
         }
+        // FUSE_WRITEBACK_CACHE is deliberately NOT requested, and the reason
+        // is measured rather than cautious.
+        //
+        // It is a huge win in isolation: 4000 small writes through this mount
+        // take ~4.4-5.7 s without it and ~70-130 ms with it, because each
+        // write() otherwise becomes its own synchronous FUSE WRITE. Sixty
+        // times, on the shape a compiler produces.
+        //
+        // And it corrupts reads on the one workload this filesystem exists
+        // for. Turning it on hands the kernel ownership of the page cache and
+        // of i_size; `apply_events_native` answers a remote Modified with
+        // `inval_inode`, and the kernel cannot drop a DIRTY page. Measured,
+        // three times out of three: write locally without flushing, change
+        // the file on the server, read it back — the mount returns
+        // "server-CHANGED-r" where the server holds "server-CHANGED-remotely".
+        // Not stale, not the local edit: the remote content truncated to the
+        // kernel's own idea of the size. Data that exists on neither side,
+        // with no error anywhere.
+        //
+        // That is a design conflict rather than a bug to fix here. Writeback
+        // caching is a single-writer contract, and a shared export whose
+        // changes arrive as events is multi-writer by construction. What
+        // would make it safe is making a remote change wait for the local
+        // dirty pages first — flush, then invalidate — which turns corruption
+        // into an ordinary last-writer-wins race. Until that exists, the
+        // 60x is not available.
         Ok(())
     }
 
