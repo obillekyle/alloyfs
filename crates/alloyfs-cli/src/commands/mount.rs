@@ -55,6 +55,7 @@ pub async fn run_cli(
             pins,
             auto_cache_max,
             auto_cache_budget,
+            None, // no `cache:` block on the two-positional path
             data_dir,
             no_server_defaults,
             write_through,
@@ -88,8 +89,22 @@ pub async fn run_cli(
         excludes
     };
     let pins = if pins.is_empty() { mount.pin } else { pins };
-    let auto_cache_max = resolve_size(auto_cache_max, mount.auto_cache_max, "auto_cache_max")?;
-    let auto_cache_budget = resolve_size(auto_cache_budget, mount.auto_cache_budget, "auto_cache_budget")?;
+    // A `cache:` block on the entry (or inherited from `client:`) supplies
+    // all three numbers; the older flat keys still work where it is absent.
+    // Flags beat both, which is why they are checked first.
+    let (c_size, c_max, c_warm) = crate::config::CacheConfig::resolve(mount.cache.as_ref())?;
+    let stated_cache = mount.cache.is_some();
+    let auto_cache_max = match auto_cache_max {
+        Some(flag) => Some(flag),
+        None if stated_cache => Some(c_size.to_string()),
+        None => resolve_size(None, mount.auto_cache_max, "auto_cache_max")?,
+    };
+    let auto_cache_budget = match auto_cache_budget {
+        Some(flag) => Some(flag),
+        None if stated_cache => Some(c_max.to_string()),
+        None => resolve_size(None, mount.auto_cache_budget, "auto_cache_budget")?,
+    };
+    let auto_cache_warm = stated_cache.then(|| c_warm.to_string());
     run(
         mount.url,
         mount.at,
@@ -99,6 +114,7 @@ pub async fn run_cli(
         pins,
         auto_cache_max,
         auto_cache_budget,
+        auto_cache_warm,
         data_dir.or(mount.data_dir),
         no_server_defaults || mount.no_server_defaults,
         write_through,
@@ -170,6 +186,7 @@ pub async fn run(
     pins: Vec<String>,
     auto_cache_max: Option<String>,
     auto_cache_budget: Option<String>,
+    auto_cache_warm: Option<String>,
     data_dir: Option<PathBuf>,
     no_server_defaults: bool,
     write_through: bool,
@@ -200,17 +217,32 @@ pub async fn run(
     } else {
         pins
     };
+    // The `cache:` block, when present, supplies all three numbers and beats
+    // the older flat keys — which stay working, so an existing config keeps
+    // its meaning. A `--auto-cache-max` flag still beats both: flags win.
+    let (c_auto_size, c_auto_max, c_warm_max) = crate::config::CacheConfig::resolve(file_cfg.cache.as_ref())?;
+    let stated_cache = file_cfg.cache.is_some();
     let auto_cache_max = match (auto_cache_max, &file_cfg.auto_cache_max) {
         (Some(flag), _) => Some(parse_size(&flag).map_err(|e| anyhow::anyhow!(e))?),
+        (None, _) if stated_cache => Some(c_auto_size),
         (None, Some(f)) => Some(f.to_bytes().map_err(|e| anyhow::anyhow!(e))?),
         (None, None) => None,
     };
     let auto_cache_budget = match (auto_cache_budget, &file_cfg.auto_cache_budget) {
         (Some(flag), _) => Some(parse_size(&flag).map_err(|e| anyhow::anyhow!(e))?),
+        (None, _) if stated_cache => Some(c_auto_max),
         (None, Some(f)) => Some(f.to_bytes().map_err(|e| anyhow::anyhow!(e))?),
         (None, None) => None,
     };
-    let no_server_defaults = no_server_defaults || file_cfg.no_server_defaults.unwrap_or(false);
+    // The caller's value wins — `run_cli` already resolved the named mount's
+    // own `cache:` block, which this function cannot see (it is handed
+    // `config: None` on that path, deliberately, so the file is not read
+    // twice and re-applied over an entry that opted out).
+    let auto_cache_warm = match auto_cache_warm {
+        Some(s) => Some(parse_size(&s).map_err(|e| anyhow::anyhow!(e))?),
+        None if stated_cache => Some(c_warm_max),
+        None => None,
+    };
     let token = token.or(file_cfg.token);
 
     let (conn, export) = connect_target(&url, &remote_cmd, &whoami(), token.as_deref()).await?;
@@ -236,10 +268,14 @@ pub async fn run(
         pins,
         auto_cache_max,
         auto_cache_budget,
+        auto_cache_warm,
         // CLI mounts default to auto-caching (2M files, 512M budget) when
         // neither the user nor the server picked values.
         auto_cache_max_fallback: 2 * 1024 * 1024,
         auto_cache_budget_fallback: 512 * 1024 * 1024,
+        // Files a READ pulled down get their own, larger pool: see
+        // `CacheConfig` for why the two are not one number.
+        auto_cache_warm_fallback: 4 * 1024 * 1024 * 1024,
         no_server_defaults,
         write_through,
         detect_conflicts: detect_conflicts || file_cfg.detect_conflicts.unwrap_or(false),

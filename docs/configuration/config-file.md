@@ -207,6 +207,48 @@ inherit a pattern, at which point there is no way to say it. Replacement is
 what makes `exclude: []` able to mean "inherit nothing", and it is the same
 rule scalars follow, which is the rule nobody is surprised by.
 
+## cache
+
+What the local cache pulls down, and how much of it is kept.
+
+```yaml
+client:
+  cache:
+    auto-size: 2M     # per file: prefetch anything up to this
+    auto-max: 512M    # total pool for prefetched files
+    warm-max: 4G      # total pool for files a read pulled in
+```
+
+`cache: true` (or saying nothing) means exactly the three values above.
+`cache: false` turns the local cache off entirely. Set only the keys you care
+about; the rest keep their defaults.
+
+**Three numbers, because they answer three different questions.**
+
+`auto-size` is **per file**, and it bounds a *guess*: the walker downloads
+anything up to it ahead of use, so it is there before anyone asks. Bigger is
+not automatically better — every byte it takes is a byte fetched for a file
+nobody may open.
+
+`auto-max` is the pool those guesses share.
+
+`warm-max` is the pool for files a **read** pulled in. A read is demand rather
+than speculation, so it is **not bounded by `auto-size` at all**: a 4 GB file
+someone opened gets cached, while a 4 GB file nobody touched does not. This is
+what makes a second pass over a large file local instead of another trip over
+the link.
+
+The two pools are separate on purpose. Sharing one would mean a single large
+read could evict the entire prefetched working set, and a background prefetch
+could evict the file being read right now. Separate pools make both impossible.
+
+A cached file is dropped as soon as a server-side change event names it, so a
+warmed copy cannot go stale — it is re-fetched on the next read.
+
+**The older flat keys still work.** `auto_cache_max` and `auto_cache_budget`
+mean what they always did and map onto `auto-size` and `auto-max`; a `cache:`
+block beats them where both appear, and a CLI flag beats everything.
+
 ## Two different `client:` blocks
 
 The word appears in two places and they are unrelated mechanisms:

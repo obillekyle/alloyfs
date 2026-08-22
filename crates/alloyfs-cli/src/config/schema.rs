@@ -31,6 +31,83 @@ use serde::{Deserialize, Serialize};
 /// The config schema this binary writes and understands.
 pub const CURRENT_VERSION: u32 = 3;
 
+/// Defaults when the config says nothing, or says only `cache: true`.
+pub const CACHE_AUTO_SIZE_DEFAULT: u64 = 2 * 1024 * 1024;
+pub const CACHE_AUTO_MAX_DEFAULT: u64 = 512 * 1024 * 1024;
+pub const CACHE_WARM_MAX_DEFAULT: u64 = 4 * 1024 * 1024 * 1024;
+
+/// `cache:` accepts a bool or a table, because most configs want to say one
+/// of two things and neither deserves three keys:
+///
+/// ```yml
+/// cache: false          # off entirely
+/// cache: true           # the defaults below — same as saying nothing
+/// cache:                # or set the ones you care about
+///   warm-max: 16G
+/// ```
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum CacheConfig {
+    /// `true` = defaults, `false` = no local cache at all.
+    Enabled(bool),
+    Detailed(CacheSection),
+}
+
+impl CacheConfig {
+    /// (auto-size, auto-max, warm-max) in bytes, defaults filled in.
+    ///
+    /// An absent `cache:` is the same as `cache: true`, so the caller passes
+    /// `None` through here rather than branching.
+    pub fn resolve(this: Option<&CacheConfig>) -> anyhow::Result<(u64, u64, u64)> {
+        let d = (
+            CACHE_AUTO_SIZE_DEFAULT,
+            CACHE_AUTO_MAX_DEFAULT,
+            CACHE_WARM_MAX_DEFAULT,
+        );
+        let bytes = |f: &Option<alloyfs_common::SizeField>, fallback: u64| -> anyhow::Result<u64> {
+            match f {
+                Some(s) => s.to_bytes().map_err(|e| anyhow::anyhow!("cache: {e}")),
+                None => Ok(fallback),
+            }
+        };
+        match this {
+            None | Some(CacheConfig::Enabled(true)) => Ok(d),
+            // Off means the walker takes nothing and a read warms nothing;
+            // zero per-file size is what the client already reads as OFF.
+            Some(CacheConfig::Enabled(false)) => Ok((0, d.1, 0)),
+            Some(CacheConfig::Detailed(s)) => Ok((
+                bytes(&s.auto_size, d.0)?,
+                bytes(&s.auto_max, d.1)?,
+                bytes(&s.warm_max, d.2)?,
+            )),
+        }
+    }
+}
+
+/// `cache:` — what the local cache pulls down and how much it keeps.
+///
+/// Three numbers because they answer three different questions, and the old
+/// flat `auto_cache_max` / `auto_cache_budget` conflated the first two:
+///
+/// - `auto-size` is PER FILE. The walker downloads anything up to it ahead of
+///   use and nothing larger. It bounds a guess about what will be wanted.
+/// - `auto-max` is the total pool those guesses may occupy.
+/// - `warm-max` is the total pool for files a READ pulled down. A read is
+///   demand rather than speculation, so it is not bound by `auto-size` at
+///   all — a 4 GB file someone opened is cached, a 4 GB file nobody touched
+///   is not. Separate pools so a large read cannot evict the prefetched
+///   working set, and a prefetch cannot evict what is being read.
+#[derive(Debug, Default, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct CacheSection {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_size: Option<alloyfs_common::SizeField>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_max: Option<alloyfs_common::SizeField>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warm_max: Option<alloyfs_common::SizeField>,
+}
+
 #[derive(Debug, Default, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -84,6 +161,8 @@ pub struct ClientSection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_cache_budget: Option<alloyfs_common::SizeField>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache: Option<CacheConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data_dir: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub no_server_defaults: Option<bool>,
@@ -117,6 +196,8 @@ pub struct MountEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_cache_budget: Option<alloyfs_common::SizeField>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache: Option<CacheConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data_dir: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub no_server_defaults: Option<bool>,
@@ -144,6 +225,7 @@ pub struct ResolvedMount {
     pub pin: Vec<String>,
     pub auto_cache_max: Option<alloyfs_common::SizeField>,
     pub auto_cache_budget: Option<alloyfs_common::SizeField>,
+    pub cache: Option<CacheConfig>,
     pub data_dir: Option<PathBuf>,
     pub no_server_defaults: bool,
     pub detect_conflicts: bool,
@@ -172,6 +254,12 @@ impl ClientSection {
                 .auto_cache_budget
                 .clone()
                 .or_else(|| self.auto_cache_budget.clone()),
+            // The mount's own `cache:` block wins whole, then the client
+            // default's. Merging them key-by-key would let a mount that
+            // states only `warm-max` silently inherit a client-level
+            // `auto-size` it never mentioned — the same trap `exclude`
+            // already documents for lists.
+            cache: entry.cache.clone().or_else(|| self.cache.clone()),
             data_dir: entry.data_dir.clone().or_else(|| self.data_dir.clone()),
             no_server_defaults: entry
                 .no_server_defaults

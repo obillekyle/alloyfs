@@ -157,6 +157,10 @@ pub(super) fn build_auto_cache(
     let (cache, rx) = AutoCache::load(crate::autocache::AutoCacheConfig {
         max_file_size: auto_cache_max,
         budget: auto_cache_budget.max(1),
+        warm_budget: opts
+            .auto_cache_warm
+            .unwrap_or(opts.auto_cache_warm_fallback)
+            .max(1),
         pins: opts.pins.clone(),
         root,
         manifest,

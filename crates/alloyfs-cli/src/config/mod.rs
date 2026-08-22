@@ -15,7 +15,7 @@ use alloyfs_agent::AgentConfig;
 
 pub use detect::{to_agent_config, Shape};
 
-pub use schema::{ClientSection, Config, ResolvedMount, CURRENT_VERSION};
+pub use schema::{CacheConfig, ClientSection, Config, ResolvedMount, CURRENT_VERSION};
 
 // Size parsing lives in alloyfs-common (the agent's `client:` section uses the
 // same forms); re-exported so callers keep one import path.

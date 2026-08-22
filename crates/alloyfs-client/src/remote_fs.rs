@@ -89,6 +89,10 @@ pub(crate) struct OpenState {
     pub server_fh: AtomicU64,
     /// May reads on this fh be served from the auto-cache blob?
     pub cache_ok: AtomicBool,
+    /// Has this handle already asked the cache to warm its path? Reads are
+    /// the hot path and a demand is only useful once, so the ask is guarded
+    /// here rather than by hashing the path on every read.
+    pub warm_asked: AtomicBool,
     /// Did any write happen through this fh (⇒ re-fetch on release)?
     pub wrote: AtomicBool,
     /// Sequential prefetch window for this handle.
@@ -920,6 +924,7 @@ impl RemoteFs {
                             flags,
                             server_fh: AtomicU64::new(NO_SERVER_FH),
                             cache_ok: AtomicBool::new(true),
+                            warm_asked: AtomicBool::new(false),
                             wrote: AtomicBool::new(false),
                             ra: ReadAhead::new(),
                             lock: std::sync::Mutex::new(Vec::new()),
@@ -981,6 +986,7 @@ impl RemoteFs {
                 flags,
                 server_fh: AtomicU64::new(fh),
                 cache_ok: AtomicBool::new(cache_ok),
+                warm_asked: AtomicBool::new(false),
                 wrote: AtomicBool::new(false),
                 ra,
                 lock: std::sync::Mutex::new(Vec::new()),
@@ -1338,6 +1344,29 @@ impl RemoteFs {
             return Ok(data.len());
         };
         let server_fh = state.server_fh.load(Ordering::Acquire);
+        // This read is going to the server, so the cache does not have this
+        // file — ask for it to be pulled down in the background, and the next
+        // read of it will be local.
+        //
+        // A demand, not a guess, which is why it is not bound by
+        // `cache.auto-size`: that bounds what the walker takes speculatively.
+        // It is charged against `cache.warm-max` instead, a separate pool, so
+        // warming a large file cannot evict the prefetched working set.
+        //
+        // Once per handle. The cache dedups by path as well, but reaching
+        // that costs a clone and a lock on a path that runs per 64 K block.
+        // Handles that WROTE are skipped: the file is in flux and the copy
+        // that landed would be a race, and release re-fetches anyway.
+        if self.cache.is_some()
+            && !state.cache_ok.load(Ordering::Relaxed)
+            && !state.wrote.load(Ordering::Relaxed)
+            && state.pending_new.is_none()
+            && !state.warm_asked.swap(true, Ordering::Relaxed)
+        {
+            if let Some(cache) = &self.cache {
+                cache.enqueue_demand(state.path.clone());
+            }
+        }
         let prefetch = state.ra.observe(offset, size);
         tracing::trace!(fh, offset, size, prefetch, "mount read");
 
@@ -1908,6 +1937,7 @@ impl RemoteFs {
                             flags,
                             server_fh: AtomicU64::new(NO_SERVER_FH),
                             cache_ok: AtomicBool::new(false),
+                            warm_asked: AtomicBool::new(false),
                             wrote: AtomicBool::new(true),
                             ra: ReadAhead::new(),
                             lock: std::sync::Mutex::new(Vec::new()),
@@ -1947,6 +1977,7 @@ impl RemoteFs {
                 flags,
                 server_fh: AtomicU64::new(fh),
                 cache_ok: AtomicBool::new(false),
+                warm_asked: AtomicBool::new(false),
                 wrote: AtomicBool::new(true),
                 ra: ReadAhead::new(),
                 lock: std::sync::Mutex::new(Vec::new()),

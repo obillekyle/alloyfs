@@ -686,6 +686,7 @@ async fn drain_refetch_queue(
 ) {
     while let Some(path) = fetch_rx.recv().await {
         if fs.is_overlay(&path) {
+            cache.clear_demand(&path);
             continue;
         }
         let permit = sem.clone().acquire_owned().await.unwrap();
@@ -693,11 +694,14 @@ async fn drain_refetch_queue(
         let cache = cache.clone();
         tokio::spawn(async move {
             let _ = fetch_one(&fs, &cache, &path).await;
+            // Settled either way. Leaving the marker would keep `wants`
+            // saying yes for a path nothing is fetching, and would stop a
+            // later read from re-demanding after a failure.
+            cache.clear_demand(&path);
             drop(permit);
         });
     }
 }
-
 /// Queue one accumulated batch for fetching, permit taken inside the task so a
 /// full pipeline never stalls discovery. One copy for the three places a
 /// batch leaves the accumulator: the tree path's threshold, the BFS path's

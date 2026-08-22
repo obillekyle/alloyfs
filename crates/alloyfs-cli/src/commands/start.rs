@@ -87,25 +87,41 @@ pub async fn run(config: Option<PathBuf>, server_only: bool, mounts_only: bool) 
         // Sizes travel as a plain byte count: `mount::run` parses whatever it
         // is given, and a resolved `2M` and a resolved `2097152` must reach it
         // as the same number rather than as two spellings.
-        let cache_max = mount
-            .auto_cache_max
-            .clone()
-            .map(|s| s.to_bytes())
-            .transpose()
-            .map_err(|e| anyhow::anyhow!("mount {label}: auto_cache_max: {e}"))?
-            .map(|b| b.to_string());
-        let cache_budget = mount
-            .auto_cache_budget
-            .clone()
-            .map(|s| s.to_bytes())
-            .transpose()
-            .map_err(|e| anyhow::anyhow!("mount {label}: auto_cache_budget: {e}"))?
-            .map(|b| b.to_string());
+        // A `cache:` block supplies all three; the flat keys still work where
+        // it is absent. Same precedence as `mount`, so a config behaves the
+        // same whether it is started by name or by `alloyfs start`.
+        let (c_size, c_max, c_warm) = crate::config::CacheConfig::resolve(mount.cache.as_ref())
+            .map_err(|e| anyhow::anyhow!("mount {label}: {e}"))?;
+        let stated_cache = mount.cache.is_some();
+        let cache_max = if stated_cache {
+            Some(c_size.to_string())
+        } else {
+            mount
+                .auto_cache_max
+                .clone()
+                .map(|s| s.to_bytes())
+                .transpose()
+                .map_err(|e| anyhow::anyhow!("mount {label}: auto_cache_max: {e}"))?
+                .map(|b| b.to_string())
+        };
+        let cache_budget = if stated_cache {
+            Some(c_max.to_string())
+        } else {
+            mount
+                .auto_cache_budget
+                .clone()
+                .map(|s| s.to_bytes())
+                .transpose()
+                .map_err(|e| anyhow::anyhow!("mount {label}: auto_cache_budget: {e}"))?
+                .map(|b| b.to_string())
+        };
+        let cache_warm = stated_cache.then(|| c_warm.to_string());
         let unit: Unit = Box::new(move || {
             // Cloned per attempt: a restart must hand `mount::run` the same
             // arguments the first try got.
             let mount = mount.clone();
-            let (cache_max, cache_budget) = (cache_max.clone(), cache_budget.clone());
+            let (cache_max, cache_budget, cache_warm) =
+                (cache_max.clone(), cache_budget.clone(), cache_warm.clone());
             Box::pin(async move {
                 super::mount::run(
                     mount.url,
@@ -116,6 +132,7 @@ pub async fn run(config: Option<PathBuf>, server_only: bool, mounts_only: bool) 
                     mount.pin,
                     cache_max,
                     cache_budget,
+                    cache_warm,
                     mount.data_dir,
                     mount.no_server_defaults,
                     // Config-driven mounts keep the batched default; the

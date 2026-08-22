@@ -20,8 +20,17 @@ use alloyfs_common::ExcludeSet;
 use alloyfs_common::OrCode;
 
 pub(crate) struct AutoCacheConfig {
+    /// `cache.auto-size`: per file. The walker auto-downloads anything up to
+    /// this and nothing larger. A read is not bound by it — see `wants`.
     pub max_file_size: u64,
+    /// `cache.auto-max`: total pool for files the WALKER pulled down.
     pub budget: u64,
+    /// `cache.warm-max`: total pool for files a READ pulled down. Separate
+    /// from `budget` on purpose — speculation gets a small allowance, and a
+    /// file someone actually opened gets a large one, so a big read cannot
+    /// evict the prefetched working set and the prefetcher cannot evict what
+    /// is being read.
+    pub warm_budget: u64,
     pub pins: Vec<String>,
     pub root: PathBuf,     // data_dir/cache/<mount_key>
     pub manifest: PathBuf, // data_dir/cache/<mount_key>.manifest.json
@@ -33,6 +42,12 @@ pub(crate) struct CacheEntry {
     pub size: u64,
     pub mtime_ns: u128,
     pub pinned: bool,
+    /// Which pool this entry is charged against: `true` for a blob a READ
+    /// demanded, `false` for one the walker chose. Defaults false so a
+    /// manifest written before the split loads as auto-downloaded, which is
+    /// what every entry in it was.
+    #[serde(default)]
+    pub warm: bool,
     pub last_used: u64,
     /// Not serialized: false after ResyncRequired until an open re-validates.
     #[serde(skip, default = "default_true")]
@@ -78,7 +93,12 @@ struct Manifest {
 
 pub(crate) struct CacheState {
     pub entries: BTreeMap<RelPath, CacheEntry>,
+    /// Every byte held, both pools. What `stats` reports and what the
+    /// manifest records.
     pub total_bytes: u64,
+    /// The read-warmed share of `total_bytes`. The auto share is the
+    /// difference, so the two pools are enforced without a second map.
+    pub warm_bytes: u64,
     tick: u64,
     /// The manifest no longer describes what is cached: an entry was added,
     /// replaced, evicted or renamed. Must be persisted.
@@ -92,11 +112,54 @@ pub(crate) struct CacheState {
     lru_dirty: bool,
 }
 
+impl CacheState {
+    /// Remove an entry and charge both counters correctly.
+    ///
+    /// Every removal goes through here. The two pools are tracked as one
+    /// total plus the warm share, so a removal that forgot to adjust
+    /// `warm_bytes` would leave the warm pool permanently over-counted and
+    /// eventually refuse to cache anything. Making that impossible to get
+    /// wrong is worth a helper.
+    fn take(&mut self, path: &RelPath) -> Option<CacheEntry> {
+        let e = self.entries.remove(path)?;
+        self.total_bytes -= e.size;
+        if e.warm {
+            self.warm_bytes -= e.size;
+        }
+        Some(e)
+    }
+
+    /// Insert an entry and charge both counters correctly.
+    fn put(&mut self, path: RelPath, e: CacheEntry) {
+        self.total_bytes += e.size;
+        if e.warm {
+            self.warm_bytes += e.size;
+        }
+        self.entries.insert(path, e);
+    }
+
+    /// Bytes held in the pool this entry class is charged against.
+    fn pool_bytes(&self, warm: bool) -> u64 {
+        if warm {
+            self.warm_bytes
+        } else {
+            self.total_bytes - self.warm_bytes
+        }
+    }
+}
+
 pub(crate) struct AutoCache {
     pub cfg: AutoCacheConfig,
     pins: ExcludeSet, // reused matcher type: "pin globs" share exclude semantics
     state: Mutex<CacheState>,
     fetch_tx: mpsc::UnboundedSender<RelPath>,
+    /// Paths a READ asked for, which the auto-download size gate must not
+    /// refuse. `auto_cache_max` bounds what the walker pulls down
+    /// speculatively; a read is not speculation, so a file the user actually
+    /// opened is cached whatever its size - bounded by the budget and its LRU,
+    /// like everything else here. Entries are removed once the fetch settles,
+    /// so this holds only what is in flight.
+    demanded: Mutex<std::collections::HashSet<RelPath>>,
     /// Event sequence the cache is current at. Loaded from the manifest and
     /// written back on every flush, so the cursor outlives the process.
     seq: std::sync::atomic::AtomicU64,
@@ -128,6 +191,7 @@ impl AutoCache {
         let pins = ExcludeSet::compile(&cfg.pins, cfg!(windows))?;
         let mut entries = BTreeMap::new();
         let mut total = 0u64;
+        let mut warm_total = 0u64;
         let mut loaded_seq = 0u64;
         let mut loaded_token = 0u64;
         if let Ok(text) = std::fs::read_to_string(&cfg.manifest) {
@@ -141,6 +205,9 @@ impl AutoCache {
                     match std::fs::metadata(&blob) {
                         Ok(md) if md.len() == entry.size => {
                             total += entry.size;
+                            if entry.warm {
+                                warm_total += entry.size;
+                            }
                             entries.insert(rel, entry);
                         }
                         _ => {
@@ -208,11 +275,13 @@ impl AutoCache {
                 state: Mutex::new(CacheState {
                     entries,
                     total_bytes: total,
+                    warm_bytes: warm_total,
                     tick,
                     dirty: false,
                     lru_dirty: false,
                 }),
                 fetch_tx,
+                demanded: Mutex::new(std::collections::HashSet::new()),
                 seq: std::sync::atomic::AtomicU64::new(loaded_seq),
                 tree_token: std::sync::atomic::AtomicU64::new(loaded_token),
                 walk_skipped: std::sync::atomic::AtomicBool::new(false),
@@ -275,8 +344,42 @@ impl AutoCache {
     }
 
     /// Should the walker/fetcher cache this file at all?
+    ///
+    /// Three ways in, and they answer different questions. A `pin` is a
+    /// standing instruction, so it ignores size. A path a READ asked for is
+    /// demand rather than speculation, so it ignores size too — see
+    /// `demanded`. Everything else is the walker guessing what will be
+    /// wanted, and `max_file_size` is the bound on that guess.
     pub fn wants(&self, path: &RelPath, size: u64) -> bool {
-        self.pin_match(path) || (self.cfg.max_file_size > 0 && size <= self.cfg.max_file_size)
+        self.pin_match(path)
+            || self.is_demanded(path)
+            || (self.cfg.max_file_size > 0 && size <= self.cfg.max_file_size)
+    }
+
+    fn is_demanded(&self, path: &RelPath) -> bool {
+        self.demanded.lock().unwrap().contains(path)
+    }
+
+    /// A read went to the network for `path`; pull the whole file down so the
+    /// next read does not have to.
+    ///
+    /// Idempotent by the `demanded` set: a second call while one is in flight
+    /// adds nothing to the queue. The caller still guards per handle so this
+    /// is not reached on every read of a large file.
+    pub fn enqueue_demand(&self, path: RelPath) {
+        if self.cfg.max_file_size == 0 && self.pins.is_empty() {
+            return; // caching is off entirely; nothing to warm
+        }
+        if !self.demanded.lock().unwrap().insert(path.clone()) {
+            return; // already in flight
+        }
+        let _ = self.fetch_tx.send(path);
+    }
+
+    /// Drop a demand marker once its fetch has settled, successfully or not.
+    /// A later read re-demands, which is what should happen after a failure.
+    pub fn clear_demand(&self, path: &RelPath) {
+        self.demanded.lock().unwrap().remove(path);
     }
 
     /// May the cached blob serve reads for `path`, given a current server
@@ -317,15 +420,26 @@ impl AutoCache {
     }
 
     /// Record a fully fetched blob (already staged at its final path by the
-    /// fetcher). Evicts LRU non-pinned entries to fit the budget.
+    /// fetcher). Evicts LRU non-pinned entries to fit the pool it belongs to.
+    ///
+    /// Which pool that is comes from whether a READ asked for this path. The
+    /// demand marker is still set here — the fetcher clears it only once the
+    /// fetch has settled — so no caller has to thread the distinction down.
     pub fn commit(&self, path: &RelPath, attr: &Attr, pinned: bool) {
+        let warm = self.is_demanded(path);
+        let budget = if warm {
+            self.cfg.warm_budget
+        } else {
+            self.cfg.budget
+        };
         let mut st = self.st();
         st.tick += 1;
         let tick = st.tick;
-        if let Some(old) = st.entries.remove(path) {
-            st.total_bytes -= old.size;
-        }
-        // Budget: evict least-recently-used non-pinned entries.
+        st.take(path);
+        // Budget: evict least-recently-used non-pinned entries FROM THE SAME
+        // POOL. Evicting across pools would defeat the split — a large read
+        // could clear the prefetched working set, and a prefetch could clear
+        // the file being read.
         //
         // Down to a LOW-WATER mark rather than to exactly-fits. Building and
         // sorting the victim list is O(n log n) with a String clone per
@@ -337,41 +451,40 @@ impl AutoCache {
         // is a cache; a walk that goes quadratic at the finish line is a
         // bug. (Tiny budgets keep the old behaviour: the tenth rounds to
         // zero and the mark collapses back onto the budget.)
-        let low_water = self.cfg.budget - self.cfg.budget / 10;
-        if st.total_bytes + attr.size > self.cfg.budget {
+        let low_water = budget - budget / 10;
+        if st.pool_bytes(warm) + attr.size > budget {
             let mut victims: Vec<(RelPath, u64, u64)> = st
                 .entries
                 .iter()
-                .filter(|(_, e)| !e.pinned)
+                .filter(|(_, e)| !e.pinned && e.warm == warm)
                 .map(|(p, e)| (p.clone(), e.last_used, e.size))
                 .collect();
             victims.sort_by_key(|(_, used, _)| *used);
-            for (vp, _, vsize) in victims {
-                if st.total_bytes + attr.size <= low_water {
+            for (vp, _, _) in victims {
+                if st.pool_bytes(warm) + attr.size <= low_water {
                     break;
                 }
-                st.entries.remove(&vp);
-                st.total_bytes -= vsize;
+                st.take(&vp);
                 let _ = std::fs::remove_file(blob_path(&self.cfg.root, &vp));
-                tracing::debug!(path = %vp, "auto-cache evicted (budget)");
+                tracing::debug!(path = %vp, warm, "auto-cache evicted (budget)");
             }
-            if pinned && st.total_bytes + attr.size > self.cfg.budget {
+            if pinned && st.pool_bytes(warm) + attr.size > budget {
                 tracing::warn!(path = %path, "pinned files exceed the cache budget; caching anyway");
-            } else if st.total_bytes + attr.size > self.cfg.budget && attr.size > self.cfg.budget {
-                // Single blob larger than the whole budget and not pinned:
+            } else if st.pool_bytes(warm) + attr.size > budget && attr.size > budget {
+                // Single blob larger than its whole pool and not pinned:
                 // don't cache it at all.
                 let _ = std::fs::remove_file(blob_path(&self.cfg.root, path));
                 return;
             }
         }
-        st.total_bytes += attr.size;
-        st.entries.insert(
+        st.put(
             path.clone(),
             CacheEntry {
                 version: attr.version,
                 size: attr.size,
                 mtime_ns: mtime_ns(attr.mtime),
                 pinned,
+                warm,
                 last_used: tick,
                 verified: true,
             },
@@ -398,8 +511,7 @@ impl AutoCache {
 
     pub fn invalidate(&self, path: &RelPath) {
         let mut st = self.st();
-        if let Some(e) = st.entries.remove(path) {
-            st.total_bytes -= e.size;
+        if st.take(path).is_some() {
             st.dirty = true;
             let _ = std::fs::remove_file(blob_path(&self.cfg.root, path));
         }
@@ -425,16 +537,16 @@ impl AutoCache {
             } else {
                 RelPath(format!("{}{}", to.0, &old.0[from.0.len()..]))
             };
-            if let Some(entry) = st.entries.remove(&old) {
+            if let Some(entry) = st.take(&old) {
                 let old_blob = blob_path(&self.cfg.root, &old);
                 let new_blob = blob_path(&self.cfg.root, &new);
                 if let Some(parent) = new_blob.parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
                 if std::fs::rename(&old_blob, &new_blob).is_ok() {
-                    st.entries.insert(new, entry);
+                    st.put(new, entry);
                 } else {
-                    st.total_bytes -= entry.size;
+                    // `take` already discharged it from both counters.
                     let _ = std::fs::remove_file(&old_blob);
                 }
                 st.dirty = true;
@@ -622,7 +734,7 @@ mod tests {
     use super::*;
     use alloyfs_proto::FileKind;
 
-    fn attr(size: u64, mtime_s: u64, version: u64) -> Attr {
+    pub(super) fn attr(size: u64, mtime_s: u64, version: u64) -> Attr {
         Attr {
             kind: FileKind::File,
             size,
@@ -637,6 +749,7 @@ mod tests {
         AutoCache::load(AutoCacheConfig {
             max_file_size: max,
             budget,
+            warm_budget: budget,
             pins: vec![],
             root: dir.join("blobs"),
             manifest: dir.join("m.manifest.json"),
@@ -797,5 +910,140 @@ mod tests {
              cleared dirty flag is not a completed write"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod warm_pool_tests {
+    use super::tests::attr;
+    use super::*;
+
+    fn cache_with(dir: &std::path::Path, auto_size: u64, auto_max: u64, warm_max: u64) -> AutoCache {
+        AutoCache::load(AutoCacheConfig {
+            max_file_size: auto_size,
+            budget: auto_max,
+            warm_budget: warm_max,
+            pins: vec![],
+            root: dir.join("blobs"),
+            manifest: dir.join("m.manifest.json"),
+        })
+        .unwrap()
+        .0
+    }
+
+    fn fresh_dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("ds-warm-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    }
+
+    /// The point of the whole change: a file too big for the walker's
+    /// `auto-size` is cached anyway once a READ asks for it.
+    ///
+    /// Without the demand path `wants` refuses it on size and the fetcher
+    /// never commits, which is exactly why reading a 100 MB file crossed the
+    /// link on every pass.
+    #[test]
+    fn a_read_caches_a_file_the_walker_would_refuse() {
+        let dir = fresh_dir("demand");
+        // auto-size 10 bytes: a 5000-byte file is far past what the walker takes.
+        let c = cache_with(&dir, 10, 1_000_000, 1_000_000);
+        let p = RelPath("big.bin".into());
+        let a = attr(5000, 100, 1);
+
+        assert!(!c.wants(&p, a.size), "the walker must refuse it on size");
+        c.enqueue_demand(p.clone());
+        assert!(
+            c.wants(&p, a.size),
+            "a read demanded it, so size must stop mattering"
+        );
+
+        stage_write(&c.blob_final_path(&p), &vec![7u8; 5000]).unwrap();
+        c.commit(&p, &a, false);
+        assert!(c.fresh_for(&p, &a), "and it is now served locally");
+    }
+
+    /// The two pools are charged separately, so a big read cannot evict the
+    /// prefetched working set.
+    #[test]
+    fn warming_a_large_file_does_not_evict_the_prefetched_set() {
+        let dir = fresh_dir("pools");
+        // Tiny auto pool, roomy warm pool.
+        let c = cache_with(&dir, 1000, 3000, 100_000);
+        // warm pool 100_000: two 60 KB reads cannot both fit, so the second
+        // must evict — from its OWN pool.
+
+        // Three walker-chosen files that exactly fill the auto pool.
+        for i in 0..3 {
+            let p = RelPath(format!("small{i}.bin"));
+            let a = attr(1000, 100, 1);
+            stage_write(&c.blob_final_path(&p), &vec![1u8; 1000]).unwrap();
+            c.commit(&p, &a, false);
+        }
+        for i in 0..3 {
+            let p = RelPath(format!("small{i}.bin"));
+            assert!(c.known(&p), "small{i} should be cached before the big read");
+        }
+
+        // Two reads that between them OVERFILL the warm pool, so the warm
+        // commit genuinely has to evict. Without that the eviction branch
+        // never runs and the test cannot tell the pools apart at all.
+        for (name, size) in [("huge1.bin", 60_000u64), ("huge2.bin", 60_000)] {
+            let bp = RelPath(name.into());
+            let ba = attr(size, 100, 1);
+            c.enqueue_demand(bp.clone());
+            stage_write(&c.blob_final_path(&bp), &vec![9u8; size as usize]).unwrap();
+            c.commit(&bp, &ba, false);
+            c.clear_demand(&bp);
+        }
+        let big = RelPath("huge2.bin".into());
+
+        assert!(c.known(&big), "the demanded file is cached");
+        for i in 0..3 {
+            let p = RelPath(format!("small{i}.bin"));
+            assert!(
+                c.known(&p),
+                "small{i} was evicted by a warm commit — the pools are not separate"
+            );
+        }
+    }
+
+    /// And the reverse: prefetching cannot evict what a read pulled in.
+    #[test]
+    fn prefetch_does_not_evict_the_warm_set() {
+        let dir = fresh_dir("reverse");
+        let c = cache_with(&dir, 1000, 2000, 100_000);
+
+        let warm = RelPath("opened.bin".into());
+        let wa = attr(1500, 100, 1);
+        c.enqueue_demand(warm.clone());
+        stage_write(&c.blob_final_path(&warm), &vec![3u8; 1500]).unwrap();
+        c.commit(&warm, &wa, false);
+        assert!(c.known(&warm));
+
+        // Fill the auto pool several times over.
+        for i in 0..6 {
+            let p = RelPath(format!("pf{i}.bin"));
+            let a = attr(900, 100, 1);
+            stage_write(&c.blob_final_path(&p), &vec![2u8; 900]).unwrap();
+            c.commit(&p, &a, false);
+        }
+        assert!(
+            c.known(&warm),
+            "the file a read pulled in was evicted by prefetching"
+        );
+    }
+
+    /// A settled fetch drops its marker, or `wants` would keep saying yes for
+    /// a path nothing is fetching and a later read could never re-demand.
+    #[test]
+    fn a_settled_demand_stops_overriding_the_size_gate() {
+        let dir = fresh_dir("clear");
+        let c = cache_with(&dir, 10, 1_000_000, 1_000_000);
+        let p = RelPath("x.bin".into());
+        c.enqueue_demand(p.clone());
+        assert!(c.wants(&p, 5000));
+        c.clear_demand(&p);
+        assert!(!c.wants(&p, 5000), "the marker must not outlive its fetch");
     }
 }

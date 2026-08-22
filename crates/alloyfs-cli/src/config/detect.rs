@@ -194,6 +194,7 @@ pub fn from_legacy_mount(old: MountConfig) -> Config {
         version: None,
         server: None,
         client: Some(ClientSection {
+            cache: None,
             exclude: (!old.exclude.is_empty()).then_some(old.exclude),
             pin: (!old.pin.is_empty()).then_some(old.pin),
             auto_cache_max: old.auto_cache_max,

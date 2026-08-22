@@ -29,10 +29,15 @@ pub struct ClientOptions {
     /// the fallback below. `Some(0)` is an explicit OFF that beats both.
     pub auto_cache_max: Option<u64>,
     pub auto_cache_budget: Option<u64>,
+    /// `cache.warm-max`: the pool for files a READ pulled down, kept apart
+    /// from `auto_cache_budget` so a large read cannot evict the prefetched
+    /// working set. None = use the fallback.
+    pub auto_cache_warm: Option<u64>,
     /// Used when neither the client nor the server chose a value. The
     /// library default is off/512M; the CLI mounts pass 2M/512M.
     pub auto_cache_max_fallback: u64,
     pub auto_cache_budget_fallback: u64,
+    pub auto_cache_warm_fallback: u64,
     pub pins: Vec<String>,
     pub dialer: Option<Dialer>,
     /// Extra data connections for cold sequential streams (see
@@ -69,8 +74,13 @@ impl Default for ClientOptions {
             mount_key: String::new(),
             auto_cache_max: None,
             auto_cache_budget: None,
+            auto_cache_warm: None,
             auto_cache_max_fallback: 0, // library default: cache off
             auto_cache_budget_fallback: 512 * 1024 * 1024,
+            // Eight times the prefetch pool: a read is evidence, where a
+            // prefetch is a guess, and the files that make this pool matter
+            // are the large ones the walker was told not to take.
+            auto_cache_warm_fallback: 4 * 1024 * 1024 * 1024,
             pins: Vec::new(),
             dialer: None,
             stream_conns: 0,

@@ -95,8 +95,21 @@ pub fn print(path: Option<std::path::PathBuf>, mount: Option<String>) -> anyhow:
         println!("  at: {}", m.at.display());
         println!("  exclude: {:?}", m.exclude);
         println!("  pin: {:?}", m.pin);
-        println!("  auto_cache_max: {}", opt(&m.auto_cache_max));
-        println!("  auto_cache_budget: {}", opt(&m.auto_cache_budget));
+        // The `cache:` block is what most configs will set, so print what it
+        // SETTLED to rather than the raw flat keys — the point of `print` is
+        // the resolved values, and a config using `cache:` showed "(unset)"
+        // for both of these while behaving nothing like unset.
+        match crate::config::CacheConfig::resolve(m.cache.as_ref()) {
+            Ok((size, auto, warm)) if m.cache.is_some() => {
+                println!("  cache.auto-size: {}", human(size));
+                println!("  cache.auto-max:  {}", human(auto));
+                println!("  cache.warm-max:  {}", human(warm));
+            }
+            _ => {
+                println!("  auto_cache_max: {}", opt(&m.auto_cache_max));
+                println!("  auto_cache_budget: {}", opt(&m.auto_cache_budget));
+            }
+        }
         println!(
             "  data_dir: {}",
             m.data_dir
@@ -149,6 +162,17 @@ pub fn schema() -> anyhow::Result<()> {
     );
     println!("{}", serde_json::to_string_pretty(&schema)?);
     Ok(())
+}
+/// Bytes as the config would have spelled them.
+fn human(b: u64) -> String {
+    const K: u64 = 1024;
+    match b {
+        0 => "0 (off)".into(),
+        n if n % (K * K * K) == 0 => format!("{}G", n / (K * K * K)),
+        n if n % (K * K) == 0 => format!("{}M", n / (K * K)),
+        n if n % K == 0 => format!("{}K", n / K),
+        n => n.to_string(),
+    }
 }
 
 #[cfg(test)]
