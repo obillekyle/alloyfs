@@ -87,8 +87,8 @@ where
     S: AsyncRead + AsyncWrite + Send + 'static,
 {
     let (r, w) = tokio::io::split(stream);
-    let mut reader = FramedRead::new(r, FrameCodec::default());
-    let mut writer = FramedWrite::new(w, FrameCodec::default());
+    let mut reader = FramedRead::with_capacity(r, FrameCodec::default(), crate::FRAME_BUFFER);
+    let mut writer = FramedWrite::with_capacity(w, FrameCodec::default(), crate::FRAME_BUFFER);
 
     let proto = match reader.next().await {
         Some(Ok(Frame::Hello {
