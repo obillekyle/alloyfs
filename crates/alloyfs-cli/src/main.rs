@@ -264,6 +264,14 @@ enum Command {
         /// Print the command that would run, and stop.
         #[arg(long)]
         dry_run: bool,
+        /// Report whether a newer release exists and stop. Exits 1 when one
+        /// does, so a script can act on the status alone.
+        #[arg(long, conflicts_with_all = ["dry_run", "rollback"])]
+        check: bool,
+        /// Put back the binary kept by the last update. No network needed —
+        /// which is the point, when the new release is what broke.
+        #[arg(long, conflicts_with = "dry_run")]
+        rollback: bool,
     },
     /// Read what a long-running command logged. No name lists what is there.
     Logs {
@@ -671,7 +679,16 @@ async fn async_main() -> anyhow::Result<()> {
             global,
             force,
         } => commands::init::run(dir, name, global, force),
-        Command::Update { channel, dry_run } => commands::update::run(channel, dry_run),
+        Command::Update {
+            channel,
+            dry_run,
+            check,
+            rollback,
+        } => match (check, rollback) {
+            (true, _) => commands::update::check(),
+            (_, true) => commands::update::rollback(),
+            _ => commands::update::run(channel, dry_run),
+        },
         Command::Logs { name, follow, lines } => commands::logs::run(name, follow, lines).await,
     }
 }

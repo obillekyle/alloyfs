@@ -159,7 +159,24 @@ not a command.
 alloyfs update              # the latest release
 alloyfs update v0.1.1       # pin, or roll back
 alloyfs update --dry-run    # print the command, run nothing
+alloyfs update --check      # is there a newer release? exits 1 if so
+alloyfs update --rollback   # put back the previous binary, no network
 ```
+
+`--check` reports two numbers because they answer different questions and
+often disagree: `stable` is the newest non-prerelease, and `newest` is the
+newest thing published at all. On a machine running an alpha the stable one
+is usually *older* — so the comparison is by version precedence, not string
+equality, and it will not talk you into a downgrade. Exit status is 1 when an
+update is available and 0 otherwise, so a cron job can act on the status
+alone.
+
+`--rollback` restores the copy `alloyfs update` keeps beside the binary
+(`alloyfs.exe.prev` / `alloyfs.prev`). No network and no remembering which
+tag you were on — which is the point, since the case for rolling back is
+usually that the new release is what broke. The binary it displaces is kept
+as `alloyfs.rolled-back`. Anything already running keeps its old image until
+restarted: `alloyfs service restart <id>`.
 
 Re-runs the installer from `alloy.okyle.dev` rather than replacing the binary
 itself — one implementation of download-verify-install instead of two. On
