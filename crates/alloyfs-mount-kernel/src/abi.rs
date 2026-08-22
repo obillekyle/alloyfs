@@ -379,6 +379,25 @@ pub fn write_out(written: u32) -> Vec<u8> {
     v
 }
 
+/// Write the reply header into the first [`OUT_HEADER_LEN`] bytes of a frame
+/// the caller has already filled with its payload.
+///
+/// The counterpart to [`response`] for payloads big enough that building them
+/// somewhere else and copying them in is the expensive part — which in
+/// practice means READ, and only READ. Everything smaller is better served by
+/// `response`, where one small copy buys a much simpler contract.
+///
+/// # Panics
+/// If `frame` is shorter than the header it has to hold.
+pub fn fill_response_header(frame: &mut [u8], unique: u64, error: i32) {
+    assert!(frame.len() >= OUT_HEADER_LEN, "frame has no room for its header");
+    debug_assert!(frame.len() - OUT_HEADER_LEN <= MAX_PAYLOAD);
+    let len = frame.len() as u32;
+    frame[0..4].copy_from_slice(&len.to_ne_bytes());
+    frame[4..8].copy_from_slice(&error.to_ne_bytes());
+    frame[8..16].copy_from_slice(&unique.to_ne_bytes());
+}
+
 /// A complete response frame: header (len patched in) followed by `payload`.
 /// `error` is 0, a NEGATIVE errno, or — with `unique == 0` — a notify code.
 pub fn response(unique: u64, error: i32, payload: &[u8]) -> Vec<u8> {

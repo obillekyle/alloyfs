@@ -45,7 +45,12 @@ fn file_type(kind: FileKind) -> FileType {
 }
 
 /// One directory's entries, materialized once for the life of a handle.
-type DirSnapshot = Arc<Vec<(u64, FileType, String)>>;
+///
+/// The attribute is carried, not just the kind, because `readdir` already
+/// fetched it and `readdirplus` needs exactly that — dropping it here only to
+/// have the kernel ask for it back one LOOKUP at a time was the whole cost
+/// `ls -l` used to pay.
+type DirSnapshot = Arc<Vec<(u64, FileType, String, Attr)>>;
 
 struct DsFuse {
     fs: Arc<RemoteFs>,
@@ -95,11 +100,27 @@ impl DsFuse {
     /// Build one directory's full entry list, `.` and `..` included.
     fn materialize_dir(&self, ino: u64) -> Result<DirSnapshot, FsError> {
         let entries = self.fs.readdir(ino)?;
-        let mut all: Vec<(u64, FileType, String)> = Vec::with_capacity(entries.len() + 2);
-        all.push((ino, FileType::Directory, ".".into()));
-        all.push((ROOT_INO, FileType::Directory, "..".into()));
+        let mut all: Vec<(u64, FileType, String, Attr)> = Vec::with_capacity(entries.len() + 2);
+        // "." and ".." carry real inode numbers and real attributes. The
+        // parent used to be reported as the root regardless of depth, which
+        // plain readdir gets away with because the kernel ignores an entry's
+        // ino there — readdirplus does not, and would have instantiated a
+        // dentry pointing at the wrong inode. Both stats are attr-cache hits
+        // in practice: this directory was just listed, and the walk to reach
+        // it went through its parent.
+        let this = self.fs.getattr(ino)?;
+        let parent = self
+            .fs
+            .ino
+            .path_of(ino)
+            .and_then(|p| p.split().map(|(parent, _)| parent))
+            .and_then(|parent| self.fs.ino.ino_of(&parent))
+            .unwrap_or(ROOT_INO);
+        let parent_attr = self.fs.getattr(parent).unwrap_or(this);
+        all.push((ino, FileType::Directory, ".".into(), this));
+        all.push((parent, FileType::Directory, "..".into(), parent_attr));
         for (name, child_ino, attr) in entries {
-            all.push((child_ino, file_type(attr.kind), name));
+            all.push((child_ino, file_type(attr.kind), name, attr));
         }
         Ok(Arc::new(all))
     }
@@ -152,9 +173,17 @@ impl Filesystem for DsFuse {
         // kernel serializes same-directory lookups under i_rwsem — exactly
         // the calls a remote fs wants overlapped — and CACHE_SYMLINKS lets
         // the page cache hold link targets instead of re-asking readlink.
-        if let Err(unsupported) = config
-            .add_capabilities(fuser::InitFlags::FUSE_PARALLEL_DIROPS | fuser::InitFlags::FUSE_CACHE_SYMLINKS)
-        {
+        // DO_READDIRPLUS turns `ls -l` from a readdir plus one LOOKUP per
+        // file into a single reply; READDIRPLUS_AUTO lets the kernel fall
+        // back to plain readdir when the caller does not stat what it lists,
+        // which is the other half of the workload (`ls` with no -l) and where
+        // the extra attributes would be wasted bytes.
+        if let Err(unsupported) = config.add_capabilities(
+            fuser::InitFlags::FUSE_PARALLEL_DIROPS
+                | fuser::InitFlags::FUSE_CACHE_SYMLINKS
+                | fuser::InitFlags::FUSE_DO_READDIRPLUS
+                | fuser::InitFlags::FUSE_READDIRPLUS_AUTO,
+        ) {
             tracing::debug!(?unsupported, "kernel lacks optional readdir/symlink niceties");
         }
         Ok(())
@@ -257,9 +286,55 @@ impl Filesystem for DsFuse {
             },
         };
         // The kernel's offset counts entries (incl. "." / "..") it already got.
-        for (i, (child_ino, ft, name)) in snapshot.iter().enumerate().skip(offset as usize) {
+        for (i, (child_ino, ft, name, _)) in snapshot.iter().enumerate().skip(offset as usize) {
             // add() returns true when the reply buffer is full.
             if reply.add(INodeNo(*child_ino), (i + 1) as u64, *ft, name) {
+                break;
+            }
+        }
+        reply.ok();
+    }
+
+    /// `readdir` that answers the stat as well as the name.
+    ///
+    /// `ls -l` over a directory of N files is a readdir followed by N
+    /// LOOKUPs, each its own trip through /dev/fuse with its own context
+    /// switch. Every one of those answers was already sitting in the snapshot
+    /// this handle materialized — `RemoteFs::readdir` returns attributes and
+    /// the listing simply discarded them — so the lookups bought nothing but
+    /// syscalls. Here they ride along with the names.
+    ///
+    /// Each entry the kernel accepts counts as a lookup and will be forgotten
+    /// like one, which is why `forget` releasing an inode outright (rather
+    /// than by count) is fine only because Linux sends a single FORGET per
+    /// inode carrying the whole accumulated count.
+    fn readdirplus(
+        &self,
+        _req: &FuseRequest,
+        ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
+        mut reply: fuser::ReplyDirectoryPlus,
+    ) {
+        let snapshot = match self.dirs.lock().unwrap().get(&fh.0).cloned() {
+            Some(s) => s,
+            None => match self.materialize_dir(ino.0) {
+                Ok(s) => s,
+                Err(e) => {
+                    reply.error(errno(&e));
+                    return;
+                }
+            },
+        };
+        for (i, (child_ino, _, name, attr)) in snapshot.iter().enumerate().skip(offset as usize) {
+            if reply.add(
+                INodeNo(*child_ino),
+                (i + 1) as u64,
+                name,
+                &KERNEL_TTL,
+                &self.file_attr(*child_ino, attr),
+                Generation(0),
+            ) {
                 break;
             }
         }

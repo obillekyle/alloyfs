@@ -129,6 +129,22 @@ impl Server {
     pub fn handle(&self, buf: &[u8]) -> Option<Vec<u8>> {
         let h = InHeader::parse(buf)?;
         let payload = &buf[abi::IN_HEADER_LEN..h.len as usize];
+        // READ is framed in place. Every other op hands back a payload that
+        // `abi::response` copies into a frame, which is the right trade when
+        // a payload is an attr or a dirent page — but a READ payload is up to
+        // 128 KiB, so that convention meant allocating and filling one buffer
+        // and then allocating and filling a second, larger one. Here the
+        // frame is allocated once and the file's bytes land directly behind
+        // its header.
+        if h.opcode == abi::OP_READ {
+            return Some(match self.op_read_framed(&h) {
+                Ok(frame) => frame,
+                Err(errno) => {
+                    tracing::debug!(op = h.opcode, nodeid = h.nodeid, errno, "request failed");
+                    abi::response(h.unique, -errno, &[])
+                }
+            });
+        }
         Some(match self.dispatch(&h, payload) {
             Ok(out) => abi::response(h.unique, 0, &out),
             Err(errno) => {
@@ -143,7 +159,11 @@ impl Server {
             abi::OP_LOOKUP => self.op_lookup(header.nodeid, payload),
             abi::OP_GETATTR => self.op_getattr(header.nodeid),
             abi::OP_READDIR => self.op_readdir(header.nodeid, header.offset, header.size as usize),
-            abi::OP_READ => self.op_read(header.nodeid, header.offset, header.size),
+            // OP_READ is deliberately absent: `handle` routes it to
+            // `op_read_framed` before reaching here, so that it can build its
+            // reply frame in one allocation instead of returning a payload to
+            // be copied into a second. Adding an arm for it here would create
+            // a second, slower implementation that nothing calls.
             abi::OP_CREATE => self.op_create(header.nodeid, payload, false),
             abi::OP_MKDIR => self.op_create(header.nodeid, payload, true),
             abi::OP_UNLINK => self.op_remove(header.nodeid, payload, false),
@@ -385,13 +405,27 @@ impl Server {
 
     // ------------------------------------------------------------- data
 
-    fn op_read(&self, nodeid: u64, offset: u64, size: u32) -> Result<Vec<u8>, i32> {
-        let size = size.min(abi::MAX_PAYLOAD as u32);
+    /// Serve a READ as a complete reply frame — see the note in `handle`.
+    ///
+    /// The buffer is sized for the whole request up front and the file's
+    /// bytes are read straight in behind the header; a short read just
+    /// truncates it. Allocating zeroed and truncating afterwards is what
+    /// keeps this out of `unsafe`, and the kernel is only ever shown the
+    /// bytes that were actually read.
+    fn op_read_framed(&self, h: &InHeader) -> Result<Vec<u8>, i32> {
+        let size = h.size.min(abi::MAX_PAYLOAD as u32) as usize;
         if size == 0 {
-            return Ok(Vec::new());
+            return Ok(abi::response(h.unique, 0, &[]));
         }
-        let fh = self.handle_for(nodeid, false)?;
-        self.fs.read(fh, offset, size).map_err(|e| errno_of(&e))
+        let fh = self.handle_for(h.nodeid, false)?;
+        let mut frame = vec![0u8; abi::OUT_HEADER_LEN + size];
+        let n = self
+            .fs
+            .read_into(fh, h.offset, &mut frame[abi::OUT_HEADER_LEN..])
+            .map_err(|e| errno_of(&e))?;
+        frame.truncate(abi::OUT_HEADER_LEN + n);
+        abi::fill_response_header(&mut frame, h.unique, 0);
+        Ok(frame)
     }
 
     fn op_write(&self, nodeid: u64, offset: u64, data: &[u8]) -> Result<Vec<u8>, i32> {
