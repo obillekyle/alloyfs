@@ -19,6 +19,7 @@ alloyfs-http.workspace = true
 tokio.workspace = true
 futures.workspace = true
 clap.workspace = true
+clap_complete.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

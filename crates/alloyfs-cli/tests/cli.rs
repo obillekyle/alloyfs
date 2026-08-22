@@ -171,6 +171,26 @@ fn doctor_reports_the_checks_it_ran() {
     }
 }
 
+/// Completions generate for every shell, and know the current commands.
+///
+/// They come from the same clap definition the binary parses with, so this
+/// is really checking that the generator still runs and that nothing has
+/// made the command tree unrepresentable — a hand-written script would
+/// need a second list kept in step instead.
+#[test]
+fn completions_generate_for_every_shell() {
+    let dir = tmp();
+    for shell in ["bash", "zsh", "fish", "powershell", "elvish"] {
+        let o = alloyfs(dir.path(), &["completions", shell]);
+        assert!(o.status.success(), "{shell}: {}", out(&o));
+        let script = String::from_utf8_lossy(&o.stdout);
+        assert!(script.len() > 200, "{shell} produced almost nothing:\n{script}");
+        // A command added this week, to catch a generator wired to a stale
+        // definition rather than the live one.
+        assert!(script.contains("doctor"), "{shell} does not know `doctor`");
+    }
+}
+
 /// Every file under `root`, so a test can assert that nothing was created.
 fn walk(root: &Path) -> Vec<String> {
     let mut found = Vec::new();

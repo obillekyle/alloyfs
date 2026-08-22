@@ -16,6 +16,7 @@ alloyfs <COMMAND>
 | `logs` | Read what a long-running command logged |
 | `doctor` | Check the local things that stop a drive from working |
 | `config` | Validate the config, or print the settled values |
+| `completions` | Print a shell completion script |
 | `ping` | Round-trip time to an agent |
 | `bench` | Timed pipelined read, no mount involved |
 | `stress` | Concurrent load generator |
@@ -184,6 +185,19 @@ Re-runs the installer from `alloy.okyle.dev` rather than replacing the binary
 itself — one implementation of download-verify-install instead of two. On
 Windows the installer renames the running executable aside before writing the
 new one, which is the only way to replace a binary that is currently executing.
+
+## completions
+
+```bash
+alloyfs completions bash > /etc/bash_completion.d/alloyfs
+alloyfs completions zsh  > ~/.zfunc/_alloyfs
+alloyfs completions fish > ~/.config/fish/completions/alloyfs.fish
+alloyfs completions powershell | Out-String | Invoke-Expression
+```
+
+Generated from the same definition the binary parses with, so a new command
+or flag is completable the moment it exists — there is no second list to keep
+in step. Writes to stdout; where it goes from there is your shell's business.
 
 ## Environment
 

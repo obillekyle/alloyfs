@@ -275,6 +275,17 @@ enum Command {
     },
     /// Check the local things that stop a drive from working.
     Doctor,
+    /// Print a shell completion script.
+    ///
+    /// Writes to stdout; where it goes from there is the shell's business.
+    ///   bash:       alloyfs completions bash > /etc/bash_completion.d/alloyfs
+    ///   zsh:        alloyfs completions zsh  > ~/.zfunc/_alloyfs
+    ///   fish:       alloyfs completions fish > ~/.config/fish/completions/alloyfs.fish
+    ///   powershell: alloyfs completions powershell | Out-String | Invoke-Expression
+    Completions {
+        /// bash, zsh, fish, powershell or elvish.
+        shell: clap_complete::Shell,
+    },
     /// Inspect the configuration file.
     Config {
         #[command(subcommand)]
@@ -715,6 +726,15 @@ async fn async_main() -> anyhow::Result<()> {
             _ => commands::update::run(channel, dry_run),
         },
         Command::Doctor => commands::doctor::run(),
+        Command::Completions { shell } => {
+            // Generated from the SAME clap definition the binary parses
+            // with, so a new command or flag is completable the moment it
+            // exists — there is no second list to keep in step, which is
+            // the failure mode a hand-written completion script has.
+            let mut cmd = <Cli as clap::CommandFactory>::command();
+            clap_complete::generate(shell, &mut cmd, "alloyfs", &mut std::io::stdout());
+            Ok(())
+        }
         Command::Config { cmd } => match cmd {
             ConfigCmd::Validate { config } => commands::config_cmd::validate(config),
             ConfigCmd::Print { config, mount } => commands::config_cmd::print(config, mount),
