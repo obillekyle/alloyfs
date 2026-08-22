@@ -8,19 +8,9 @@ is only ever as good as the commits — which is the point.
 explanation in the commit body, where it is also visible in `git log`, in a
 pull request, and on the release page.
 
-## [0.8.0] — 2026-08-22
-
-<sub>diff: [5969e77...5961dd6](https://github.com/obillekyle/alloyfs/compare/5969e77...5961dd6)</sub>
-
-### New Features
-
-- **release:** publish per-asset sha256, and verify it on install ([5961dd6](https://github.com/obillekyle/alloyfs/commit/5961dd6))
-
-    Publish runs from this branch's workflow definition, so the checksum writing has to live here to take effect; the installers are served from alloy.okyle.dev and are fetched fresh by every install, so they are here for the same reason.
-
 ## [0.7.0] — 2026-08-18
 
-<sub>diff: [6141878...5969e77](https://github.com/obillekyle/alloyfs/compare/6141878...5969e77)</sub>
+<sub>diff: [6141878...88051b7](https://github.com/obillekyle/alloyfs/compare/6141878...88051b7)</sub>
 
 ### New Features
 
@@ -177,4 +167,125 @@ pull request, and on the release page.
 
         cp: cannot stat 'target/release/alloyfs'$'\r''.exe': No such file or directory
 
-Older releases are in the git tags and on the releases page.
+## [0.1.0] — 2026-08-15
+
+<sub>diff: [3e918d8...fedde5a](https://github.com/obillekyle/alloyfs/compare/3e918d8...fedde5a)</sub>
+
+### New Features
+
+- drive-sync sync — real-directory mode + CLI + battery ([c42a105](https://github.com/obillekyle/alloyfs/commit/c42a105))
+
+    The sync subcommand, its clap surface, and a 10-test loopback battery running REAL OS watchers on both ends: initial pull/push/merge, live bidirectional propagation (create/modify/rename/delete each way), LWW conflicts with preserved .sync-conflict copies, delete-vs-edit in both directions, the echo-free steady-state guard, stat-compare suppression (a human edit inside the window still syncs), two-way excludes, and --one-shot.
+
+- **client:** bidirectional sync engine ([244c067](https://github.com/obillekyle/alloyfs/commit/244c067))
+
+    A real local directory kept equal to an export: remote events apply as real VFS operations (full-fidelity inotify on Linux — the thing no mounted filesystem can deliver), a local watcher pushes edits back.
+
+- advisory locks survive reconnects; blocking waits bounded by liveness ([84211a6](https://github.com/obillekyle/alloyfs/commit/84211a6))
+
+    Blocking lock waits no longer die at the 30s request timeout: they use a keepalive request (ping every 10s, 10s grace) so a healthy-but-busy server can hold a waiter indefinitely while a wedged one still fails in ~20s and a dead connection fails immediately.
+
+- TCP auth tokens + transparent wire compression (protocol v3) ([6da8aef](https://github.com/obillekyle/alloyfs/commit/6da8aef))
+
+    agent.tcp_token makes every TCP session authenticate (Request::Auth, constant-time compare) before anything else is served; serving TCP on a non-loopback address without a token now refuses at startup. Clients pass --token / token: in the mount config, and the reconnect dialer re-authenticates automatically. ssh mounts are exempt — the login was the authentication. Token-protected listeners require v3 so older clients get a version error they can decode instead of AuthRequired.
+
+- negotiated mount defaults (protocol v2) ([c9ab485](https://github.com/obillekyle/alloyfs/commit/c9ab485))
+
+    Exports can publish a client: section (exclude/pin/auto_cache_max/ auto_cache_budget) that v2+ clients fetch at attach and merge under their own config: CLI flag > mount file > server suggestion > fallback, lists unioned client-first, explicit 0 beats the suggestion, and --no-server-defaults / no_server_defaults skips the exchange. The request is version-gated so v1 peers never see the new variants. parse_size/SizeField move to ds-common; goldens regenerated (hello frames embed PROTO_VERSION_MAX); loopback tests 22-23 cover the negotiation and its precedence rules.
+
+### Fixes
+
+- **sync:** three real bugs CI found in the conflict path ([c385d71](https://github.com/obillekyle/alloyfs/commit/c385d71))
+
+    CI failed conflict_both_changed_lww on both OSes where it passed locally — three genuine defects, not test flake:
+
+    1. shutdown() only flushed the manifest. The executor, event pump and
+       file watcher all kept running (their tasks hold Arc clones), so a
+       'stopped' engine went on mutating; two engines over one directory
+       fought and conflict-resolved each other's conflict copies. It now
+       sets a stopped flag, refuses new work, and drops the watcher.
+
+- events --since wired, no hot-path panics, one loopback check ([b6dbac5](https://github.com/obillekyle/alloyfs/commit/b6dbac5))
+
+    The events command's --since flag now actually requests ring-log catch-up (TooOld degrades to live with a warning); the pump seeds its resubscription cursor from it. The mount read path returns EIO instead of panicking on a broken window invariant; the WinFsp notify mutexes shrug off poisoning. ds-http now uses the same resolving loopback check as the TCP server (the string-match version treated 127.0.0.2 as remote). HTTP mutations documented as deliberately origin-less. Stale 'arrives in M5' comments updated to describe what shipped.
+
+- **agent:** real statfs numbers, attach misbind guard, atomic replace-rename ([c7141b3](https://github.com/obillekyle/alloyfs/commit/c7141b3))
+
+    statfs now reports the export volume's actual size/free space (statvfs on Unix, GetDiskFreeSpaceExW on Windows), keeping placeholders only pre-attach and on syscall failure. A second Attach naming a DIFFERENT export is refused (AlreadyExists) instead of silently serving the first; same-export re-attach stays idempotent. The Windows remove-then-rename window is gone: std::fs::rename replaces atomically on both platforms now (verified on this toolchain, target open included), in the agent and the client overlay both.
+
+- one rename, one event ([33f79f7](https://github.com/obillekyle/alloyfs/commit/33f79f7))
+
+    Backends that report a rename as From + To + Both used to yield a RenamedFrom plus degraded Removed/Created halves. The paired event now purges exact halves at flush; a real Modified on the target survives (cache freshness depends on it). Covered by two watcher unit tests.
+
+- two reconnect races found by the extended battery ([2b7e74c](https://github.com/obillekyle/alloyfs/commit/2b7e74c))
+
+    - Post-mortem request hang: the reader now flips closed BEFORE clearing the inflight map, and request() re-checks is_closed after inserting its entry — a request racing connection teardown fails fast instead of orphaning and eating the full 30s deadline. - Epoch-bump race: the event pump captures the reconnect epoch before entering its recv loop and waits with conn_changed_since(epoch), so a supervisor bump that lands mid-loop is caught instead of missed (was observable as bimodal test timing; now consistently fast).
+
+- **golden:** 100ns-aligned canonical timestamp for cross-OS portability ([5e8fcbb](https://github.com/obillekyle/alloyfs/commit/5e8fcbb))
+
+    First cross-OS run of the frozen-wire test caught it: Windows SystemTime has 100ns resolution, so the 123_456_789ns fixture silently truncated to ...700 when goldens were generated on Windows, while Linux encoded the exact value. Protocol behavior is unaffected (times round-trip literally); the canonical fixture is now representable identically on both platforms. Goldens regenerated.
+
+### Performance
+
+- measure the prefetch window instead of rebuilding it ([304f57f](https://github.com/obillekyle/alloyfs/commit/304f57f))
+
+    The backlog carried a per-handle prefetch pump: move the window top-up off the read path so it refills continuously rather than once per kernel read. Measured first, and the premise did not hold.
+
+- tolerant readahead windowing — 2x sequential mount throughput ([c783c85](https://github.com/obillekyle/alloyfs/commit/c783c85))
+
+    The window used to clear itself on ANY offset that wasn't exactly expected_next — and WinFsp's multi-threaded dispatch plus cache-manager overlapped read-ahead make slightly out-of-order offsets the NORMAL shape of a sequential stream, so real copies ran with a perpetually collapsing window (2 MiB of useful in-flight data aborted per hiccup, wire burned by aborted fetches). Now only a genuine far seek clears; near-window deviations keep the streak. Prefetch top-up moved BEFORE the blocking waits, recently served blocks are retained for sub-chunk re-reads (64 KiB paging I/O used to re-fetch every block it had just consumed), and the window deepened to 32 blocks.
+
+### Refactor
+
+- one Linux errno table, and symlink rewriting for every backend ([069ede9](https://github.com/obillekyle/alloyfs/commit/069ede9))
+
+    Two of the four findings the cleanup pass deferred, both layering rather than tidying.
+
+- extract the event coalescer to ds-common ([2d2f21d](https://github.com/obillekyle/alloyfs/commit/2d2f21d))
+
+    The collapse table, rename pairing, and exclude-boundary degradation move to ds_common::coalesce::Coalescer — the sync engine's local watcher needs the exact same semantics, and two copies would drift (the same reasoning that moved ExcludeSet here). The agent's watch loop keeps only pacing and the server-side publish (version bumps + hub). EventHub::with_capacity lets tests exercise TooOld with a tiny ring. Behavior-preserving: watcher tests moved over and stay green.
+
+- **ds-cli:** split main.rs into config/urls/commands modules; clippy clean ([71c023b](https://github.com/obillekyle/alloyfs/commit/71c023b))
+
+    main.rs is the clap surface and a dispatch table; behavior lives in commands/{serve,mount,cache,diag}. parse_size/mount_key/url parsing gained unit tests in their new homes. Workspace passes clippy --all-targets -D warnings.
+
+- **ds-client:** ds-common imports, expect_resp! macro, named overlay predicates ([8c94031](https://github.com/obillekyle/alloyfs/commit/8c94031))
+
+    Deletes the duplicated exclude/localfs modules; every RPC unwrap is one line via expect_resp!; autocache state lock behind st(); the readdir union now reads as shadowed_by_overlay / lives_in_overlay.
+
+- **ds-agent:** per-request handlers, shared ds-common, resolve_unchecked ([3eba1d6](https://github.com/obillekyle/alloyfs/commit/3eba1d6))
+
+    dispatch_blocking is now a phone book; each request has its own method. read_only gate hoisted into writable_export(). fsutil shrinks to the renamed resolve_unchecked (Export::resolve is the only sanctioned caller). Exclude/fs helpers now come from ds-common; .or_code() replaces the map_err(io_to_code) chains here.
+
+### Docs
+
+- the upstream reports are a record, not a queue ([4ec696d](https://github.com/obillekyle/alloyfs/commit/4ec696d))
+
+    Decision: none of the three will be filed. Recording it where the reports live, because "unfiled" and "not being filed" look identical in a directory listing and the difference matters to whoever reads this next — the first invites someone to finish the job, the second says the job is done.
+
+- correct two claims the kernel backend made stale ([7b2d2a2](https://github.com/obillekyle/alloyfs/commit/7b2d2a2))
+
+    Both were found by inventorying features against the source rather than against the notes, and both had the docs telling users something no longer true.
+
+- upstream bug reports for three third-party issues ([cdd65bf](https://github.com/obillekyle/alloyfs/commit/cdd65bf))
+
+    Three write-ups held as drafts — nothing filed. Confidence is calibrated per report rather than uniform: the winfsp-rs one is confirmed against the crate source, the bun one has a known mechanism with the inference step marked, and the thin-LTO one is a symptom with a bisect and no root cause, written as a request for help and explicitly NOT ready to send.
+
+- upstream bug reports for the three third-party issues ([4b9307d](https://github.com/obillekyle/alloyfs/commit/4b9307d))
+
+    Three write-ups under docs/upstream/, drafted for submission but not filed:
+
+    - winfsp-rs: WideNameInfo::set_name counts the NUL terminator in the
+      entry's declared name length, so the kernel pattern-matches against
+      "file.txt\0" and end-anchored patterns never match. Suggested patch
+      included.
+    - thin-LTO release builds hang on the first read through a WinFsp mount.
+      Symptom plus a one-variable bisect, no root cause; written as a request
+      for help with a plan for reducing it, not as a miscompilation claim.
+    - bun: ENOENT on every WinFsp-backed drive, because
+      GetFinalPathNameByHandle does not round-trip on session-local DOS
+      devices. Affects rclone and WinFsp's own memfs identically.
+
+- describe the ~/.alloyfs layout ([d6f55aa](https://github.com/obillekyle/alloyfs/commit/d6f55aa))
+
+    The README still pointed at %LOCALAPPDATA% and C:\MyApps. Adds a 'Where things live' section covering the tree, the data/cache split and why it exists, the override order, and the fact that upgrading needs no action.
