@@ -102,6 +102,26 @@ if ($magic[0] -ne 0x4D -or $magic[1] -ne 0x5A) {
   Die "downloaded file is not a Windows executable. This usually means the URL returned an error page."
 }
 
+# Checksum, when the release publishes one. Releases from before this
+# existed have no .sha256 asset, and refusing those would break rolling back
+# to them -- so a MISSING sum warns and continues, while a sum that is
+# present and does not match is fatal. The magic-byte check above catches an
+# error page; this catches a truncated download or a swapped asset.
+$want = $null
+try {
+  $sumUrl = "https://github.com/$Repo/releases/download/$version/$asset.sha256"
+  $want = (Invoke-WebRequest -Uri $sumUrl -UseBasicParsing).Content.Trim()
+} catch {
+  Write-Host "note: $version publishes no checksum; skipping verification" -ForegroundColor DarkGray
+}
+if ($want) {
+  $got = (Get-FileHash -Path $out -Algorithm SHA256).Hash.ToLower()
+  if ($got -ne $want.ToLower()) {
+    Die "checksum mismatch for ${asset}: expected $want, got $got. Refusing to install."
+  }
+  Write-Host 'Checksum verified.' -ForegroundColor Green
+}
+
 # --- install ----------------------------------------------------------------
 
 New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
