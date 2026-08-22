@@ -240,6 +240,27 @@ becomes correct by trying again. `alloyfs update --check` also uses 1 to mean
 | `ALLOYFS_VERSION` | Pin the installers to a tag instead of the latest release. |
 | `ALLOYFS_READ_STATS` | Set to anything to log read-ahead statistics — window hits, retained hits, synchronous fetches, tolerated out-of-order reads. For diagnosing read throughput, not for normal use. |
 | `ALLOYFS_LOG_NAME` | The log file name for this process. Set by a service supervisor for its child, so both write to one file; rarely useful by hand. |
+| `ALLOYFS_WINFSP_THREADS` | Windows only: dispatcher threads for the mount. Normally chosen from the measured round trip — WinFsp's CPU-derived default for a local link, 32 for a remote one. Override only if a measurement says so; see below. |
+
+A mount's dispatcher threads bound how many filesystem callbacks can be in
+flight at once, and every callback that misses the caches waits on a wire
+round trip. WinFsp derives its default from the processor count, which is the
+right rule for a local filesystem and the wrong resource for this one — on a
+2-core machine it comes out around 4.
+
+Measured over a 62 ms link, 120 distinct files read at concurrency 16 with
+the auto-cache off:
+
+| threads | 4 (derived) | 8 | 16 | 32 | 64 |
+|---|---|---|---|---|---|
+| elapsed | 2274 ms | 1205 ms | 894 ms | 740 ms | 907 ms |
+
+The same 32 threads make a *loopback* mount worse — a serial metadata sweep
+goes from ~120 ms to ~175 ms, since nothing there is waiting on a network and
+the extra threads only contend for the cores. So the count is picked from one
+round trip taken at mount time rather than fixed, and `ALLOYFS_WINFSP_THREADS`
+exists for the case where you have measured something the threshold gets
+wrong.
 
 ## config
 

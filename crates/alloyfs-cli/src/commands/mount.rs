@@ -447,7 +447,12 @@ async fn mount_platform(
     // checked above, so what remains is a letter in use, a reserved name,
     // or the Mount Manager refusing. A distinct code lets a wrapper script
     // pick another letter instead of guessing from the message.
-    let drive = alloyfs_mount_winfsp::mount(fs.clone(), &mountpoint, export)
+    // One round trip, to tell a loopback mount from a remote one. The
+    // dispatcher thread count depends on it and the two answers are far
+    // apart — see the comment at `start_with_threads`. A ping that fails
+    // yields None, which takes WinFsp's own default: the conservative side.
+    let rtt = fs.conn().ping().await.ok();
+    let drive = alloyfs_mount_winfsp::mount(fs.clone(), &mountpoint, export, rtt)
         .map_err(|e| crate::exit::Fatal::err(crate::exit::MOUNTPOINT, format!("{e:#}")))?;
     // Server events → cache invalidation (in the pump) → the notify timer
     // re-emits them as real ReadDirectoryChangesW notifications.

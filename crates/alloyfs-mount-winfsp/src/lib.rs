@@ -1282,7 +1282,26 @@ impl MountedDrive {
 ///
 /// The tokio runtime that `fs` was attached on must stay alive while mounted:
 /// every callback parks a WinFsp dispatcher thread on it via `block_on`.
-pub fn mount(fs: Arc<RemoteFs>, mountpoint: &str, volume_label: &str) -> anyhow::Result<MountedDrive> {
+/// Above this round-trip time a mount is treated as latency-bound and gets
+/// the wide dispatcher pool; below it, WinFsp's CPU-derived default.
+///
+/// A dividing line drawn between two measured points rather than a measured
+/// optimum: loopback pings at 0.3 ms and is HURT by the wide pool, the ssh
+/// link to the test server pings at 62 ms and is helped 3x by it. Nothing was
+/// measured in between, so a formula here would be invented precision.
+const LATENCY_BOUND_RTT: std::time::Duration = std::time::Duration::from_millis(2);
+
+/// Mount `fs` at `mountpoint`.
+///
+/// `rtt` is one measured round trip to the server, or `None` when it could
+/// not be taken; it decides the dispatcher thread count. See the comment at
+/// `start_with_threads`.
+pub fn mount(
+    fs: Arc<RemoteFs>,
+    mountpoint: &str,
+    volume_label: &str,
+    rtt: Option<std::time::Duration>,
+) -> anyhow::Result<MountedDrive> {
     winfsp::winfsp_init()
         .map_err(|e| anyhow::anyhow!("WinFsp is not available (is it installed?): {}", e))?;
 
@@ -1389,7 +1408,47 @@ pub fn mount(fs: Arc<RemoteFs>, mountpoint: &str, volume_label: &str) -> anyhow:
         context,
     )
     .map_err(|e| anyhow::anyhow!("creating WinFsp filesystem failed: {e}"))?;
-    host.start()
+    // Dispatcher threads, chosen from the link rather than from the CPU.
+    //
+    // Passing 0 lets WinFsp derive the count from the processor count, which
+    // its own documentation says "should be chosen in most cases" — right for
+    // a filesystem whose callbacks return without blocking. Ours do not:
+    // every callback that misses the caches waits on a wire round trip, so
+    // the count bounds how many independent operations can be in flight, and
+    // deriving it from CPUs measures the wrong resource. On this 2-core
+    // laptop the derived count is about 4.
+    //
+    // Measured over a 62 ms ssh link, 120 distinct files opened and read at
+    // concurrency 16, auto-cache off so the link is genuinely involved:
+    //
+    //     threads     4       8      16      32      64
+    //     elapsed  2274 ms  1205    894     740     907
+    //
+    // Three alternating rounds put the derived default at 2258-2379 ms
+    // against 655-1051 ms for 32 — a 3.2x median difference with no overlap
+    // between the arms, CPU controls level across both. It plateaus at 16-32
+    // because the probe only offers 16 operations at a time.
+    //
+    // But the same 32 threads make a LOOPBACK mount measurably worse — a
+    // serial metadata sweep went from 117-131 ms to 173-178 ms, and the
+    // FileInfo pass from ~440 ms to 700-845 ms. Nothing is waiting on a
+    // network there, so the extra threads only contend for two cores. That
+    // is why this is not a constant: the right answer genuinely differs by
+    // link, and picking one number would have to lose one of these cases.
+    let threads = match std::env::var("ALLOYFS_WINFSP_THREADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        Some(explicit) => explicit,
+        None if rtt.is_some_and(|d| d >= LATENCY_BOUND_RTT) => 32,
+        None => 0,
+    };
+    tracing::debug!(
+        threads,
+        rtt_ms = rtt.map(|d| d.as_secs_f64() * 1000.0),
+        "winfsp dispatcher threads (0 = derived from CPU count)"
+    );
+    host.start_with_threads(threads)
         .map_err(|e| anyhow::anyhow!("starting WinFsp dispatcher failed: {e}"))?;
     // Drive letters: register with the Windows Mount Manager when possible
     // (mountpoint "\\.\X:"). Session-local DOS-device mounts (plain "X:")
