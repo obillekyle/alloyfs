@@ -247,6 +247,7 @@ becomes correct by trying again. `alloyfs update --check` also uses 1 to mean
 alloyfs config validate            # does it parse, and what does it describe?
 alloyfs config print               # the settled values
 alloyfs config print --mount work  # just one mount
+alloyfs config schema              # JSON Schema, for editor completion
 ```
 
 `validate` parses the file the same way every other command does, which is
@@ -263,6 +264,27 @@ Tokens print as `(set)`, never their value.
 
 Note that no command creates a config as a side effect any more. `alloyfs
 init` writes one; everything else reports that it found none.
+
+`schema` prints a JSON Schema for the config file. Point an editor at it and
+every key is completed and every typo underlined as it is typed, instead of
+diagnosed by this binary refusing to start:
+
+```bash
+alloyfs config schema > alloyfs.schema.json
+```
+
+```yaml
+# yaml-language-server: $schema=./alloyfs.schema.json
+version: 3
+server:
+  exports:
+    docs: /srv/docs
+```
+
+It is generated from the same types `serde` parses with, so it cannot
+describe a file this build would reject — which is the point. A schema
+maintained separately drifts, and a drifted schema is worse than none: it
+underlines valid keys and blesses invalid ones, while being trusted.
 
 ## doctor
 

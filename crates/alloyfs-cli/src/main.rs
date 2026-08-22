@@ -343,6 +343,18 @@ enum ConfigCmd {
         #[arg(long)]
         mount: Option<String>,
     },
+    /// Print the JSON Schema for the config file.
+    ///
+    /// Point an editor at it — VS Code's YAML extension, Neovim's yamlls,
+    /// anything speaking the language server protocol — and every key is
+    /// completed and every typo underlined as it is typed, rather than
+    /// diagnosed by this binary refusing to start.
+    ///
+    ///     alloyfs config schema > alloyfs.schema.json
+    ///
+    /// It is generated from the same types serde parses with, so it cannot
+    /// describe a file this build would reject.
+    Schema,
 }
 
 #[derive(Subcommand)]
@@ -791,6 +803,7 @@ async fn async_main() -> anyhow::Result<()> {
         Command::Config { cmd } => match cmd {
             ConfigCmd::Validate { config } => commands::config_cmd::validate(config),
             ConfigCmd::Print { config, mount } => commands::config_cmd::print(config, mount),
+            ConfigCmd::Schema => commands::config_cmd::schema(),
         },
         Command::Logs { name, follow, lines } => commands::logs::run(name, follow, lines).await,
     }

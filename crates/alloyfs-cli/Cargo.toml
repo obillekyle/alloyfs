@@ -25,6 +25,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 serde_json.workspace = true
 serde.workspace = true
+schemars.workspace = true
 serde_yaml.workspace = true
 
 [target.'cfg(unix)'.dependencies]

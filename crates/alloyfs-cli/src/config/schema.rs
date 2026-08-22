@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 /// The config schema this binary writes and understands.
 pub const CURRENT_VERSION: u32 = 3;
 
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Default, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     /// Absent means "whatever shape this file is in", which the loader has
@@ -45,7 +45,7 @@ pub struct Config {
 }
 
 /// What this machine offers to others.
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Default, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ServerSection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -72,7 +72,7 @@ pub struct ServerSection {
 
 /// What this machine consumes from others: defaults, then the mounts they
 /// apply to.
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Default, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ClientSection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -100,7 +100,7 @@ pub struct ClientSection {
 
 /// One named mount. Every field except `url` and `at` overrides the same key
 /// on the enclosing [`ClientSection`].
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct MountEntry {
     pub url: String,

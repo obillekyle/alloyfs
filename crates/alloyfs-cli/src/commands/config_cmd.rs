@@ -126,3 +126,97 @@ fn opt<T: std::fmt::Debug>(v: &Option<T>) -> String {
         None => "(unset)".to_string(),
     }
 }
+
+/// Print the JSON Schema for the config file.
+///
+/// Derived from the same types `serde` deserializes with, which is the whole
+/// value of it: a schema maintained separately drifts, and a schema that
+/// drifts is worse than none — it underlines valid keys and blesses invalid
+/// ones. This one cannot describe a file the binary would reject, because
+/// both come from the same struct definitions.
+///
+/// The complement to the located parse errors: those tell you where you went
+/// wrong after the fact, this stops the typo being typed.
+pub fn schema() -> anyhow::Result<()> {
+    let mut schema = schemars::schema_for!(crate::config::Config);
+    // `$id` is what lets an editor associate the schema with a file by URL
+    // instead of by local path, and what makes `alloyfs.schema.json` in a
+    // repository self-describing.
+    schema.insert("$id".into(), "https://alloy.okyle.dev/alloyfs.schema.json".into());
+    schema.insert(
+        "title".into(),
+        format!("AlloyFS config (version {})", crate::config::CURRENT_VERSION).into(),
+    );
+    println!("{}", serde_json::to_string_pretty(&schema)?);
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    /// The schema must describe the config the parser actually accepts.
+    ///
+    /// Not a full JSON Schema validation — that would mean a validator
+    /// dependency for one test — but a check of the specific claims that go
+    /// wrong when a type grows a field or changes shape, each one a case
+    /// where an editor would otherwise disagree with the binary.
+    #[test]
+    fn the_schema_matches_what_the_parser_accepts() {
+        let schema = schemars::schema_for!(crate::config::Config);
+        let json = serde_json::to_value(&schema).expect("the schema serializes");
+        let defs = json["$defs"].as_object().expect("named definitions");
+
+        // Unknown keys are refused by every section, because every section is
+        // `deny_unknown_fields`. A schema that allowed them would bless a
+        // typo the binary rejects.
+        for section in ["ServerSection", "ClientSection", "MountEntry", "ClientDefaults"] {
+            assert_eq!(
+                defs[section]["additionalProperties"],
+                serde_json::json!(false),
+                "{section} must refuse unknown keys, as its deserializer does"
+            );
+        }
+
+        // An export is a path OR a table, and the table half refuses unknown
+        // keys even though the derive cannot see the attribute that says so
+        // — see ExportConfig::allow_the_short_form.
+        let export = &defs["ExportConfig"];
+        let forms = export["oneOf"].as_array().expect("both forms of an export");
+        assert_eq!(forms.len(), 2, "an export is a path or a table: {export}");
+        assert!(
+            forms.iter().any(|f| f["type"] == "string"),
+            "the short form must be describable: {export}"
+        );
+        let table = forms
+            .iter()
+            .find(|f| f["properties"].is_object())
+            .expect("the table form");
+        assert_eq!(
+            table["additionalProperties"],
+            serde_json::json!(false),
+            "the table form must refuse unknown keys: {table}"
+        );
+        assert!(
+            table["properties"]["path"].is_object(),
+            "the table form must have a path: {table}"
+        );
+    }
+
+    /// Every field the parser knows about reaches the schema.
+    ///
+    /// The failure this catches is adding a key to a config section and
+    /// forgetting the derive, which produces a schema that underlines a
+    /// perfectly valid line — worse than no schema, because it is trusted.
+    #[test]
+    fn every_section_field_is_described() {
+        let json = serde_json::to_value(schemars::schema_for!(crate::config::Config))
+            .expect("the schema serializes");
+        let props = json["properties"].as_object().expect("top-level keys");
+        for key in ["version", "server", "client"] {
+            assert!(props.contains_key(key), "{key} missing from the schema");
+        }
+        let server = &json["$defs"]["ServerSection"]["properties"];
+        for key in ["tcp_listen", "tcp_token", "http_listen", "exports"] {
+            assert!(server[key].is_object(), "server.{key} missing: {server}");
+        }
+    }
+}

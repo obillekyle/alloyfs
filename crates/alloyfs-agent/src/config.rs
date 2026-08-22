@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 /// path = "/home/kyle/projects"
 /// read_only = false
 /// ```
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Default, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AgentConfig {
     #[serde(default)]
@@ -22,7 +22,7 @@ pub struct AgentConfig {
     pub exports: BTreeMap<String, ExportConfig>,
 }
 
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Default, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AgentSection {
     pub tcp_listen: Option<String>,
@@ -131,7 +131,8 @@ impl<'de> Deserialize<'de> for ExportConfig {
 /// attributes that would normally carry the defaults live in its inner
 /// mirror struct instead. What stays here is `skip_serializing_if`, which is
 /// the derived `Serialize`'s business.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+#[schemars(transform = ExportConfig::allow_the_short_form)]
 pub struct ExportConfig {
     pub path: PathBuf,
     pub read_only: bool,
@@ -163,6 +164,41 @@ pub struct ExportConfig {
     pub tree_max_entries: Option<usize>,
 }
 
+impl ExportConfig {
+    /// Widen the derived schema to the two forms `Deserialize` accepts.
+    ///
+    /// The derive only sees the struct, so it describes the table and calls a
+    /// bare path invalid — an editor would underline the shorter spelling
+    /// that the binary is perfectly happy with, which is worse than having no
+    /// schema at all. This rewrites the generated object into
+    /// `oneOf: [<that object>, string]`.
+    ///
+    /// Written as a transform on the derive rather than a hand-rolled
+    /// `JsonSchema` impl so the table half stays generated: add a field to
+    /// this struct and the schema still describes it.
+    fn allow_the_short_form(schema: &mut schemars::Schema) {
+        let mut table = schema.clone();
+        // The derive puts `additionalProperties: false` on a struct marked
+        // `deny_unknown_fields`, and this one is not — the attribute lives on
+        // the inner mirror struct that the hand-written `Deserialize` uses,
+        // where the derive cannot see it. Without this an editor would accept
+        // `read_onyl` that the binary rejects, which is the exact drift a
+        // generated schema exists to prevent.
+        table.insert("additionalProperties".into(), false.into());
+        let description = schema
+            .get("description")
+            .cloned()
+            .unwrap_or_else(|| serde_json::Value::String("An export.".into()));
+        *schema = schemars::json_schema!({
+            "description": description,
+            "oneOf": [
+                table,
+                { "type": "string", "description": "The exported path, with every other setting left at its default." }
+            ]
+        });
+    }
+}
+
 fn default_true() -> bool {
     true
 }
@@ -185,7 +221,7 @@ impl Default for ExportConfig {
 
 /// The `client:` section of an export: what this server recommends mounts
 /// configure locally (overlay excludes, pins, cache sizing).
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ClientDefaults {
     #[serde(default)]

@@ -12,6 +12,7 @@ alloyfs-transport.workspace = true
 tokio.workspace = true
 bytes.workspace = true
 serde.workspace = true
+schemars.workspace = true
 toml.workspace = true
 serde_yaml.workspace = true
 notify.workspace = true
