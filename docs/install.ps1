@@ -110,9 +110,28 @@ if ($magic[0] -ne 0x4D -or $magic[1] -ne 0x5A) {
 $want = $null
 try {
   $sumUrl = "https://github.com/$Repo/releases/download/$version/$asset.sha256"
-  $want = (Invoke-WebRequest -Uri $sumUrl -UseBasicParsing).Content.Trim()
+  $body = (Invoke-WebRequest -Uri $sumUrl -UseBasicParsing).Content
+  # GitHub serves .sha256 as application/octet-stream, and Windows PowerShell
+  # 5.1 hands back a Byte[] for any content-type it does not read as text.
+  # Calling .Trim() on that throws, the catch below swallows it, and the
+  # installer reports "publishes no checksum" for a release that published
+  # one -- so verification silently never ran on the shell this script
+  # targets. Decode first; PowerShell 7 already gives a string.
+  if ($body -is [byte[]]) { $body = [System.Text.Encoding]::ASCII.GetString($body) }
+  $want = $body.Trim()
 } catch {
-  Write-Host "note: $version publishes no checksum; skipping verification" -ForegroundColor DarkGray
+  # Only a genuine 404 means "this release predates checksums" -- that is the
+  # case worth continuing for, since refusing it would break rolling back to
+  # an old release. ANY other failure (network, TLS, a decode that threw) must
+  # be fatal: a verification step that quietly does not run is worse than no
+  # verification step, because the output says it was considered.
+  $code = $null
+  try { $code = [int]$_.Exception.Response.StatusCode } catch { }
+  if ($code -eq 404) {
+    Write-Host "note: $version publishes no checksum; skipping verification" -ForegroundColor DarkGray
+  } else {
+    Die "could not fetch the checksum for ${asset}: $($_.Exception.Message)"
+  }
 }
 if ($want) {
   $got = (Get-FileHash -Path $out -Algorithm SHA256).Hash.ToLower()
