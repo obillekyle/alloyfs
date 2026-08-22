@@ -12,7 +12,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use windows_service::service::{
-    ServiceAccess, ServiceErrorControl, ServiceInfo, ServiceStartType, ServiceState, ServiceType,
+    ServiceAccess, ServiceErrorControl, ServiceExitCode, ServiceInfo, ServiceStartType, ServiceState,
+    ServiceType,
 };
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
@@ -128,6 +129,39 @@ pub fn state(id: &str) -> String {
         },
         Err(_) => "?".into(),
     }
+}
+
+/// Why a service is in the state it is in, when the SCM has anything to
+/// say about it.
+///
+/// `state` answers one word, which is all a table column should hold — and
+/// for a service that keeps dying that one word is "running", because the
+/// supervisor is up and the CHILD is what is failing. The exit code is
+/// what distinguishes a service that stopped because someone stopped it
+/// from one that stopped because it could not start, and it was being
+/// read out of the status struct and thrown away.
+///
+/// `None` when there is nothing worth saying: a healthy running service
+/// with a clean last exit needs no annotation.
+pub fn detail(id: &str) -> Option<String> {
+    let mgr = manager(ServiceManagerAccess::CONNECT).ok()?;
+    let service = mgr
+        .open_service(service_name(id), ServiceAccess::QUERY_STATUS)
+        .ok()?;
+    let status = service.query_status().ok()?;
+    let mut parts = Vec::new();
+    match status.exit_code {
+        // NO_ERROR is the resting value; reporting it would annotate every
+        // healthy row with noise.
+        ServiceExitCode::Win32(0) => {}
+        ServiceExitCode::Win32(code) => parts.push(format!("last exit: win32 {code}")),
+        ServiceExitCode::ServiceSpecific(code) => parts.push(format!("last exit: service-specific {code}")),
+    }
+    // The pid is deliberately NOT here. It is real information, but it is
+    // present for every healthy service, and annotating every healthy row
+    // would make the detail line mean "here is a number" instead of "here
+    // is what went wrong" — which is the only reason to give up a line.
+    (!parts.is_empty()).then(|| parts.join(", "))
 }
 
 /// Everything except `list` refuses to run unelevated.

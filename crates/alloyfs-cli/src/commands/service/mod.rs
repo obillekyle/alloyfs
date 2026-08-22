@@ -252,6 +252,15 @@ pub fn list() -> anyhow::Result<()> {
         };
         let state = reg::state(&id);
         println!("{id:<16} {kind:<7} {state:<12} {command}");
+        // On its own line rather than a sixth column: this is the answer to
+        // "why", it is only sometimes there, and a column wide enough for
+        // it would push the command — the thing worth copying — off the
+        // screen. It matters most for the state the column cannot express:
+        // a supervisor reads `running` while the CHILD it keeps launching
+        // dies over and over.
+        if let Some(detail) = reg::detail(&id) {
+            println!("{:<16} {:<7} {:<12} └ {detail}", "", "", "");
+        }
     }
     if carried_definitions {
         println!();

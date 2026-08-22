@@ -242,6 +242,56 @@ pub fn stop(id: &str) -> anyhow::Result<()> {
 
 /// A word for `service list`. Never fails: an unregistered or unreadable unit
 /// is information, not an error.
+/// Why a unit is in the state it is in, when systemd has anything to say.
+///
+/// `state` answers one word, which is all a table column should hold — and
+/// for a unit whose child keeps dying that word is "running", because the
+/// supervisor is up and the CHILD is failing. systemd already tracks the
+/// rest and answers it in the same `show` call: how it last ended, what
+/// the main process exited with, and how many times it has been restarted.
+/// All of it was being asked for and discarded.
+///
+/// `None` when there is nothing worth saying, so a healthy row stays
+/// unannotated.
+pub fn detail(id: &str) -> Option<String> {
+    let out = systemctl(&[
+        "show",
+        &unit_name(id),
+        "--property=Result",
+        "--property=ExecMainStatus",
+        "--property=NRestarts",
+        "--property=StatusText",
+    ])
+    .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let field = |key: &str| {
+        text.lines()
+            .find_map(|l| l.strip_prefix(key))
+            .unwrap_or_default()
+            .trim()
+            .to_string()
+    };
+    let mut parts = Vec::new();
+    // "success" is the resting value; anything else names how it ended.
+    match field("Result=").as_str() {
+        "" | "success" => {}
+        other => parts.push(format!("result: {other}")),
+    }
+    match field("ExecMainStatus=").as_str() {
+        "" | "0" => {}
+        code => parts.push(format!("last exit: {code}")),
+    }
+    match field("NRestarts=").as_str() {
+        "" | "0" => {}
+        n => parts.push(format!("{n} restart(s)")),
+    }
+    let status_text = field("StatusText=");
+    if !status_text.is_empty() {
+        parts.push(status_text);
+    }
+    (!parts.is_empty()).then(|| parts.join(", "))
+}
+
 pub fn state(id: &str) -> String {
     let Ok(out) = systemctl(&[
         "show",
