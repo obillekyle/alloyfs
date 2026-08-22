@@ -491,6 +491,26 @@ impl ExportTree {
             return;
         }
         match std::fs::symlink_metadata(root.join(&path.0)) {
+            // A DIRECTORY arriving cannot be indexed from its own stat: it
+            // may already be full of children the watcher never reported.
+            // That is exactly how a server-side `mv` of a populated folder
+            // behaves — one rename event, no events for the contents — and
+            // inserting just the directory leaves the index holding a Dir
+            // with no children, which `readdir_all` then serves as an
+            // authoritative EMPTY listing. Files that exist, invisible, no
+            // error. The removal path has always used `remove_with_subtree`
+            // for the same reason ("the watcher does not necessarily report
+            // the children"); arrivals need the mirror of it.
+            //
+            // Dropping the index is the unconditional answer, and the same
+            // one `ResyncRequired` takes. Walking the subtree inline instead
+            // would be cheaper on paper and would re-introduce the
+            // hold-the-lock-across-a-walk stall that `ensure` was fixed to
+            // avoid — for an event that is rare next to ordinary writes.
+            Ok(md) if md.is_dir() => {
+                drop(st);
+                self.invalidate();
+            }
             Ok(md) => idx.insert(path.clone(), attr_from_metadata(&md, 0)),
             // Gone between the event and the stat: treat as removed rather
             // than leaving an entry describing a file that is not there.
@@ -521,6 +541,10 @@ impl ExportTree {
             /// Vanished between the event and the stat: the entry alone
             /// goes, same as `note_change`'s stat-failure arm.
             Vanished,
+            /// A directory arrived. Its contents were never reported, so the
+            /// index cannot vouch for them — see `note_change` for why this
+            /// drops the index instead of inserting.
+            ArrivedDir,
             Present(Attr),
         }
         let stats: Vec<(&RelPath, Fate)> = changes
@@ -530,6 +554,7 @@ impl ExportTree {
                     Fate::Gone
                 } else {
                     match std::fs::symlink_metadata(root.join(&path.0)) {
+                        Ok(md) if md.is_dir() => Fate::ArrivedDir,
                         Ok(md) => Fate::Present(attr_from_metadata(&md, 0)),
                         Err(_) => Fate::Vanished,
                     }
@@ -537,6 +562,13 @@ impl ExportTree {
                 (path, fate)
             })
             .collect();
+        // One arriving directory dooms the whole batch: nothing applied onto
+        // an index that is about to be dropped can matter, and applying first
+        // would only widen the window in which it is wrong.
+        if stats.iter().any(|(_, f)| matches!(f, Fate::ArrivedDir)) {
+            self.invalidate();
+            return;
+        }
         let mut st = self.state.lock().unwrap();
         let State::Live(idx) = &mut *st else {
             return;
@@ -546,6 +578,8 @@ impl ExportTree {
                 Fate::Gone => remove_with_subtree(idx, path),
                 Fate::Vanished => idx.remove(path),
                 Fate::Present(attr) => idx.insert(path.clone(), attr),
+                // Handled above, before the lock.
+                Fate::ArrivedDir => unreachable!("batch invalidated above"),
             }
         }
     }
@@ -967,5 +1001,116 @@ mod build_concurrency_tests {
         // ...and the export is not stuck: the next ask walks again.
         assert_ne!(tree.ensure(Path::new("/nonexistent"), &ex), 0);
         assert_eq!(walks.load(Ordering::SeqCst), 2);
+    }
+}
+
+#[cfg(test)]
+mod rename_arrival_tests {
+    use super::*;
+
+    /// A populated directory renamed INTO the export must not list as empty.
+    ///
+    /// This is the shape a server-side `mv` produces: one rename event for the
+    /// directory and nothing at all for the files inside it. Inserting only
+    /// the directory left the index holding a Dir with no children, and
+    /// `readdir_all` reports that as an exact answer — so `readdir` returned
+    /// an authoritative EMPTY listing and never fell through to the disk.
+    /// Four hundred files that exist, invisible through the mount, no error
+    /// anywhere. Found by a benchmark whose dataset was staged with `mv` and
+    /// then measured as zero files.
+    #[test]
+    fn a_populated_directory_arriving_by_rename_is_not_served_as_empty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir(root.join("visible")).unwrap();
+        std::fs::write(root.join("visible/a.txt"), b"a").unwrap();
+
+        let tree = ExportTree::new(1000);
+        let exclude = ExcludeSet::default();
+        assert_ne!(tree.ensure(root, &exclude), 0, "index builds");
+        assert!(
+            tree.readdir_all(&RelPath("visible".into())).is_some(),
+            "the indexed directory answers from the index"
+        );
+
+        // Stage a populated directory OUTSIDE the export, then move it in —
+        // exactly what the watcher sees as a single rename.
+        let staging = dir.path().join("..staging");
+        std::fs::create_dir(&staging).unwrap();
+        for i in 0..5 {
+            std::fs::write(staging.join(format!("f{i}.txt")), b"x").unwrap();
+        }
+        std::fs::rename(&staging, root.join("arrived")).unwrap();
+
+        // The one event the watcher reports: `arrived` exists now.
+        tree.note_change(root, &RelPath("arrived".into()), false);
+
+        match tree.readdir_all(&RelPath("arrived".into())) {
+            // Falling through to disk is the correct outcome: the index
+            // cannot vouch for children it never saw.
+            None => {}
+            Some((children, _)) => assert_eq!(
+                children.len(),
+                5,
+                "the index answered for a directory whose contents it never \
+                 indexed — served {} of 5 files",
+                children.len()
+            ),
+        }
+    }
+
+    /// The same, through the batch path the event pump actually uses.
+    #[test]
+    fn the_batch_path_also_refuses_to_vouch_for_an_arrived_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::write(root.join("seed.txt"), b"s").unwrap();
+
+        let tree = ExportTree::new(1000);
+        assert_ne!(tree.ensure(root, &ExcludeSet::default()), 0, "index builds");
+
+        let staging = dir.path().join("..staging2");
+        std::fs::create_dir(&staging).unwrap();
+        for i in 0..3 {
+            std::fs::write(staging.join(format!("g{i}.txt")), b"y").unwrap();
+        }
+        std::fs::rename(&staging, root.join("moved")).unwrap();
+
+        tree.note_changes(root, &[(RelPath("moved".into()), false)]);
+
+        match tree.readdir_all(&RelPath("moved".into())) {
+            None => {}
+            Some((children, _)) => assert_eq!(
+                children.len(),
+                3,
+                "batch path vouched for {} of 3 files it never indexed",
+                children.len()
+            ),
+        }
+    }
+
+    /// The cheap path must stay cheap: an ordinary FILE arriving still
+    /// updates in place rather than dropping the whole index.
+    #[test]
+    fn an_arriving_file_still_updates_the_index_in_place() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::write(root.join("seed.txt"), b"s").unwrap();
+
+        let tree = ExportTree::new(1000);
+        let before = tree.ensure(root, &ExcludeSet::default());
+        assert_ne!(before, 0);
+
+        std::fs::write(root.join("new.txt"), b"n").unwrap();
+        tree.note_change(root, &RelPath("new.txt".into()), false);
+
+        assert_ne!(tree.token(), 0, "a file arrival must NOT drop the index");
+        let (children, _) = tree
+            .readdir_all(&RelPath(String::new()))
+            .expect("root still answers from the index");
+        assert!(
+            children.iter().any(|(n, _)| n == "new.txt"),
+            "the arrived file is in the index"
+        );
     }
 }
