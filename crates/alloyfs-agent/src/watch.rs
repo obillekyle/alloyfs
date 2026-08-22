@@ -107,13 +107,18 @@ impl EventHub {
     /// means the export is changing far faster than an index can track it. The
     /// build would be rebuilt on the next `ResyncRequired` anyway.
     pub fn since(&self, since: u64) -> Vec<FsEvent> {
-        self.log
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|e| e.seq > since)
-            .cloned()
-            .collect()
+        // Seek, don't scan. The ring is ordered by seq, so the wanted
+        // suffix begins at a partition point — where this used to compare
+        // every one of up to EVENT_LOG_CAP entries to find it, holding the
+        // lock `publish` needs the whole time. The matching entries are
+        // still cloned under the lock, and deliberately: they live in the
+        // ring, so copying them out IS the operation. What is gone is the
+        // 8192-comparison walk to reach them, which for this caller (the
+        // index build's replay window, usually a handful of events) was
+        // nearly all of the cost.
+        let log = self.log.lock().unwrap();
+        let start = log.partition_point(|e| e.seq <= since);
+        log.range(start..).cloned().collect()
     }
 
     /// Subscribe from `since` (None = live only). Returns the catch-up batch
@@ -131,7 +136,11 @@ impl EventHub {
                 match log.front() {
                     // Ring must contain (since+1); its head is the oldest kept.
                     Some(head) if head.seq > since + 1 => return Err(ErrorCode::TooOld),
-                    _ => log.iter().filter(|e| e.seq > since).cloned().collect(),
+                    // Seek rather than scan; see `since`.
+                    _ => {
+                        let start = log.partition_point(|e| e.seq <= since);
+                        log.range(start..).cloned().collect()
+                    }
                 }
             }
         };

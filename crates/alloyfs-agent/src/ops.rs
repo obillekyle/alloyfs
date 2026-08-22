@@ -207,6 +207,14 @@ impl Export {
     }
 
     pub fn version_of(&self, path: &RelPath) -> u64 {
+        // Called once per entry of every listing and tree page, against a
+        // map that only holds paths this process has MUTATED — empty on a
+        // read-only export, and tiny on most others. The emptiness check is
+        // a relaxed load against a DashMap probe that hashes the path and
+        // takes a shard lock; 0 is what the probe would have answered.
+        if self.versions.is_empty() {
+            return 0;
+        }
         self.versions.get(path).map(|v| *v).unwrap_or(0)
     }
 
@@ -1019,7 +1027,20 @@ impl SessionInner {
                     continue;
                 }
             };
-            let md = match std::fs::metadata(&full) {
+            // Open FIRST, then fstat the handle we already hold. The old
+            // order — resolve, stat by path, open by path — walked the same
+            // path three times per file, up to READ_MANY_ENTRIES of them
+            // per request, and left a stat-then-open window where the file
+            // could change identity underneath. What the handle reports is
+            // what the handle will read.
+            let file = match File::open(&full) {
+                Ok(f) => f,
+                Err(e) => {
+                    entries.push(ManyEntry::Skipped(alloyfs_common::io_to_code(&e)));
+                    continue;
+                }
+            };
+            let md = match file.metadata() {
                 Ok(md) if md.is_file() => md,
                 Ok(_) => {
                     entries.push(ManyEntry::Skipped(ErrorCode::IsADirectory));
@@ -1042,7 +1063,7 @@ impl SessionInner {
                 break; // out of room; the client asks for the rest
             }
             let mut buf = vec![0u8; size as usize];
-            let n = match read_fully(&File::open(&full).or_code()?, &mut buf, 0) {
+            let n = match read_fully(&file, &mut buf, 0) {
                 Ok(n) => n,
                 Err(e) => {
                     entries.push(ManyEntry::Skipped(alloyfs_common::io_to_code(&e)));
@@ -1065,6 +1086,16 @@ impl SessionInner {
             return Err(ErrorCode::Io);
         }
         let of = self.handle_of(fh)?;
+        // The zeroing here is deliberate, not an oversight. Serving from
+        // uninitialised capacity would save a memset per 128 KiB block, but
+        // it costs a `&mut [u8]` aimed at memory Rust considers
+        // uninitialised — UB by the letter of the model even when every
+        // byte is written before anyone looks. This process already runs
+        // with LTO disabled because cross-crate inlining exposed suspected
+        // latent UB in the FFI glue (docs/upstream/thin-lto-winfsp-ffi-hang);
+        // buying a memset with more of the same is the wrong trade in a
+        // filesystem daemon. If this ever measures as a real cost, the
+        // answer is a reused buffer, not an uninitialised one.
         let mut buf = vec![0u8; len as usize];
         let n = read_fully(&of.file, &mut buf, offset).or_code()?;
         buf.truncate(n);
