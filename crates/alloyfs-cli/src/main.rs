@@ -273,6 +273,8 @@ enum Command {
         #[arg(long, conflicts_with = "dry_run")]
         rollback: bool,
     },
+    /// Check the local things that stop a drive from working.
+    Doctor,
     /// Read what a long-running command logged. No name lists what is there.
     Logs {
         /// Log name: a service id, or `serve` / `mount` / `start`.
@@ -689,6 +691,7 @@ async fn async_main() -> anyhow::Result<()> {
             (_, true) => commands::update::rollback(),
             _ => commands::update::run(channel, dry_run),
         },
+        Command::Doctor => commands::doctor::run(),
         Command::Logs { name, follow, lines } => commands::logs::run(name, follow, lines).await,
     }
 }

@@ -56,6 +56,35 @@ pub(crate) fn verify_backend() -> anyhow::Result<()> {
     reg::verify_backend()
 }
 
+/// Is the platform's service supervisor reachable — the SCM here, the
+/// systemd user bus there? For `doctor`, which reports it rather than
+/// refusing to continue: a machine that mounts by hand needs no supervisor.
+pub(crate) fn verify_supervisor_check() -> anyhow::Result<()> {
+    reg::verify_supervisor()
+}
+
+/// The platform's note about services not starting until login, if it has
+/// one (linger on Linux; Windows services start at boot regardless).
+pub(crate) fn linger_note_check() -> Option<String> {
+    reg::linger_note()
+}
+
+/// Registered instances and their states, on one line, for `doctor`.
+///
+/// Deliberately not `list`'s table: the question here is "is anything
+/// registered, and is it running", not "what exactly does each one run".
+pub(crate) fn instance_summary() -> anyhow::Result<String> {
+    let ids = instance::list_ids();
+    if ids.is_empty() {
+        return Ok(String::new());
+    }
+    let mut parts = Vec::with_capacity(ids.len());
+    for id in &ids {
+        parts.push(format!("{id}={}", reg::state(id)));
+    }
+    Ok(format!("{} registered: {}", ids.len(), parts.join(", ")))
+}
+
 // ------------------------------------------------------------------ commands
 
 pub fn setup() -> anyhow::Result<()> {

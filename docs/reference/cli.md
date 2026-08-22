@@ -14,6 +14,7 @@ alloyfs <COMMAND>
 | `cache` | Manage the local cache (`cache clear` drops it) |
 | `events` | Tail the change stream as NDJSON |
 | `logs` | Read what a long-running command logged |
+| `doctor` | Check the local things that stop a drive from working |
 | `ping` | Round-trip time to an agent |
 | `bench` | Timed pipelined read, no mount involved |
 | `stress` | Concurrent load generator |
@@ -182,6 +183,27 @@ Re-runs the installer from `alloy.okyle.dev` rather than replacing the binary
 itself — one implementation of download-verify-install instead of two. On
 Windows the installer renames the running executable aside before writing the
 new one, which is the only way to replace a binary that is currently executing.
+
+## doctor
+
+```bash
+alloyfs doctor
+```
+
+Checks the local things that stop a drive from working, and says which one
+is wrong instead of leaving you to guess which command happens to test it:
+the filesystem driver (WinFsp / FUSE, with the install URL when it is
+missing), whether the service supervisor is reachable, which config file is
+actually in force and whether it parses, where the logs are and whether
+there are any, and what services are registered with their current state. On
+Linux it also warns when user services will not start until login (linger).
+
+Local and fast, deliberately. Whether a server answers is a real question
+and it belongs to `alloyfs ping <url>`, which reports a round-trip time —
+probing the network here would make the command slow and hang on exactly the
+machines that need it. Exit status is non-zero if any check fails; the table
+goes to stdout and log lines to stderr, so `alloyfs doctor 2>/dev/null` pipes
+cleanly.
 
 ## logs
 
