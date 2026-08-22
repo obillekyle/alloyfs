@@ -6,20 +6,60 @@ use alloyfs_proto::{Request, Response, PROTO_RANGE};
 
 use crate::urls::{connect_target, require_export, whoami};
 
-pub async fn ping(url: String, count: u32, token: Option<String>) -> anyhow::Result<()> {
+pub async fn ping(url: String, count: u32, token: Option<String>, json: bool) -> anyhow::Result<()> {
     let (conn, _) = connect_target(&url, "alloyfs", "ping", token.as_deref()).await?;
-    println!("connected to {}", conn.server_name);
-    // Both halves of the compatibility question in one quotable line: what
-    // this pair settled on, and what this build was willing to speak. A peer
-    // that refuses to connect at all is diagnosed by comparing two of these.
-    println!(
-        "protocol v{} negotiated (this build speaks {PROTO_RANGE})",
-        conn.proto
-    );
+    if !json {
+        println!("connected to {}", conn.server_name);
+        // Both halves of the compatibility question in one quotable line:
+        // what this pair settled on, and what this build was willing to
+        // speak. A peer that refuses to connect at all is diagnosed by
+        // comparing two of these.
+        println!(
+            "protocol v{} negotiated (this build speaks {PROTO_RANGE})",
+            conn.proto
+        );
+    }
+    let mut rtts = Vec::with_capacity(count as usize);
     for i in 1..=count {
         let rtt = conn.ping().await?;
-        println!("ping {i}: {:.3} ms", rtt.as_secs_f64() * 1000.0);
+        let ms = rtt.as_secs_f64() * 1000.0;
+        rtts.push(ms);
+        if !json {
+            println!("ping {i}: {ms:.3} ms");
+        }
     }
+    if json {
+        // Milliseconds as numbers, not preformatted strings: a consumer that
+        // wants three decimal places can round, and one that wants to
+        // average cannot un-round.
+        let sorted = {
+            let mut v = rtts.clone();
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            v
+        };
+        emit(serde_json::json!({
+            "url": url,
+            "server": conn.server_name,
+            "proto": conn.proto,
+            "proto_range": PROTO_RANGE,
+            "count": count,
+            "rtt_ms": rtts,
+            "min_ms": sorted.first(),
+            "median_ms": sorted.get(sorted.len() / 2),
+            "max_ms": sorted.last(),
+        }))?;
+    }
+    Ok(())
+}
+
+/// One JSON document on stdout, pretty-printed and newline-terminated.
+///
+/// Pretty rather than compact because these are commands a person runs and
+/// then pipes to `jq` — and `jq` reformats anyway, so the only reader who
+/// notices is the one looking at raw output. Newline-terminated so a shell
+/// prompt does not land on the closing brace.
+fn emit(value: serde_json::Value) -> anyhow::Result<()> {
+    println!("{}", serde_json::to_string_pretty(&value)?);
     Ok(())
 }
 
@@ -151,7 +191,7 @@ pub async fn events(
 /// comparison it exists to make is against `Readdir`, which needs one round
 /// trip per directory — so the directory count in the output is roughly the
 /// number of round trips this replaced.
-pub async fn tree(url: String, remote_cmd: String, token: Option<String>) -> anyhow::Result<()> {
+pub async fn tree(url: String, remote_cmd: String, token: Option<String>, json: bool) -> anyhow::Result<()> {
     let (conn, export) = connect_target(&url, &remote_cmd, &whoami(), token.as_deref()).await?;
     let export = require_export(export, &url)?;
     conn.request(alloyfs_proto::Request::Attach { export }).await??;
@@ -187,6 +227,12 @@ pub async fn tree(url: String, remote_cmd: String, token: Option<String>) -> any
         };
         requests += 1;
         if token == 0 {
+            if json {
+                // `indexed: false` rather than an error: not being indexed is
+                // a legitimate configuration, and a monitoring script should
+                // be able to see it without parsing a message.
+                return emit(serde_json::json!({ "url": url, "indexed": false }));
+            }
             println!("{url}: not indexed — clients fall back to per-directory readdir");
             println!("  (the export is past the agent's tree_max_entries, or indexing failed)");
             return Ok(());
@@ -213,6 +259,23 @@ pub async fn tree(url: String, remote_cmd: String, token: Option<String>) -> any
         }
     }
     let ms = started.elapsed().as_secs_f64() * 1000.0;
+    if json {
+        return emit(serde_json::json!({
+            "url": url,
+            "indexed": true,
+            // A string: the token is a u64 whose top bit is routinely set,
+            // and JSON numbers are doubles in most consumers — JavaScript
+            // would silently round it and then compare two tokens as equal
+            // when they are not, which is the one thing a token is for.
+            "token": format!("{token_seen:#018x}"),
+            "entries": dirs + files,
+            "directories": dirs,
+            "files": files,
+            "bytes": bytes,
+            "requests": requests,
+            "elapsed_ms": ms,
+        }));
+    }
     println!("{url}");
     println!("  token       {token_seen:#018x}");
     println!(
@@ -243,6 +306,7 @@ pub async fn bulk(
     rounds: usize,
     remote_cmd: String,
     token: Option<String>,
+    json: bool,
 ) -> anyhow::Result<()> {
     use alloyfs_proto::{ManyEntry, OpenFlags, RelPath, DATA_CHUNK};
 
@@ -286,10 +350,12 @@ pub async fn bulk(
     }
     anyhow::ensure!(!files.is_empty(), "{dir} has no files to measure");
     let total_bytes: u64 = files.iter().map(|(_, s)| s).sum();
-    println!(
-        "{} files, {total_bytes} bytes total, {rounds} round(s) of each strategy\n",
-        files.len()
-    );
+    if !json {
+        println!(
+            "{} files, {total_bytes} bytes total, {rounds} round(s) of each strategy\n",
+            files.len()
+        );
+    }
 
     // Per-file: Open, Read the whole thing, Release. What the walker did before
     // v8, and what any consumer without ReadMany still does.
@@ -402,6 +468,7 @@ pub async fn bulk(
     let mut serial_ms = Vec::new();
     let mut conc_ms = Vec::new();
     let mut bulk_ms = Vec::new();
+    let mut controls: Vec<(f64, f64)> = Vec::new();
     for round in 1..=rounds {
         let ctl_a = control();
 
@@ -421,19 +488,50 @@ pub async fn bulk(
         bulk_ms.push(b);
 
         let ctl_b = control();
-        println!(
-            "round {round}: serial {a:9.1} ms ({a_bytes} B) | 4-way {c:8.1} ms ({c_bytes} B) \
-             | ReadMany {b:7.1} ms ({b_bytes} B) | control {ctl_a:.0}/{ctl_b:.0} ms"
-        );
+        // The control belongs in the output whichever form it takes: a round
+        // whose control moved is a round where the MACHINE moved, and a
+        // consumer that cannot see that will read drift as a result.
+        controls.push((ctl_a, ctl_b));
+        if !json {
+            println!(
+                "round {round}: serial {a:9.1} ms ({a_bytes} B) | 4-way {c:8.1} ms ({c_bytes} B) \
+                 | ReadMany {b:7.1} ms ({b_bytes} B) | control {ctl_a:.0}/{ctl_b:.0} ms"
+            );
+        }
     }
 
     let median = |mut v: Vec<f64>| {
         v.sort_by(|x, y| x.partial_cmp(y).unwrap());
         v[v.len() / 2]
     };
-    let a = median(serial_ms);
-    let c = median(conc_ms);
-    let b = median(bulk_ms);
+    let a = median(serial_ms.clone());
+    let c = median(conc_ms.clone());
+    let b = median(bulk_ms.clone());
+    if json {
+        return emit(serde_json::json!({
+            "url": url,
+            "dir": dir,
+            "rounds": rounds,
+            "files": files.len(),
+            // The size of the workload, which the human header carries and
+            // the JSON would otherwise drop: a timing without it is not
+            // comparable to a timing from another directory.
+            "bytes": total_bytes,
+            "serial_ms": serial_ms,
+            "concurrent_4_ms": conc_ms,
+            "readmany_ms": bulk_ms,
+            // Two per round, taken before and after: they bracket the round,
+            // so a gap between them is drift that happened DURING it.
+            "control_ms": controls.iter().map(|(x, y)| vec![*x, *y]).collect::<Vec<_>>(),
+            "median": {
+                "serial_ms": a,
+                "concurrent_4_ms": c,
+                "readmany_ms": b,
+                "serial_over_readmany": a / b.max(0.001),
+                "concurrent_over_readmany": c / b.max(0.001),
+            },
+        }));
+    }
     println!("\nmedians over {rounds} round(s):");
     println!("  per-file, serial     {a:9.1} ms   ({:.1}x)", a / b.max(0.001));
     println!(

@@ -226,10 +226,44 @@ pub fn control(action: &str, id: Option<String>) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn list() -> anyhow::Result<()> {
+pub fn list(json: bool) -> anyhow::Result<()> {
     // Deliberately skips `preflight`: "what is registered" is a question worth
     // answering from any shell, elevated or not.
     let ids = instance::list_ids();
+    if json {
+        let services: Vec<serde_json::Value> = ids
+            .iter()
+            .map(|id| {
+                let (kind, command, legacy, error) = match instance::load(id) {
+                    Ok(i) => (
+                        Some(i.kind().to_string()),
+                        Some(format!("alloyfs {}", i.command())),
+                        matches!(i, Instance::Legacy(_)),
+                        None,
+                    ),
+                    Err(e) => (None, None, false, Some(format!("{e}"))),
+                };
+                serde_json::json!({
+                    "id": id,
+                    "kind": kind,
+                    "state": reg::state(id),
+                    "command": command,
+                    // The "why" behind the state, when the supervisor has
+                    // one. This is the field worth alerting on: a crash-loop
+                    // reads as `running` in `state`, because the supervisor
+                    // is up — it is the child that keeps dying.
+                    "detail": reg::detail(id),
+                    "legacy": legacy,
+                    "error": error,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({ "services": services }))?
+        );
+        return Ok(());
+    }
     if ids.is_empty() {
         println!("no services defined.");
         println!("  alloyfs service add alloyfs   # everything the config describes");

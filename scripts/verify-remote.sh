@@ -58,11 +58,18 @@ tar czf - Cargo.toml Cargo.lock rust-toolchain.toml rustfmt.toml crates scripts 
 # dead-code errors that broke the Linux build come from `clippy -D warnings`,
 # and `cargo test` reports them as warnings it prints and ignores. A check that
 # is easier to satisfy than CI is worse than no check, because it is believed.
+# nextest when the destination has it, plain `cargo test` when it does not —
+# same optional treatment as scripts/verify.sh, and for the same reason: a
+# box that can build this must be able to check it.
 echo "==> fmt + clippy + test on $host"
 run_there "cd $dest && . ~/.cargo/env 2>/dev/null; \
   cargo fmt --all --check && \
   cargo clippy --workspace --all-targets -- -D warnings && \
-  cargo test --workspace"
+  if command -v cargo-nextest >/dev/null 2>&1; then \
+    cargo nextest run --workspace && cargo test --workspace --doc; \
+  else \
+    cargo test --workspace; \
+  fi"
 
 echo
 echo "verify OK ($host)"

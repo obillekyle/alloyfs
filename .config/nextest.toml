@@ -1,0 +1,34 @@
+# cargo-nextest, when it is installed. `scripts/verify.sh` and CI both fall
+# back to `cargo test` when it is not, so nothing here is load-bearing — it
+# only decides what nextest does with a suite it is already running.
+
+[profile.default]
+# A test that has not finished in 60 s has almost certainly deadlocked rather
+# than got slow: the whole loopback battery runs in seconds, and its longest
+# waits are event-pump settles measured in hundreds of milliseconds. Naming
+# the offender beats a suite that hangs until somebody notices.
+slow-timeout = { period = "20s", terminate-after = 3 }
+
+# Retry once, and REPORT the retry. This is the reason for adopting nextest at
+# all: `cargo test` reruns tell you a suite passed, not that a test failed and
+# then passed. A flake here comes out labelled FLAKY with its name, which is
+# what turns "the create-burst test is sometimes red" into an entry in a
+# backlog. It is not a way to make failures go away — a test that fails twice
+# still fails the run.
+retries = 1
+
+# Failures printed where they happen AND collected at the end, because the
+# loopback battery is chatty enough that a failure 200 lines up is a failure
+# nobody reads. `status-level = "retry"` is what makes a retried test visible
+# at all — the default says nothing until the final summary.
+failure-output = "immediate-final"
+status-level = "retry"
+
+[profile.ci]
+# CI has no operator watching, so it should say everything at the end.
+failure-output = "immediate-final"
+final-status-level = "flaky"
+# Shared runners are slower and noisier than any dev box; the same reasoning
+# as ALLOYFS_TEST_DEADLINE_MULT=3 in the workflow.
+slow-timeout = { period = "60s", terminate-after = 3 }
+retries = 2

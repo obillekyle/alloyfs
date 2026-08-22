@@ -194,6 +194,11 @@ enum Command {
         /// Shared secret for token-protected TCP servers.
         #[arg(long)]
         token: Option<String>,
+        /// One JSON document instead of the summary. An unindexed export is
+        /// `indexed: false` rather than an error — it is a legitimate
+        /// configuration, not a failure.
+        #[arg(long)]
+        json: bool,
     },
     /// Measure round-trip latency to an agent (url: tcp://host:port or ssh://host).
     Ping {
@@ -203,6 +208,10 @@ enum Command {
         /// Shared secret for token-protected TCP servers.
         #[arg(long)]
         token: Option<String>,
+        /// One JSON document instead of a line per ping, with every round
+        /// trip as a number rather than a rounded string.
+        #[arg(long)]
+        json: bool,
     },
     /// Fire many concurrent pipelined requests at an agent and verify replies.
     Stress {
@@ -243,6 +252,12 @@ enum Command {
         /// Shared secret for token-protected TCP servers.
         #[arg(long)]
         token: Option<String>,
+        /// One JSON document instead of a line per round, carrying every
+        /// round's raw timings AND the CPU control — a run whose control
+        /// moved is a run where the machine moved, and a consumer that
+        /// cannot see that will read drift as a result.
+        #[arg(long)]
+        json: bool,
     },
     /// Write a config for a directory, ready to serve.
     Init {
@@ -273,6 +288,13 @@ enum Command {
         /// which is the point, when the new release is what broke.
         #[arg(long, conflicts_with = "dry_run")]
         rollback: bool,
+        /// Stop registered services before installing and start them after.
+        /// Without it the update lands on disk and the services keep running
+        /// the version it replaced until they are restarted; with it, a
+        /// FAILED install leaves them stopped. Off by default for that
+        /// reason.
+        #[arg(long, conflicts_with_all = ["dry_run", "check", "rollback"])]
+        restart: bool,
     },
     /// Check the local things that stop a drive from working.
     Doctor,
@@ -347,7 +369,13 @@ enum ServiceCmd {
     /// Restart one instance, or every instance.
     Restart { id: Option<String> },
     /// What is defined, and what each one is doing.
-    List,
+    List {
+        /// One JSON document instead of the table. `detail` is the field to
+        /// alert on: a crash-looping service reads as `running` in `state`,
+        /// because the supervisor is up and it is the child that keeps dying.
+        #[arg(long)]
+        json: bool,
+    },
     /// Remove EVERY instance and its definition.
     Reset {
         #[arg(long)]
@@ -676,7 +704,7 @@ async fn async_main() -> anyhow::Result<()> {
             ServiceCmd::Start { id } => commands::service::control("start", id),
             ServiceCmd::Stop { id } => commands::service::control("stop", id),
             ServiceCmd::Restart { id } => commands::service::control("restart", id),
-            ServiceCmd::List => commands::service::list(),
+            ServiceCmd::List { json } => commands::service::list(json),
             ServiceCmd::Reset { confirm } => commands::service::reset(confirm),
             #[cfg(windows)]
             ServiceCmd::Run { id } => commands::service::runtime::run(&id),
@@ -709,8 +737,14 @@ async fn async_main() -> anyhow::Result<()> {
             url,
             remote_cmd,
             token,
-        } => commands::diag::tree(url, remote_cmd, token).await,
-        Command::Ping { url, count, token } => commands::diag::ping(url, count, token).await,
+            json,
+        } => commands::diag::tree(url, remote_cmd, token, json).await,
+        Command::Ping {
+            url,
+            count,
+            token,
+            json,
+        } => commands::diag::ping(url, count, token, json).await,
         Command::Stress { url, count, token } => commands::diag::stress(url, count, token).await,
         Command::Bulk {
             url,
@@ -718,7 +752,8 @@ async fn async_main() -> anyhow::Result<()> {
             rounds,
             remote_cmd,
             token,
-        } => commands::diag::bulk(url, dir, rounds, remote_cmd, token).await,
+            json,
+        } => commands::diag::bulk(url, dir, rounds, remote_cmd, token, json).await,
         Command::Bench {
             url,
             path,
@@ -737,10 +772,11 @@ async fn async_main() -> anyhow::Result<()> {
             dry_run,
             check,
             rollback,
+            restart,
         } => match (check, rollback) {
             (true, _) => commands::update::check(),
             (_, true) => commands::update::rollback(),
-            _ => commands::update::run(channel, dry_run),
+            _ => commands::update::run(channel, dry_run, restart),
         },
         Command::Doctor => commands::doctor::run(),
         Command::Completions { shell } => {

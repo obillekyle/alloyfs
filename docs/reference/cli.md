@@ -164,7 +164,21 @@ alloyfs update v0.1.1       # pin, or roll back
 alloyfs update --dry-run    # print the command, run nothing
 alloyfs update --check      # is there a newer release? exits 1 if so
 alloyfs update --rollback   # put back the previous binary, no network
+alloyfs update --restart    # stop services, install, start them again
 ```
+
+An update replaces the binary on disk; it does not replace the binary a
+service is *running*. Windows cannot overwrite a running executable at all —
+the installer renames the old one aside and the service keeps executing it —
+and on Linux the old inode stays mapped until the process exits. Either way
+the drives go on serving the version that was just replaced. `update` says so
+when it finishes, naming the services that need attention.
+
+`--restart` does the stop-install-start sequence instead. It is opt-in
+because the failure modes are not symmetric: left alone, a failed update
+means the old version keeps running, which nobody has to think about;
+stopping first means a failed install leaves the drives **down**. Both need
+the same privilege the services were registered with.
 
 `--check` reports two numbers because they answer different questions and
 often disagree: `stable` is the newest non-prerelease, and `newest` is the
@@ -304,3 +318,32 @@ number a mount is being compared against. `--depth 1` shows what serial
 round-trips cost.
 
 Measure with `--auto-cache-max 0` on the mount, or you are timing your disk.
+
+### `--json`
+
+`ping`, `tree`, `bulk` and `service list` take `--json` and write one
+document to stdout and nothing else, so they can be piped straight into `jq`
+or a monitoring script.
+
+```bash
+alloyfs ping tcp://host:7440 --json | jq .median_ms
+alloyfs service list --json | jq -r '.services[] | select(.detail) | .id'
+```
+
+Some of it is deliberate rather than mechanical:
+
+- Timings are **numbers**, not the rounded strings the human output prints.
+  A consumer that wants three decimal places can round; one that wants to
+  average cannot un-round.
+- `tree` reports its token as a **string**. It is a `u64` whose top bit is
+  routinely set, and JSON numbers are doubles in most consumers —
+  JavaScript would silently round it and then compare two different tokens
+  as equal, which is the one thing a token exists to prevent.
+- An unindexed export is `indexed: false`, not an error. Not being indexed
+  is a legitimate configuration.
+- `bulk` carries every round's raw timings **and** the CPU control that
+  brackets each round. A run whose control moved is a run where the machine
+  moved; a consumer that cannot see that will read drift as a result.
+- `service list` exposes `detail` separately from `state`. That is the field
+  to alert on: a crash-looping service reads as `running`, because the
+  supervisor is up and it is the child that keeps dying.

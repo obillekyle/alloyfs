@@ -214,7 +214,50 @@ pub fn rollback() -> anyhow::Result<()> {
 
 /// What to install. A channel is just a tag prefix, so this stays honest about
 /// the fact that there is exactly one release stream today.
-pub fn run(channel: Option<String>, dry_run: bool) -> anyhow::Result<()> {
+/// Services registered on this machine, which an update does not touch.
+///
+/// A new binary on disk is not a new binary running: Windows cannot overwrite
+/// a running executable at all (the installer renames the old one aside and a
+/// running service keeps executing it), and on Linux the old inode stays
+/// mapped until the process exits. Either way the update reports success and
+/// the drives go on serving the version it replaced, indefinitely, with
+/// nothing said about it.
+///
+/// Reading the registered ids needs no privilege — `service list` deliberately
+/// skips the elevation preflight for exactly this reason — so the closing
+/// report is always available even when acting on it would not be.
+fn registered_services() -> Vec<String> {
+    super::service::instance::list_ids()
+}
+
+/// Stop every registered service, run `f`, then start them again.
+///
+/// Opt-in (`--restart`) rather than automatic, because the failure modes are
+/// not symmetric. Left alone, a failed update means the old version keeps
+/// running — an outcome nobody has to think about. Stopping first means a
+/// failed install leaves the drives DOWN, and the operator finds out when
+/// something else breaks. That is a trade worth offering and not worth
+/// making on someone's behalf.
+///
+/// Restart is attempted for every service even after one fails to come back,
+/// on the same reasoning `service control` uses: four drives up and one
+/// named is better than one refusal hiding the rest.
+fn around_restart<T>(ids: &[String], f: impl FnOnce() -> anyhow::Result<T>) -> anyhow::Result<T> {
+    println!("stopping {} service(s) first", ids.len());
+    super::service::control("stop", None)?;
+    let result = f();
+    println!("\nstarting {} service(s) again", ids.len());
+    // Reported, not propagated: the update itself either worked or it did
+    // not, and burying that behind a restart failure would misreport which
+    // step went wrong.
+    if let Err(e) = super::service::control("start", None) {
+        eprintln!("the update finished, but a service did not come back: {e:#}");
+        eprintln!("start them by hand with `alloyfs service start`");
+    }
+    result
+}
+
+pub fn run(channel: Option<String>, dry_run: bool, restart: bool) -> anyhow::Result<()> {
     let version = match channel.as_deref() {
         None | Some("stable") | Some("latest") => None,
         // A literal tag: `alloyfs update v0.1.1` pins, which is what you want
@@ -270,23 +313,48 @@ pub fn run(channel: Option<String>, dry_run: bool) -> anyhow::Result<()> {
         }
     }
 
-    println!("\nrunning the installer from {BASE}\n");
-    let mut cmd = Command::new(&program);
-    cmd.args(&args);
-    if let Some(dir) = &install_dir {
-        // Through the environment, not the command string: the child shells
-        // inherit it, and a path never has to survive quoting.
-        cmd.env("ALLOYFS_INSTALL", dir);
-    }
-    let status = cmd
-        .status()
-        .map_err(|e| anyhow::anyhow!("could not run {program}: {e}"))?;
+    let install = || {
+        println!("\nrunning the installer from {BASE}\n");
+        let mut cmd = Command::new(&program);
+        cmd.args(&args);
+        if let Some(dir) = &install_dir {
+            // Through the environment, not the command string: the child
+            // shells inherit it, and a path never has to survive quoting.
+            cmd.env("ALLOYFS_INSTALL", dir);
+        }
+        let status = cmd
+            .status()
+            .map_err(|e| anyhow::anyhow!("could not run {program}: {e}"))?;
 
-    if !status.success() {
-        anyhow::bail!(
-            "the installer failed. Run it by hand to see why:\n  {program} {}",
-            args.join(" ")
+        if !status.success() {
+            anyhow::bail!(
+                "the installer failed. Run it by hand to see why:\n  {program} {}",
+                args.join(" ")
+            );
+        }
+        Ok(())
+    };
+
+    let services = registered_services();
+    if restart && !services.is_empty() {
+        return around_restart(&services, install);
+    }
+    install()?;
+
+    // The closing report, and the reason this is not silent: the new binary
+    // is on disk, and every registered service is still executing the old
+    // one. Nothing above this line makes that happen and nothing below it
+    // can — it takes a restart, which needs the privilege an update may not
+    // have been run with.
+    if !services.is_empty() {
+        println!();
+        println!(
+            "{} service(s) are still running the previous version: {}",
+            services.len(),
+            services.join(", ")
         );
+        println!("  alloyfs service restart          (elevated / with sudo)");
+        println!("  alloyfs update --restart         does this for you next time");
     }
     Ok(())
 }
