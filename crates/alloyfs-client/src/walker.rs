@@ -542,6 +542,13 @@ async fn fetch_many(fs: &Arc<RemoteFs>, cache: &Arc<AutoCache>, batch: Vec<RelPa
     let mut remaining = batch;
 
     while !remaining.is_empty() {
+        // The clone here is structural, not an oversight: `ReadMany` owns
+        // its paths (it crosses a wire), and the list is still needed
+        // afterwards — to zip against a reply that is only a PREFIX, to
+        // fall back per-file if the request fails, and to keep the
+        // unserved tail for the next round. Moving it into the request
+        // would mean recovering it from the request, which is strictly
+        // worse. It costs one path list per round, at mount time only.
         let resp = fs
             .conn()
             .request(Request::ReadMany {

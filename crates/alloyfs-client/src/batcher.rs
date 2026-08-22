@@ -59,7 +59,13 @@ pub(crate) enum PendingOp {
     Write {
         path: RelPath,
         mode: u32,
-        data: Vec<u8>,
+        /// `Bytes`, not `Vec<u8>`: the flush builds its request out of a
+        /// BORROWED run of the drained queue, so the payload cannot be
+        /// moved out of it and every batched file's bytes were copied a
+        /// second time on the way to the wire — up to a full flush budget
+        /// per batch, on precisely the untar/`npm install` path this whole
+        /// subsystem exists for. A `Bytes` clone is a refcount bump.
+        data: bytes::Bytes,
     },
     Remove {
         path: RelPath,
@@ -328,7 +334,7 @@ impl Batcher {
                             PendingOp::Write { path, mode, data } => ManyWrite {
                                 path: path.clone(),
                                 mode: *mode,
-                                data: bytes::Bytes::from(data.clone()),
+                                data: data.clone(), // refcount, not a copy
                             },
                             _ => unreachable!("run is writes"),
                         })
@@ -455,7 +461,7 @@ mod tests {
         batcher.push(PendingOp::Write {
             path: RelPath("a.bin".into()),
             mode: 0o644,
-            data: b"payload".to_vec(),
+            data: bytes::Bytes::from_static(b"payload"),
         });
 
         // A ticket dispenser: each interesting moment takes the next

@@ -90,6 +90,20 @@ pub(crate) struct OpenState {
     /// time, which is exactly what SQLite does. Replaying only the last one
     /// taken would restore less than the server had and call it success.
     pub lock: std::sync::Mutex<Vec<HeldRange>>,
+    /// This handle's idea of the file's size, for bounding readahead.
+    ///
+    /// Kept here because the alternative was two map lookups on EVERY
+    /// read — hash the path to find the ino, then hash the ino to find the
+    /// attr — for a number the open already had in hand. Worse, when the
+    /// attr entry had since been invalidated the lookup fell back to
+    /// "unknown", and unknown does not merely widen the window: it turns
+    /// OFF stream-pool striping for the rest of the handle's life, because
+    /// the pool refuses to dial for a file whose length it cannot see.
+    ///
+    /// A prefetch HINT, not a fact. Our own writes advance it; a remote
+    /// change may leave it short, which costs readahead and nothing else —
+    /// the same trade the comment at the read site already documents.
+    pub size: AtomicU64,
     /// Set when a reconnect could not restore this handle's lock (or the
     /// handle itself, if it held one). A poisoned handle fails read/write/
     /// lock/flush with EIO — mutual exclusion may have been broken and the
@@ -787,6 +801,7 @@ impl RemoteFs {
                             pending_new: None,
                             blob: std::sync::RwLock::new(None),
                             version: AtomicU64::new(attr.version),
+                            size: AtomicU64::new(attr.size),
                         },
                     );
                     return Ok((fh, attr));
@@ -844,6 +859,7 @@ impl RemoteFs {
                 pending_new: None,
                 blob: std::sync::RwLock::new(None),
                 version: AtomicU64::new(attr.version),
+                size: AtomicU64::new(attr.size),
             },
         );
         Ok((fh, attr))
@@ -990,7 +1006,7 @@ impl RemoteFs {
         batch.push(PendingOp::Write {
             path: path.clone(),
             mode: p.mode,
-            data: p.data,
+            data: p.data.into(),
         });
         // Queued claim taken; the unsealed one retires.
         batch.forget(&path);
@@ -1119,11 +1135,20 @@ impl RemoteFs {
         // A cold attr cache falls back to unbounded rather than guessing. This
         // bound is a prefetch hint: too low only forgoes readahead, and too
         // high is what the code did before.
-        let eof_block_exclusive = self
-            .ino
-            .ino_of(&state.path)
-            .and_then(|ino| self.attr_cache.get(&ino).map(|hit| hit.0.size))
-            .map(|size| ReadAhead::block_of(size.saturating_sub(1)) + 1)
+        // From the handle, which has known the size since it was opened.
+        // The attr cache is consulted only if the handle never learned one
+        // (0 is the resting value for a file created empty, and re-reading
+        // it there is free).
+        let known_size = match state.size.load(Ordering::Relaxed) {
+            0 => self
+                .ino
+                .ino_of(&state.path)
+                .and_then(|ino| self.attr_cache.get(&ino).map(|hit| hit.0.size)),
+            size => Some(size),
+        };
+        let eof_block_exclusive = known_size
+            .filter(|size| *size > 0)
+            .map(|size| ReadAhead::block_of(size - 1) + 1)
             .unwrap_or(u64::MAX);
         if prefetch {
             // Multi-stream: a long cold stream stripes its window across the
@@ -1468,6 +1493,13 @@ impl RemoteFs {
         // self-origin), so cache coherence is synchronous, right here.
         if let Some(state) = self.open_files.get(&fh) {
             state.wrote.store(true, Ordering::Relaxed);
+            // Keep the readahead bound honest about what we just wrote:
+            // the server's answer when it gave one, otherwise at least as
+            // far as this write reached.
+            let grown = fresh
+                .map(|a| a.size)
+                .unwrap_or_else(|| offset + data.len() as u64);
+            state.size.fetch_max(grown, Ordering::Relaxed);
             self.mark_path_written(
                 &state.path,
                 fresh.zip(self.ino.ino_of(&state.path)).map(|(a, i)| (i, a)),
@@ -1651,6 +1683,7 @@ impl RemoteFs {
                                 cancelled: false,
                             })),
                             version: AtomicU64::new(0),
+                            size: AtomicU64::new(0),
                         },
                     );
                     return Ok((ino, fh, attr));
@@ -1685,6 +1718,7 @@ impl RemoteFs {
                 pending_new: None,
                 blob: std::sync::RwLock::new(None),
                 version: AtomicU64::new(attr.version),
+                size: AtomicU64::new(attr.size),
             },
         );
         Ok((ino, fh, attr))
