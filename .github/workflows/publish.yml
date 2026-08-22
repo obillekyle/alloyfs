@@ -164,6 +164,19 @@ jobs:
             *-*) pre=--prerelease ;;
             *)   pre= ;;
           esac
+          # One checksum file per asset, beside it. Per-asset rather than a
+          # single SHASUMS file because the installers download exactly one
+          # binary and should fetch exactly one small file to check it —
+          # a combined manifest would make every install parse a list to
+          # find its own line.
+          #
+          # Written before the upload so the sums travel with the release
+          # they describe, and computed from the very bytes being uploaded
+          # rather than rebuilt.
+          ( cd staged && for f in *; do
+              case "$f" in *.sha256) continue ;; esac
+              sha256sum "$f" | awk '{print $1}' > "$f.sha256"
+            done )
           gh release create "$TAG" --repo "$REPO" --title "$TAG" --notes-file notes.md $pre \
             || gh release edit "$TAG" --repo "$REPO" --notes-file notes.md
           gh release upload "$TAG" --repo "$REPO" --clobber staged/*

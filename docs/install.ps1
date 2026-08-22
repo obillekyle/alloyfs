@@ -3,9 +3,20 @@
 #   irm alloy.okyle.dev/install.ps1 | iex
 #
 # Environment:
-#   $env:ALLOYFS_VERSION   install this tag instead of the latest (e.g. v0.1.1)
-#   $env:ALLOYFS_INSTALL   install here instead of %LOCALAPPDATA%\Programs\alloyfs
-#   $env:GITHUB_TOKEN      optional; raises the GitHub API rate limit
+#   $env:ALLOYFS_VERSION      install this tag instead of the latest (e.g. v0.1.1)
+#   $env:ALLOYFS_INSTALL      install here instead of %LOCALAPPDATA%\Programs\alloyfs
+#   $env:GITHUB_TOKEN         optional; raises the GitHub API rate limit
+#   $env:ALLOYFS_SKIP_WINFSP  do not offer to install the WinFsp driver
+#   $env:WINFSP_VERSION       install this WinFsp tag instead of the latest
+#
+# This is the SILENT installer: it prompts for nothing, elevates nothing, and
+# is safe to run unattended. AlloyFS installs per-user and needs no rights at
+# all. WinFsp is a kernel driver and does need them, so it is installed only
+# when this is already running elevated; otherwise the script says so and
+# carries on.
+#
+# For an interactive install that asks for those rights once and then does
+# everything, use install.cmd.
 
 $ErrorActionPreference = 'Stop'
 
@@ -91,6 +102,26 @@ if ($magic[0] -ne 0x4D -or $magic[1] -ne 0x5A) {
   Die "downloaded file is not a Windows executable. This usually means the URL returned an error page."
 }
 
+# Checksum, when the release publishes one. Releases from before this
+# existed have no .sha256 asset, and refusing those would break rolling back
+# to them -- so a MISSING sum warns and continues, while a sum that is
+# present and does not match is fatal. The magic-byte check above catches an
+# error page; this catches a truncated download or a swapped asset.
+$want = $null
+try {
+  $sumUrl = "https://github.com/$Repo/releases/download/$version/$asset.sha256"
+  $want = (Invoke-WebRequest -Uri $sumUrl -UseBasicParsing).Content.Trim()
+} catch {
+  Write-Host "note: $version publishes no checksum; skipping verification" -ForegroundColor DarkGray
+}
+if ($want) {
+  $got = (Get-FileHash -Path $out -Algorithm SHA256).Hash.ToLower()
+  if ($got -ne $want.ToLower()) {
+    Die "checksum mismatch for ${asset}: expected $want, got $got. Refusing to install."
+  }
+  Write-Host 'Checksum verified.' -ForegroundColor Green
+}
+
 # --- install ----------------------------------------------------------------
 
 New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
@@ -119,13 +150,142 @@ if ($userPath -notlike "*$InstallDir*") {
   Dim "Added $InstallDir to your user PATH. Open a new terminal for it to apply everywhere."
 }
 
-# --- what it needs to actually mount ---------------------------------------
+# --- WinFsp: the driver that makes a mount possible ------------------------
+#
+# AlloyFS on Windows is a WinFsp filesystem. Without the driver, `alloyfs` runs
+# and every mount fails, which is a confusing place to leave someone who just
+# ran an installer.
+#
+# THIS SCRIPT RAISES NO UAC PROMPT. It is the silent installer -- the target of
+# `irm ... | iex` and of any unattended tooling -- and a silent installer that
+# stops to ask a question is a script that hangs on a machine with nobody
+# watching. install.cmd is the interactive front door: it asks once, up front,
+# and runs this with the rights already in hand.
+#
+# Elevated or not, AlloyFS itself installs per-user and needs nothing. Only the
+# WinFsp driver does, and without those rights this reports it rather than
+# asking for them.
+
+function Test-WinFsp {
+  (Test-Path 'HKLM:\SOFTWARE\WOW6432Node\WinFsp') -or (Test-Path 'HKLM:\SOFTWARE\WinFsp')
+}
+
+function Test-Admin {
+  $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+  (New-Object Security.Principal.WindowsPrincipal $id).IsInRole(
+    [Security.Principal.WindowsBuiltinRole]::Administrator)
+}
+
+function Install-WinFsp {
+  $wfRepo = 'winfsp/winfsp'
+  $wfTag  = $env:WINFSP_VERSION
+
+  Write-Host ''
+  Write-Host 'WinFsp is not installed. It is the filesystem driver AlloyFS mounts through.' -ForegroundColor Cyan
+
+  try {
+    $url = if ($wfTag) { "https://api.github.com/repos/$wfRepo/releases/tags/$wfTag" }
+           else        { "https://api.github.com/repos/$wfRepo/releases/latest" }
+    $wfRel = Invoke-RestMethod -Uri $url -Headers $headers
+  } catch {
+    Dim "  Could not reach the WinFsp release API: $($_.Exception.Message)"
+    Dim '  Install it by hand from https://winfsp.dev and re-run nothing -- alloyfs is already installed.'
+    return
+  }
+
+  # The asset carries a build number the tag does not ("v2.1" ->
+  # winfsp-2.1.25156.msi), so it is matched rather than constructed. The
+  # -notlike excludes winfsp-tests-*.msi, which is a different package.
+  $msiAsset = $wfRel.assets |
+    Where-Object { $_.name -like 'winfsp-*.msi' -and $_.name -notlike 'winfsp-tests-*' } |
+    Select-Object -First 1
+  if (-not $msiAsset) {
+    Dim "  Release $($wfRel.tag_name) has no installer asset. Install from https://winfsp.dev"
+    return
+  }
+
+  $wfTmp = Join-Path ([IO.Path]::GetTempPath()) ("winfsp-" + [Guid]::NewGuid())
+  New-Item -ItemType Directory -Path $wfTmp | Out-Null
+  $msi = Join-Path $wfTmp $msiAsset.name
+  try {
+    Write-Host "  Downloading $($msiAsset.name)..."
+    Invoke-WebRequest -Uri $msiAsset.browser_download_url -OutFile $msi
+  } catch {
+    Dim "  Download failed: $($_.Exception.Message)"
+    Remove-Item $wfTmp -Recurse -Force -ErrorAction SilentlyContinue
+    return
+  }
+
+  # Checked before running it, because this installs a KERNEL DRIVER. A
+  # signature check is the right test rather than a pinned hash: WinFsp
+  # publishes a new build under the same tag scheme regularly, and a hash
+  # baked in here would either go stale or quietly stop being verified.
+  $sig = Get-AuthenticodeSignature $msi
+  if ($sig.Status -ne 'Valid') {
+    Dim "  Refusing to run it: the installer's signature is '$($sig.Status)', not Valid."
+    Dim '  Install by hand from https://winfsp.dev'
+    Remove-Item $wfTmp -Recurse -Force -ErrorAction SilentlyContinue
+    return
+  }
+  Dim "  Signed by: $($sig.SignerCertificate.Subject -replace '^CN=([^,]+).*','$1')"
+
+  # /qn is silent, and no -Verb RunAs: this script raises no UAC dialog. It is
+  # reached by `irm … | iex` and by unattended tooling, and a silent installer
+  # that stops to ask a question is not silent — it is a script that hangs on a
+  # machine with nobody watching. install.cmd is the interactive front door and
+  # elevates before any of this runs, so by the time msiexec is reached the
+  # rights are already in hand.
+  #
+  # No INSTALLLEVEL, unlike .github/workflows/publish.yml, which passes 1000 to
+  # pull in the WinFsp SDK. That is a BUILD dependency — the headers a release
+  # build compiles against — and installing it here would put a development kit
+  # on the machine of someone who only wants to mount a drive. The default
+  # level installs the driver and runtime, which is all a mount needs.
+  Write-Host '  Installing...'
+  $msiArgs = @("/i", "`"$msi`"", "/qn", "/norestart")
+  try {
+    $p = Start-Process msiexec -ArgumentList $msiArgs -Wait -PassThru
+  } catch {
+    Dim "  msiexec could not be started: $($_.Exception.Message)"
+    Remove-Item $wfTmp -Recurse -Force -ErrorAction SilentlyContinue
+    return
+  }
+  Remove-Item $wfTmp -Recurse -Force -ErrorAction SilentlyContinue
+
+  switch ($p.ExitCode) {
+    0 {
+      if (Test-WinFsp) { Write-Host '  WinFsp installed.' -ForegroundColor Green }
+      else { Dim '  msiexec reported success but WinFsp is still not registered.' }
+    }
+    3010 {
+      Write-Host '  WinFsp installed -- REBOOT REQUIRED before mounting will work.' -ForegroundColor Yellow
+    }
+    1602 { Dim '  Installation was cancelled. Install later from https://winfsp.dev' }
+    default { Dim "  msiexec failed with exit code $($p.ExitCode). See https://winfsp.dev" }
+  }
+}
 
 Write-Host ''
-if (-not (Test-Path 'HKLM:\SOFTWARE\WOW6432Node\WinFsp') -and
-    -not (Test-Path 'HKLM:\SOFTWARE\WinFsp')) {
-  Dim 'Note: WinFsp was not found, so mounting will not work yet.'
+if (Test-WinFsp) {
+  Dim 'WinFsp is installed.'
+} elseif ($env:ALLOYFS_SKIP_WINFSP) {
+  Dim 'Note: WinFsp was not found and ALLOYFS_SKIP_WINFSP is set, so mounting will not work yet.'
   Dim '      Install it from https://winfsp.dev'
+} elseif (Test-Admin) {
+  Install-WinFsp
+} else {
+  # Not elevated, and this script does not ask. Said plainly, with the two ways
+  # out, because "mounting will not work" is a worse thing to discover at the
+  # first mount than to be told here.
+  Write-Host ''
+  Write-Host 'WinFsp is not installed, so mounting will not work yet.' -ForegroundColor Yellow
+  Dim '  It is a kernel driver and installing it needs administrator rights,'
+  Dim '  which this installer does not ask for. Either:'
+  Dim ''
+  Dim '    curl -fsSL https://alloy.okyle.dev/install.cmd -o install.cmd && install.cmd'
+  Dim ''
+  Dim '  which asks once and does the rest, or install it yourself from'
+  Dim '  https://winfsp.dev'
 }
 
 Dim 'Config lives in %USERPROFILE%\.alloyfs -- separate from the binary, so'

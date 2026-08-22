@@ -132,6 +132,31 @@ case "$magic" in
        This usually means the URL returned an error page." ;;
 esac
 
+# Checksum, when the release publishes one. Releases from before this
+# existed have no .sha256 asset, and refusing those would break rolling
+# back to them — so a MISSING sum warns and continues, while a sum that is
+# present and does not match is fatal. The magic-byte check above catches
+# an error page; this catches a truncated download or a swapped asset.
+sums=$(command -v sha256sum || command -v shasum || true)
+if [ -n "$sums" ]; then
+  want=$(fetch "$url.sha256" 2>/dev/null | tr -d ' \r\n' || true)
+  if [ -n "$want" ]; then
+    case "$sums" in
+      *shasum) got=$("$sums" -a 256 "$out" | awk '{print $1}') ;;
+      *)       got=$("$sums" "$out" | awk '{print $1}') ;;
+    esac
+    [ "$got" = "$want" ] || die "checksum mismatch for $asset
+       expected $want
+       got      $got
+       Refusing to install. Try again; if it persists, the release asset may be corrupt."
+    bold "Checksum verified."
+  else
+    printf 'note: %s publishes no checksum; skipping verification\n' "$version" >&2
+  fi
+else
+  printf 'note: no sha256sum/shasum on PATH; skipping checksum verification\n' >&2
+fi
+
 # --- install ----------------------------------------------------------------
 
 mkdir -p "$INSTALL_DIR"
