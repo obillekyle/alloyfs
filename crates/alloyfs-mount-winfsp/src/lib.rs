@@ -259,12 +259,22 @@ fn decode_symlink_reparse(buf: &[u8]) -> Option<String> {
 }
 
 /// "\dir\sub\file.txt" (or "\") -> RelPath("dir/sub/file.txt") / RelPath("").
+/// The FSD's `\`-separated name as one of ours, in a single pass.
+///
+/// Called on every open, create, security probe, rename (twice) and
+/// reparse callback, and it used to allocate three times to do it: decode
+/// to a `String`, `replace('\\', "/")` into a second, then `trim` and
+/// `to_string()` into a third. The trim bounds are found on the decoded
+/// text and the separators are swapped while copying, so one allocation
+/// does the whole job.
 fn rel_path(file_name: &U16CStr) -> winfsp::Result<RelPath> {
     let s = file_name
         .to_string()
         .map_err(|_| nt(STATUS_OBJECT_NAME_INVALID))?;
-    let normalized = s.replace('\\', "/");
-    Ok(RelPath(normalized.trim_matches('/').to_string()))
+    let trimmed = s.trim_matches(|c| c == '/' || c == '\\');
+    let mut out = String::with_capacity(trimmed.len());
+    out.extend(trimmed.chars().map(|c| if c == '\\' { '/' } else { c }));
+    Ok(RelPath(out))
 }
 
 /// One open Windows handle. WinFsp hands this back by shared reference on
@@ -326,8 +336,25 @@ impl WinFspFs {
         // pattern matching (`del file.txt`, `dir *.txt` → "File Not Found":
         // end-anchored patterns never match "file.txt\0"). Encode without the
         // terminator and use set_name_raw, whose size is exactly what we pass.
-        let wide: Vec<u16> = name.encode_utf16().collect();
-        if dirinfo.set_name_raw(wide.as_slice()).is_err() {
+        //
+        // The encode goes into a stack buffer rather than a `Vec`: this runs
+        // once per directory entry, and a `collect()` here heap-allocated for
+        // every one of them only to drop it two lines later — ten thousand
+        // allocations to list ten thousand files. `DirInfo<255>` caps a name
+        // at 255 units, so nothing that overflows this array could have been
+        // written anyway; overflowing it takes the same skip path the buffer's
+        // own rejection does.
+        let mut wide = [0u16; 255];
+        let mut len = 0usize;
+        let fits = name.encode_utf16().all(|unit| {
+            let Some(slot) = wide.get_mut(len) else {
+                return false;
+            };
+            *slot = unit;
+            len += 1;
+            true
+        });
+        if !fits || dirinfo.set_name_raw(&wide[..len]).is_err() {
             // Name longer than the 255-unit DirInfo buffer: skip the entry
             // rather than failing the whole enumeration.
             tracing::warn!(name, "skipping directory entry: name too long");
@@ -734,7 +761,22 @@ impl FileSystemContext for WinFspFs {
         marker: DirMarker,
         buffer: &mut [u8],
     ) -> winfsp::Result<u32> {
-        match context.dir_buffer.acquire(marker.is_none(), None) {
+        // Size the buffer up front when the listing's length is already
+        // known. WinFsp's directory buffer starts empty and doubles, so a
+        // large directory paid a reallocation and a copy of everything
+        // written so far every time it crossed a power of two. The hint is in
+        // bytes: a `FSP_FSCTL_DIR_INFO` is ~110 bytes of fixed header plus the
+        // UTF-16 name, so ~160 covers a typical entry, and being wrong only
+        // costs the slack or one growth — it is a hint, not a bound. `None`
+        // when nothing is cached: finding out would cost a round trip, which
+        // is far more than the reallocations it would save.
+        let hint = self.fs.dir_len_hint(context.ino).map(|n| {
+            (n as u32)
+                .saturating_add(2)
+                .saturating_mul(160)
+                .saturating_add(4096)
+        });
+        match context.dir_buffer.acquire(marker.is_none(), hint) {
             Ok(lock) => {
                 let mut dirinfo = DirInfo::<255>::new();
                 let path = self
@@ -880,11 +922,8 @@ impl FileSystemContext for WinFspFs {
         _file_name: &U16CStr,
         delete_file: bool,
     ) -> winfsp::Result<()> {
-        if delete_file && context.is_dir {
-            let entries = self.fs.readdir(context.ino).map_err(fsp_err)?;
-            if !entries.is_empty() {
-                return Err(nt(STATUS_DIRECTORY_NOT_EMPTY));
-            }
+        if delete_file && context.is_dir && !self.fs.dir_is_empty(context.ino).map_err(fsp_err)? {
+            return Err(nt(STATUS_DIRECTORY_NOT_EMPTY));
         }
         // Record intent only: actual removal happens in cleanup, keyed off the
         // FspCleanupDelete flag the FSD passes there.

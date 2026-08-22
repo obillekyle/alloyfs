@@ -82,9 +82,19 @@ struct HandleCache {
     tick: u64,
 }
 
+/// One directory's children as the kernel wants them: name, nodeid, isdir.
+///
+/// Shared rather than owned because a directory is read one page at a time
+/// and every page asks for the whole listing again. Owned, that meant a deep
+/// clone — a `String` per child — per page: reading a ten-thousand-entry
+/// directory in 4 KiB pages cloned ten thousand names about a hundred times
+/// over. Nothing mutates a cached listing (a change replaces it wholesale),
+/// so the pages can share one.
+type DirEntries = Arc<Vec<(String, u64, bool)>>;
+
 struct DirListing {
     at: Instant,
-    entries: Vec<(String, u64, bool)>, // name, nodeid, isdir
+    entries: DirEntries,
 }
 
 pub struct Server {
@@ -204,28 +214,35 @@ impl Server {
     /// The listing to page from. A cursor at the start always refetches; a
     /// continuation reuses the listing it started on, so paging cannot skip or
     /// duplicate entries because the directory changed underneath it.
-    fn dir_entries(&self, nodeid: u64, offset: u64) -> Result<Vec<(String, u64, bool)>, i32> {
+    fn dir_entries(&self, nodeid: u64, offset: u64) -> Result<DirEntries, i32> {
         if offset > DOTS {
             if let Some(hit) = self.dirs.lock().unwrap().get(&nodeid) {
                 if hit.at.elapsed() < DIR_CACHE_TTL {
-                    return Ok(hit.entries.clone());
+                    return Ok(Arc::clone(&hit.entries));
                 }
             }
         }
         let listing = self.fs.readdir(nodeid).map_err(|e| errno_of(&e))?;
-        let entries: Vec<(String, u64, bool)> = listing
-            .into_iter()
-            .map(|(name, ino, attr)| {
+        let mut entries = Vec::with_capacity(listing.len());
+        // One acquisition for the whole listing rather than one per child.
+        // The map is only ever touched from these few sites and none of them
+        // is reachable from inside this loop, so holding it across the walk
+        // cannot deadlock — and the per-entry version was locking and
+        // unlocking ten thousand times to record ten thousand booleans.
+        {
+            let mut kinds = self.kinds.lock().unwrap();
+            for (name, ino, attr) in listing {
                 let isdir = matches!(attr.kind, FileKind::Dir);
-                self.kinds.lock().unwrap().insert(ino, isdir);
-                (name, ino, isdir)
-            })
-            .collect();
+                kinds.insert(ino, isdir);
+                entries.push((name, ino, isdir));
+            }
+        }
+        let entries = Arc::new(entries);
         self.dirs.lock().unwrap().insert(
             nodeid,
             DirListing {
                 at: Instant::now(),
-                entries: entries.clone(),
+                entries: Arc::clone(&entries),
             },
         );
         Ok(entries)

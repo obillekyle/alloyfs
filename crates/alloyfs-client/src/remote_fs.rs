@@ -643,6 +643,74 @@ impl RemoteFs {
 
     /// Full listing. With an overlay: remote entries minus shadowed names,
     /// plus local overlay children of this directory.
+    /// How many entries a listing of `ino` would produce, if that is already
+    /// known — for sizing a buffer, never for answering a question.
+    ///
+    /// Deliberately approximate: it reads the cached or warm listing's length
+    /// and ignores the overlay merge and shadow filter entirely, so the number
+    /// can be a little low or a little high. `None` means nothing is cached
+    /// and the caller should not pay a round trip to find out.
+    pub fn dir_len_hint(&self, ino: u64) -> Option<usize> {
+        if let Some(hit) = self.dir_cache.get(&ino) {
+            let (entries, when) = &*hit;
+            if when.elapsed() < self.dir_ttl() {
+                return Some(entries.len());
+            }
+        }
+        let dir = self.path_of(ino).ok()?;
+        self.warm.get(&dir).map(|w| w.len())
+    }
+
+    /// Is this directory empty — asked without materializing it.
+    ///
+    /// The mount layer asks exactly this before allowing a directory to be
+    /// deleted, and asking it through `readdir` meant deep-cloning the cached
+    /// listing (a `String` per child, plus an overlay merge) to look at
+    /// `.is_empty()` and drop it. Deleting a directory of ten thousand files
+    /// therefore allocated ten thousand names to learn a single bit.
+    ///
+    /// This reads a length instead, and leans on the one structural fact that
+    /// makes that safe: `merge_overlay_children` only ever PUSHES. The merged
+    /// listing is empty exactly when the base half is empty and no overlay
+    /// child lives here, so a non-empty base half settles the question by
+    /// itself. Anything the fast paths can't answer falls through to the real
+    /// listing, so the answer is never weaker than `readdir`'s.
+    pub fn dir_is_empty(&self, ino: u64) -> Result<bool, FsError> {
+        let dir = self.path_of(ino)?;
+        if self.is_overlay(&dir) {
+            return Ok(self.overlay_ref().readdir_children(&dir).is_empty());
+        }
+        let overlay_empty = || {
+            self.overlay.as_ref().is_none_or(|ov| {
+                !ov.readdir_children(&dir)
+                    .into_iter()
+                    .any(|(name, _)| self.lives_in_overlay(&dir.join(&name)))
+            })
+        };
+        if let Some(hit) = self.dir_cache.get(&ino) {
+            let (entries, when) = &*hit;
+            if when.elapsed() < self.dir_ttl() {
+                let base_empty = entries.is_empty();
+                drop(hit);
+                return Ok(base_empty && overlay_empty());
+            }
+        }
+        if let Some(w) = self.warm.get(&dir) {
+            // Only an outright empty warm listing is cheap to trust. A
+            // non-empty one still owes `readdir`'s per-entry shadow filter,
+            // and every entry could be shadowed by an overlay whiteout — in
+            // which case the directory really is empty. Re-deriving that here
+            // would duplicate the filter for no gain, since the warm tier
+            // serves cold mounts rather than the hot path.
+            let empty = w.is_empty();
+            drop(w);
+            if empty {
+                return Ok(overlay_empty());
+            }
+        }
+        Ok(self.readdir(ino)?.is_empty())
+    }
+
     pub fn readdir(&self, ino: u64) -> Result<Vec<(String, u64, Attr)>, FsError> {
         let dir = self.path_of(ino)?;
         if self.is_overlay(&dir) {
