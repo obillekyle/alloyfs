@@ -15,6 +15,7 @@ alloyfs <COMMAND>
 | `events` | Tail the change stream as NDJSON |
 | `logs` | Read what a long-running command logged |
 | `doctor` | Check the local things that stop a drive from working |
+| `config` | Validate the config, or print the settled values |
 | `ping` | Round-trip time to an agent |
 | `bench` | Timed pipelined read, no mount involved |
 | `stress` | Concurrent load generator |
@@ -183,6 +184,29 @@ Re-runs the installer from `alloy.okyle.dev` rather than replacing the binary
 itself — one implementation of download-verify-install instead of two. On
 Windows the installer renames the running executable aside before writing the
 new one, which is the only way to replace a binary that is currently executing.
+
+## config
+
+```bash
+alloyfs config validate            # does it parse, and what does it describe?
+alloyfs config print               # the settled values
+alloyfs config print --mount work  # just one mount
+```
+
+`validate` parses the file the same way every other command does, which is
+the whole check: `deny_unknown_fields` makes a typo'd key a hard error rather
+than a silently ignored line, so a config that loads is one whose every key
+reached a struct.
+
+`print` shows what the merge actually produced — client defaults with each
+mount's overrides applied, where lists *replace* rather than union. Two
+layers are deliberately absent and the output says so: CLI flags land on top
+at mount time, and a v2+ server may suggest excludes, pins and cache sizes
+underneath. Both need the mount to run, and this command reads a file.
+Tokens print as `(set)`, never their value.
+
+Note that no command creates a config as a side effect any more. `alloyfs
+init` writes one; everything else reports that it found none.
 
 ## doctor
 

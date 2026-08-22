@@ -275,6 +275,11 @@ enum Command {
     },
     /// Check the local things that stop a drive from working.
     Doctor,
+    /// Inspect the configuration file.
+    Config {
+        #[command(subcommand)]
+        cmd: ConfigCmd,
+    },
     /// Read what a long-running command logged. No name lists what is there.
     Logs {
         /// Log name: a service id, or `serve` / `mount` / `start`.
@@ -285,6 +290,24 @@ enum Command {
         /// Trailing lines to print first.
         #[arg(short = 'n', long, default_value_t = 200)]
         lines: usize,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConfigCmd {
+    /// Parse the config and report what it describes.
+    Validate {
+        #[arg(long, value_name = "PATH")]
+        config: Option<PathBuf>,
+    },
+    /// Print the settled values, after client defaults and per-mount
+    /// overrides have been merged.
+    Print {
+        #[arg(long, value_name = "PATH")]
+        config: Option<PathBuf>,
+        /// Only this mount.
+        #[arg(long)]
+        mount: Option<String>,
     },
 }
 
@@ -692,6 +715,10 @@ async fn async_main() -> anyhow::Result<()> {
             _ => commands::update::run(channel, dry_run),
         },
         Command::Doctor => commands::doctor::run(),
+        Command::Config { cmd } => match cmd {
+            ConfigCmd::Validate { config } => commands::config_cmd::validate(config),
+            ConfigCmd::Print { config, mount } => commands::config_cmd::print(config, mount),
+        },
         Command::Logs { name, follow, lines } => commands::logs::run(name, follow, lines).await,
     }
 }

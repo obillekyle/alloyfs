@@ -1,4 +1,5 @@
 pub mod cache;
+pub mod config_cmd;
 pub mod diag;
 pub mod doctor;
 pub mod init;
