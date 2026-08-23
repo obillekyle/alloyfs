@@ -1343,6 +1343,20 @@ impl RemoteFs {
     /// Callers must already have cleared the overlay, pending-file and
     /// auto-cache paths — `read` and `read_into` both do, in that order,
     /// before reaching here.
+    /// How many bytes block `b` holds in a file of `size` — a full chunk, or
+    /// the short tail.
+    ///
+    /// A held block must be read at its EXACT length. The blob is sparse and
+    /// full-length, so asking for a whole chunk at the tail would read the
+    /// zeros past EOF and hand them back as data.
+    fn block_len(b: u64, size: u64) -> usize {
+        let start = b * DATA_CHUNK as u64;
+        if start >= size {
+            return 0;
+        }
+        ((size - start).min(DATA_CHUNK as u64)) as usize
+    }
+
     fn read_blocks_into(&self, fh: u64, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
         let size = buf.len() as u32;
         // If the open never took a handle out, take one now — this is the
@@ -1376,9 +1390,34 @@ impl RemoteFs {
                 let size = state.size.load(Ordering::Relaxed);
                 // Only worth collecting what the cache would actually keep.
                 if size > 0 && size <= cache.warm_limit() {
-                    let stage = cache.warm_stage_path(&state.path, fh);
-                    *state.warm_fill.lock().unwrap() =
-                        crate::autocache::WarmFill::begin(stage, size, state.version.load(Ordering::Relaxed));
+                    let attr = alloyfs_proto::Attr {
+                        kind: alloyfs_proto::FileKind::File,
+                        size,
+                        mtime: std::time::UNIX_EPOCH
+                            + std::time::Duration::from_nanos(state.mtime_ns.load(Ordering::Relaxed)),
+                        ctime: std::time::UNIX_EPOCH,
+                        mode: 0o644,
+                        version: state.version.load(Ordering::Relaxed),
+                    };
+                    // Resume a partial blob when one is on disk and still
+                    // describes this version of the file; otherwise start a
+                    // fresh staging file.
+                    let fill = match cache.blocks_for(&state.path, &attr) {
+                        Some(map) if !map.is_complete() => crate::autocache::WarmFill::resume(
+                            cache.blob_final_path(&state.path),
+                            size,
+                            attr.version,
+                            map,
+                        ),
+                        _ => None,
+                    };
+                    *state.warm_fill.lock().unwrap() = fill.or_else(|| {
+                        crate::autocache::WarmFill::begin(
+                            cache.warm_stage_path(&state.path, fh),
+                            size,
+                            attr.version,
+                        )
+                    });
                 }
             }
         }
@@ -1472,6 +1511,26 @@ impl RemoteFs {
                     _ => need.push(b), // prefetch failed (old conn?) — refetch
                 },
                 None => need.push(b),
+            }
+        }
+        if !need.is_empty() {
+            // Blocks this file already has on disk are read locally instead
+            // of over the wire — the whole point of keeping a partial blob.
+            // Done before the network batch so the request only asks for what
+            // is genuinely missing.
+            if let Ok(guard) = state.warm_fill.try_lock() {
+                if let Some(fill) = guard.as_ref() {
+                    need.retain(|&b| {
+                        let want = Self::block_len(b, state.size.load(Relaxed));
+                        match fill.get(b, want) {
+                            Some(data) => {
+                                ready.insert(b, Bytes::from(data));
+                                false // served locally; drop it from the ask
+                            }
+                            None => true,
+                        }
+                    });
+                }
             }
         }
         if !need.is_empty() {
@@ -2583,6 +2642,33 @@ impl RemoteFs {
             self.seal_pending(fh);
             self.untrack_open(fh);
             return;
+        }
+        // A fill that never completed still holds real blocks. Keep them:
+        // the sparse blob moves into place and the entry records which parts
+        // of it are real, so the next open of this file resumes instead of
+        // starting over. Discarding them is what made a scrubbing reader
+        // pay full price on every pass.
+        if let Some(cache) = &self.cache {
+            if let Some(state) = self.open_files.get(&fh) {
+                let mut guard = state.warm_fill.lock().unwrap();
+                if let Some(fill) = guard.as_mut() {
+                    let (size, version, on_disk) = (fill.size(), fill.version(), fill.on_disk());
+                    if let Some(map) = fill.keep_partial(&cache.blob_final_path(&state.path)) {
+                        let attr = alloyfs_proto::Attr {
+                            kind: alloyfs_proto::FileKind::File,
+                            size,
+                            mtime: std::time::UNIX_EPOCH
+                                + std::time::Duration::from_nanos(state.mtime_ns.load(Ordering::Relaxed)),
+                            ctime: std::time::UNIX_EPOCH,
+                            mode: 0o644,
+                            version,
+                        };
+                        cache.commit_partial(&state.path, &attr, map, on_disk);
+                        tracing::debug!(path = %state.path, on_disk, "partial fill kept");
+                    }
+                }
+                *guard = None;
+            }
         }
         let server_fh = self.server_fh(fh);
         if let Some(state) = self.untrack_open(fh) {

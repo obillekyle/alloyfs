@@ -36,6 +36,90 @@ pub(crate) struct AutoCacheConfig {
     pub manifest: PathBuf, // data_dir/cache/<mount_key>.manifest.json
 }
 
+/// Which 128 KiB blocks of a file the cache actually holds.
+///
+/// A blob used to be all-or-nothing: the walker fetched a whole file or the
+/// cache had none of it. That left a reader who only ever touches part of a
+/// large file — scrubbing a video, reading a header, seeking around an
+/// archive — with nothing cached at all, because the fill never completed and
+/// completing it would have meant fetching the rest.
+///
+/// The blob file is sparse: created at the file's full length, with only the
+/// blocks that have been read written into it. This records which those are,
+/// so a later read knows what it can serve locally and what it still has to
+/// ask for.
+#[derive(Serialize, Deserialize, Clone, Default, Debug, PartialEq)]
+pub(crate) struct BlockMap {
+    /// One bit per block, LSB first. EMPTY means complete — every entry
+    /// written before partial caching existed was a whole file, and that is
+    /// what an absent field must keep meaning.
+    ///
+    /// Every field defaults, so a manifest that omits the map entirely, or
+    /// carries only part of it, loads as complete rather than failing the
+    /// whole document.
+    #[serde(default)]
+    bits: Vec<u8>,
+    /// Blocks present. Kept alongside the bits so "how much of this file do
+    /// we hold" is not a popcount over the whole map on every commit.
+    #[serde(default)]
+    have: u32,
+    /// Blocks the file has in total. 0 with empty bits = complete.
+    #[serde(default)]
+    total: u32,
+}
+
+impl BlockMap {
+    pub(crate) fn complete() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn empty(total_blocks: u32) -> Self {
+        Self {
+            bits: vec![0u8; total_blocks.div_ceil(8) as usize],
+            have: 0,
+            total: total_blocks,
+        }
+    }
+
+    pub(crate) fn is_complete(&self) -> bool {
+        self.total == 0 || self.have >= self.total
+    }
+
+    pub(crate) fn has(&self, index: u32) -> bool {
+        if self.is_complete() {
+            return true;
+        }
+        self.bits
+            .get((index / 8) as usize)
+            .is_some_and(|b| b & (1 << (index % 8)) != 0)
+    }
+
+    /// Record a block. Returns true if this one was new.
+    pub(crate) fn set(&mut self, index: u32) -> bool {
+        if self.is_complete() {
+            return false;
+        }
+        let Some(byte) = self.bits.get_mut((index / 8) as usize) else {
+            return false;
+        };
+        let mask = 1 << (index % 8);
+        if *byte & mask != 0 {
+            return false;
+        }
+        *byte |= mask;
+        self.have += 1;
+        true
+    }
+
+    pub(crate) fn have(&self) -> u32 {
+        if self.is_complete() {
+            self.total
+        } else {
+            self.have
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct CacheEntry {
     pub version: u64,
@@ -49,6 +133,15 @@ pub(crate) struct CacheEntry {
     #[serde(default)]
     pub warm: bool,
     pub last_used: u64,
+    /// Which blocks of the file are actually on disk. Default = complete,
+    /// which is what every entry written before partial caching was.
+    #[serde(default)]
+    pub blocks: BlockMap,
+    /// Bytes actually written to the sparse blob. For a complete entry this
+    /// is `size`; for a partial one it is what the disk really holds, which
+    /// is what the pools must be charged.
+    #[serde(default)]
+    pub on_disk: u64,
     /// Not serialized: false after ResyncRequired until an open re-validates.
     #[serde(skip, default = "default_true")]
     pub verified: bool,
@@ -122,18 +215,18 @@ impl CacheState {
     /// wrong is worth a helper.
     fn take(&mut self, path: &RelPath) -> Option<CacheEntry> {
         let e = self.entries.remove(path)?;
-        self.total_bytes -= e.size;
+        self.total_bytes -= e.on_disk;
         if e.warm {
-            self.warm_bytes -= e.size;
+            self.warm_bytes -= e.on_disk;
         }
         Some(e)
     }
 
     /// Insert an entry and charge both counters correctly.
     fn put(&mut self, path: RelPath, e: CacheEntry) {
-        self.total_bytes += e.size;
+        self.total_bytes += e.on_disk;
         if e.warm {
-            self.warm_bytes += e.size;
+            self.warm_bytes += e.on_disk;
         }
         self.entries.insert(path, e);
     }
@@ -197,9 +290,19 @@ impl AutoCache {
                     let blob = blob_path(&cfg.root, &rel);
                     match std::fs::metadata(&blob) {
                         Ok(md) if md.len() == entry.size => {
-                            total += entry.size;
+                            // A manifest written before partial caching has no
+                            // `on_disk`, and it defaults to 0 — which would
+                            // charge every existing entry nothing and leave the
+                            // budget believing an full cache was empty. Those
+                            // entries were all complete, so the file IS what
+                            // they occupy.
+                            let mut entry = entry;
+                            if entry.on_disk == 0 && entry.blocks.is_complete() {
+                                entry.on_disk = entry.size;
+                            }
+                            total += entry.on_disk;
                             if entry.warm {
-                                warm_total += entry.size;
+                                warm_total += entry.on_disk;
                             }
                             entries.insert(rel, entry);
                         }
@@ -222,7 +325,7 @@ impl AutoCache {
         if total > cfg.budget {
             let mut victims: Vec<(RelPath, u64, u64, bool)> = entries
                 .iter()
-                .map(|(p, e)| (p.clone(), e.last_used, e.size, e.pinned))
+                .map(|(p, e)| (p.clone(), e.last_used, e.on_disk, e.pinned))
                 .collect();
             victims.sort_by_key(|(_, used, _, _)| *used);
             let mut evicted = 0usize;
@@ -397,6 +500,44 @@ impl AutoCache {
         self.commit_as(path, attr, pinned, false);
     }
 
+    /// Committed as a PARTIAL warm entry: the blob is sparse and `blocks`
+    /// says which of it is real. A later open resumes from it, so a reader
+    /// who only ever touches part of a large file keeps that part instead of
+    /// re-fetching it every time.
+    pub fn commit_partial(&self, path: &RelPath, attr: &Attr, blocks: BlockMap, on_disk: u64) {
+        let mut st = self.st();
+        st.tick += 1;
+        let tick = st.tick;
+        st.take(path);
+        st.put(
+            path.clone(),
+            CacheEntry {
+                version: attr.version,
+                size: attr.size,
+                mtime_ns: mtime_ns(attr.mtime),
+                pinned: self.pin_match(path),
+                warm: true,
+                blocks,
+                on_disk,
+                last_used: tick,
+                verified: true,
+            },
+        );
+        st.dirty = true;
+    }
+
+    /// What the cache holds of `path`, if the entry is valid for `attr`.
+    /// `None` when there is nothing usable — no entry, or one describing a
+    /// different version of the file.
+    pub fn blocks_for(&self, path: &RelPath, attr: &Attr) -> Option<BlockMap> {
+        let st = self.st();
+        let e = st.entries.get(path)?;
+        let fresh = attr.size == e.size
+            && mtime_ns(attr.mtime) == e.mtime_ns
+            && (attr.version == e.version || attr.version == 0 || e.version == 0);
+        fresh.then(|| e.blocks.clone())
+    }
+
     /// Committed into the WARM pool: the bytes came from a read, either
     /// collected as they passed (`WarmFill`) or fetched on demand.
     pub fn commit_warm(&self, path: &RelPath, attr: &Attr, pinned: bool) {
@@ -434,7 +575,7 @@ impl AutoCache {
                 .entries
                 .iter()
                 .filter(|(_, e)| !e.pinned && e.warm == warm)
-                .map(|(p, e)| (p.clone(), e.last_used, e.size))
+                .map(|(p, e)| (p.clone(), e.last_used, e.on_disk))
                 .collect();
             victims.sort_by_key(|(_, used, _)| *used);
             for (vp, _, _) in victims {
@@ -462,6 +603,11 @@ impl AutoCache {
                 mtime_ns: mtime_ns(attr.mtime),
                 pinned,
                 warm,
+                // A commit through here is a WHOLE file: the walker fetched
+                // all of it, or a fill collected every block. Partial entries
+                // arrive through `commit_partial`.
+                blocks: BlockMap::complete(),
+                on_disk: attr.size,
                 last_used: tick,
                 verified: true,
             },
@@ -1062,8 +1208,9 @@ pub(crate) struct WarmFill {
     /// will not rename a file that is still open for writing.
     file: Option<std::fs::File>,
     stage: std::path::PathBuf,
-    have: Vec<bool>,
-    remaining: usize,
+    /// Which blocks are on disk. Shared with `CacheEntry` so a partial fill
+    /// and a partial cache entry are the same fact in the same shape.
+    map: BlockMap,
     size: u64,
     /// The version the file had when this fill started. A file that changes
     /// underneath us would otherwise commit a blob that is half one version
@@ -1079,7 +1226,9 @@ impl WarmFill {
         if size == 0 {
             return None;
         }
-        let blocks = size.div_ceil(alloyfs_proto::DATA_CHUNK as u64) as usize;
+        let Ok(blocks) = u32::try_from(size.div_ceil(alloyfs_proto::DATA_CHUNK as u64)) else {
+            return None;
+        };
         if let Some(parent) = stage.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -1093,31 +1242,32 @@ impl WarmFill {
             file: Some(file),
             committed: false,
             stage,
-            have: vec![false; blocks],
-            remaining: blocks,
+            map: BlockMap::empty(blocks),
             size,
             version,
         })
     }
 
     /// Record one fetched block. Returns true once every block has landed.
+    ///
+    /// The write happens BEFORE the bit is set, so a failed write leaves the
+    /// block marked absent and it is simply fetched again — never a bit
+    /// claiming disk content that is not there.
     pub(crate) fn put(&mut self, index: u64, data: &[u8]) -> bool {
-        let Some(slot) = self.have.get_mut(index as usize) else {
-            return false; // past EOF for the size we started with
+        let Ok(i) = u32::try_from(index) else {
+            return false;
         };
-        if *slot {
+        if self.map.has(i) {
             return false; // a re-read of a block already written
         }
-        let off = index * alloyfs_proto::DATA_CHUNK as u64;
         let Some(f) = self.file.as_ref() else {
             return false;
         };
-        if write_at(f, data, off).is_err() {
+        if write_at(f, data, index * alloyfs_proto::DATA_CHUNK as u64).is_err() {
             return false;
         }
-        *slot = true;
-        self.remaining -= 1;
-        self.remaining == 0
+        self.map.set(i);
+        self.map.is_complete()
     }
 
     pub(crate) fn size(&self) -> u64 {
@@ -1126,6 +1276,73 @@ impl WarmFill {
 
     pub(crate) fn version(&self) -> u64 {
         self.version
+    }
+
+    /// Reopen a partially-cached file so the blocks already on disk are not
+    /// fetched again.
+    ///
+    /// The blob is sparse and full-length; `map` says which blocks of it are
+    /// real. Opened read+write so this session can both serve from it and
+    /// keep adding to it.
+    pub(crate) fn resume(blob: std::path::PathBuf, size: u64, version: u64, map: BlockMap) -> Option<Self> {
+        if size == 0 || map.is_complete() {
+            return None;
+        }
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&blob)
+            .ok()?;
+        Some(Self {
+            file: Some(file),
+            stage: blob,
+            map,
+            size,
+            version,
+            committed: true, // already the real blob; Drop must not delete it
+        })
+    }
+
+    /// Is this block already on disk?
+    pub(crate) fn has(&self, index: u64) -> bool {
+        u32::try_from(index).is_ok_and(|i| self.map.has(i))
+    }
+
+    /// Read a block this fill already holds. `None` if it does not hold it,
+    /// or the read failed — either way the caller fetches it as usual.
+    pub(crate) fn get(&self, index: u64, len: usize) -> Option<Vec<u8>> {
+        if !self.has(index) {
+            return None;
+        }
+        let f = self.file.as_ref()?;
+        let mut buf = vec![0u8; len];
+        read_at(f, &mut buf, index * alloyfs_proto::DATA_CHUNK as u64).ok()?;
+        Some(buf)
+    }
+
+    /// Bytes actually written into the sparse file.
+    pub(crate) fn on_disk(&self) -> u64 {
+        self.map.have() as u64 * alloyfs_proto::DATA_CHUNK as u64
+    }
+
+    /// Keep a PARTIAL fill: move it to the blob path so a later open can
+    /// resume it. Returns the block map to record against the entry.
+    pub(crate) fn keep_partial(&mut self, final_path: &std::path::Path) -> Option<BlockMap> {
+        if self.map.have() == 0 {
+            return None; // nothing worth keeping
+        }
+        drop(self.file.take());
+        if self.stage != final_path {
+            if let Some(parent) = final_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if std::fs::rename(&self.stage, final_path).is_err() {
+                let _ = std::fs::remove_file(&self.stage);
+                return None;
+            }
+        }
+        self.committed = true;
+        Some(self.map.clone())
     }
 
     /// Move the completed stage file into place. The caller commits it to the
@@ -1267,5 +1484,196 @@ mod warm_fill_tests {
     fn an_empty_file_starts_no_fill() {
         let d = dir("empty");
         assert!(WarmFill::begin(d.join("e.part"), 0, 1).is_none());
+    }
+}
+
+#[cfg(test)]
+mod block_map_tests {
+    use super::*;
+
+    /// An absent or empty map means COMPLETE, because that is what every
+    /// entry written before partial caching was. Getting this backwards
+    /// would make an old manifest look like a cache holding nothing.
+    #[test]
+    fn the_default_map_is_complete() {
+        let m = BlockMap::default();
+        assert!(m.is_complete());
+        assert!(m.has(0), "a complete map has every block");
+        assert!(m.has(9_999), "including ones past any real file");
+        assert_eq!(
+            serde_json::from_str::<BlockMap>("{}").unwrap(),
+            BlockMap::complete(),
+            "a manifest with no map at all loads as complete"
+        );
+    }
+
+    #[test]
+    fn bits_are_recorded_and_counted() {
+        let mut m = BlockMap::empty(20);
+        assert!(!m.is_complete());
+        assert!(!m.has(3));
+        assert!(m.set(3), "a new block");
+        assert!(m.has(3));
+        assert!(!m.set(3), "the same block again is not new");
+        assert_eq!(m.have(), 1);
+        assert!(m.set(19), "the last block is addressable");
+        assert!(m.has(19));
+        assert_eq!(m.have(), 2);
+        assert!(!m.has(4), "and its neighbours are untouched");
+    }
+
+    /// Filling every block must flip the map to complete, or a fully-read
+    /// file would keep being treated as partial forever.
+    #[test]
+    fn filling_every_block_completes_the_map() {
+        let mut m = BlockMap::empty(9); // spans two bytes
+        for i in 0..9 {
+            assert!(!m.is_complete(), "still short at block {i}");
+            assert!(m.set(i));
+        }
+        assert!(m.is_complete(), "every block present");
+        assert!(m.has(0) && m.has(8));
+    }
+
+    /// The map survives the manifest, which is the only reason it is worth
+    /// keeping — a partial file must still be partial after a remount.
+    #[test]
+    fn a_partial_map_round_trips_through_json() {
+        let mut m = BlockMap::empty(12);
+        m.set(0);
+        m.set(5);
+        m.set(11);
+        let back: BlockMap = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+        assert_eq!(back, m);
+        assert!(back.has(0) && back.has(5) && back.has(11));
+        assert!(!back.has(1) && !back.has(10));
+        assert_eq!(back.have(), 3);
+    }
+
+    /// Out-of-range indices must not panic — a file that shrank server-side
+    /// can hand us a block number the map was never sized for.
+    #[test]
+    fn an_index_past_the_end_is_absent_not_a_panic() {
+        let mut m = BlockMap::empty(4);
+        assert!(!m.has(400));
+        assert!(!m.set(400), "and setting it records nothing");
+        assert_eq!(m.have(), 0);
+    }
+}
+
+#[cfg(unix)]
+fn read_at(f: &std::fs::File, buf: &mut [u8], off: u64) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    f.read_exact_at(buf, off)
+}
+
+#[cfg(windows)]
+fn read_at(f: &std::fs::File, buf: &mut [u8], off: u64) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    let mut read = 0usize;
+    while read < buf.len() {
+        match f.seek_read(&mut buf[read..], off + read as u64) {
+            Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+            Ok(n) => read += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod partial_blob_tests {
+    use super::*;
+
+    const CH: usize = alloyfs_proto::DATA_CHUNK as usize;
+
+    fn dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("ds-part-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// The whole point of partial caching: blocks a reader touched survive
+    /// the handle closing, and the next open serves them from disk instead
+    /// of the network.
+    #[test]
+    fn blocks_kept_from_a_partial_read_are_served_on_the_next_open() {
+        let d = dir("resume");
+        let blob = d.join("big.bin");
+        let size = (CH * 4) as u64;
+
+        // A reader that touched blocks 1 and 3 only, then closed.
+        let map = {
+            let mut fill = WarmFill::begin(d.join("big.part"), size, 7).expect("begins");
+            assert!(!fill.put(1, &vec![0xAAu8; CH]), "still short of complete");
+            assert!(!fill.put(3, &vec![0xBBu8; CH]));
+            fill.keep_partial(&blob).expect("keeps what it has")
+        };
+        assert!(!map.is_complete(), "two of four blocks");
+        assert_eq!(map.have(), 2);
+        assert!(blob.exists(), "the sparse blob is in place");
+
+        // The next open resumes it.
+        let resumed = WarmFill::resume(blob.clone(), size, 7, map).expect("resumes");
+        assert!(resumed.has(1) && resumed.has(3), "holds what was kept");
+        assert!(!resumed.has(0) && !resumed.has(2), "and nothing else");
+        assert_eq!(
+            resumed.get(1, CH).as_deref(),
+            Some(&vec![0xAAu8; CH][..]),
+            "block 1 comes back byte for byte"
+        );
+        assert_eq!(resumed.get(3, CH).as_deref(), Some(&vec![0xBBu8; CH][..]));
+        assert!(
+            resumed.get(0, CH).is_none(),
+            "a block never written is not served"
+        );
+    }
+
+    /// A resumed fill keeps filling, and completing it promotes the blob.
+    #[test]
+    fn a_resumed_fill_can_be_completed_later() {
+        let d = dir("finish");
+        let blob = d.join("f.bin");
+        let size = (CH * 3) as u64;
+
+        let map = {
+            let mut fill = WarmFill::begin(d.join("f.part"), size, 1).expect("begins");
+            fill.put(0, &vec![1u8; CH]);
+            fill.keep_partial(&blob).expect("keeps block 0")
+        };
+
+        let mut fill = WarmFill::resume(blob.clone(), size, 1, map).expect("resumes");
+        assert!(!fill.put(2, &vec![3u8; CH]), "still missing block 1");
+        assert!(fill.put(1, &vec![2u8; CH]), "and now it is whole");
+
+        assert!(fill.finish(&blob), "promotes in place");
+        let got = std::fs::read(&blob).unwrap();
+        assert_eq!(got.len() as u64, size);
+        assert_eq!(&got[..CH], &vec![1u8; CH][..], "the block from the FIRST session");
+        assert_eq!(&got[CH..CH * 2], &vec![2u8; CH][..]);
+        assert_eq!(&got[CH * 2..], &vec![3u8; CH][..]);
+    }
+
+    /// A fill that collected nothing leaves nothing — an open-and-close with
+    /// no read must not litter the cache with empty sparse files.
+    #[test]
+    fn a_fill_that_read_nothing_keeps_nothing() {
+        let d = dir("nothing");
+        let blob = d.join("n.bin");
+        let mut fill = WarmFill::begin(d.join("n.part"), (CH * 2) as u64, 1).expect("begins");
+        assert!(fill.keep_partial(&blob).is_none(), "nothing worth keeping");
+        assert!(!blob.exists(), "and no blob left behind");
+    }
+
+    /// A complete entry must never be resumed as partial — that path exists
+    /// only for blobs with holes, and the fast whole-blob read serves the rest.
+    #[test]
+    fn a_complete_map_is_not_resumable() {
+        let d = dir("complete");
+        let blob = d.join("c.bin");
+        std::fs::write(&blob, vec![0u8; CH]).unwrap();
+        assert!(WarmFill::resume(blob, CH as u64, 1, BlockMap::complete()).is_none());
     }
 }
