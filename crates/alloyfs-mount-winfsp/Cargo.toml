@@ -16,5 +16,16 @@ windows-sys.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
 
+[target.'cfg(windows)'.build-dependencies]
+winfsp.workspace = true
+
+# Test-only: a smoke test needs a real agent to serve the volume and a real
+# runtime to drive it. Windows-only for the same reason the deps above are.
+[target.'cfg(windows)'.dev-dependencies]
+alloyfs-agent.workspace = true
+alloyfs-transport.workspace = true
+tokio.workspace = true
+tempfile.workspace = true
+
 [lints]
 workspace = true
