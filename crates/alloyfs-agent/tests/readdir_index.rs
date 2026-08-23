@@ -366,3 +366,108 @@ async fn a_live_index_is_what_answers_readdir() {
         .await;
     assert!(not_dir.is_err(), "listing a file must still fail: {not_dir:?}");
 }
+
+/// A symlink must list identically through both paths, and must list the
+/// TARGET's attrs — the contract `getattr` already keeps.
+///
+/// The two paths used to disagree here. The index path followed the link with
+/// a bare `fs::metadata`; the disk path carried a comment claiming
+/// `DirEntry::metadata` follows symlinks, which std documents it does not — so
+/// it served the link's own attrs and nobody noticed, because the difference
+/// only shows on an export where indexing happened to be on or off.
+///
+/// Unix-only: creating a symlink on Windows needs Developer Mode or an
+/// elevated process, which a test must not require. The code under test is
+/// platform-independent, and the Linux leg of the gate runs this.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_symlink_lists_its_target_through_both_paths() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // 4096 bytes, so the target's size cannot be confused with the link's own
+    // (a link's size is the byte length of its target path — here, 8).
+    std::fs::write(dir.path().join("real.bin"), vec![7u8; 4096]).unwrap();
+    std::os::unix::fs::symlink("real.bin", dir.path().join("link.bin")).unwrap();
+
+    let indexed = registry(dir.path(), None, vec![]);
+    let mut ip = Peer::connect(&indexed).await;
+    assert_ne!(ip.tree_token().await, 0, "the index must be live");
+    let (from_index, _) = ip.readdir_all("").await;
+
+    let disk = registry(dir.path(), Some(0), vec![]);
+    let mut dp = Peer::connect(&disk).await;
+    assert_eq!(dp.tree_token().await, 0, "cap 0 must leave the export unindexed");
+    let (from_disk, _) = dp.readdir_all("").await;
+
+    let pick = |v: &[DirEntry], n: &str| v.iter().find(|e| e.name == n).cloned().expect("entry");
+    let li = pick(&from_index, "link.bin");
+    let ld = pick(&from_disk, "link.bin");
+
+    assert_eq!(li.attr, ld.attr, "a link must list the same through both paths");
+    assert_eq!(
+        li.attr.size, 4096,
+        "the listing must report the target's size, as getattr does"
+    );
+    assert_eq!(
+        li.attr.kind,
+        pick(&from_index, "real.bin").attr.kind,
+        "a followed link lists as what it points at"
+    );
+}
+
+/// A symlink pointing OUT of the export must not publish its target's attrs.
+///
+/// This is why the follow goes through `resolve` and not `fs::metadata`:
+/// resolve canonicalizes and refuses anything landing outside the root. The
+/// index path used to follow raw, so the size and mtime of a file the client
+/// can never open — and that the export boundary exists to hide — were served
+/// in the listing.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_link_out_of_the_export_lists_as_itself() {
+    let outside = tempfile::tempdir().expect("outside");
+    let secret = outside.path().join("secret.bin");
+    std::fs::write(&secret, vec![9u8; 8192]).unwrap();
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::os::unix::fs::symlink(&secret, dir.path().join("escape.bin")).unwrap();
+
+    for cap in [None, Some(0)] {
+        let reg = registry(dir.path(), cap, vec![]);
+        let mut peer = Peer::connect(&reg).await;
+        peer.tree_token().await;
+        let (entries, _) = peer.readdir_all("").await;
+        let e = entries
+            .iter()
+            .find(|e| e.name == "escape.bin")
+            .expect("the link still lists");
+        assert_ne!(
+            e.attr.size, 8192,
+            "cap {cap:?}: the size of a file outside the export must not be served"
+        );
+        assert_eq!(
+            e.attr.kind,
+            alloyfs_proto::FileKind::Symlink,
+            "cap {cap:?}: an unfollowable link lists as a link"
+        );
+    }
+}
+
+/// A dangling link still lists, with its own attrs.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dangling_link_still_lists() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::os::unix::fs::symlink("nothing-here", dir.path().join("broken")).unwrap();
+
+    for cap in [None, Some(0)] {
+        let reg = registry(dir.path(), cap, vec![]);
+        let mut peer = Peer::connect(&reg).await;
+        peer.tree_token().await;
+        let (entries, _) = peer.readdir_all("").await;
+        let e = entries
+            .iter()
+            .find(|e| e.name == "broken")
+            .unwrap_or_else(|| panic!("cap {cap:?}: a broken link must still list"));
+        assert_eq!(e.attr.kind, alloyfs_proto::FileKind::Symlink);
+    }
+}

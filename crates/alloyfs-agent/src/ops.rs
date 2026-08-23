@@ -43,6 +43,20 @@ pub struct Export {
     vclock: AtomicU64,
     /// Event fan-out for this export (watcher feeds it, sessions subscribe).
     pub events: Arc<crate::watch::EventHub>,
+    /// Whether an OS watcher is actually running on `root`.
+    ///
+    /// False means this export is serving a filesystem whose changes it
+    /// cannot see: `versions` still bump for mutations made THROUGH alloyfs,
+    /// but anything written directly on the server is invisible, so no
+    /// invalidation event ever reaches a client and its cache can serve a
+    /// stale file indefinitely. That is a state an operator has to be able to
+    /// find without reading the agent's log, which is why it lives on the
+    /// export and is reported by the HTTP API rather than only logged once at
+    /// startup.
+    ///
+    /// Atomic because the registry is built before the watchers are spawned,
+    /// and every `Export` is behind an `Arc` by then.
+    watching: std::sync::atomic::AtomicBool,
     /// Whole-file advisory locks shared by all sessions of this export.
     pub locks: crate::locks::LockManager,
     /// Who has each path open for WRITING, across every session. Reports the
@@ -70,6 +84,22 @@ pub struct Export {
 }
 
 impl Export {
+    /// Record that no OS watcher is running on this export. See [`watching`].
+    ///
+    /// One way only: a watcher that dies is rebuilt by the supervisor in
+    /// `watch.rs` without coming back through here, and the case this marks
+    /// is the one that cannot recover on its own — the root could not be
+    /// watched at all, so the agent gave up on it at startup.
+    pub fn mark_unwatched(&self) {
+        self.watching
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Is an OS watcher running on this export?
+    pub fn is_watching(&self) -> bool {
+        self.watching.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Merge the v11 bits into a served Attr. On Windows this is the
     /// identity — `attr_from_metadata` read the bits off the metadata
     /// already; on Linux it is the sidecar's serve-time merge. The tree
@@ -278,6 +308,49 @@ impl Export {
         self.bump(to)
     }
 
+    /// The attrs one directory entry lists with — the single place all three
+    /// readdir paths agree, so a link can never list differently depending on
+    /// which one served it.
+    ///
+    /// `link_attr` is the entry's OWN attrs. `DirEntry::metadata` does not
+    /// traverse — std is explicit about it, and the comment on the disk path
+    /// used to claim the opposite, which is how the two paths came to
+    /// disagree: the index path followed, the disk path only believed it did.
+    ///
+    /// A symlink is followed here, deliberately, because `getattr` reports the
+    /// target (see `getattr_one`). A listing that disagreed with the `stat`
+    /// right after it would be a disagreement the client then caches.
+    ///
+    /// Following goes through `resolve`, never a bare `fs::metadata`. Resolve
+    /// canonicalizes and refuses a result outside the export root, and
+    /// re-checks excludes against the resolved name. Following raw — which the
+    /// index path did — publishes the size and mtime of whatever the link
+    /// points at, including files outside the export entirely, which is the
+    /// one thing the export boundary exists to prevent.
+    ///
+    /// A link that cannot be followed (dangling, escaping, or landing on an
+    /// excluded path) keeps its own attrs and still lists. That is what the
+    /// kernel shows for a broken link, and dropping the entry would be worse.
+    fn entry_attr(&self, child: &RelPath, link_attr: Attr) -> Attr {
+        let mut attr = link_attr;
+        if attr.kind == FileKind::Symlink {
+            if let Some(target) = self
+                .resolve(child)
+                .ok()
+                .and_then(|full| std::fs::metadata(full).ok())
+            {
+                attr = attr_from_metadata(&target, 0);
+            }
+        }
+        self.with_winattrs(
+            child,
+            Attr {
+                version: self.version_of(child),
+                ..attr
+            },
+        )
+    }
+
     /// Directory listing with the same path hardening as the wire protocol —
     /// used by the HTTP browse endpoint. Blocking: call via spawn_blocking.
     pub fn browse(&self, rel: &RelPath) -> Result<Vec<DirEntry>, ErrorCode> {
@@ -292,13 +365,12 @@ impl Export {
             if self.exclude.is_excluded(&child) {
                 continue; // invisible
             }
-            let md = item
-                .metadata()
-                .or_else(|_| std::fs::symlink_metadata(item.path()));
-            let Ok(md) = md else { continue };
+            // Non-traversing, so this is the link's own metadata; `entry_attr`
+            // does the following, safely.
+            let Ok(md) = item.metadata() else { continue };
             entries.push(DirEntry {
                 name,
-                attr: self.with_winattrs(&child, attr_from_metadata(&md, self.version_of(&child))),
+                attr: self.entry_attr(&child, attr_from_metadata(&md, 0)),
             });
         }
         entries.sort_by(|a, b| a.name.cmp(&b.name));
@@ -378,6 +450,10 @@ impl ExportRegistry {
                     versions: DashMap::new(),
                     vclock: AtomicU64::new(0),
                     events: crate::watch::EventHub::new(),
+                    // Assumed until the watcher actually fails to spawn: an
+                    // export that never gets a watcher (a --stdio agent) is
+                    // not the degraded case this flag is about.
+                    watching: std::sync::atomic::AtomicBool::new(true),
                     locks: crate::locks::LockManager::default(),
                     writers: crate::writers::WriterRegistry::default(),
                     exclude,
@@ -863,28 +939,13 @@ impl SessionInner {
                 .into_iter()
                 .map(|(name, attr)| {
                     let child = path.join(&name);
-                    // The index stores a link AS a link (following one during
-                    // the walk could escape the export); the disk path below
-                    // follows. Keep readdir's contract by following here —
-                    // links are rare enough to stat individually, and a broken
-                    // one keeps the link's own attrs, matching the disk path's
-                    // symlink_metadata fallback.
-                    let attr = if attr.kind == FileKind::Symlink {
-                        std::fs::metadata(export.root.join(&child.0))
-                            .map(|md| attr_from_metadata(&md, 0))
-                            .unwrap_or(attr)
-                    } else {
-                        attr
-                    };
+                    // The index stores a link AS a link — following one during
+                    // the walk could escape the export. `entry_attr` follows
+                    // it here instead, through `resolve`, which is what makes
+                    // the follow safe.
                     DirEntry {
                         name,
-                        attr: export.with_winattrs(
-                            &child,
-                            Attr {
-                                version: export.version_of(&child),
-                                ..attr
-                            },
-                        ),
+                        attr: export.entry_attr(&child, attr),
                     }
                 })
                 .collect();
@@ -906,17 +967,15 @@ impl SessionInner {
             if export.exclude.is_excluded(&child) {
                 continue; // invisible to every client
             }
-            // metadata() follows symlinks; fall back to the link's own
-            // metadata for broken links so the entry still lists.
-            let md = item
-                .metadata()
-                .or_else(|_| std::fs::symlink_metadata(item.path()));
-            let Ok(md) = md else { continue };
+            // `DirEntry::metadata` does NOT traverse, so this is the link's
+            // own metadata; `entry_attr` follows it through `resolve`.
+            let Ok(md) = item.metadata() else { continue };
             // Real versions in listings: the client auto-cache walker relies
-            // on them for freshness without extra Getattrs.
+            // on them for freshness without extra Getattrs. `entry_attr`
+            // applies them.
             entries.push(DirEntry {
                 name,
-                attr: export.with_winattrs(&child, attr_from_metadata(&md, export.version_of(&child))),
+                attr: export.entry_attr(&child, attr_from_metadata(&md, 0)),
             });
         }
         entries.sort_by(|a, b| a.name.cmp(&b.name));
