@@ -7,16 +7,20 @@
 #   $env:ALLOYFS_INSTALL      install here instead of %LOCALAPPDATA%\Programs\alloyfs
 #   $env:GITHUB_TOKEN         optional; raises the GitHub API rate limit
 #   $env:ALLOYFS_SKIP_WINFSP  do not offer to install the WinFsp driver
+#   $env:ALLOYFS_NO_ELEVATE   never raise a UAC prompt; skip the driver instead
 #   $env:WINFSP_VERSION       install this WinFsp tag instead of the latest
 #
-# This is the SILENT installer: it prompts for nothing, elevates nothing, and
-# is safe to run unattended. AlloyFS installs per-user and needs no rights at
-# all. WinFsp is a kernel driver and does need them, so it is installed only
-# when this is already running elevated; otherwise the script says so and
-# carries on.
+# AlloyFS itself installs PER-USER and needs no rights at all — that part
+# prompts for nothing and is safe to run unattended.
 #
-# For an interactive install that asks for those rights once and then does
-# everything, use install.cmd.
+# WinFsp is a kernel driver and does need rights. If this is not already
+# elevated, one UAC prompt is raised for the DRIVER ALONE. A denied or
+# impossible prompt is not a failure: the script says what is missing and
+# carries on, leaving a working per-user alloyfs behind. Set
+# ALLOYFS_NO_ELEVATE=1 to skip asking at all.
+#
+# install.cmd remains the front door that elevates once up front and then
+# does everything without a second prompt.
 
 $ErrorActionPreference = 'Stop'
 
@@ -248,24 +252,41 @@ function Install-WinFsp {
   }
   Dim "  Signed by: $($sig.SignerCertificate.Subject -replace '^CN=([^,]+).*','$1')"
 
-  # /qn is silent, and no -Verb RunAs: this script raises no UAC dialog. It is
-  # reached by `irm … | iex` and by unattended tooling, and a silent installer
-  # that stops to ask a question is not silent — it is a script that hangs on a
-  # machine with nobody watching. install.cmd is the interactive front door and
-  # elevates before any of this runs, so by the time msiexec is reached the
-  # rights are already in hand.
+  # /qn keeps msiexec silent. Whether it is ELEVATED depends on what we
+  # already have:
   #
-  # No INSTALLLEVEL, unlike .github/workflows/publish.yml, which passes 1000 to
-  # pull in the WinFsp SDK. That is a BUILD dependency — the headers a release
-  # build compiles against — and installing it here would put a development kit
-  # on the machine of someone who only wants to mount a drive. The default
-  # level installs the driver and runtime, which is all a mount needs.
+  # - Already admin (install.cmd's path, or an elevated shell): run it
+  #   directly, exactly as before. No dialog, nothing to approve.
+  # - Not admin: ask for the rights with -Verb RunAs. This raises one UAC
+  #   prompt, for the kernel driver only — never for AlloyFS itself, which is
+  #   a per-user install and needs no rights at all.
+  #
+  # The script used to skip the driver entirely when unelevated, which left
+  # `irm … | iex` installing an alloyfs that could not mount anything and
+  # saying so in a line most people scrolled past.
+  #
+  # Unattended safety is kept by what happens when the prompt cannot be
+  # answered: a denied or impossible elevation throws, and the catch below
+  # lands on exactly the old behaviour — say what is missing, carry on, leave
+  # a working per-user alloyfs behind. Set ALLOYFS_NO_ELEVATE=1 to refuse
+  # outright and go straight there.
   Write-Host '  Installing...'
   $msiArgs = @("/i", "`"$msi`"", "/qn", "/norestart")
+  $elevate = -not (Test-Admin) -and -not $env:ALLOYFS_NO_ELEVATE
+  if ($elevate) {
+    Write-Host '  This needs administrator rights — approve the prompt to install the driver.' -ForegroundColor Cyan
+  }
   try {
-    $p = Start-Process msiexec -ArgumentList $msiArgs -Wait -PassThru
+    $p = if ($elevate) {
+      Start-Process msiexec -ArgumentList $msiArgs -Verb RunAs -Wait -PassThru
+    } else {
+      Start-Process msiexec -ArgumentList $msiArgs -Wait -PassThru
+    }
   } catch {
-    Dim "  msiexec could not be started: $($_.Exception.Message)"
+    # The usual cause is a declined UAC prompt, or no interactive desktop to
+    # show one on. Neither is an install failure: alloyfs is already in place.
+    Dim "  The driver was not installed: $($_.Exception.Message)"
+    Dim '  Install WinFsp from https://winfsp.dev, or re-run this from an elevated shell.'
     Remove-Item $wfTmp -Recurse -Force -ErrorAction SilentlyContinue
     return
   }
@@ -290,21 +311,21 @@ if (Test-WinFsp) {
 } elseif ($env:ALLOYFS_SKIP_WINFSP) {
   Dim 'Note: WinFsp was not found and ALLOYFS_SKIP_WINFSP is set, so mounting will not work yet.'
   Dim '      Install it from https://winfsp.dev'
-} elseif (Test-Admin) {
-  Install-WinFsp
-} else {
-  # Not elevated, and this script does not ask. Said plainly, with the two ways
-  # out, because "mounting will not work" is a worse thing to discover at the
-  # first mount than to be told here.
+} elseif ($env:ALLOYFS_NO_ELEVATE -and -not (Test-Admin)) {
+  # Elevation refused by configuration. Say what is missing and how to fix it,
+  # rather than leaving it to be discovered at the first mount.
   Write-Host ''
   Write-Host 'WinFsp is not installed, so mounting will not work yet.' -ForegroundColor Yellow
   Dim '  It is a kernel driver and installing it needs administrator rights,'
-  Dim '  which this installer does not ask for. Either:'
+  Dim '  and ALLOYFS_NO_ELEVATE is set, so this installer did not ask. Either:'
   Dim ''
-  Dim '    curl -fsSL https://alloy.okyle.dev/install.cmd -o install.cmd && install.cmd'
+  Dim '    re-run this from an elevated shell,'
   Dim ''
-  Dim '  which asks once and does the rest, or install it yourself from'
-  Dim '  https://winfsp.dev'
+  Dim '  or install it yourself from https://winfsp.dev'
+} else {
+  # Elevated already, or willing to ask for it — Install-WinFsp decides which
+  # and raises at most one prompt, for the driver alone.
+  Install-WinFsp
 }
 
 Dim 'Config lives in %USERPROFILE%\.alloyfs -- separate from the binary, so'
