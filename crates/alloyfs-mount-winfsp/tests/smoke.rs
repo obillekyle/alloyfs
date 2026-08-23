@@ -563,6 +563,14 @@ fn the_mount_agrees_with_the_origin_under_churn() {
             let Ok(rd) = std::fs::read_dir(at) else { return };
             for e in rd.flatten() {
                 let p = e.path();
+                // Agent bookkeeping, not user data: a Windows agent keeps a
+                // POSIX-mode sidecar under `.alloyfs` in the export root. It is
+                // auto-excluded from the client, so leaving it in makes this
+                // test sensitive to exclude settings that have nothing to do
+                // with what the two sides are meant to agree about.
+                if e.file_name().to_string_lossy().starts_with(".alloyfs") {
+                    continue;
+                }
                 let Ok(md) = std::fs::metadata(&p) else { continue };
                 if md.is_dir() {
                     walk(base, &p, out);
@@ -632,23 +640,35 @@ fn the_mount_agrees_with_the_origin_under_churn() {
 
             // Converge, with a bound. Anything that needs more than this is
             // the bug the test is looking for.
-            let want = picture(&root);
+            // BOTH sides are re-read every poll. Snapshotting the origin once
+            // and polling the mount against it compares a live view to a stale
+            // one: anything appearing in the export after the snapshot — agent
+            // bookkeeping, an editor temp file, the OS — shows up on the mount,
+            // never in the snapshot, and the test reports it as the mount
+            // inventing a file. That is exactly what it did on CI.
             let start = std::time::Instant::now();
             let deadline = start + Duration::from_secs(10);
-            let mut got = picture(&mount_root);
+            let (mut got, mut want) = (picture(&mount_root), picture(&root));
             while got != want && std::time::Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(20));
+                want = picture(&root);
                 got = picture(&mount_root);
             }
             worst = worst.max(start.elapsed());
 
-            assert_eq!(
-                got.len(),
-                want.len(),
-                "round {round}: the mount lists {} files, the origin has {}",
-                got.len(),
-                want.len()
-            );
+            if got.len() != want.len() {
+                let g: Vec<&str> = got.iter().map(|e| e.0.as_str()).collect();
+                let w: Vec<&str> = want.iter().map(|e| e.0.as_str()).collect();
+                panic!(
+                    "round {round}: the mount lists {} files, the origin has {}\n  \
+                     mount:  {g:?}\n  origin: {w:?}\n  \
+                     extra on the mount: {:?}\n  missing from the mount: {:?}",
+                    got.len(),
+                    want.len(),
+                    g.iter().filter(|n| !w.contains(n)).collect::<Vec<_>>(),
+                    w.iter().filter(|n| !g.contains(n)).collect::<Vec<_>>(),
+                );
+            }
             for (a, b) in got.iter().zip(&want) {
                 assert_eq!(a.0, b.0, "round {round}: name mismatch");
                 assert_eq!(a.1, b.1, "round {round}: {} size {} vs {}", a.0, a.1, b.1);
