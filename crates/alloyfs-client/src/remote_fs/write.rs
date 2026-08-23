@@ -344,5 +344,4 @@ impl RemoteFs {
         }
         self.warm.get(path).map(|w| w.is_empty()).unwrap_or(false)
     }
-
 }

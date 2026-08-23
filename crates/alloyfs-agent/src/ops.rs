@@ -91,8 +91,7 @@ impl Export {
     /// is the one that cannot recover on its own — the root could not be
     /// watched at all, so the agent gave up on it at startup.
     pub fn mark_unwatched(&self) {
-        self.watching
-            .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.watching.store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Is an OS watcher running on this export?

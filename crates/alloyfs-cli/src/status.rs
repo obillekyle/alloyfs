@@ -253,7 +253,7 @@ mod tests {
             "past the grace period, the writer has stopped"
         );
     }
-/// A snapshot written by an older build has no pool pair at all. It must
+    /// A snapshot written by an older build has no pool pair at all. It must
     /// still read — `status` is the tool someone runs right after an upgrade
     /// goes wrong, and it is worth nothing if the upgrade made it unreadable.
     #[test]

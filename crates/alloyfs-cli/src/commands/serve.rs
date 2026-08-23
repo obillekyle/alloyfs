@@ -35,8 +35,7 @@ pub async fn run(
         // platform ran out of watch descriptors; and a flag on the export so
         // `GET /api/exports` reports it, because the person who notices the
         // staleness is looking at a client, not at this log.
-        match alloyfs_agent::watch::spawn(export.clone(), hub, std::time::Duration::from_millis(250))
-        {
+        match alloyfs_agent::watch::spawn(export.clone(), hub, std::time::Duration::from_millis(250)) {
             Ok(guard) => _watch_guards.push(guard),
             Err(e) => {
                 export.mark_unwatched();

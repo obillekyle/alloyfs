@@ -127,7 +127,10 @@ fn fixture() -> Fixture {
 #[test]
 fn a_volume_mounts_reads_and_unmounts() {
     let Some(letter) = free_drive_letter() else {
-        eprintln!("SKIP: no free drive letter among {}", String::from_utf8_lossy(CANDIDATES));
+        eprintln!(
+            "SKIP: no free drive letter among {}",
+            String::from_utf8_lossy(CANDIDATES)
+        );
         return;
     };
     let fixture = fixture();
@@ -176,10 +179,7 @@ fn a_volume_mounts_reads_and_unmounts() {
         // whole thing rather than the first byte.
         let nested = std::fs::read(sub.join("nested.bin")).expect("read the nested file");
         assert_eq!(nested.len(), 40_000, "a multi-chunk read must be complete");
-        assert!(
-            nested.iter().all(|&b| b == 7),
-            "and assembled in the right order"
-        );
+        assert!(nested.iter().all(|&b| b == 7), "and assembled in the right order");
 
         let mut names: Vec<String> = std::fs::read_dir(&root)
             .expect("enumerate the volume root")

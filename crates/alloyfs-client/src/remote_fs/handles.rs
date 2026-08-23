@@ -359,5 +359,4 @@ impl RemoteFs {
         }
         Some(path)
     }
-
 }

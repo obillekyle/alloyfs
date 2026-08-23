@@ -156,9 +156,13 @@ dependencies = [
 name = "alloyfs-mount-winfsp"
 version = "1.0.0-alpha.90"
 dependencies = [
+ "alloyfs-agent",
  "alloyfs-client",
  "alloyfs-proto",
+ "alloyfs-transport",
  "anyhow",
+ "tempfile",
+ "tokio",
  "tracing",
  "windows-sys 0.60.2",
  "winfsp",
