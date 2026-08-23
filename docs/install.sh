@@ -5,7 +5,8 @@
 #
 # Environment:
 #   ALLOYFS_VERSION   install this tag instead of the latest (e.g. v0.1.1)
-#   ALLOYFS_INSTALL   install here instead of ~/.local/bin
+#   ALLOYFS_INSTALL   install here instead of the default (~/.local/bin, or
+#                     /usr/local/bin when running as root)
 #   GITHUB_TOKEN      optional; raises the GitHub API rate limit
 #
 # POSIX sh on purpose: this runs before anything is installed, on whatever
@@ -13,7 +14,25 @@
 set -eu
 
 REPO="obillekyle/alloyfs"
-INSTALL_DIR="${ALLOYFS_INSTALL:-$HOME/.local/bin}"
+
+# Where the binary lands, in three cases rather than one.
+#
+# `$HOME/.local/bin` alone got this wrong for the most common first command
+# anyone runs. Under `sudo sh install.sh` — which is what someone types when
+# they want alloyfs available to the whole machine, and what the FUSE note at
+# the end of this script encourages — sudo sets HOME to /root, so the binary
+# went to /root/.local/bin: a directory on nobody's PATH, unreadable by the
+# user who ran the command, and reported as a success.
+#
+# Running as root therefore means /usr/local/bin, the system location that is
+# already on every PATH. An explicit ALLOYFS_INSTALL still wins over both.
+if [ -n "${ALLOYFS_INSTALL:-}" ]; then
+  INSTALL_DIR="$ALLOYFS_INSTALL"
+elif [ "$(id -u)" = 0 ]; then
+  INSTALL_DIR=/usr/local/bin
+else
+  INSTALL_DIR="$HOME/.local/bin"
+fi
 
 red() { printf '\033[31m%s\033[0m\n' "$1" >&2; }
 dim() { printf '\033[2m%s\033[0m\n' "$1"; }
@@ -79,12 +98,63 @@ api() {
 
 # --- which version ----------------------------------------------------------
 
+# Whichever of two tags is newer by semver precedence.
+#
+# Needed because GitHub's `releases/latest` EXCLUDES prereleases. On a project
+# whose current line is 1.0.0-alpha.N it answers with the last STABLE — here
+# v0.7.0, which predates the 1.0 line entirely and cannot speak the current
+# wire protocol. So `curl … | sh`, the install command in the docs, handed
+# every new user a build from before the rewrite and called it a success.
+#
+# Same rule `alloyfs update` applies in Rust (`is_newer`, commands/update.rs):
+# numeric fields first, then a release outranks its own prereleases, then
+# prerelease identifiers compare numerically when both are numeric.
+newer_of() {
+  a="$1"; b="$2"
+  a_core=${a#v}; a_pre=''; case "$a_core" in *-*) a_pre=${a_core#*-}; a_core=${a_core%%-*};; esac
+  b_core=${b#v}; b_pre=''; case "$b_core" in *-*) b_pre=${b_core#*-}; b_core=${b_core%%-*};; esac
+  i=1
+  while [ "$i" -le 3 ]; do
+    x=$(printf '%s' "$a_core" | cut -d. -f"$i"); y=$(printf '%s' "$b_core" | cut -d. -f"$i")
+    x=${x:-0}; y=${y:-0}
+    case "$x$y" in *[!0-9]*) x=0; y=0 ;; esac
+    if [ "$x" -gt "$y" ]; then printf '%s' "$a"; return; fi
+    if [ "$x" -lt "$y" ]; then printf '%s' "$b"; return; fi
+    i=$((i + 1))
+  done
+  # Equal cores: a release beats its own prereleases.
+  if [ -z "$a_pre" ]; then printf '%s' "$a"; return; fi
+  if [ -z "$b_pre" ]; then printf '%s' "$b"; return; fi
+  # Both prereleases: compare the trailing identifier, numerically if it is one.
+  x=${a_pre##*.}; y=${b_pre##*.}
+  case "$x$y" in
+    *[!0-9]*) if [ "$x" \> "$y" ]; then printf '%s' "$a"; else printf '%s' "$b"; fi ;;
+    *) if [ "$x" -gt "$y" ]; then printf '%s' "$a"; else printf '%s' "$b"; fi ;;
+  esac
+}
+
+tag_from() {
+  api "https://api.github.com/repos/$REPO/$1" \
+    | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+    | head -1
+}
+
 version="${ALLOYFS_VERSION:-}"
 if [ -z "$version" ]; then
   bold "Looking up the latest release..."
-  version=$(api "https://api.github.com/repos/$REPO/releases/latest" \
-    | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
-    | head -1) || true
+  # Both, because they answer different questions: releases/latest is the
+  # newest STABLE, the first page of releases is the newest thing published
+  # at all. Whichever is genuinely newer wins.
+  stable=$(tag_from "releases/latest") || true
+  newest=$(tag_from "releases?per_page=1") || true
+  if [ -n "$stable" ] && [ -n "$newest" ]; then
+    version=$(newer_of "$newest" "$stable")
+  else
+    version="${stable:-$newest}"
+  fi
+  case "$version" in
+    *-*) dim "The newest release is a prerelease ($version); installing it." ;;
+  esac
 fi
 
 if [ -z "$version" ]; then
