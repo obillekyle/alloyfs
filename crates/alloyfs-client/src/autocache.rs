@@ -289,7 +289,21 @@ impl AutoCache {
                     // Crash tolerance: blob must exist with the recorded size.
                     let blob = blob_path(&cfg.root, &rel);
                     match std::fs::metadata(&blob) {
-                        Ok(md) if md.len() == entry.size => {
+                        // A COMPLETE blob must be exactly the file. A partial
+                        // one is shorter: its length runs to the end of the
+                        // highest block written so far, and nothing pads the
+                        // gap. Requiring an exact match dropped every partial
+                        // entry at load — the blocks were on disk and the map
+                        // recorded them, and the check threw both away, so
+                        // partial caching survived a handle but never a
+                        // restart.
+                        Ok(md)
+                            if if entry.blocks.is_complete() {
+                                md.len() == entry.size
+                            } else {
+                                md.len() <= entry.size
+                            } =>
+                        {
                             // A manifest written before partial caching has no
                             // `on_disk`, and it defaults to 0 — which would
                             // charge every existing entry nothing and leave the
@@ -1751,5 +1765,59 @@ mod partial_serving_tests {
         c.commit_warm(&p, &a, false);
 
         assert!(c.fresh_for(&p, &a), "a whole blob serves as it always did");
+    }
+}
+
+#[cfg(test)]
+mod partial_reload_tests {
+    use super::tests::attr;
+    use super::*;
+
+    const CH: usize = alloyfs_proto::DATA_CHUNK as usize;
+
+    /// A partial entry must survive the manifest round trip.
+    ///
+    /// Its blob is SHORTER than the file: the length runs to the end of the
+    /// highest block written, and nothing pads the gap. The load check
+    /// demanded an exact length match, so every partial entry was dropped and
+    /// its blob deleted — partial caching survived a handle, and never a
+    /// restart. Caught on the live drive: blocks recorded 9/800 in the
+    /// manifest, and reading them after a restart still cost a round trip.
+    #[test]
+    fn a_partial_entry_survives_a_reload_with_a_short_blob() {
+        let dir = std::env::temp_dir().join(format!("ds-reload-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let p = RelPath("sparse.bin".into());
+        let size = (CH * 8) as u64;
+
+        {
+            let (c, _rx) = super::tests::cache(&dir, 1_000_000, 10_000_000);
+            // Blocks 0 and 2 only: the blob ends after block 2, well short of
+            // the file's eight blocks.
+            let mut fill = WarmFill::begin(c.warm_stage_path(&p, 1), size, 0).expect("begins");
+            fill.put(0, &vec![1u8; CH]);
+            fill.put(2, &vec![3u8; CH]);
+            let on_disk = fill.on_disk();
+            let map = fill.keep_partial(&c.blob_final_path(&p)).expect("kept");
+            c.commit_partial(&p, &attr(size, 100, 0), map, on_disk);
+            c.flush_manifest_final();
+        }
+
+        let blob_len = std::fs::metadata(dir.join("blobs").join("sparse.bin"))
+            .expect("blob exists")
+            .len();
+        assert!(blob_len < size, "the blob really is short: {blob_len} < {size}");
+
+        // A fresh cache over the same directory — what a remount does.
+        let (c2, _rx2) = super::tests::cache(&dir, 1_000_000, 10_000_000);
+        let held = c2
+            .blocks_for(&p, &attr(size, 100, 0))
+            .expect("the partial entry survived the reload");
+        assert!(held.has(0) && held.has(2), "and still names its blocks");
+        assert!(!held.has(1), "without inventing any");
+        assert!(
+            !c2.fresh_for(&p, &attr(size, 100, 0)),
+            "still not servable as a whole blob"
+        );
     }
 }
