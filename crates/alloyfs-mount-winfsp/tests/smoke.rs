@@ -42,17 +42,62 @@ use alloyfs_transport::{serve_connection, MuxConnection, RequestHandler};
 /// mounts tend to claim.
 const CANDIDATES: &[u8] = b"YXWVUTSRQP";
 
-fn free_drive_letter() -> Option<char> {
+/// A drive letter claimed for the life of this value, released on drop.
+///
+/// `GetLogicalDrives` alone is not enough. nextest runs every test in its own
+/// PROCESS, concurrently, so two mount tests both saw the same letter free and
+/// both took it — the smoke test then read the staleness test's volume and
+/// failed on content it never wrote. It passed on retry, which is the worst
+/// version of the problem: a flake that looks like a product bug.
+///
+/// The lock file is the claim, and `create_new` is what makes it atomic across
+/// processes: exactly one caller can create a given path, and the loser moves
+/// to the next letter.
+struct LetterClaim {
+    letter: char,
+    lock: std::path::PathBuf,
+}
+
+impl Drop for LetterClaim {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.lock);
+    }
+}
+
+fn claim_drive_letter() -> Option<LetterClaim> {
     // Bit 0 is A:, bit 1 is B:, and so on. A set bit means the letter is
     // taken — by a disk, a network share, or another user-mode filesystem.
     let mask = unsafe { windows_sys::Win32::Storage::FileSystem::GetLogicalDrives() };
     if mask == 0 {
         return None; // the call failed; take no chances with a letter
     }
-    CANDIDATES
-        .iter()
-        .map(|&b| b as char)
-        .find(|&c| mask & (1u32 << (c as u8 - b'A')) == 0)
+    for &b in CANDIDATES {
+        let letter = b as char;
+        if mask & (1u32 << (b - b'A')) != 0 {
+            continue; // the system has it
+        }
+        let lock = std::env::temp_dir().join(format!("alloyfs-test-drive-{letter}.lock"));
+        // A crashed run must not take a letter out of circulation forever.
+        if let Ok(md) = std::fs::metadata(&lock) {
+            let stale = md
+                .modified()
+                .ok()
+                .and_then(|m| m.elapsed().ok())
+                .is_some_and(|age| age > std::time::Duration::from_secs(300));
+            if stale {
+                let _ = std::fs::remove_file(&lock);
+            }
+        }
+        if std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock)
+            .is_ok()
+        {
+            return Some(LetterClaim { letter, lock });
+        }
+    }
+    None
 }
 
 struct Fixture {
@@ -143,13 +188,14 @@ fn fixture() -> Fixture {
 /// assertion here needs the same one. A failure names which step it was.
 #[test]
 fn a_volume_mounts_reads_and_unmounts() {
-    let Some(letter) = free_drive_letter() else {
+    let Some(claim) = claim_drive_letter() else {
         eprintln!(
             "SKIP: no free drive letter among {}",
             String::from_utf8_lossy(CANDIDATES)
         );
         return;
     };
+    let letter = claim.letter;
     let fixture = fixture();
     let mountpoint = format!("{letter}:");
 
@@ -284,10 +330,11 @@ fn read_via_client(fs: &Arc<RemoteFs>, rt: &tokio::runtime::Handle, name: &str) 
 /// report both rather than just failing.
 #[test]
 fn a_same_size_server_change_reaches_the_next_read() {
-    let Some(letter) = free_drive_letter() else {
+    let Some(claim) = claim_drive_letter() else {
         eprintln!("SKIP: no free drive letter");
         return;
     };
+    let letter = claim.letter;
     let fixture = fixture();
     let mountpoint = format!("{letter}:");
     let backing = fixture.dir.path().join("hello.txt");

@@ -32,15 +32,51 @@ const READS: usize = 500;
 const BLOCK: usize = 64 * 1024;
 const FILE_BYTES: usize = 4 * 1024 * 1024;
 
-fn free_drive_letter() -> Option<char> {
+/// See `smoke.rs` for why this is a lock file and not just `GetLogicalDrives`:
+/// nextest runs each test in its own process, and two mount tests racing for
+/// the same letter read each other's volumes.
+struct LetterClaim {
+    letter: char,
+    lock: std::path::PathBuf,
+}
+
+impl Drop for LetterClaim {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.lock);
+    }
+}
+
+fn claim_drive_letter() -> Option<LetterClaim> {
     let mask = unsafe { windows_sys::Win32::Storage::FileSystem::GetLogicalDrives() };
     if mask == 0 {
         return None;
     }
-    b"YXWVUTSRQP"
-        .iter()
-        .map(|&b| b as char)
-        .find(|&c| mask & (1u32 << (c as u8 - b'A')) == 0)
+    for &b in b"YXWVUTSRQP" {
+        let letter = b as char;
+        if mask & (1u32 << (b - b'A')) != 0 {
+            continue;
+        }
+        let lock = std::env::temp_dir().join(format!("alloyfs-test-drive-{letter}.lock"));
+        if let Ok(md) = std::fs::metadata(&lock) {
+            if md
+                .modified()
+                .ok()
+                .and_then(|m| m.elapsed().ok())
+                .is_some_and(|age| age > std::time::Duration::from_secs(300))
+            {
+                let _ = std::fs::remove_file(&lock);
+            }
+        }
+        if std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock)
+            .is_ok()
+        {
+            return Some(LetterClaim { letter, lock });
+        }
+    }
+    None
 }
 
 fn pct(mut v: Vec<u128>, p: f64) -> f64 {
@@ -79,10 +115,11 @@ fn measure(path: &std::path::Path) -> (f64, f64) {
 #[test]
 #[ignore]
 fn what_a_cached_read_costs_at_each_timeout() {
-    let Some(letter) = free_drive_letter() else {
+    let Some(claim) = claim_drive_letter() else {
         eprintln!("SKIP: no free drive letter");
         return;
     };
+    let letter = claim.letter;
 
     let dir = tempfile::TempDir::new().expect("tempdir");
     let payload: Vec<u8> = (0..FILE_BYTES).map(|i| (i % 251) as u8).collect();
