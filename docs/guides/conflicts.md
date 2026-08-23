@@ -38,6 +38,43 @@ It is a refusal, not a report. Being told your colleague's edit was overwritten,
 - **Your own writes never conflict with themselves.** Each chunk advances the
   expected version, so a large write does not trip over its own bumps.
 
+
+## The agent also reports collisions it cannot prevent
+
+Independently of `--detect-conflicts`, the agent warns when **two different
+sessions hold one path open for writing at the same time**:
+
+```
+WARN two sessions have this file open for writing  path=db.sqlite session=7 other=4
+```
+
+This exists because of the Windows lock gap. WinFsp services lock requests
+inside its own kernel driver and exposes no callback, so a Windows client's
+byte-range locks are enforced on its own machine and nowhere else — two Windows
+machines writing one SQLite database through the same export believe they are
+serialised and are not. The agent is never asked for the lock, so it cannot
+enforce anything; but it is the one process that sees both opens, so it is the
+only place the collision can be observed at all.
+
+**It reports, it never refuses.** Refusing the second open would invent a
+restriction the protocol never promised and would break the ordinary case of
+one client reopening a file it already has open. Two handles in the *same*
+session are not reported for the same reason — one machine's own locks do
+apply there.
+
+### What it does not cover
+
+- **One agent only.** The registry lives in the agent process, so it sees two
+  clients of one agent. Two agents exporting the same directory — a second
+  `alloyfs serve` on the same machine, or an export reached through a
+  different host — each see one writer and neither warns.
+- **It is not a lock.** By the time the warning is written, both writers are
+  already running. It turns silent corruption into something findable in
+  `alloyfs logs`; it does not stop it.
+- **Use `--detect-conflicts` when you want to be stopped**, or keep the
+  database off the mount. On Linux-to-Linux mounts, byte-range locks are
+  forwarded and work properly — see [Locking](#/guides/locking).
+
 ## Sync mode ignores this
 
 [Sync mode](#/guides/sync-mode) pre-checks conflicts and keeps the loser as

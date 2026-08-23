@@ -26,6 +26,13 @@ and cannot**: it requires all processes to share memory, which processes on
 different machines cannot do. That is SQLite's own constraint, not this
 filesystem's. Postgres remains out entirely.
 
+**The collision reporter sees one agent, not one directory.** Where locks
+cannot be forwarded, the agent at least warns when two different sessions hold
+one path open for writing — see [Write conflicts](#/guides/conflicts). It
+reports and never refuses, and its view stops at the process boundary: two
+agents exporting the same directory each see one writer, so neither warns.
+It makes a collision findable in the log; it is not mutual exclusion.
+
 ## Change notification
 
 **`inotify` does not fire for remote changes on a FUSE mount.** The kernel only
