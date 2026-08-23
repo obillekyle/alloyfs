@@ -50,13 +50,72 @@ if ($token) { $headers['Authorization'] = "Bearer $token" }
 
 # --- which version ----------------------------------------------------------
 
+# Whichever of two tags is newer by semver precedence.
+#
+# Needed because GitHub's `releases/latest` EXCLUDES prereleases, and every
+# 1.0.0-alpha is published as one — so the lookup answered v0.7.0, a build from
+# before the 1.0 line that cannot speak the current wire protocol. The shell
+# installer had the same bug and the same fix; `alloyfs update` runs one of
+# these two scripts, so a stale answer here is a DOWNGRADE rather than a
+# missed upgrade.
+#
+# Same rule `alloyfs update` applies in Rust (`is_newer`, commands/update.rs):
+# numeric fields first, then a release outranks its own prereleases, then
+# prerelease identifiers compare numerically when both are numeric.
+function Newer-Of([string]$a, [string]$b) {
+  function Split-Tag([string]$t) {
+    $t = $t.TrimStart('v')
+    $pre = $null
+    if ($t.Contains('-')) { $pre = $t.Substring($t.IndexOf('-') + 1); $t = $t.Split('-')[0] }
+    $nums = @(0, 0, 0)
+    $parts = $t.Split('.')
+    for ($i = 0; $i -lt 3 -and $i -lt $parts.Count; $i++) {
+      $n = 0
+      if ([int]::TryParse($parts[$i], [ref]$n)) { $nums[$i] = $n }
+    }
+    return @{ Nums = $nums; Pre = $pre }
+  }
+  $x = Split-Tag $a
+  $y = Split-Tag $b
+  for ($i = 0; $i -lt 3; $i++) {
+    if ($x.Nums[$i] -gt $y.Nums[$i]) { return $a }
+    if ($x.Nums[$i] -lt $y.Nums[$i]) { return $b }
+  }
+  # Equal cores: a release beats its own prereleases.
+  if (-not $x.Pre) { return $a }
+  if (-not $y.Pre) { return $b }
+  # Both prereleases: the trailing identifier, numerically when it is one.
+  $xi = $x.Pre.Split('.')[-1]
+  $yi = $y.Pre.Split('.')[-1]
+  $xn = 0; $yn = 0
+  if ([int]::TryParse($xi, [ref]$xn) -and [int]::TryParse($yi, [ref]$yn)) {
+    if ($xn -gt $yn) { return $a } else { return $b }
+  }
+  if ($xi -gt $yi) { return $a } else { return $b }
+}
+
+function Get-Tag([string]$path) {
+  try {
+    $r = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/$path" -Headers $headers
+    if ($r -is [array]) { return $r[0].tag_name }
+    return $r.tag_name
+  } catch { return $null }
+}
+
 $version = $env:ALLOYFS_VERSION
 if (-not $version) {
   Write-Host 'Looking up the latest release...'
-  try {
-    $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest" -Headers $headers
-    $version = $rel.tag_name
-  } catch { $version = $null }
+  # Both, because they answer different questions: releases/latest is the
+  # newest STABLE, the first page of releases is the newest thing published at
+  # all. Whichever is genuinely newer wins.
+  $stable = Get-Tag 'releases/latest'
+  $newest = Get-Tag 'releases?per_page=1'
+  if ($stable -and $newest) { $version = Newer-Of $newest $stable }
+  elseif ($stable) { $version = $stable }
+  else { $version = $newest }
+  if ($version -and $version.Contains('-')) {
+    Dim "The newest release is a prerelease ($version); installing it."
+  }
 }
 
 if (-not $version) {
