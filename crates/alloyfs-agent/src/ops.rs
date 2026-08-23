@@ -45,6 +45,9 @@ pub struct Export {
     pub events: Arc<crate::watch::EventHub>,
     /// Whole-file advisory locks shared by all sessions of this export.
     pub locks: crate::locks::LockManager,
+    /// Who has each path open for WRITING, across every session. Reports the
+    /// collision byte-range locks cannot catch on Windows; see writers.rs.
+    pub writers: crate::writers::WriterRegistry,
     /// Server-side excludes: matching paths are invisible to every client.
     pub exclude: ExcludeSet,
     /// Suggested client settings (already size-parsed), served to v2 mounts.
@@ -376,6 +379,7 @@ impl ExportRegistry {
                     vclock: AtomicU64::new(0),
                     events: crate::watch::EventHub::new(),
                     locks: crate::locks::LockManager::default(),
+                    writers: crate::writers::WriterRegistry::default(),
                     exclude,
                     mount_defaults,
                     tree: crate::tree::ExportTree::new(
@@ -576,6 +580,10 @@ impl SessionInner {
         let mut released = 0;
         if let Some(export) = self.attached.get() {
             released = export.locks.release_session(self.id);
+            // A client that vanished sent no releases. Without this its
+            // writable opens would be reported as live forever, making every
+            // later open of those paths a false alarm.
+            export.writers.session_gone(self.id);
         }
         released += self.handles.len();
         self.handles.clear();
@@ -604,6 +612,28 @@ impl SessionInner {
 
     fn insert_handle(&self, file: File, path: RelPath, writable: bool) -> u64 {
         let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
+        // A writable open is the one worth noticing. Byte-range locks would
+        // normally order two writers, and a Windows client's never reach us,
+        // so this is the only place the collision is visible at all. It is
+        // reported and never refused: the protocol promised no such
+        // restriction, and refusing would break a client legitimately
+        // reopening its own file. See writers.rs.
+        if writable {
+            if let Some(export) = self.attached.get() {
+                if let crate::writers::Overlap::OtherSession(other) =
+                    export.writers.opened(&path, self.id, fh)
+                {
+                    tracing::warn!(
+                        path = %path,
+                        session = self.id,
+                        other_session = other,
+                        "two sessions hold this file open for writing; on Windows \
+                         byte-range locks do not cross machines, so nothing is \
+                         serialising them"
+                    );
+                }
+            }
+        }
         self.handles
             .insert(fh, Arc::new(OpenFile { file, path, writable }));
         fh
@@ -1607,6 +1637,9 @@ impl SessionInner {
             // Closing a handle drops any lock it held (flock semantics).
             if let Some(export) = self.attached.get() {
                 export.locks.unlock(&of.path, self.id, fh);
+                if of.writable {
+                    export.writers.closed(&of.path, self.id, fh);
+                }
             }
         }
         Ok(Response::Ok)

@@ -12,6 +12,7 @@ mod ops;
 pub mod tree;
 pub mod watch;
 mod winattr;
+pub mod writers;
 
 pub use config::{AgentConfig, ClientDefaults, ExportConfig};
 pub use ops::{AgentSession, Export, ExportRegistry, MountDefaults};
