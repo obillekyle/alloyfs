@@ -460,7 +460,21 @@ impl AutoCache {
         let Some(entry) = st.entries.get_mut(path) else {
             return false;
         };
-        let fresh = attr.size == entry.size
+        // COMPLETE is part of the question, not a detail. This answers "may
+        // the blob serve reads", and a sparse blob cannot serve arbitrary
+        // ones: the whole-blob fast path maps the file and slices it, so a
+        // hole comes back as a SHORT READ — EOF for data that exists.
+        //
+        // Leaving it out returned 0 bytes for every offset past the first
+        // cached block, on a file whose size read perfectly. Caught on the
+        // live drive, not by a test: the fill tests exercised WarmFill in
+        // isolation and never asked whether a partial entry could reach the
+        // whole-blob path. It could.
+        //
+        // Partial entries are served by the resume path instead, which knows
+        // which blocks are real.
+        let fresh = entry.blocks.is_complete()
+            && attr.size == entry.size
             && mtime_ns(attr.mtime) == entry.mtime_ns
             && (attr.version == entry.version || attr.version == 0 || entry.version == 0);
         if fresh {
@@ -888,7 +902,11 @@ mod tests {
         }
     }
 
-    fn cache(dir: &std::path::Path, max: u64, budget: u64) -> (AutoCache, mpsc::UnboundedReceiver<RelPath>) {
+    pub(super) fn cache(
+        dir: &std::path::Path,
+        max: u64,
+        budget: u64,
+    ) -> (AutoCache, mpsc::UnboundedReceiver<RelPath>) {
         AutoCache::load(AutoCacheConfig {
             max_file_size: max,
             budget,
@@ -1675,5 +1693,63 @@ mod partial_blob_tests {
         let blob = d.join("c.bin");
         std::fs::write(&blob, vec![0u8; CH]).unwrap();
         assert!(WarmFill::resume(blob, CH as u64, 1, BlockMap::complete()).is_none());
+    }
+}
+
+#[cfg(test)]
+mod partial_serving_tests {
+    use super::tests::attr;
+    use super::*;
+
+    const CH: usize = alloyfs_proto::DATA_CHUNK as usize;
+
+    /// A PARTIAL entry must never satisfy `fresh_for`.
+    ///
+    /// `fresh_for` gates the whole-blob fast path, which maps the file and
+    /// slices it. A sparse blob answered that way returns its holes as a
+    /// short read — EOF for data that exists. On the live drive this showed
+    /// up as a 100 MB file whose size read correctly and whose every read
+    /// past the first cached block returned 0 bytes.
+    #[test]
+    fn a_partial_entry_never_passes_the_whole_blob_check() {
+        let dir = std::env::temp_dir().join(format!("ds-ps-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (c, _rx) = super::tests::cache(&dir, 1_000_000, 10_000_000);
+
+        let p = RelPath("sparse.bin".into());
+        let a = attr((CH * 4) as u64, 100, 3);
+
+        // Two of four blocks — exactly what a partial read leaves behind.
+        let mut map = BlockMap::empty(4);
+        map.set(0);
+        map.set(2);
+        stage_write(&c.blob_final_path(&p), &vec![0u8; CH * 4]).unwrap();
+        c.commit_partial(&p, &a, map, (CH * 2) as u64);
+
+        assert!(
+            !c.fresh_for(&p, &a),
+            "a sparse blob must not be served as if it were whole"
+        );
+        // But it IS known, and its map is available for the resume path.
+        let held = c.blocks_for(&p, &a).expect("the entry is valid for this attr");
+        assert!(!held.is_complete());
+        assert!(held.has(0) && held.has(2), "and says which blocks are real");
+        assert!(!held.has(1) && !held.has(3));
+    }
+
+    /// The same entry, once complete, does serve — otherwise the check above
+    /// would have turned the whole cache off rather than fixed a hole.
+    #[test]
+    fn a_complete_entry_still_passes() {
+        let dir = std::env::temp_dir().join(format!("ds-ps2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (c, _rx) = super::tests::cache(&dir, 1_000_000, 10_000_000);
+
+        let p = RelPath("whole.bin".into());
+        let a = attr((CH * 2) as u64, 100, 3);
+        stage_write(&c.blob_final_path(&p), &vec![1u8; CH * 2]).unwrap();
+        c.commit_warm(&p, &a, false);
+
+        assert!(c.fresh_for(&p, &a), "a whole blob serves as it always did");
     }
 }
