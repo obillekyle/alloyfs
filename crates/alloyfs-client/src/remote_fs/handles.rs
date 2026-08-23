@@ -182,7 +182,20 @@ impl RemoteFs {
             return Ok(attr);
         }
         if self.conn().proto < 11 {
-            // The old contract, kept exactly: acknowledged, unpersisted.
+            // The old contract, kept exactly: acknowledged, unpersisted. A
+            // pre-v11 agent has no `SetWinAttrs` verb, and refusing would
+            // break mounts against one — so this stays a no-op on purpose.
+            //
+            // But it says so now. This is the same silent shape as the two
+            // overlay bugs found today (accept, discard, report the old state
+            // as success), and the only thing separating it from those is that
+            // it is deliberate. A line in the log is what lets someone
+            // diagnosing "Hidden does not stick" tell the two apart.
+            tracing::debug!(
+                %path,
+                proto = self.conn().proto,
+                "SetWinAttrs needs proto v11; acknowledged without persisting"
+            );
             return self.getattr(ino);
         }
         if self.batch.as_ref().is_some_and(|b| b.involves(&path)) {
