@@ -93,6 +93,10 @@ pub(crate) struct OpenState {
     /// the hot path and a demand is only useful once, so the ask is guarded
     /// here rather than by hashing the path on every read.
     pub warm_asked: AtomicBool,
+    /// Blocks this handle fetched, accumulating into a cache blob. See
+    /// `WarmFill` — the read pays for its own warm, so nothing is fetched
+    /// twice.
+    pub warm_fill: std::sync::Mutex<Option<crate::autocache::WarmFill>>,
     /// Did any write happen through this fh (⇒ re-fetch on release)?
     pub wrote: AtomicBool,
     /// Sequential prefetch window for this handle.
@@ -119,6 +123,12 @@ pub(crate) struct OpenState {
     /// change may leave it short, which costs readahead and nothing else —
     /// the same trade the comment at the read site already documents.
     pub size: AtomicU64,
+    /// The mtime this handle opened at, in nanoseconds since the epoch.
+    /// Carried so a completed warm fill can be committed with attrs that
+    /// MATCH what the server said — `fresh_for` compares mtime, and a blob
+    /// committed with a made-up one would be refused at every later open,
+    /// which would look exactly like the cache not working.
+    pub mtime_ns: AtomicU64,
     /// Set when a reconnect could not restore this handle's lock (or the
     /// handle itself, if it held one). A poisoned handle fails read/write/
     /// lock/flush with EIO — mutual exclusion may have been broken and the
@@ -925,6 +935,7 @@ impl RemoteFs {
                             server_fh: AtomicU64::new(NO_SERVER_FH),
                             cache_ok: AtomicBool::new(true),
                             warm_asked: AtomicBool::new(false),
+                            warm_fill: std::sync::Mutex::new(None),
                             wrote: AtomicBool::new(false),
                             ra: ReadAhead::new(),
                             lock: std::sync::Mutex::new(Vec::new()),
@@ -933,6 +944,7 @@ impl RemoteFs {
                             blob: std::sync::RwLock::new(None),
                             version: AtomicU64::new(attr.version),
                             size: AtomicU64::new(attr.size),
+                            mtime_ns: AtomicU64::new(crate::autocache::mtime_ns(attr.mtime) as u64),
                         },
                     );
                     return Ok((fh, attr));
@@ -987,6 +999,7 @@ impl RemoteFs {
                 server_fh: AtomicU64::new(fh),
                 cache_ok: AtomicBool::new(cache_ok),
                 warm_asked: AtomicBool::new(false),
+                warm_fill: std::sync::Mutex::new(None),
                 wrote: AtomicBool::new(false),
                 ra,
                 lock: std::sync::Mutex::new(Vec::new()),
@@ -995,6 +1008,7 @@ impl RemoteFs {
                 blob: std::sync::RwLock::new(None),
                 version: AtomicU64::new(attr.version),
                 size: AtomicU64::new(attr.size),
+                mtime_ns: AtomicU64::new(crate::autocache::mtime_ns(attr.mtime) as u64),
             },
         );
         Ok((fh, attr))
@@ -1344,19 +1358,14 @@ impl RemoteFs {
             return Ok(data.len());
         };
         let server_fh = state.server_fh.load(Ordering::Acquire);
-        // This read is going to the server, so the cache does not have this
-        // file — ask for it to be pulled down in the background, and the next
-        // read of it will be local.
+        // This read is going to the server, so start (or continue) collecting
+        // its blocks into a cache blob. The bytes are already being paid for;
+        // writing them down as they pass is what makes a second read local
+        // without a second transfer. See `WarmFill`.
         //
-        // A demand, not a guess, which is why it is not bound by
-        // `cache.auto-size`: that bounds what the walker takes speculatively.
-        // It is charged against `cache.warm-max` instead, a separate pool, so
-        // warming a large file cannot evict the prefetched working set.
-        //
-        // Once per handle. The cache dedups by path as well, but reaching
-        // that costs a clone and a lock on a path that runs per 64 K block.
-        // Handles that WROTE are skipped: the file is in flux and the copy
-        // that landed would be a race, and release re-fetches anyway.
+        // Skipped for handles that WROTE — the file is in flux, and release
+        // re-fetches it anyway — and for pending new files, which have no
+        // server copy yet.
         if self.cache.is_some()
             && !state.cache_ok.load(Ordering::Relaxed)
             && !state.wrote.load(Ordering::Relaxed)
@@ -1364,7 +1373,13 @@ impl RemoteFs {
             && !state.warm_asked.swap(true, Ordering::Relaxed)
         {
             if let Some(cache) = &self.cache {
-                cache.enqueue_demand(state.path.clone());
+                let size = state.size.load(Ordering::Relaxed);
+                // Only worth collecting what the cache would actually keep.
+                if size > 0 && size <= cache.warm_limit() {
+                    let stage = cache.warm_stage_path(&state.path, fh);
+                    *state.warm_fill.lock().unwrap() =
+                        crate::autocache::WarmFill::begin(stage, size, state.version.load(Ordering::Relaxed));
+                }
             }
         }
         let prefetch = state.ra.observe(offset, size);
@@ -1475,6 +1490,42 @@ impl RemoteFs {
                         ready.insert(*b, d);
                     }
                     None => return Err(ErrorCode::Io.into()),
+                }
+            }
+        }
+        // Every block this read pulled is in hand. Write them into the warm
+        // fill before they are copied out — the same bytes, no second fetch.
+        // Completion commits the blob; a fill that never completes is dropped
+        // with its staging file when the handle closes.
+        if let (Some(cache), Ok(mut guard)) = (&self.cache, state.warm_fill.try_lock()) {
+            if let Some(fill) = guard.as_mut() {
+                let mut complete = false;
+                for (b, data) in ready.iter() {
+                    complete |= fill.put(*b, data);
+                }
+                if complete {
+                    let size = fill.size();
+                    let version = fill.version();
+                    if fill.finish(&cache.blob_final_path(&state.path)) {
+                        // Attrs as the file was when the fill began. A change
+                        // mid-read moves the version, and `fresh_for` then
+                        // refuses this blob at the next open rather than
+                        // serving a mixture.
+                        let attr = alloyfs_proto::Attr {
+                            kind: alloyfs_proto::FileKind::File,
+                            size,
+                            mtime: std::time::UNIX_EPOCH
+                                + std::time::Duration::from_nanos(state.mtime_ns.load(Ordering::Relaxed)),
+                            ctime: std::time::UNIX_EPOCH,
+                            mode: 0o644,
+                            version,
+                        };
+                        cache.commit_warm(&state.path, &attr, cache.pin_match(&state.path));
+                        tracing::debug!(path = %state.path, size, "warm fill committed from reads");
+                    }
+                }
+                if complete {
+                    *guard = None;
                 }
             }
         }
@@ -1938,6 +1989,7 @@ impl RemoteFs {
                             server_fh: AtomicU64::new(NO_SERVER_FH),
                             cache_ok: AtomicBool::new(false),
                             warm_asked: AtomicBool::new(false),
+                            warm_fill: std::sync::Mutex::new(None),
                             wrote: AtomicBool::new(true),
                             ra: ReadAhead::new(),
                             lock: std::sync::Mutex::new(Vec::new()),
@@ -1950,6 +2002,7 @@ impl RemoteFs {
                             })),
                             version: AtomicU64::new(0),
                             size: AtomicU64::new(0),
+                            mtime_ns: AtomicU64::new(0),
                         },
                     );
                     return Ok((ino, fh, attr));
@@ -1978,6 +2031,7 @@ impl RemoteFs {
                 server_fh: AtomicU64::new(fh),
                 cache_ok: AtomicBool::new(false),
                 warm_asked: AtomicBool::new(false),
+                warm_fill: std::sync::Mutex::new(None),
                 wrote: AtomicBool::new(true),
                 ra: ReadAhead::new(),
                 lock: std::sync::Mutex::new(Vec::new()),
@@ -1986,6 +2040,7 @@ impl RemoteFs {
                 blob: std::sync::RwLock::new(None),
                 version: AtomicU64::new(attr.version),
                 size: AtomicU64::new(attr.size),
+                mtime_ns: AtomicU64::new(crate::autocache::mtime_ns(attr.mtime) as u64),
             },
         );
         Ok((ino, fh, attr))

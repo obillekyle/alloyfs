@@ -43,7 +43,7 @@ pub(crate) struct CacheEntry {
     pub mtime_ns: u128,
     pub pinned: bool,
     /// Which pool this entry is charged against: `true` for a blob a READ
-    /// demanded, `false` for one the walker chose. Defaults false so a
+    /// read kept, `false` for one the walker chose. Defaults false so a
     /// manifest written before the split loads as auto-downloaded, which is
     /// what every entry in it was.
     #[serde(default)]
@@ -153,13 +153,6 @@ pub(crate) struct AutoCache {
     pins: ExcludeSet, // reused matcher type: "pin globs" share exclude semantics
     state: Mutex<CacheState>,
     fetch_tx: mpsc::UnboundedSender<RelPath>,
-    /// Paths a READ asked for, which the auto-download size gate must not
-    /// refuse. `auto_cache_max` bounds what the walker pulls down
-    /// speculatively; a read is not speculation, so a file the user actually
-    /// opened is cached whatever its size - bounded by the budget and its LRU,
-    /// like everything else here. Entries are removed once the fetch settles,
-    /// so this holds only what is in flight.
-    demanded: Mutex<std::collections::HashSet<RelPath>>,
     /// Event sequence the cache is current at. Loaded from the manifest and
     /// written back on every flush, so the cursor outlives the process.
     seq: std::sync::atomic::AtomicU64,
@@ -281,7 +274,6 @@ impl AutoCache {
                     lru_dirty: false,
                 }),
                 fetch_tx,
-                demanded: Mutex::new(std::collections::HashSet::new()),
                 seq: std::sync::atomic::AtomicU64::new(loaded_seq),
                 tree_token: std::sync::atomic::AtomicU64::new(loaded_token),
                 walk_skipped: std::sync::atomic::AtomicBool::new(false),
@@ -343,43 +335,17 @@ impl AutoCache {
         self.pins.is_excluded(path)
     }
 
-    /// Should the walker/fetcher cache this file at all?
+    /// Should the WALKER prefetch this file?
     ///
-    /// Three ways in, and they answer different questions. A `pin` is a
-    /// standing instruction, so it ignores size. A path a READ asked for is
-    /// demand rather than speculation, so it ignores size too — see
-    /// `demanded`. Everything else is the walker guessing what will be
-    /// wanted, and `max_file_size` is the bound on that guess.
+    /// Only the walker asks. A `pin` is a standing instruction and ignores
+    /// size; everything else is the walker guessing what will be wanted, and
+    /// `cache.auto-size` is the bound on that guess.
+    ///
+    /// A read does not come through here at all. Reads keep the blocks they
+    /// already fetched (see `WarmFill`), so there is no size question to ask:
+    /// the bytes have been paid for either way.
     pub fn wants(&self, path: &RelPath, size: u64) -> bool {
-        self.pin_match(path)
-            || self.is_demanded(path)
-            || (self.cfg.max_file_size > 0 && size <= self.cfg.max_file_size)
-    }
-
-    fn is_demanded(&self, path: &RelPath) -> bool {
-        self.demanded.lock().unwrap().contains(path)
-    }
-
-    /// A read went to the network for `path`; pull the whole file down so the
-    /// next read does not have to.
-    ///
-    /// Idempotent by the `demanded` set: a second call while one is in flight
-    /// adds nothing to the queue. The caller still guards per handle so this
-    /// is not reached on every read of a large file.
-    pub fn enqueue_demand(&self, path: RelPath) {
-        if self.cfg.max_file_size == 0 && self.pins.is_empty() {
-            return; // caching is off entirely; nothing to warm
-        }
-        if !self.demanded.lock().unwrap().insert(path.clone()) {
-            return; // already in flight
-        }
-        let _ = self.fetch_tx.send(path);
-    }
-
-    /// Drop a demand marker once its fetch has settled, successfully or not.
-    /// A later read re-demands, which is what should happen after a failure.
-    pub fn clear_demand(&self, path: &RelPath) {
-        self.demanded.lock().unwrap().remove(path);
+        self.pin_match(path) || (self.cfg.max_file_size > 0 && size <= self.cfg.max_file_size)
     }
 
     /// May the cached blob serve reads for `path`, given a current server
@@ -425,8 +391,19 @@ impl AutoCache {
     /// Which pool that is comes from whether a READ asked for this path. The
     /// demand marker is still set here — the fetcher clears it only once the
     /// fetch has settled — so no caller has to thread the distinction down.
+    /// Committed as a PREFETCH — the walker chose this path, so it is
+    /// charged against `cache.auto-max`.
     pub fn commit(&self, path: &RelPath, attr: &Attr, pinned: bool) {
-        let warm = self.is_demanded(path);
+        self.commit_as(path, attr, pinned, false);
+    }
+
+    /// Committed into the WARM pool: the bytes came from a read, either
+    /// collected as they passed (`WarmFill`) or fetched on demand.
+    pub fn commit_warm(&self, path: &RelPath, attr: &Attr, pinned: bool) {
+        self.commit_as(path, attr, pinned, true);
+    }
+
+    fn commit_as(&self, path: &RelPath, attr: &Attr, pinned: bool, warm: bool) {
         let budget = if warm {
             self.cfg.warm_budget
         } else {
@@ -628,6 +605,26 @@ impl AutoCache {
             }
             Err(e) => tracing::warn!(error = %e, "manifest serialize failed"),
         }
+    }
+
+    /// The largest file worth collecting into the warm pool. A blob bigger
+    /// than the pool itself could never be kept, so filling one would be a
+    /// staging file written and then thrown away.
+    pub fn warm_limit(&self) -> u64 {
+        self.cfg.warm_budget
+    }
+
+    /// Staging path for a read-fill, keyed by handle as well as path: two
+    /// handles reading the same file must not write into one another's
+    /// staging file.
+    pub fn warm_stage_path(&self, path: &RelPath, fh: u64) -> PathBuf {
+        let mut p = blob_path(&self.cfg.root, path);
+        let name = format!(
+            "{}.warm{fh}",
+            p.file_name().and_then(|n| n.to_str()).unwrap_or("blob")
+        );
+        p.set_file_name(name);
+        p
     }
 
     pub fn blob_stage_path(&self, path: &RelPath) -> PathBuf {
@@ -951,15 +948,15 @@ mod warm_pool_tests {
         let p = RelPath("big.bin".into());
         let a = attr(5000, 100, 1);
 
-        assert!(!c.wants(&p, a.size), "the walker must refuse it on size");
-        c.enqueue_demand(p.clone());
         assert!(
-            c.wants(&p, a.size),
-            "a read demanded it, so size must stop mattering"
+            !c.wants(&p, a.size),
+            "the walker must still refuse it on size — that gate is unchanged"
         );
 
+        // A read does not ask `wants` at all: it kept the blocks it fetched
+        // and commits them into the warm pool directly.
         stage_write(&c.blob_final_path(&p), &vec![7u8; 5000]).unwrap();
-        c.commit(&p, &a, false);
+        c.commit_warm(&p, &a, false);
         assert!(c.fresh_for(&p, &a), "and it is now served locally");
     }
 
@@ -991,10 +988,8 @@ mod warm_pool_tests {
         for (name, size) in [("huge1.bin", 60_000u64), ("huge2.bin", 60_000)] {
             let bp = RelPath(name.into());
             let ba = attr(size, 100, 1);
-            c.enqueue_demand(bp.clone());
             stage_write(&c.blob_final_path(&bp), &vec![9u8; size as usize]).unwrap();
-            c.commit(&bp, &ba, false);
-            c.clear_demand(&bp);
+            c.commit_warm(&bp, &ba, false);
         }
         let big = RelPath("huge2.bin".into());
 
@@ -1016,9 +1011,8 @@ mod warm_pool_tests {
 
         let warm = RelPath("opened.bin".into());
         let wa = attr(1500, 100, 1);
-        c.enqueue_demand(warm.clone());
         stage_write(&c.blob_final_path(&warm), &vec![3u8; 1500]).unwrap();
-        c.commit(&warm, &wa, false);
+        c.commit_warm(&warm, &wa, false);
         assert!(c.known(&warm));
 
         // Fill the auto pool several times over.
@@ -1034,16 +1028,244 @@ mod warm_pool_tests {
         );
     }
 
-    /// A settled fetch drops its marker, or `wants` would keep saying yes for
-    /// a path nothing is fetching and a later read could never re-demand.
+    /// The walker's size gate is not something a read can talk its way past
+    /// any more — a read never consults it, because it keeps bytes it has
+    /// already fetched rather than asking for more.
     #[test]
-    fn a_settled_demand_stops_overriding_the_size_gate() {
-        let dir = fresh_dir("clear");
+    fn the_prefetch_gate_answers_only_to_size_and_pins() {
+        let dir = fresh_dir("gate");
         let c = cache_with(&dir, 10, 1_000_000, 1_000_000);
         let p = RelPath("x.bin".into());
-        c.enqueue_demand(p.clone());
-        assert!(c.wants(&p, 5000));
-        c.clear_demand(&p);
-        assert!(!c.wants(&p, 5000), "the marker must not outlive its fetch");
+        assert!(!c.wants(&p, 5000), "over auto-size: the walker declines");
+        assert!(c.wants(&p, 8), "under it: the walker takes it");
+    }
+}
+
+/// Bytes a READ already pulled over the wire, written into the cache as they
+/// pass rather than fetched a second time.
+///
+/// The first version of read-warming queued the path for the fetcher, which
+/// opened its own handle and pulled the WHOLE file down while the read was
+/// still streaming it. Measured on a 100 MB file over a ~3.4 MiB/s link: the
+/// first pass dropped from 3.38 MiB/s to 2.18 because the two transfers were
+/// competing, and ~200 MB crossed the link to serve 100 MB of reads.
+///
+/// The read path already holds every block it fetched, keyed by index, just
+/// before copying them into the caller's buffer. Writing each one positionally
+/// at `index * DATA_CHUNK` costs a page-cache write against a block that just
+/// cost a round trip, and needs no second transfer at all. Blocks may arrive
+/// in any order — a seek-heavy reader fills the file in pieces — so
+/// completeness is tracked per block rather than by a high-water mark, and the
+/// blob is committed only once every block has landed.
+pub(crate) struct WarmFill {
+    /// Taken on `finish` so the handle is closed before the rename — Windows
+    /// will not rename a file that is still open for writing.
+    file: Option<std::fs::File>,
+    stage: std::path::PathBuf,
+    have: Vec<bool>,
+    remaining: usize,
+    size: u64,
+    /// The version the file had when this fill started. A file that changes
+    /// underneath us would otherwise commit a blob that is half one version
+    /// and half another.
+    version: u64,
+    committed: bool,
+}
+
+impl WarmFill {
+    /// `None` if the file is empty, unreasonably large for one blob, or the
+    /// stage file cannot be created — warming is best-effort throughout.
+    pub(crate) fn begin(stage: std::path::PathBuf, size: u64, version: u64) -> Option<Self> {
+        if size == 0 {
+            return None;
+        }
+        let blocks = size.div_ceil(alloyfs_proto::DATA_CHUNK as u64) as usize;
+        if let Some(parent) = stage.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&stage)
+            .ok()?;
+        Some(Self {
+            file: Some(file),
+            committed: false,
+            stage,
+            have: vec![false; blocks],
+            remaining: blocks,
+            size,
+            version,
+        })
+    }
+
+    /// Record one fetched block. Returns true once every block has landed.
+    pub(crate) fn put(&mut self, index: u64, data: &[u8]) -> bool {
+        let Some(slot) = self.have.get_mut(index as usize) else {
+            return false; // past EOF for the size we started with
+        };
+        if *slot {
+            return false; // a re-read of a block already written
+        }
+        let off = index * alloyfs_proto::DATA_CHUNK as u64;
+        let Some(f) = self.file.as_ref() else {
+            return false;
+        };
+        if write_at(f, data, off).is_err() {
+            return false;
+        }
+        *slot = true;
+        self.remaining -= 1;
+        self.remaining == 0
+    }
+
+    pub(crate) fn size(&self) -> u64 {
+        self.size
+    }
+
+    pub(crate) fn version(&self) -> u64 {
+        self.version
+    }
+
+    /// Move the completed stage file into place. The caller commits it to the
+    /// cache index afterwards; until then it is a file nothing refers to.
+    pub(crate) fn finish(&mut self, final_path: &std::path::Path) -> bool {
+        drop(self.file.take());
+        if let Some(parent) = final_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if std::fs::rename(&self.stage, final_path).is_err() {
+            let _ = std::fs::remove_file(&self.stage);
+            return false;
+        }
+        self.committed = true;
+        true
+    }
+}
+
+impl Drop for WarmFill {
+    /// An abandoned fill leaves nothing behind. A handle closed halfway
+    /// through a file is the common case, not an error.
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = std::fs::remove_file(&self.stage);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn write_at(f: &std::fs::File, buf: &[u8], off: u64) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    f.write_all_at(buf, off)
+}
+
+#[cfg(windows)]
+fn write_at(f: &std::fs::File, buf: &[u8], off: u64) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    let mut written = 0usize;
+    while written < buf.len() {
+        match f.seek_write(&buf[written..], off + written as u64) {
+            Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+            Ok(n) => written += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod warm_fill_tests {
+    use super::*;
+
+    fn dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("ds-fill-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    const CH: usize = alloyfs_proto::DATA_CHUNK as usize;
+
+    /// Blocks arriving OUT OF ORDER must still produce the right file. A
+    /// seek-heavy reader fills a file in pieces, and a high-water mark would
+    /// either drop those pieces or write them to the wrong offset.
+    #[test]
+    fn out_of_order_blocks_rebuild_the_file_exactly() {
+        let d = dir("order");
+        let size = (CH * 3 + 17) as u64;
+        let mut fill = WarmFill::begin(d.join("x.part"), size, 5).expect("begins");
+
+        let b0 = vec![1u8; CH];
+        let b1 = vec![2u8; CH];
+        let b2 = vec![3u8; CH];
+        let b3 = vec![4u8; 17];
+
+        assert!(!fill.put(2, &b2), "not complete yet");
+        assert!(!fill.put(0, &b0));
+        assert!(!fill.put(3, &b3));
+        assert!(fill.put(1, &b1), "the last block completes the fill");
+
+        let out = d.join("x.bin");
+        assert!(fill.finish(&out), "renames into place");
+        let got = std::fs::read(&out).unwrap();
+        assert_eq!(got.len() as u64, size, "exact length");
+        assert_eq!(&got[..CH], &b0[..], "block 0 landed at offset 0");
+        assert_eq!(&got[CH..CH * 2], &b1[..], "block 1 at its own offset");
+        assert_eq!(&got[CH * 2..CH * 3], &b2[..], "block 2 too");
+        assert_eq!(&got[CH * 3..], &b3[..], "and the short tail");
+    }
+
+    /// Re-reading a block already written must not double-count it, or the
+    /// fill would report complete while holes remained.
+    #[test]
+    fn a_repeated_block_does_not_complete_the_fill_early() {
+        let d = dir("dup");
+        let mut fill = WarmFill::begin(d.join("y.part"), (CH * 2) as u64, 1).expect("begins");
+        assert!(!fill.put(0, &vec![9u8; CH]));
+        assert!(
+            !fill.put(0, &vec![9u8; CH]),
+            "the same block again is not progress"
+        );
+        assert!(!fill.put(0, &vec![9u8; CH]));
+        assert!(fill.put(1, &vec![8u8; CH]), "only a NEW block can complete it");
+    }
+
+    /// An abandoned fill leaves nothing behind — a handle closed halfway
+    /// through a file is the ordinary case, and a stray `.warm` file per such
+    /// read would accumulate forever.
+    #[test]
+    fn an_incomplete_fill_removes_its_staging_file() {
+        let d = dir("abandon");
+        let stage = d.join("z.part");
+        {
+            let mut fill = WarmFill::begin(stage.clone(), (CH * 4) as u64, 1).expect("begins");
+            fill.put(0, &vec![1u8; CH]);
+            assert!(stage.exists(), "staged while filling");
+        }
+        assert!(!stage.exists(), "and gone once dropped incomplete");
+    }
+
+    /// A committed fill keeps its file — Drop must not delete what `finish`
+    /// just renamed into place.
+    #[test]
+    fn a_finished_fill_survives_being_dropped() {
+        let d = dir("keep");
+        let out = d.join("kept.bin");
+        {
+            let mut fill = WarmFill::begin(d.join("k.part"), CH as u64, 1).expect("begins");
+            assert!(fill.put(0, &vec![7u8; CH]));
+            assert!(fill.finish(&out));
+        }
+        assert!(out.exists(), "the committed blob outlives the fill");
+        assert_eq!(std::fs::read(&out).unwrap().len(), CH);
+    }
+
+    /// An empty file has no blocks to collect, so there is nothing to fill.
+    #[test]
+    fn an_empty_file_starts_no_fill() {
+        let d = dir("empty");
+        assert!(WarmFill::begin(d.join("e.part"), 0, 1).is_none());
     }
 }
