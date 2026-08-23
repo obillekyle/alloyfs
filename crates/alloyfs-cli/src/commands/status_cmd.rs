@@ -63,16 +63,27 @@ pub fn run(json: bool) -> anyhow::Result<()> {
             notes.push(format!("{} re-warmed", s.rewarmed_paths));
         }
         // Live against configured, not the lifetime total: "3 stream conns"
-        // read as healthy on a pool that had dialed three and lost two.
+        // reads as healthy on a pool that had dialed three and lost two.
+        //
+        // But SHORT only when the pool actually TRIED and failed. It dials
+        // lazily, for qualifying cold streams alone, so a mount that has not
+        // read a large file rests at 0 of its target in perfect health — and
+        // the first version of this line reported exactly that as a fault, on
+        // the live mount, hours after shipping. A warning that fires when
+        // nothing is wrong is worse than no warning at all.
         if s.stream_conns_target > 0 {
-            if s.stream_conns_live < s.stream_conns_target {
+            if s.stream_pool_short {
                 notes.push(format!(
                     "stream pool SHORT {}/{}",
                     s.stream_conns_live, s.stream_conns_target
                 ));
-            } else {
-                notes.push(format!("{} stream conns", s.stream_conns_live));
+            } else if s.stream_conns_live > 0 {
+                notes.push(format!(
+                    "{}/{} stream conns",
+                    s.stream_conns_live, s.stream_conns_target
+                ));
             }
+            // Idle and never short: say nothing. That is the resting state.
         } else if s.stream_conns > 0 {
             // A snapshot written by a build from before the pair existed.
             notes.push(format!("{} stream conns", s.stream_conns));

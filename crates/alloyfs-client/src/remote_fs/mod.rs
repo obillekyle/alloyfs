@@ -459,16 +459,20 @@ impl RemoteFs {
         self.stream_pool.as_ref().map_or(0, |p| p.established())
     }
 
-    /// Lanes live right now and the number configured — `(0, 0)` without a
-    /// pool.
+    /// Lanes live right now, the number configured, and whether the pool has
+    /// ever fallen short — `(0, 0, false)` without a pool.
     ///
-    /// The pair, not either half: `established` alone counts connections that
-    /// may since have died, so a pool reporting 3 could be serving 1. A
-    /// shortfall is a supported state (reads fall back to the primary), which
-    /// is exactly why it has to be visible rather than inferred from
-    /// throughput.
-    pub fn stream_conns_live(&self) -> (usize, usize) {
-        self.stream_pool.as_ref().map_or((0, 0), |p| p.live_and_target())
+    /// The triple, not the pair. `established` alone counts connections that
+    /// may since have died, so a pool reporting 3 could be serving 1 — that is
+    /// why live is here. And the pool is LAZY, dialing only when a cold stream
+    /// qualifies, so 0 live is the normal resting state of a mount that has
+    /// not read a large file: without the third value, "0 of 3" reads as a
+    /// fault on a perfectly healthy mount. It did, on the live one, hours
+    /// after this was first shipped.
+    pub fn stream_conns_live(&self) -> (usize, usize, bool) {
+        self.stream_pool
+            .as_ref()
+            .map_or((0, 0, false), |p| p.live_and_target())
     }
 
     /// Files the auto-cache holds and the bytes they occupy, or `None` on a

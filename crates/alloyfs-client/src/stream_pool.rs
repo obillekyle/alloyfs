@@ -215,10 +215,20 @@ impl StreamPool {
     /// ever made: a pool that dialed three lanes and lost two reports 3 there
     /// and 1 here. Status wants this pair — "1 of 3" is a health statement,
     /// "3" on its own reads as healthy while the pool is degraded.
-    pub(crate) fn live_and_target(&self) -> (usize, usize) {
+    /// The third value is what keeps this from crying wolf. The pool is LAZY:
+    /// it dials only when a cold stream qualifies, so a mount that has never
+    /// read a large file sequentially rests at 0 of 3 in perfect health.
+    /// Reporting that as SHORT — which the first version did, on the live
+    /// mount, within hours of shipping — trains people to ignore the line.
+    /// `short` is true only when `fill` actually tried and gave up.
+    pub(crate) fn live_and_target(&self) -> (usize, usize, bool) {
         let mut conns = self.conns.lock().unwrap();
         conns.retain(|e| !e.conn.is_closed());
-        (conns.len(), self.target)
+        (
+            conns.len(),
+            self.target,
+            self.short_reported.load(Ordering::Acquire),
+        )
     }
 
     /// Release every pool handle for `path` — called when the mount closes

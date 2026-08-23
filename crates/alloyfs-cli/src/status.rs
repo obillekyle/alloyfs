@@ -82,6 +82,14 @@ pub struct Snapshot {
     pub stream_conns_live: usize,
     #[serde(default)]
     pub stream_conns_target: usize,
+    /// Has the pool ever tried to reach its target and failed?
+    ///
+    /// Without this, `live < target` reads as a fault — but the pool dials
+    /// lazily, only for a qualifying cold stream, so a mount that has never
+    /// read a large file sits at 0 of 3 in perfect health. This separates
+    /// "idle" from "tried and could not".
+    #[serde(default)]
+    pub stream_pool_short: bool,
     /// Files in the auto-cache and the bytes they occupy; `None` without one.
     pub cache_files: Option<usize>,
     pub cache_bytes: Option<u64>,
@@ -109,7 +117,7 @@ pub fn capture(
     started_at: SystemTime,
 ) -> Snapshot {
     let conn = fs.conn();
-    let (live, target) = fs.stream_conns_live();
+    let (live, target, pool_short) = fs.stream_conns_live();
     let (cache_files, cache_bytes) = match fs.cache_stats() {
         Some((files, bytes)) => (Some(files), Some(bytes)),
         None => (None, None),
@@ -139,6 +147,7 @@ pub fn capture(
         stream_conns: fs.stream_conns_established(),
         stream_conns_live: live,
         stream_conns_target: target,
+        stream_pool_short: pool_short,
         cache_files,
         cache_bytes,
     }
@@ -215,6 +224,7 @@ mod tests {
             stream_conns: 4,
             stream_conns_live: 3,
             stream_conns_target: 3,
+            stream_pool_short: false,
             cache_files: Some(10),
             cache_bytes: Some(4096),
         }
