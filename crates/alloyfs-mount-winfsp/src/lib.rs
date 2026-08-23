@@ -1300,6 +1300,11 @@ impl MountedDrive {
 /// optimum: loopback pings at 0.3 ms and is HURT by the wide pool, the ssh
 /// link to the test server pings at 62 ms and is helped 3x by it. Nothing was
 /// measured in between, so a formula here would be invented precision.
+/// The kernel metadata cache window. BOUNDED — see the long comment at the
+/// `.file_info_timeout` call for why `u32::MAX` is a correctness bug and not a
+/// faster setting.
+const FILE_INFO_TIMEOUT_MS: u32 = 30_000;
+
 const LATENCY_BOUND_RTT: std::time::Duration = std::time::Duration::from_millis(2);
 
 /// Mount `fs` at `mountpoint`.
@@ -1312,6 +1317,23 @@ pub fn mount(
     mountpoint: &str,
     volume_label: &str,
     rtt: Option<std::time::Duration>,
+) -> anyhow::Result<MountedDrive> {
+    mount_with_timeout(fs, mountpoint, volume_label, rtt, FILE_INFO_TIMEOUT_MS)
+}
+
+/// [`mount`], with the kernel metadata timeout as a parameter.
+///
+/// Exists so `tests/readcost.rs` can measure what each setting costs in one
+/// process, adjacently — the only way to compare on a box whose latency drifts
+/// 50% intraday. Production always takes the default; there is deliberately no
+/// config knob, because the safe range is "any bounded value" and the unsafe
+/// one is a correctness bug rather than a tuning choice.
+pub fn mount_with_timeout(
+    fs: Arc<RemoteFs>,
+    mountpoint: &str,
+    volume_label: &str,
+    rtt: Option<std::time::Duration>,
+    file_info_timeout_ms: u32,
 ) -> anyhow::Result<MountedDrive> {
     winfsp::winfsp_init()
         .map_err(|e| anyhow::anyhow!("WinFsp is not available (is it installed?): {}", e))?;
@@ -1363,6 +1385,23 @@ pub fn mount(
         // That 6.5x is real and it is given up on purpose, because u32::MAX
         // also serves STALE DATA and nothing here can stop it.
         //
+        // What it costs on a real workload, 64 KiB random reads over ssh to
+        // the test server. MEDIAN of the warm rounds, not the mean — a mean
+        // over a tail metric is meaningless here, and averaging one 8,364 us
+        // round into the alpha.89 p95 made this look like a 57x loss when it
+        // is nearer 14x:
+        //
+        //                   p50        p95      vs rclone
+        //     bounded     ~107 us    ~672 us    p50 ahead, p95 level
+        //     u32::MAX     ~17 us     ~49 us    ahead on both
+        //     rclone      ~160 us    ~613 us
+        //
+        // So bounded is still faster than rclone at the median and level at
+        // the tail; it is the performance every release before alpha.90 had.
+        // Getting the tail back needs a real way to purge the kernel's data
+        // cache, which WinFsp does not expose — an upstream question, not one
+        // that can be solved here. See docs/upstream/.
+        //
         // This was shipped in alpha.90 and found on a live mount the same day:
         // eleven files served content from before an out-of-band change while
         // reporting the size and mtime from after it. The origin and our own
@@ -1387,7 +1426,7 @@ pub fn mount(
         // paths and treats disagreement as a change — but it compares ATTRS,
         // and a same-size content edit leaves every attr identical. A
         // comparison is only a check on the thing it actually compares.
-        .file_info_timeout(30_000)
+        .file_info_timeout(file_info_timeout_ms)
         // Only post Cleanup when something actually changed (or a delete is
         // pending) — saves a callback storm on read-only workloads.
         .post_cleanup_when_modified_only(true)
