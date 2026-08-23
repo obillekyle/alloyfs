@@ -100,6 +100,24 @@ fn claim_drive_letter() -> Option<LetterClaim> {
     None
 }
 
+/// Names Windows puts on a volume by itself, which the test did not create and
+/// must not compare.
+///
+/// `System Volume Information` is the one that actually bit: Windows writes
+/// `WPSettings.dat` into every freshly mounted volume, so it appears THROUGH
+/// the mount — and not in a walk of the backing directory, because the folder
+/// is ACL-restricted and `read_dir` on it fails for an ordinary process. The
+/// result reads exactly like the mount inventing a file, which is the accusation
+/// these tests exist to make, so it has to be ruled out explicitly rather than
+/// left to look like a finding.
+///
+/// It did not reproduce locally and failed every CI run, which is the usual
+/// shape of "the test environment is doing something the developer's box is
+/// not".
+fn is_windows_volume_metadata(name: &str) -> bool {
+    name.eq_ignore_ascii_case("System Volume Information") || name.eq_ignore_ascii_case("$RECYCLE.BIN")
+}
+
 struct Fixture {
     dir: tempfile::TempDir,
     fs: Arc<RemoteFs>,
@@ -248,6 +266,7 @@ fn a_volume_mounts_reads_and_unmounts() {
             .expect("enumerate the volume root")
             .flatten()
             .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| !is_windows_volume_metadata(n))
             .collect();
         names.sort();
         assert_eq!(names, ["hello.txt", "sub"], "the root must list both entries");
@@ -563,12 +582,17 @@ fn the_mount_agrees_with_the_origin_under_churn() {
             let Ok(rd) = std::fs::read_dir(at) else { return };
             for e in rd.flatten() {
                 let p = e.path();
-                // Agent bookkeeping, not user data: a Windows agent keeps a
-                // POSIX-mode sidecar under `.alloyfs` in the export root. It is
-                // auto-excluded from the client, so leaving it in makes this
-                // test sensitive to exclude settings that have nothing to do
-                // with what the two sides are meant to agree about.
-                if e.file_name().to_string_lossy().starts_with(".alloyfs") {
+                let name = e.file_name().to_string_lossy().into_owned();
+                // Two kinds of thing neither side is meant to be compared on.
+                //
+                // `.alloyfs` is agent bookkeeping — a Windows agent keeps a
+                // POSIX-mode sidecar there, auto-excluded from the client, so
+                // leaving it in makes this sensitive to exclude settings that
+                // have nothing to do with the question.
+                //
+                // `System Volume Information` is Windows writing to its own
+                // fresh volume. See `is_windows_volume_metadata`.
+                if name.starts_with(".alloyfs") || is_windows_volume_metadata(&name) {
                     continue;
                 }
                 let Ok(md) = std::fs::metadata(&p) else { continue };
