@@ -78,13 +78,28 @@ function Newer-Of([string]$a, [string]$b) {
   }
   if (-not $x.Pre) { return $a }
   if (-not $y.Pre) { return $b }
-  $xi = $x.Pre.Split('.')[-1]
-  $yi = $y.Pre.Split('.')[-1]
-  $xn = 0; $yn = 0
-  if ([int]::TryParse($xi, [ref]$xn) -and [int]::TryParse($yi, [ref]$yn)) {
-    if ($xn -gt $yn) { return $a } else { return $b }
+  # Both prereleases: identifier by identifier, left to right — NOT the
+  # trailing one alone. Comparing only the last field says alpha.93 beats
+  # beta.0, because it sees 93 against 0 and never looks at the channel. That
+  # breaks the one upgrade that matters at a channel change: everyone on the
+  # alpha line would sit there forever while beta shipped.
+  $xs = $x.Pre.Split('.')
+  $ys = $y.Pre.Split('.')
+  for ($i = 0; $i -lt [Math]::Max($xs.Count, $ys.Count); $i++) {
+    # Per semver, a larger set of identifiers wins when all before it match.
+    if ($i -ge $xs.Count) { return $b }
+    if ($i -ge $ys.Count) { return $a }
+    if ($xs[$i] -eq $ys[$i]) { continue }
+    $xn = 0; $yn = 0
+    if ([int]::TryParse($xs[$i], [ref]$xn) -and [int]::TryParse($ys[$i], [ref]$yn)) {
+      if ($xn -gt $yn) { return $a } else { return $b }
+    }
+    # Either side non-numeric: compare as text. This also gives the semver
+    # rule that a numeric identifier ranks below an alphanumeric one, since
+    # digits sort before letters.
+    if ($xs[$i] -gt $ys[$i]) { return $a } else { return $b }
   }
-  if ($xi -gt $yi) { return $a } else { return $b }
+  return $b
 }
 
 function Get-Tag([string]$path) {
