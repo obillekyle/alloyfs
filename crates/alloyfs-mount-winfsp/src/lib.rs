@@ -1308,10 +1308,12 @@ impl MountedDrive {
 /// measured (`tests/readcost.rs::what_a_repeated_stat_costs_at_each_timeout`,
 /// 1000 stats of one file, three rounds, order rotated):
 ///
-///     FileInfoTimeout      p50        p95
-///       0               ~490 us    ~1670 us
-///       30 s            ~273 us     ~790 us
-///       u32::MAX        ~278 us     ~740 us
+/// ```text
+/// FileInfoTimeout      p50        p95
+///   0               ~490 us    ~1670 us
+///   30 s            ~273 us     ~790 us
+///   u32::MAX        ~278 us     ~740 us
+/// ```
 ///
 /// Two things follow. **0 costs 1.8x on stat** — the kernel's metadata cache
 /// is absorbing real calls, consistently, with no overlap between the groups.
@@ -1326,9 +1328,11 @@ impl MountedDrive {
 /// this to 0 — is already what happens; the cost is not where it sounds.
 /// `tests/readcost.rs::where_a_stat_actually_goes` splits one stat three ways:
 ///
-///     RemoteFs::getattr  (our cache alone)      5.6 us
-///     RemoteFs::lookup   (by name, as mount)   11.6 us
-///     std::fs::metadata  (through the mount)  448.2 us
+/// ```text
+/// RemoteFs::getattr  (our cache alone)      5.6 us
+/// RemoteFs::lookup   (by name, as mount)   11.6 us
+/// std::fs::metadata  (through the mount)  448.2 us
+/// ```
 ///
 /// Our share is 2.6%. The other 97.4% is the FSD round trip — and a
 /// `std::fs::metadata` on Windows is a CreateFile, a GetFileInformation and a
