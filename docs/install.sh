@@ -79,12 +79,61 @@ api() {
 
 # --- which version ----------------------------------------------------------
 
+# Whichever of two tags is newer by semver precedence.
+#
+# GitHub's `releases/latest` EXCLUDES prereleases, and this project's current
+# line is published entirely as prereleases (1.0.0-alpha.N). So the lookup
+# below answered v0.7.0 — a build from before the 1.0 line, which cannot speak
+# the current wire protocol — and `alloyfs update` runs this very script, so on
+# a machine already on an alpha the wrong answer was a DOWNGRADE rather than a
+# missed upgrade.
+#
+# Numeric fields first, then a release outranks its own prereleases, then
+# prerelease identifiers compare numerically when both are numeric.
+newer_of() {
+  a="$1"; b="$2"
+  a_core=${a#v}; a_pre=''; case "$a_core" in *-*) a_pre=${a_core#*-}; a_core=${a_core%%-*};; esac
+  b_core=${b#v}; b_pre=''; case "$b_core" in *-*) b_pre=${b_core#*-}; b_core=${b_core%%-*};; esac
+  i=1
+  while [ "$i" -le 3 ]; do
+    x=$(printf '%s' "$a_core" | cut -d. -f"$i"); y=$(printf '%s' "$b_core" | cut -d. -f"$i")
+    x=${x:-0}; y=${y:-0}
+    case "$x$y" in *[!0-9]*) x=0; y=0 ;; esac
+    if [ "$x" -gt "$y" ]; then printf '%s' "$a"; return; fi
+    if [ "$x" -lt "$y" ]; then printf '%s' "$b"; return; fi
+    i=$((i + 1))
+  done
+  if [ -z "$a_pre" ]; then printf '%s' "$a"; return; fi
+  if [ -z "$b_pre" ]; then printf '%s' "$b"; return; fi
+  x=${a_pre##*.}; y=${b_pre##*.}
+  case "$x$y" in
+    *[!0-9]*) if [ "$x" \> "$y" ]; then printf '%s' "$a"; else printf '%s' "$b"; fi ;;
+    *) if [ "$x" -gt "$y" ]; then printf '%s' "$a"; else printf '%s' "$b"; fi ;;
+  esac
+}
+
+tag_from() {
+  api "https://api.github.com/repos/$REPO/$1" \
+    | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+    | head -1
+}
+
 version="${ALLOYFS_VERSION:-}"
 if [ -z "$version" ]; then
   bold "Looking up the latest release..."
-  version=$(api "https://api.github.com/repos/$REPO/releases/latest" \
-    | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
-    | head -1) || true
+  # Both, because they answer different questions: releases/latest is the
+  # newest STABLE, the first page of releases is the newest thing published at
+  # all. Whichever is genuinely newer wins.
+  stable=$(tag_from "releases/latest") || true
+  newest=$(tag_from "releases?per_page=1") || true
+  if [ -n "$stable" ] && [ -n "$newest" ]; then
+    version=$(newer_of "$newest" "$stable")
+  else
+    version="${stable:-$newest}"
+  fi
+  case "$version" in
+    *-*) dim "The newest release is a prerelease ($version); installing it." ;;
+  esac
 fi
 
 if [ -z "$version" ]; then
