@@ -15,3 +15,6 @@ winfsp.workspace = true
 windows-sys.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
+
+[lints]
+workspace = true

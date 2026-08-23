@@ -19,6 +19,25 @@ edition = "2021"
 license = "MIT"
 repository = "https://github.com/obillekyle/alloyfs"
 
+
+# The lints the gate enforces, declared where the editor can see them.
+#
+# `scripts/verify.sh` runs `clippy --workspace --all-targets -- -D warnings`,
+# but rust-analyzer reads only what is in the manifest — so before this table
+# existed, a lint the gate would reject showed up clean in the editor and was
+# only discovered at push time. Both now read the same source.
+#
+# `priority = -1` lets the specific entries below override the group.
+[workspace.lints.rust]
+rust_2018_idioms = { level = "warn", priority = -1 }
+# FFI glue in mount-kernel, mount-winfsp and transport: an unsafe fn does not
+# get to make its whole body an implicit unsafe block. Every unsafe operation
+# names itself, which is what makes a safety comment reviewable.
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
 [workspace.dependencies]
 alloyfs-proto = { path = "crates/alloyfs-proto" }
 alloyfs-common = { path = "crates/alloyfs-common" }

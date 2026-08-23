@@ -28,3 +28,6 @@ tracing-subscriber.workspace = true
 # The harness implements RequestHandler to stall one request kind, which is
 # how the batcher's barrier promises are testable at all.
 async-trait.workspace = true
+
+[lints]
+workspace = true

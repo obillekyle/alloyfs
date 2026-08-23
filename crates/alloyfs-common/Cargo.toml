@@ -12,3 +12,6 @@ globset.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 schemars.workspace = true
+
+[lints]
+workspace = true

@@ -80,7 +80,7 @@ impl<'de> Deserialize<'de> for ExportConfig {
         impl<'de> serde::de::Visitor<'de> for ExportVisitor {
             type Value = ExportConfig;
 
-            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 f.write_str("a path, or a table with a `path` key")
             }
 

@@ -319,7 +319,7 @@ impl WinFspFs {
 
     fn write_dir_entry(
         &self,
-        lock: &DirBufferLock,
+        lock: &DirBufferLock<'_>,
         dirinfo: &mut DirInfo,
         name: &str,
         ino: u64,
@@ -773,7 +773,7 @@ impl FileSystemContext for WinFspFs {
         &self,
         context: &FileContext,
         _pattern: Option<&U16CStr>,
-        marker: DirMarker,
+        marker: DirMarker<'_>,
         buffer: &mut [u8],
     ) -> winfsp::Result<u32> {
         // Size the buffer up front when the listing's length is already

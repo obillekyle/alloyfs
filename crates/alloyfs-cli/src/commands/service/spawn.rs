@@ -259,14 +259,22 @@ fn quote(arg: &str) -> String {
 /// one `CreateEnvironmentBlock` just produced.
 unsafe fn env_block_with(block: *const u16, var: &str, value: &str) -> Vec<u16> {
     let mut end = 0usize;
-    // An empty entry (a NUL where an entry would start) is the terminator.
-    while *block.add(end) != 0 {
+    // SAFETY: the caller guarantees a doubly-NUL-terminated block, so the
+    // walk cannot pass the end: the outer condition stops at the empty entry
+    // that terminates it, and the inner one stops at each entry's own NUL.
+    // Every `add` therefore stays within the allocation.
+    unsafe {
+        // An empty entry (a NUL where an entry would start) is the terminator.
         while *block.add(end) != 0 {
-            end += 1;
+            while *block.add(end) != 0 {
+                end += 1;
+            }
+            end += 1; // step over this entry's own NUL
         }
-        end += 1; // step over this entry's own NUL
     }
-    let mut out = std::slice::from_raw_parts(block, end).to_vec();
+    // SAFETY: `end` is the length the walk above measured, so `block..block+end`
+    // is initialized and contained in the same allocation.
+    let mut out = unsafe { std::slice::from_raw_parts(block, end) }.to_vec();
     out.extend(format!("{var}={value}").encode_utf16());
     out.push(0); // ends the appended entry
     out.push(0); // ...and the block
