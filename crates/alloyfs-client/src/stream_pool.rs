@@ -111,6 +111,9 @@ pub(crate) struct StreamPool {
     /// Connections successfully established over the pool's lifetime —
     /// what the loopback test pins engagement with.
     established: AtomicUsize,
+    /// Set when a shortfall has been logged, cleared when the pool refills —
+    /// so one degraded episode produces one warning, not one per readdir.
+    short_reported: AtomicBool,
     last_use: Mutex<Instant>,
 }
 
@@ -128,6 +131,7 @@ impl StreamPool {
             conns: Mutex::new(Vec::new()),
             dialing: AtomicBool::new(false),
             established: AtomicUsize::new(0),
+            short_reported: AtomicBool::new(false),
             last_use: Mutex::new(Instant::now()),
         });
         // Weak, like the mux pinger: the reaper must never keep a dropped
@@ -152,19 +156,32 @@ impl StreamPool {
 
     /// Dial until the pool is full or a dial fails; failures leave the pool
     /// short and the next `lanes` call tries again.
+    ///
+    /// A shortfall is REPORTED, once per episode. Running short is not an
+    /// error — reads still work, they just all ride the primary — but it is
+    /// the difference between the throughput that was configured and the
+    /// throughput being delivered, and it used to be invisible from both the
+    /// log and `alloyfs status`. `short_reported` keeps a pool that is short
+    /// for an hour from saying so on every readdir; it clears when the pool
+    /// comes back up, so a second episode is reported again.
     async fn fill(self: Arc<Self>) {
+        let mut why: Option<&'static str> = None;
         loop {
             let have = self.conns.lock().unwrap().len();
             if have >= self.target {
                 break;
             }
-            let Ok(conn) = (self.dialer)().await else { break };
+            let Ok(conn) = (self.dialer)().await else {
+                why = Some("the dial failed");
+                break;
+            };
             let attached = conn
                 .request(Request::Attach {
                     export: self.export.clone(),
                 })
                 .await;
             if !matches!(attached, Ok(Ok(Response::AttachOk { .. }))) {
+                why = Some("the agent refused the attach");
                 break;
             }
             self.established.fetch_add(1, Ordering::Relaxed);
@@ -174,7 +191,34 @@ impl StreamPool {
                 opening: tokio::sync::Mutex::new(()),
             }));
         }
+        let have = self.conns.lock().unwrap().len();
+        if have < self.target {
+            if let Some(why) = why {
+                if !self.short_reported.swap(true, Ordering::AcqRel) {
+                    tracing::warn!(
+                        export = self.export,
+                        have,
+                        target = self.target,
+                        "stream pool is short: {why}; reads fall back to the primary connection"
+                    );
+                }
+            }
+        } else {
+            self.short_reported.store(false, Ordering::Release);
+        }
         self.dialing.store(false, Ordering::Release);
+    }
+
+    /// Lanes ready RIGHT NOW, and the number configured.
+    ///
+    /// Distinct from [`established`], which counts every connection the pool
+    /// ever made: a pool that dialed three lanes and lost two reports 3 there
+    /// and 1 here. Status wants this pair — "1 of 3" is a health statement,
+    /// "3" on its own reads as healthy while the pool is degraded.
+    pub(crate) fn live_and_target(&self) -> (usize, usize) {
+        let mut conns = self.conns.lock().unwrap();
+        conns.retain(|e| !e.conn.is_closed());
+        (conns.len(), self.target)
     }
 
     /// Release every pool handle for `path` — called when the mount closes

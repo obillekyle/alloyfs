@@ -68,7 +68,20 @@ pub struct Snapshot {
     pub open_handles: usize,
     pub rewarmed_paths: u64,
     pub batch_settle_failures: u64,
+    /// Connections the pool established over its lifetime.
     pub stream_conns: usize,
+    /// Lanes live right now, and the number configured. A snapshot showing
+    /// `stream_conns_live < stream_conns_target` is a pool running degraded —
+    /// reads still work, on the primary connection alone.
+    ///
+    /// `default`, because a snapshot on disk outlives the binary that wrote
+    /// it: `alloyfs status` after an upgrade reads files the previous version
+    /// left behind, and a missing field must degrade to "not reported"
+    /// rather than making the whole snapshot unreadable.
+    #[serde(default)]
+    pub stream_conns_live: usize,
+    #[serde(default)]
+    pub stream_conns_target: usize,
     /// Files in the auto-cache and the bytes they occupy; `None` without one.
     pub cache_files: Option<usize>,
     pub cache_bytes: Option<u64>,
@@ -96,6 +109,7 @@ pub fn capture(
     started_at: SystemTime,
 ) -> Snapshot {
     let conn = fs.conn();
+    let (live, target) = fs.stream_conns_live();
     let (cache_files, cache_bytes) = match fs.cache_stats() {
         Some((files, bytes)) => (Some(files), Some(bytes)),
         None => (None, None),
@@ -123,6 +137,8 @@ pub fn capture(
         rewarmed_paths: fs.rewarmed_paths(),
         batch_settle_failures: fs.batch_settle_failures(),
         stream_conns: fs.stream_conns_established(),
+        stream_conns_live: live,
+        stream_conns_target: target,
         cache_files,
         cache_bytes,
     }
@@ -197,6 +213,8 @@ mod tests {
             rewarmed_paths: 2,
             batch_settle_failures: 0,
             stream_conns: 4,
+            stream_conns_live: 3,
+            stream_conns_target: 3,
             cache_files: Some(10),
             cache_bytes: Some(4096),
         }
@@ -233,6 +251,24 @@ mod tests {
         assert!(
             sample("gone", INTERVAL * (STALE_AFTER + 1)).is_stale(),
             "past the grace period, the writer has stopped"
+        );
+    }
+/// A snapshot written by an older build has no pool pair at all. It must
+    /// still read — `status` is the tool someone runs right after an upgrade
+    /// goes wrong, and it is worth nothing if the upgrade made it unreadable.
+    #[test]
+    fn a_snapshot_without_the_pool_pair_still_reads() {
+        let snap = sample("old", Duration::from_secs(0));
+        let mut v = serde_json::to_value(&snap).expect("serializes");
+        let obj = v.as_object_mut().expect("an object");
+        obj.remove("stream_conns_live");
+        obj.remove("stream_conns_target");
+        let back: Snapshot = serde_json::from_value(v).expect("an older snapshot still parses");
+        assert_eq!(back.stream_conns, 4, "the fields it does carry survive");
+        assert_eq!(
+            (back.stream_conns_live, back.stream_conns_target),
+            (0, 0),
+            "an absent pair reads as not-reported, and status prints the old field instead"
         );
     }
 }

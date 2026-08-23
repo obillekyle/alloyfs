@@ -420,6 +420,10 @@ struct ExportInfo {
     root: String,
     read_only: bool,
     last_seq: u64,
+    /// False = no OS watcher on this root, so changes made directly on the
+    /// server never reach a client and cached copies can go stale. The one
+    /// field here that is a health statement rather than configuration.
+    watching: bool,
 }
 
 fn export_info(e: &alloyfs_agent::Export) -> ExportInfo {
@@ -428,6 +432,7 @@ fn export_info(e: &alloyfs_agent::Export) -> ExportInfo {
         root: e.root.display().to_string(),
         read_only: e.read_only,
         last_seq: e.events.last_seq(),
+        watching: e.is_watching(),
     }
 }
 

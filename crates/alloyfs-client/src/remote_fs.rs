@@ -436,6 +436,18 @@ impl RemoteFs {
         self.stream_pool.as_ref().map_or(0, |p| p.established())
     }
 
+    /// Lanes live right now and the number configured — `(0, 0)` without a
+    /// pool.
+    ///
+    /// The pair, not either half: `established` alone counts connections that
+    /// may since have died, so a pool reporting 3 could be serving 1. A
+    /// shortfall is a supported state (reads fall back to the primary), which
+    /// is exactly why it has to be visible rather than inferred from
+    /// throughput.
+    pub fn stream_conns_live(&self) -> (usize, usize) {
+        self.stream_pool.as_ref().map_or((0, 0), |p| p.live_and_target())
+    }
+
     /// Files the auto-cache holds and the bytes they occupy, or `None` on a
     /// mount running without one.
     ///

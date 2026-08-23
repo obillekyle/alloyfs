@@ -62,7 +62,19 @@ pub fn run(json: bool) -> anyhow::Result<()> {
         if s.rewarmed_paths > 0 {
             notes.push(format!("{} re-warmed", s.rewarmed_paths));
         }
-        if s.stream_conns > 0 {
+        // Live against configured, not the lifetime total: "3 stream conns"
+        // read as healthy on a pool that had dialed three and lost two.
+        if s.stream_conns_target > 0 {
+            if s.stream_conns_live < s.stream_conns_target {
+                notes.push(format!(
+                    "stream pool SHORT {}/{}",
+                    s.stream_conns_live, s.stream_conns_target
+                ));
+            } else {
+                notes.push(format!("{} stream conns", s.stream_conns_live));
+            }
+        } else if s.stream_conns > 0 {
+            // A snapshot written by a build from before the pair existed.
             notes.push(format!("{} stream conns", s.stream_conns));
         }
         if s.batch_settle_failures > 0 {

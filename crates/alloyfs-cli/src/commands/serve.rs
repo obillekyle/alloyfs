@@ -20,11 +20,35 @@ pub async fn run(
     for export in registry.all() {
         let hub = export.events.clone();
         let name = export.name.clone();
+        let root = export.root.clone();
         // A failed watcher degrades that export to no-events; it must never
         // take the whole agent down.
-        match alloyfs_agent::watch::spawn(export, hub, std::time::Duration::from_millis(250)) {
+        //
+        // But it must not pass quietly either. Without a watcher, a file
+        // changed directly on the server produces no event, so no client is
+        // ever told to invalidate — every mount can serve that file from cache
+        // indefinitely and believe it is current. That is worse than an error,
+        // because everything keeps appearing to work.
+        //
+        // So: `error`, not `warn`; the reason and the root, since "watching
+        // disabled" alone does not say whether the path is wrong or the
+        // platform ran out of watch descriptors; and a flag on the export so
+        // `GET /api/exports` reports it, because the person who notices the
+        // staleness is looking at a client, not at this log.
+        match alloyfs_agent::watch::spawn(export.clone(), hub, std::time::Duration::from_millis(250))
+        {
             Ok(guard) => _watch_guards.push(guard),
-            Err(e) => tracing::warn!(export = name, error = %e, "file watching disabled"),
+            Err(e) => {
+                export.mark_unwatched();
+                tracing::error!(
+                    export = name,
+                    root = %root.display(),
+                    error = %e,
+                    "NOT watching this export: changes made directly on the server \
+                     will not reach any client, and cached copies can be served stale. \
+                     Clients see it as watching=false on GET /api/exports."
+                );
+            }
         }
     }
     // Frees locks/handles of clients that vanish without disconnecting
