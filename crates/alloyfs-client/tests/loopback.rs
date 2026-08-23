@@ -4359,3 +4359,104 @@ async fn hiding_an_overlay_directory_actually_hides_it() {
         "FILE_ATTRIBUTE_HIDDEN is not set on the overlay directory on disk"
     );
 }
+
+// ---------------------------------------------------------------------
+/// Marking an OVERLAY file read-only must actually mark it read-only.
+///
+/// Found by auditing the short-circuits after the Hidden bug, not by report,
+/// and it is the same shape: `overlay.setattr` took `_mode` — underscore,
+/// never read — applied size and mtime, then returned `attr_from_metadata`,
+/// which DESCRIBES the file. So the mode was dropped and the reply looked
+/// like success.
+///
+/// `setattr_readonly` is what the WinFsp backend calls for the read-only
+/// checkbox (mount-winfsp/src/lib.rs). It resolves the flag into a mode and
+/// hands it to `overlay.setattr` — the call that ignored it. So on Windows
+/// the checkbox did nothing on overlay files, exactly as Hidden did nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn marking_an_overlay_file_readonly_actually_marks_it() {
+    let agent = start_agent(AgentOpts::default());
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let opts = ClientOptions {
+        excludes: vec!["*.local".into()],
+        data_dir: data_dir.path().to_path_buf(),
+        cache_dir: data_dir.path().join("cache"),
+        mount_key: "t".into(),
+        ..ClientOptions::default()
+    };
+    let s = connect(&agent, opts).await;
+
+    let ino = mkfile(&s.fs, ROOT_INO, "notes.local", b"client only").await;
+    let on_disk = data_dir.path().join("overlay").join("t").join("notes.local");
+
+    let attr = on_fs(&s.fs, move |fs| fs.setattr_readonly(ino, None, None, true))
+        .await
+        .expect("set readonly");
+    assert_eq!(
+        attr.mode & 0o222,
+        0,
+        "the reply must report the file as read-only, not echo the old mode back"
+    );
+
+    // And on the FILE, read straight from the filesystem rather than from the
+    // thing under test.
+    assert!(
+        std::fs::metadata(&on_disk).unwrap().permissions().readonly(),
+        "the overlay file on disk is still writable"
+    );
+
+    // Clearing has to work too — on Windows that is the change users
+    // actually make, and the one a write-open cannot perform.
+    let attr = on_fs(&s.fs, move |fs| fs.setattr_readonly(ino, None, None, false))
+        .await
+        .expect("clear readonly");
+    assert_ne!(attr.mode & 0o200, 0, "the reply must report it writable again");
+    assert!(
+        !std::fs::metadata(&on_disk).unwrap().permissions().readonly(),
+        "the overlay file on disk is still read-only"
+    );
+}
+
+/// A plain `setattr` carrying a mode must apply it, alongside size and mtime.
+///
+/// The same dropped `_mode`, reached by the other caller. Split from the
+/// read-only test because they fail for one reason and would be fixed by one
+/// change, but a future regression could easily break only one of them.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn setattr_on_an_overlay_file_applies_the_mode() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let agent = start_agent(AgentOpts::default());
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let opts = ClientOptions {
+        excludes: vec!["*.local".into()],
+        data_dir: data_dir.path().to_path_buf(),
+        cache_dir: data_dir.path().join("cache"),
+        mount_key: "t".into(),
+        ..ClientOptions::default()
+    };
+    let s = connect(&agent, opts).await;
+
+    let ino = mkfile(&s.fs, ROOT_INO, "script.local", b"#!/bin/sh\n").await;
+    let on_disk = data_dir.path().join("overlay").join("t").join("script.local");
+
+    // chmod +x, the change a person actually makes on a client.
+    let attr = on_fs(&s.fs, move |fs| fs.setattr(ino, None, None, Some(0o755)))
+        .await
+        .expect("setattr");
+    assert_eq!(attr.mode & 0o777, 0o755, "the reply must report the new mode");
+    assert_eq!(
+        std::fs::metadata(&on_disk).unwrap().permissions().mode() & 0o777,
+        0o755,
+        "the overlay file on disk did not get the mode"
+    );
+
+    // Size and mtime must still work — they were never broken and must not
+    // become broken by fixing the mode.
+    let attr = on_fs(&s.fs, move |fs| fs.setattr(ino, Some(4), None, None))
+        .await
+        .expect("truncate");
+    assert_eq!(attr.size, 4, "size must still apply");
+    assert_eq!(attr.mode & 0o777, 0o755, "and must not disturb the mode");
+}

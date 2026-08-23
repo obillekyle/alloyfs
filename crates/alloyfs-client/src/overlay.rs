@@ -206,12 +206,24 @@ impl Overlay {
         Ok(std::fs::rename(&from_full, &to_full).or_code()?)
     }
 
+    /// Apply size, mtime and mode to an overlay entry.
+    ///
+    /// `mode` used to be `_mode` — accepted and dropped, while the reply came
+    /// from `attr_from_metadata`, which DESCRIBES the file. So the mode never
+    /// landed and the caller saw a well-formed success. On Windows that is the
+    /// read-only checkbox (`setattr_readonly` resolves the flag into a mode
+    /// and calls straight into here); on Unix it is `chmod`.
+    ///
+    /// Order matters: the mode goes LAST. Setting read-only first would make
+    /// the size and mtime writes fail on Windows, which refuses to write-open
+    /// a READONLY file — the same trap `set_mode_path` exists to dodge for the
+    /// server path.
     pub fn setattr(
         &self,
         path: &RelPath,
         size: Option<u64>,
         mtime: Option<SystemTime>,
-        _mode: Option<u32>,
+        mode: Option<u32>,
     ) -> Result<Attr, FsError> {
         let full = self.abs(path);
         if let Some(size) = size {
@@ -221,6 +233,17 @@ impl Overlay {
         if let Some(mtime) = mtime {
             let f = File::options().write(true).open(&full).or_code()?;
             f.set_modified(mtime).or_code()?;
+        }
+        if let Some(mode) = mode {
+            // By path, not by fd: Windows refuses to write-open a READONLY
+            // file, so the fd form cannot perform the one change people
+            // actually make — clearing it.
+            //
+            // MODE_WIN_MASK is stripped because those high bits are the
+            // Hidden/System carriers, not permissions; they travel through
+            // `set_win_attrs` instead, and feeding them to a chmod would set
+            // nonsense bits on a Unix client.
+            alloyfs_common::set_mode_path(&full, mode & !alloyfs_proto::MODE_WIN_MASK).or_code()?;
         }
         let md = std::fs::metadata(&full).or_code()?;
         Ok(attr_from_metadata(&md, 0))
