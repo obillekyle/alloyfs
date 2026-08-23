@@ -360,6 +360,17 @@ impl WinFspFs {
     }
 }
 
+/// Byte-range locks are not forwarded, and there is no callback to forward
+/// them through: `FSP_FILE_SYSTEM_INTERFACE` has thirty-odd operations and
+/// not one is a lock. WinFsp services `IRP_MJ_LOCK_CONTROL` inside its own
+/// FSD and never tells user mode. So locks are fully enforced between
+/// processes on THIS machine — verified: a second handle taking a held range
+/// is refused, exactly as on a local disk — and mean nothing between machines
+/// sharing an export.
+///
+/// This is a property of the driver boundary, not a gap in this file. Do not
+/// go looking for the callback; see docs/guides/locking.md, which also covers
+/// what it means for SQLite.
 impl FileSystemContext for WinFspFs {
     type FileContext = FileContext;
 
