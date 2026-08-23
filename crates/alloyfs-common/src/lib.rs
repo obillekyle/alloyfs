@@ -8,6 +8,8 @@ mod exclude;
 mod fs;
 
 pub use exclude::ExcludeSet;
+#[cfg(windows)]
+pub use fs::apply_win_attrs;
 pub use fs::{
     attr_from_metadata, mode_of_md, read_at, read_fully, set_mode, set_mode_path, write_at, write_fully,
 };

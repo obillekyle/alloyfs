@@ -4243,3 +4243,119 @@ async fn a_server_side_copy_moves_no_bytes_over_the_wire() {
         "a pre-v14 server answers EOPNOTSUPP, which is a kernel's cue to copy it itself"
     );
 }
+
+// ---------------------------------------------------------------------
+/// Hiding an OVERLAY file must actually hide it.
+///
+/// `SetWinAttrs` is a server request, and an overlay file exists only on this
+/// machine — so the client short-circuits it. The short-circuit returned the
+/// file's CURRENT attributes without applying the requested bits, which means
+/// Explorer's "Hidden" tick reported success and changed nothing. Silent,
+/// because the reply is a well-formed Attr and the caller has no reason to
+/// doubt it.
+///
+/// Windows-only: the bits are NTFS attributes, and there is nothing to set on
+/// a filesystem that has no concept of them.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hiding_an_overlay_file_actually_hides_it() {
+    use alloyfs_proto::{MODE_WIN_HIDDEN, MODE_WIN_SYSTEM};
+
+    let agent = start_agent(AgentOpts::default());
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let opts = ClientOptions {
+        excludes: vec!["*.local".into()],
+        data_dir: data_dir.path().to_path_buf(),
+        cache_dir: data_dir.path().join("cache"),
+        mount_key: "t".into(),
+        ..ClientOptions::default()
+    };
+    let s = connect(&agent, opts).await;
+
+    let ino = mkfile(&s.fs, ROOT_INO, "notes.local", b"client only").await;
+    let on_disk = data_dir.path().join("overlay").join("t").join("notes.local");
+    assert!(on_disk.exists(), "the overlay file must be local");
+
+    // Set Hidden, the way the mount does.
+    let attr = on_fs(&s.fs, move |fs| fs.set_win_attrs(ino, MODE_WIN_HIDDEN, 0))
+        .await
+        .expect("set_win_attrs");
+    assert_ne!(
+        attr.mode & MODE_WIN_HIDDEN,
+        0,
+        "the reply must report the file as hidden, not echo the old attrs back"
+    );
+
+    // And it must be true of the FILE, not just of the reply. Read the real
+    // NTFS attributes rather than asking the thing under test.
+    let native = {
+        use std::os::windows::fs::MetadataExt;
+        std::fs::metadata(&on_disk).unwrap().file_attributes()
+    };
+    assert_ne!(
+        native & 0x2,
+        0,
+        "FILE_ATTRIBUTE_HIDDEN is not set on the overlay file on disk"
+    );
+
+    // getattr agrees, so a later listing shows it hidden too.
+    let seen = on_fs(&s.fs, move |fs| fs.getattr(ino)).await.unwrap();
+    assert_ne!(seen.mode & MODE_WIN_HIDDEN, 0, "getattr must see it");
+
+    // Clearing works the same way round.
+    let attr = on_fs(&s.fs, move |fs| fs.set_win_attrs(ino, 0, MODE_WIN_HIDDEN))
+        .await
+        .expect("clear");
+    assert_eq!(attr.mode & MODE_WIN_HIDDEN, 0, "clearing must clear");
+    let native = {
+        use std::os::windows::fs::MetadataExt;
+        std::fs::metadata(&on_disk).unwrap().file_attributes()
+    };
+    assert_eq!(native & 0x2, 0, "FILE_ATTRIBUTE_HIDDEN must be gone on disk");
+
+    // System too, since it rides the same path.
+    let attr = on_fs(&s.fs, move |fs| fs.set_win_attrs(ino, MODE_WIN_SYSTEM, 0))
+        .await
+        .expect("system");
+    assert_ne!(attr.mode & MODE_WIN_SYSTEM, 0, "System must set too");
+}
+
+/// The same, for an overlay DIRECTORY — Kyle reported folders as well as
+/// files, and directories reach `set_win_attrs` by the same path.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hiding_an_overlay_directory_actually_hides_it() {
+    use alloyfs_proto::MODE_WIN_HIDDEN;
+
+    let agent = start_agent(AgentOpts::default());
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let opts = ClientOptions {
+        excludes: vec!["scratch/**".into(), "scratch".into()],
+        data_dir: data_dir.path().to_path_buf(),
+        cache_dir: data_dir.path().join("cache"),
+        mount_key: "t".into(),
+        ..ClientOptions::default()
+    };
+    let s = connect(&agent, opts).await;
+
+    let (ino, _) = on_fs(&s.fs, |fs| fs.mkdir(ROOT_INO, "scratch", 0o755))
+        .await
+        .expect("mkdir into the overlay");
+    let on_disk = data_dir.path().join("overlay").join("t").join("scratch");
+    assert!(on_disk.is_dir(), "the overlay directory must be local");
+
+    let attr = on_fs(&s.fs, move |fs| fs.set_win_attrs(ino, MODE_WIN_HIDDEN, 0))
+        .await
+        .expect("set_win_attrs on a directory");
+    assert_ne!(attr.mode & MODE_WIN_HIDDEN, 0, "the reply must report hidden");
+
+    let native = {
+        use std::os::windows::fs::MetadataExt;
+        std::fs::metadata(&on_disk).unwrap().file_attributes()
+    };
+    assert_ne!(
+        native & 0x2,
+        0,
+        "FILE_ATTRIBUTE_HIDDEN is not set on the overlay directory on disk"
+    );
+}

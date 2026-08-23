@@ -177,3 +177,59 @@ pub fn set_mode_path(path: &std::path::Path, mode: u32) -> std::io::Result<()> {
         std::fs::set_permissions(path, perms)
     }
 }
+
+/// Apply Windows attribute bits to a real path, read-modify-write.
+///
+/// The counterpart of the read in [`attr_from_metadata`], which maps
+/// `FILE_ATTRIBUTE_HIDDEN`/`SYSTEM` into `MODE_WIN_*`. It lives here rather
+/// than in either caller because BOTH need it and they are on opposite sides
+/// of the wire: the agent applies these to an export's files, and the client
+/// applies them to overlay files, which exist only locally and so are never
+/// reachable by a `SetWinAttrs` request at all.
+///
+/// That asymmetry was the bug. The client's `set_win_attrs` short-circuited
+/// overlay paths and returned the file's CURRENT attributes without applying
+/// anything, so Explorer's Hidden tick reported success and changed nothing —
+/// silently, because a well-formed `Attr` came back.
+///
+/// Only HIDDEN and SYSTEM are carried; the other native bits are not ours to
+/// touch, and the read-modify-write preserves them.
+#[cfg(windows)]
+pub fn apply_win_attrs(full: &std::path::Path, set: u32, clear: u32) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+    const FILE_ATTRIBUTE_SYSTEM: u32 = 0x4;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetFileAttributesW(lpFileName: *const u16) -> u32;
+        fn SetFileAttributesW(lpFileName: *const u16, dwFileAttributes: u32) -> i32;
+    }
+
+    let to_native = |bits: u32| {
+        let mut n = 0u32;
+        if bits & alloyfs_proto::MODE_WIN_HIDDEN != 0 {
+            n |= FILE_ATTRIBUTE_HIDDEN;
+        }
+        if bits & alloyfs_proto::MODE_WIN_SYSTEM != 0 {
+            n |= FILE_ATTRIBUTE_SYSTEM;
+        }
+        n
+    };
+
+    let wide: Vec<u16> = full.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    // SAFETY: `wide` is NUL-terminated and outlives both calls; the pointer is
+    // only read by the OS for the duration of each.
+    unsafe {
+        let cur = GetFileAttributesW(wide.as_ptr());
+        if cur == u32::MAX {
+            return Err(std::io::Error::last_os_error());
+        }
+        let next = (cur | to_native(set)) & !to_native(clear);
+        if next != cur && SetFileAttributesW(wide.as_ptr(), next) == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}

@@ -170,9 +170,16 @@ impl RemoteFs {
     pub fn set_win_attrs(&self, ino: u64, set: u32, clear: u32) -> Result<Attr, FsError> {
         let path = self.path_of(ino)?;
         if self.is_overlay(&path) {
-            // The overlay's local file carries real NTFS bits already;
-            // nothing to send anywhere. Serve current attrs back.
-            return self.overlay_ref().getattr(&path);
+            // An overlay file exists only here, so `SetWinAttrs` has nothing
+            // to reach — but the bits still have to be APPLIED, to the local
+            // file, by us. Returning `getattr` instead (which this did) hands
+            // back the unchanged attributes and reads as success: Explorer's
+            // Hidden tick appeared to work and changed nothing, on files and
+            // folders alike.
+            let attr = self.overlay_ref().set_win_attrs(&path, set, clear)?;
+            self.patch_parent_dir(&path, ListingPatch::Upsert(ino, attr));
+            self.cache_attr(ino, attr);
+            return Ok(attr);
         }
         if self.conn().proto < 11 {
             // The old contract, kept exactly: acknowledged, unpersisted.

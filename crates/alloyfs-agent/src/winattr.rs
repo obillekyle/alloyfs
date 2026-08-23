@@ -269,32 +269,14 @@ mod imp {
 
         /// Apply against the REAL attributes, atomically enough for a bit
         /// toggle: read-modify-write on the native flags.
+        ///
+        /// The implementation lives in `alloyfs-common` because the CLIENT
+        /// needs the identical operation for overlay files — those exist only
+        /// on the client and no `SetWinAttrs` request can ever reach them, so
+        /// it applies the bits itself. Two copies of a read-modify-write over
+        /// the same two flags is exactly the pair that drifts.
         pub fn apply_native(full: &Path, set: u32, clear: u32) -> std::io::Result<()> {
-            use std::os::windows::ffi::OsStrExt;
-            let wide: Vec<u16> = full.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
-            // MODE_WIN_HIDDEN (1<<20) ↔ FILE_ATTRIBUTE_HIDDEN (0x2),
-            // MODE_WIN_SYSTEM (1<<21) ↔ FILE_ATTRIBUTE_SYSTEM (0x4).
-            let to_native = |bits: u32| {
-                let mut n = 0u32;
-                if bits & alloyfs_proto::MODE_WIN_HIDDEN != 0 {
-                    n |= 0x2;
-                }
-                if bits & alloyfs_proto::MODE_WIN_SYSTEM != 0 {
-                    n |= 0x4;
-                }
-                n
-            };
-            unsafe {
-                let cur = GetFileAttributesW(wide.as_ptr());
-                if cur == u32::MAX {
-                    return Err(std::io::Error::last_os_error());
-                }
-                let next = (cur | to_native(set)) & !to_native(clear);
-                if next != cur && SetFileAttributesW(wide.as_ptr(), next) == 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-            }
-            Ok(())
+            alloyfs_common::apply_win_attrs(full, set, clear)
         }
 
         pub fn remove(&self, _rel: &RelPath) {}
@@ -305,12 +287,6 @@ mod imp {
         pub fn batch(&self) -> NoopBatch {
             NoopBatch
         }
-    }
-
-    #[link(name = "kernel32")]
-    extern "system" {
-        fn GetFileAttributesW(lpFileName: *const u16) -> u32;
-        fn SetFileAttributesW(lpFileName: *const u16, dwFileAttributes: u32) -> i32;
     }
 }
 

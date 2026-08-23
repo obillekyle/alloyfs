@@ -72,6 +72,32 @@ impl Overlay {
         Ok(attr_from_metadata(&md, 0))
     }
 
+    /// Set or clear Windows attribute bits on an overlay entry.
+    ///
+    /// An overlay file exists only on this machine, so `SetWinAttrs` — a
+    /// server request — can never reach it. Without this the client's
+    /// `set_win_attrs` had nothing to do for an overlay path and returned the
+    /// CURRENT attributes, which reads as success and changes nothing: the
+    /// Hidden tick in Explorer appeared to work and did not.
+    ///
+    /// Files and directories both, since NTFS carries the bits either way and
+    /// the caller does not distinguish.
+    ///
+    /// On a non-Windows client this is a no-op that reports the attrs
+    /// unchanged, which is the truth there — the bits have no meaning on a
+    /// filesystem without them, and failing would be worse than doing nothing.
+    pub fn set_win_attrs(&self, path: &RelPath, set: u32, clear: u32) -> Result<Attr, FsError> {
+        #[cfg(windows)]
+        {
+            alloyfs_common::apply_win_attrs(&self.abs(path), set, clear).or_code()?;
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (set, clear);
+        }
+        self.getattr(path)
+    }
+
     pub fn open(&self, path: &RelPath, flags: OpenFlags) -> Result<(u64, Attr), FsError> {
         let wants_write = flags.write || flags.truncate || flags.append;
         let file = File::options()
