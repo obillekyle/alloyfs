@@ -1303,7 +1303,90 @@ impl MountedDrive {
 /// The kernel metadata cache window. BOUNDED — see the long comment at the
 /// `.file_info_timeout` call for why `u32::MAX` is a correctness bug and not a
 /// faster setting.
+///
+/// 30 s is the sweet spot rather than a compromise, and both directions were
+/// measured (`tests/readcost.rs::what_a_repeated_stat_costs_at_each_timeout`,
+/// 1000 stats of one file, three rounds, order rotated):
+///
+///     FileInfoTimeout      p50        p95
+///       0               ~490 us    ~1670 us
+///       30 s            ~273 us     ~790 us
+///       u32::MAX        ~278 us     ~740 us
+///
+/// Two things follow. **0 costs 1.8x on stat** — the kernel's metadata cache
+/// is absorbing real calls, consistently, with no overlap between the groups.
+/// And **`u32::MAX` is worth nothing over 30 s for metadata**: the bounded
+/// window already captures the whole benefit. Everything `u32::MAX` added on
+/// top was the DATA caching, which is the part that served stale bytes.
+///
+/// So this is not "as much cache as we dare". It is all of the cache that
+/// helps, and none of the cache that breaks.
+///
+/// And the obvious counter-proposal — serve metadata from our own RAM and set
+/// this to 0 — is already what happens; the cost is not where it sounds.
+/// `tests/readcost.rs::where_a_stat_actually_goes` splits one stat three ways:
+///
+///     RemoteFs::getattr  (our cache alone)      5.6 us
+///     RemoteFs::lookup   (by name, as mount)   11.6 us
+///     std::fs::metadata  (through the mount)  448.2 us
+///
+/// Our share is 2.6%. The other 97.4% is the FSD round trip — and a
+/// `std::fs::metadata` on Windows is a CreateFile, a GetFileInformation and a
+/// CloseHandle, so it is three crossings, not one. We already answer from RAM
+/// in microseconds; what costs is being ASKED.
+///
+/// Which is exactly why the kernel window earns its 1.8x. It is not caching
+/// something we could cache better — it is skipping the trip. And it caps how
+/// much a leaner dispatch could ever buy at 2.6%.
+///
+/// And 30 s is a BACKSTOP, not the mechanism — measured, not asserted.
+/// `tests/smoke.rs::a_server_side_attribute_change_reaches_the_next_stat`
+/// grows a file on the server and times how long the new size takes to reach
+/// a stat through the mount: **78 ms** at 30 s, against 66 ms with no kernel
+/// cache at all. Notify evicts the cached FileInfo immediately; the window
+/// only ever applies if that path breaks.
+///
+/// Worth knowing what the first run of that test showed, before the event
+/// pump was wired into it: 5.0 s, exactly the client's `ATTR_TTL_POLL`. A
+/// mount with no pump is not stale for 30 s either — the client's own
+/// degraded floor catches it first. That is why the test asserts a 2 s bound:
+/// anything at 5 s means the pump is not subscribed, and a looser bound would
+/// pass a mount running blind.
 const FILE_INFO_TIMEOUT_MS: u32 = 30_000;
+
+/// The directory-listing cache window, which `DirInfoTimeout` overrides
+/// [`FILE_INFO_TIMEOUT_MS`] for.
+///
+/// Equal to the file window, and MEASURED to be the right choice rather than
+/// assumed.
+///
+/// The reasoning that suggested raising it is sound: the two are not the same
+/// risk. What made `u32::MAX` unusable for file info was cached DATA, and a
+/// listing has none — it is names and attrs, and attr invalidation is the half
+/// that demonstrably works (FspFileNodeInvalidateCachesAndNotifyChangeByName
+/// purges dir-info per entry and the parent listing). So a long dir window
+/// looked like free speed on the one operation an interactive user notices,
+/// opening a folder.
+///
+/// It is not. `tests/readcost.rs::what_opening_a_folder_costs` enumerates a
+/// 500-entry directory 100 times at 0, 30 s, 300 s and `u32::MAX`, three rounds
+/// with the order rotated. No setting wins: the spread WITHIN one setting
+/// across rounds (1.0 ms to 5.6 ms at 300 s) is larger than any difference
+/// between them. A fresh enumeration does not come from that cache.
+///
+/// `0` measures the same as the rest, so the choice between it and 30 s is not
+/// about speed — it is about which unverified staleness window to keep. 30 s
+/// wins that on evidence: unlike the DATA cache, metadata invalidation is
+/// demonstrably working. Sizes and mtimes were correct throughout the incident
+/// that forced the file window down, which is precisely the notify path this
+/// window is a backstop for. A backstop on a mechanism known to work is worth
+/// more than removing a window nothing has shown to be a problem.
+///
+/// Which places the real cost elsewhere. The same benchmark puts the mount at
+/// ~2.5-5 ms for 500 entries against ~0.5 ms on local disk — 5-10 us per entry
+/// against 1 us. That gap is in our own readdir path, and it is worth having,
+/// but no kernel timeout will close it.
+const DIR_INFO_TIMEOUT_MS: u32 = 30_000;
 
 const LATENCY_BOUND_RTT: std::time::Duration = std::time::Duration::from_millis(2);
 
@@ -1318,22 +1401,30 @@ pub fn mount(
     volume_label: &str,
     rtt: Option<std::time::Duration>,
 ) -> anyhow::Result<MountedDrive> {
-    mount_with_timeout(fs, mountpoint, volume_label, rtt, FILE_INFO_TIMEOUT_MS)
+    mount_with_timeout(
+        fs,
+        mountpoint,
+        volume_label,
+        rtt,
+        FILE_INFO_TIMEOUT_MS,
+        DIR_INFO_TIMEOUT_MS,
+    )
 }
 
-/// [`mount`], with the kernel metadata timeout as a parameter.
+/// [`mount`], with the two kernel metadata timeouts as parameters.
 ///
 /// Exists so `tests/readcost.rs` can measure what each setting costs in one
 /// process, adjacently — the only way to compare on a box whose latency drifts
-/// 50% intraday. Production always takes the default; there is deliberately no
-/// config knob, because the safe range is "any bounded value" and the unsafe
-/// one is a correctness bug rather than a tuning choice.
+/// 50% intraday. Production always takes the defaults; there is deliberately
+/// no config knob, because for file info the safe range is "any bounded value"
+/// and the unsafe one is a correctness bug rather than a tuning choice.
 pub fn mount_with_timeout(
     fs: Arc<RemoteFs>,
     mountpoint: &str,
     volume_label: &str,
     rtt: Option<std::time::Duration>,
     file_info_timeout_ms: u32,
+    dir_info_timeout_ms: u32,
 ) -> anyhow::Result<MountedDrive> {
     winfsp::winfsp_init()
         .map_err(|e| anyhow::anyhow!("WinFsp is not available (is it installed?): {}", e))?;
@@ -1427,6 +1518,8 @@ pub fn mount_with_timeout(
         // and a same-size content edit leaves every attr identical. A
         // comparison is only a check on the thing it actually compares.
         .file_info_timeout(file_info_timeout_ms)
+        // Directory listings, separately. See DIR_INFO_TIMEOUT_MS.
+        .dir_info_timeout(dir_info_timeout_ms)
         // Only post Cleanup when something actually changed (or a delete is
         // pending) — saves a callback storm on read-only workloads.
         .post_cleanup_when_modified_only(true)

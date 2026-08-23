@@ -400,3 +400,408 @@ fn a_same_size_server_change_reaches_the_next_read() {
         std::panic::resume_unwind(panic);
     }
 }
+
+/// How long a server-side ATTRIBUTE change takes to reach the next `stat`.
+///
+/// `FileInfoTimeout` is 30 s, and a timeout that long is only acceptable if it
+/// is a backstop rather than the mechanism — the mechanism being
+/// `FspFileSystemNotify`, which should evict the kernel's cached FileInfo the
+/// moment an event lands. If it works, a change is visible in milliseconds and
+/// the 30 s never applies. If it does not, a mount serves a stale size for up
+/// to half a minute, and plenty happens in half a minute.
+///
+/// So this measures the latency rather than assuming it, and fails if the
+/// answer is anywhere near the timeout. Run at 0 too, which has no window at
+/// all, so the two can be compared: if 30 s is meaningfully slower than 0, the
+/// notify path is not doing the work and the timeout is load-bearing.
+#[cfg(windows)]
+#[test]
+fn a_server_side_attribute_change_reaches_the_next_stat() {
+    let Some(claim) = claim_drive_letter() else {
+        eprintln!("SKIP: no free drive letter");
+        return;
+    };
+    let letter = claim.letter;
+    let mountpoint = format!("{letter}:");
+
+    for fit in [30_000u32, 0u32] {
+        let fixture = fixture();
+        let backing = fixture.dir.path().join("hello.txt");
+        let drive = match alloyfs_mount_winfsp::mount_with_timeout(
+            fixture.fs.clone(),
+            &mountpoint,
+            "attrs",
+            Some(Duration::from_micros(300)),
+            fit,
+            fit,
+        ) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("SKIP: could not mount: {e}");
+                return;
+            }
+        };
+
+        // The production wiring, which the fixture alone does not do: events
+        // reach the kernel only if something pumps them into the drive's sink.
+        // Without this the client never subscribes, `pump_healthy` stays false,
+        // and the measurement below reports the DEGRADED 5 s floor instead of
+        // the notify path — which is exactly what the first run of this test
+        // measured before the pump was wired in.
+        let sink = drive.event_sink();
+        let pump_fs = fixture.fs.clone();
+        fixture
+            ._rt
+            .block_on(async move { pump_fs.start_event_pump(move |batch| sink.push(batch)).await })
+            .expect("event pump");
+        assert!(
+            fixture.fs.event_pump_healthy(),
+            "the pump must be subscribed, or this measures the degraded regime"
+        );
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let path = std::path::Path::new(&mountpoint).join("hello.txt");
+            let before = std::fs::metadata(&path).expect("first stat").len();
+            assert_eq!(before, 23, "baseline size");
+
+            // A SIZE change, so it is unambiguously visible in the attrs, and
+            // one the kernel would happily keep serving from cache.
+            let grown = vec![b'z'; 5000];
+            std::fs::write(&backing, &grown).expect("grow the file on the server");
+
+            let start = std::time::Instant::now();
+            let deadline = start + Duration::from_secs(25);
+            let mut seen = before;
+            while std::time::Instant::now() < deadline {
+                seen = std::fs::metadata(&path).expect("stat").len();
+                if seen == 5000 {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let took = start.elapsed();
+            println!("  FileInfoTimeout={fit:<10} new size visible after {:?}", took);
+            assert_eq!(
+                seen, 5000,
+                "FileInfoTimeout={fit}: the mount never saw the new size within 25 s — \
+                 the notify path is not evicting the kernel's cached FileInfo, which \
+                 makes the timeout the mechanism rather than a backstop"
+            );
+            assert!(
+                took < Duration::from_secs(5),
+                "FileInfoTimeout={fit}: took {took:?} to see a server-side size change. \
+                 Anything near the 30 s window means notify is not doing the work"
+            );
+        }));
+
+        drive.unmount();
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    }
+}
+
+/// Server-side churn, then: does the mount agree with the origin about
+/// EVERYTHING?
+///
+/// The gap this closes. Every other test here asks one question about one
+/// file. Real desync is not like that — it is one layer of several holding a
+/// value the others have moved past, and it shows up as a file that looks
+/// right until you compare it against the server. Metadata lives in at least
+/// six places between the disk and the drive letter: the agent's tree index,
+/// the client's attr cache, its listing cache, its auto-cache manifest, the
+/// kernel's FileInfo cache and the kernel's dir-info cache. A disagreement
+/// between any pair is a bug, and nothing was checking pairs.
+///
+/// So this churns the backing directory the way a person would — create,
+/// delete, grow, shrink, truncate to the SAME size with different bytes — and
+/// after each round compares the full picture: the set of names, and every
+/// file's size and content hash. Same-size edits are in the mix deliberately:
+/// that is the shape that hid for twenty minutes on the live drive, invisible
+/// to any check that compares attributes alone.
+///
+/// Deterministic seed, so a failure is reproducible rather than a story.
+#[cfg(windows)]
+#[test]
+fn the_mount_agrees_with_the_origin_under_churn() {
+    let Some(claim) = claim_drive_letter() else {
+        eprintln!("SKIP: no free drive letter");
+        return;
+    };
+    let letter = claim.letter;
+    let mountpoint = format!("{letter}:");
+
+    let fixture = fixture();
+    let root = fixture.dir.path().to_path_buf();
+    let drive = match alloyfs_mount_winfsp::mount(
+        fixture.fs.clone(),
+        &mountpoint,
+        "churn",
+        Some(Duration::from_micros(300)),
+    ) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("SKIP: could not mount: {e}");
+            return;
+        }
+    };
+    let sink = drive.event_sink();
+    let pump_fs = fixture.fs.clone();
+    fixture
+        ._rt
+        .block_on(async move { pump_fs.start_event_pump(move |b| sink.push(b)).await })
+        .expect("event pump");
+    assert!(fixture.fs.event_pump_healthy(), "the pump must be subscribed");
+
+    /// Every file under `dir`, as (relative path, size, content hash).
+    ///
+    /// The hash is what makes this a desync test rather than an attribute
+    /// test: a same-size edit leaves size and mtime identical and is visible
+    /// only here.
+    fn picture(dir: &std::path::Path) -> Vec<(String, u64, u64)> {
+        fn walk(base: &std::path::Path, at: &std::path::Path, out: &mut Vec<(String, u64, u64)>) {
+            let Ok(rd) = std::fs::read_dir(at) else { return };
+            for e in rd.flatten() {
+                let p = e.path();
+                let Ok(md) = std::fs::metadata(&p) else { continue };
+                if md.is_dir() {
+                    walk(base, &p, out);
+                } else {
+                    let rel = p.strip_prefix(base).unwrap().to_string_lossy().replace('\\', "/");
+                    let body = std::fs::read(&p).unwrap_or_default();
+                    // FNV-1a: no dependency, and collisions do not matter for
+                    // "did these bytes change".
+                    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+                    for b in &body {
+                        h ^= *b as u64;
+                        h = h.wrapping_mul(0x1000_0000_01b3);
+                    }
+                    out.push((rel, md.len(), h));
+                }
+            }
+        }
+        let mut v = Vec::new();
+        walk(dir, dir, &mut v);
+        v.sort();
+        v
+    }
+
+    let mount_root = std::path::PathBuf::from(format!("{mountpoint}\\"));
+    let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+    let mut rng = move || {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        seed >> 11
+    };
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut worst = Duration::ZERO;
+        for round in 0..12 {
+            // One mutation per round, cycling the kinds so every one is
+            // exercised several times.
+            let n = rng() % 40;
+            match round % 5 {
+                0 => {
+                    std::fs::write(root.join(format!("new{n}.txt")), vec![b'a'; (n as usize) + 1]).unwrap();
+                }
+                1 => {
+                    // Grow an existing file.
+                    std::fs::write(root.join("hello.txt"), vec![b'g'; 100 + n as usize]).unwrap();
+                }
+                2 => {
+                    // SAME SIZE, different bytes — the shape that hid on L:.
+                    let cur = std::fs::read(root.join("hello.txt")).unwrap();
+                    let flipped: Vec<u8> = cur.iter().map(|b| b ^ 0x20).collect();
+                    std::fs::write(root.join("hello.txt"), &flipped).unwrap();
+                }
+                3 => {
+                    std::fs::write(
+                        root.join("sub").join("nested.bin"),
+                        vec![(n % 251) as u8; 1000 + n as usize],
+                    )
+                    .unwrap();
+                }
+                _ => {
+                    let victim = root.join(format!("new{}.txt", n % 40));
+                    if victim.exists() {
+                        std::fs::remove_file(&victim).unwrap();
+                    }
+                }
+            }
+
+            // Converge, with a bound. Anything that needs more than this is
+            // the bug the test is looking for.
+            let want = picture(&root);
+            let start = std::time::Instant::now();
+            let deadline = start + Duration::from_secs(10);
+            let mut got = picture(&mount_root);
+            while got != want && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+                got = picture(&mount_root);
+            }
+            worst = worst.max(start.elapsed());
+
+            assert_eq!(
+                got.len(),
+                want.len(),
+                "round {round}: the mount lists {} files, the origin has {}",
+                got.len(),
+                want.len()
+            );
+            for (a, b) in got.iter().zip(&want) {
+                assert_eq!(a.0, b.0, "round {round}: name mismatch");
+                assert_eq!(a.1, b.1, "round {round}: {} size {} vs {}", a.0, a.1, b.1);
+                assert_eq!(
+                    a.2, b.2,
+                    "round {round}: {} has the right SIZE and the wrong BYTES — \
+                     a layer is serving a stale copy that no attribute check would catch",
+                    a.0
+                );
+            }
+        }
+        println!("  12 churn rounds agreed; slowest convergence {worst:?}");
+    }));
+
+    drive.unmount();
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+/// Writes THROUGH the mount must land on the server as bytes, not as size.
+///
+/// The hypothesis this tests, and the reason it is worth a test of its own: a
+/// file that is the right length and entirely NUL is not a truncated
+/// transfer. A truncated transfer is SHORT. Full-size-and-zero is what you get
+/// when the size landed and the data did not — `ftruncate` with no writes
+/// leaves a sparse file that reads back as zeros. Which makes it a metadata /
+/// data split on the WRITE path, the mirror of the stale-read split on the
+/// read path.
+///
+/// One such file turned up at the origin during the 2026-08-23 incident:
+/// `mockup/README.md`, 11,684 bytes, zero printable characters, while the
+/// mount served the correct content. It has since been overwritten so the
+/// evidence is gone, and the push was `scp` rather than the mount — so this
+/// does not reproduce that file. It closes the gap that made it impossible to
+/// rule the mount out.
+///
+/// Every case here ends with the SERVER's bytes being read directly, never
+/// through the mount: reading back through the thing under test is how the
+/// original went unnoticed for twenty minutes.
+#[cfg(windows)]
+#[test]
+fn a_write_through_the_mount_lands_as_bytes_on_the_server() {
+    use std::io::{Seek, SeekFrom, Write};
+
+    let Some(claim) = claim_drive_letter() else {
+        eprintln!("SKIP: no free drive letter");
+        return;
+    };
+    let letter = claim.letter;
+    let mountpoint = format!("{letter}:");
+
+    let fixture = fixture();
+    let root = fixture.dir.path().to_path_buf();
+    let drive = match alloyfs_mount_winfsp::mount(
+        fixture.fs.clone(),
+        &mountpoint,
+        "writes",
+        Some(Duration::from_micros(300)),
+    ) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("SKIP: could not mount: {e}");
+            return;
+        }
+    };
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mp = std::path::Path::new(&mountpoint);
+
+        // 1. A plain create-and-write.
+        let body = vec![b'k'; 11_684]; // the size of the file that started this
+        std::fs::write(mp.join("plain.bin"), &body).expect("write through the mount");
+        let on_server = std::fs::read(root.join("plain.bin")).expect("read the server's copy");
+        assert_eq!(on_server.len(), body.len(), "plain: size");
+        assert!(
+            on_server.iter().any(|&b| b != 0),
+            "plain: the server has {} bytes and every one is NUL — the size landed \
+             and the data did not",
+            on_server.len()
+        );
+        assert_eq!(on_server, body, "plain: bytes");
+
+        // 2. Truncate-then-write, which is what an editor saving a file does,
+        //    and the sequence that would leave a hole if the write half were
+        //    lost.
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(mp.join("plain.bin"))
+                .expect("reopen truncating");
+            f.write_all(&vec![b'j'; 9_000]).expect("write");
+            f.flush().expect("flush");
+        }
+        let on_server = std::fs::read(root.join("plain.bin")).expect("server copy");
+        assert_eq!(on_server.len(), 9_000, "truncate+write: size");
+        assert!(
+            on_server.iter().all(|&b| b == b'j'),
+            "truncate+write: the server kept a hole where the new bytes should be"
+        );
+
+        // 3. Grow by seeking PAST the end and writing, which creates a real
+        //    hole on purpose. The hole must be NUL and the written tail must
+        //    be present — a filesystem that loses the tail here reports a
+        //    perfectly-sized all-NUL file.
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(mp.join("holed.bin"))
+                .expect("create");
+            f.seek(SeekFrom::Start(5_000)).expect("seek past the end");
+            f.write_all(b"TAIL").expect("write the tail");
+            f.flush().expect("flush");
+        }
+        let on_server = std::fs::read(root.join("holed.bin")).expect("server copy");
+        assert_eq!(on_server.len(), 5_004, "holed: size");
+        assert_eq!(&on_server[5_000..], b"TAIL", "holed: the tail must survive");
+        assert!(
+            on_server[..5_000].iter().all(|&b| b == 0),
+            "holed: the hole must read as NUL"
+        );
+
+        // 4. Many small writes on one handle, the shape the write batcher
+        //    coalesces — and therefore the shape where a lost batch would
+        //    leave size without bytes.
+        {
+            let mut f = std::fs::File::create(mp.join("batched.bin")).expect("create");
+            for i in 0..400 {
+                f.write_all(&[(i % 251) as u8; 32]).expect("write");
+            }
+            f.flush().expect("flush");
+        }
+        let on_server = std::fs::read(root.join("batched.bin")).expect("server copy");
+        assert_eq!(on_server.len(), 400 * 32, "batched: size");
+        let expected: Vec<u8> = (0..400).flat_map(|i| [(i % 251) as u8; 32]).collect();
+        assert_eq!(on_server, expected, "batched: bytes, in order");
+
+        // 5. The counter that exists for exactly this. A settle failure means
+        //    the client acknowledged a write the server then refused, which is
+        //    the state that produces a file the mount believes in and the
+        //    origin does not.
+        assert_eq!(
+            fixture.fs.batch_settle_failures(),
+            0,
+            "the client acknowledged writes the server did not accept"
+        );
+    }));
+
+    drive.unmount();
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
