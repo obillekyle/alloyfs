@@ -1350,31 +1350,44 @@ pub fn mount(
         // deliberately not set: per fsctl.h it merely OVERRIDES this value,
         // so listings ride the same revocation.
         //
-        // u32::MAX rather than a number of seconds, because it means something
-        // different in kind: it hands the Windows CACHE MANAGER the volume, so
-        // repeat reads are served without reaching this process at all. It is
-        // all-or-nothing — 300 s behaves exactly like 30 s, measured — and the
-        // difference is large. Five hundred reads of one 64 KiB range:
+        // A BOUNDED number of seconds, never u32::MAX. The difference is not
+        // degree, it is kind: u32::MAX hands the Windows CACHE MANAGER the
+        // volume, so repeat reads are served without reaching this process at
+        // all. Five hundred reads of one 64 KiB range:
         //
         //     FileInfoTimeout      reads reaching us      p50       p95
         //       30 s                     500            59.7 us   ~121 us
         //       300 s                    500            72.1 us    314 us
         //       u32::MAX                   0             9.2 us     19 us
         //
-        // Local disk on the same box is 8.3 us / 17 us, so cached reads now run
-        // at local speed and never cross the boundary.
+        // That 6.5x is real and it is given up on purpose, because u32::MAX
+        // also serves STALE DATA and nothing here can stop it.
         //
-        // Safe because the timeout was never what made this correct. Our notify
-        // path is: a server-side change evicts the kernel's metadata AND its
-        // cached data, verified rather than assumed — a file read 21 times
-        // reached this process once, and one remote change put the next read
-        // back through to us. What the old 30 s bought was a bound on how long
-        // a mount stayed wrong if that path stopped working, and `canary.rs`
-        // now provides that bound by checking the thing itself: it re-stats
-        // cached paths against the server on a timer and treats any
-        // disagreement as a change. A clock cannot tell you invalidation is
-        // broken; a comparison can.
-        .file_info_timeout(u32::MAX)
+        // This was shipped in alpha.90 and found on a live mount the same day:
+        // eleven files served content from before an out-of-band change while
+        // reporting the size and mtime from after it. The origin and our own
+        // blob cache agreed byte for byte; only the bytes handed back through
+        // the drive letter were old, and they stayed old for twenty minutes.
+        //
+        // The claim it shipped under was that a server-side change "evicts the
+        // kernel's metadata AND its cached data". Only the first half is true.
+        // FspFileNodeInvalidateCachesAndNotifyChangeByName purges FileInfo,
+        // security and dir-info — metadata, all of it — which is why size and
+        // mtime were correct throughout. The cached data sections are not
+        // reachable from here: `flush_and_purge_on_cleanup` was tried against
+        // the reproduction and does not help either.
+        //
+        // The trigger is a change that does not move the file's SIZE, which is
+        // why one verification missed it. `tests/smoke.rs`
+        // (`a_same_size_server_change_reaches_the_next_read`) reproduces it in
+        // 0.2 s and fails on any u32::MAX build: it reads one file through
+        // `RemoteFs` and through the mount, and the two disagree.
+        //
+        // Note also what `canary.rs` cannot do about this. It re-stats cached
+        // paths and treats disagreement as a change — but it compares ATTRS,
+        // and a same-size content edit leaves every attr identical. A
+        // comparison is only a check on the thing it actually compares.
+        .file_info_timeout(30_000)
         // Only post Cleanup when something actually changed (or a delete is
         // pending) — saves a callback storm on read-only workloads.
         .post_cleanup_when_modified_only(true)

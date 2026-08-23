@@ -56,9 +56,11 @@ fn free_drive_letter() -> Option<char> {
 }
 
 struct Fixture {
-    _dir: tempfile::TempDir,
+    dir: tempfile::TempDir,
     fs: Arc<RemoteFs>,
     _rt: tokio::runtime::Runtime,
+    /// Dropping this stops the OS watcher, so it has to outlive the test.
+    _watch: alloyfs_agent::watch::WatchGuard,
 }
 
 /// A real agent over `tokio::io::duplex`, and a `RemoteFs` attached to it.
@@ -92,6 +94,20 @@ fn fixture() -> Fixture {
         .build()
         .expect("runtime");
 
+    // The watcher is what turns a server-side change into an event, so the
+    // staleness test needs it running. It calls `tokio::spawn` internally, so
+    // it has to be built inside the runtime context, not beside it.
+    let export = registry.get("test").expect("export");
+    let watch = {
+        let _guard = rt.enter();
+        alloyfs_agent::watch::spawn(
+            export.clone(),
+            export.events.clone(),
+            std::time::Duration::from_millis(50),
+        )
+        .expect("watcher")
+    };
+
     let fs = rt.block_on(async {
         let (client_io, server_io) = tokio::io::duplex(4 * 1024 * 1024);
         let handler: Arc<dyn RequestHandler> = Arc::new(AgentSession::new(registry));
@@ -107,9 +123,10 @@ fn fixture() -> Fixture {
     });
 
     Fixture {
-        _dir: dir,
+        dir,
         fs,
         _rt: rt,
+        _watch: watch,
     }
 }
 
@@ -215,4 +232,124 @@ fn a_volume_mounts_reads_and_unmounts() {
         0,
         "{letter}: must be free again after unmount"
     );
+}
+
+/// Read the whole of `path` through `RemoteFs` directly, bypassing Windows.
+///
+/// The point of the test below is to compare this against what the same file
+/// looks like through the mount: `RemoteFs` is everything AlloyFS owns, and
+/// the mount is that plus the Windows I/O manager and its cache manager. When
+/// the two disagree, the difference is the part we do not own.
+fn read_via_client(fs: &Arc<RemoteFs>, rt: &tokio::runtime::Handle, name: &str) -> Vec<u8> {
+    let fs = fs.clone();
+    let name = name.to_string();
+    rt.block_on(async move {
+        tokio::task::spawn_blocking(move || {
+            let (ino, _) = fs.lookup(alloyfs_client::ROOT_INO, &name).expect("lookup");
+            let (fh, attr) = fs
+                .open(
+                    ino,
+                    alloyfs_proto::OpenFlags {
+                        read: true,
+                        ..Default::default()
+                    },
+                )
+                .expect("open");
+            let data = fs.read(fh, 0, attr.size as u32).expect("read");
+            fs.release(fh);
+            data
+        })
+        .await
+        .expect("join")
+    })
+}
+
+/// A server-side change that does NOT move the file's size must still reach
+/// the next read through the mount.
+///
+/// This is the live-mount failure of 2026-08-23 reduced to one test. On `L:`,
+/// eleven files served content from before an out-of-band `scp` while
+/// reporting the size and mtime from after it — the origin and the AlloyFS
+/// blob cache agreed byte for byte, and only the bytes handed back through the
+/// drive letter were old. The trigger was a same-length edit (a `?v=7` →
+/// `?v=8` cache-buster), which is why it had gone unnoticed: a change that
+/// moves the size does not show it.
+///
+/// The test reads the same file two ways on purpose. `read_via_client` is
+/// everything AlloyFS owns; `std::fs::read` is that plus the Windows cache
+/// manager, which `file_info_timeout(u32::MAX)` deliberately hands the volume
+/// to. If the client sees the new bytes and the mount does not, the stale copy
+/// is being held above us and no amount of invalidation inside AlloyFS will
+/// fix it — which is the question that decides the fix, so the assertions
+/// report both rather than just failing.
+#[test]
+fn a_same_size_server_change_reaches_the_next_read() {
+    let Some(letter) = free_drive_letter() else {
+        eprintln!("SKIP: no free drive letter");
+        return;
+    };
+    let fixture = fixture();
+    let mountpoint = format!("{letter}:");
+    let backing = fixture.dir.path().join("hello.txt");
+
+    let drive = match alloyfs_mount_winfsp::mount(
+        fixture.fs.clone(),
+        &mountpoint,
+        "stale",
+        Some(Duration::from_micros(300)),
+    ) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("SKIP: could not mount at {mountpoint}: {e}");
+            return;
+        }
+    };
+    let rt = fixture._rt.handle().clone();
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let path = std::path::Path::new(&mountpoint).join("hello.txt");
+
+        // Read it first, so Windows has something cached to serve staly.
+        let before = std::fs::read(&path).expect("first read");
+        assert_eq!(before, b"mounted through winfsp\n", "baseline");
+
+        // Same length, different bytes — exactly the shape that hid on L:.
+        let after_bytes = b"MOUNTED THROUGH WINFSP\n";
+        assert_eq!(after_bytes.len(), before.len(), "the edit must not move the size");
+        std::fs::write(&backing, after_bytes).expect("change the file on the server");
+
+        // Wait for AlloyFS itself to see it. If this times out the failure is
+        // ours — the event never arrived — and that is a different bug from
+        // the one this test is about, so it is reported separately.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut via_client = Vec::new();
+        while std::time::Instant::now() < deadline {
+            via_client = read_via_client(&fixture.fs, &rt, "hello.txt");
+            if via_client == after_bytes {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert_eq!(
+            String::from_utf8_lossy(&via_client),
+            String::from_utf8_lossy(after_bytes),
+            "AlloyFS itself never saw the change — the event pipeline is broken, \
+             which is a different bug from the one this test is for"
+        );
+
+        // AlloyFS has the new bytes. Now: does the mount?
+        let via_mount = std::fs::read(&path).expect("second read");
+        assert_eq!(
+            String::from_utf8_lossy(&via_mount),
+            String::from_utf8_lossy(after_bytes),
+            "the client returned the NEW bytes and the mount returned the OLD ones, \
+             so the stale copy is held above AlloyFS — in the Windows cache manager \
+             that file_info_timeout(u32::MAX) hands the volume to"
+        );
+    }));
+
+    drive.unmount();
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
 }
