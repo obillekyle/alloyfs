@@ -125,12 +125,32 @@ newer_of() {
   # Equal cores: a release beats its own prereleases.
   if [ -z "$a_pre" ]; then printf '%s' "$a"; return; fi
   if [ -z "$b_pre" ]; then printf '%s' "$b"; return; fi
-  # Both prereleases: compare the trailing identifier, numerically if it is one.
-  x=${a_pre##*.}; y=${b_pre##*.}
-  case "$x$y" in
-    *[!0-9]*) if [ "$x" \> "$y" ]; then printf '%s' "$a"; else printf '%s' "$b"; fi ;;
-    *) if [ "$x" -gt "$y" ]; then printf '%s' "$a"; else printf '%s' "$b"; fi ;;
-  esac
+  # Both prereleases: identifier by identifier, left to right — NOT the
+  # trailing one alone. Comparing only the last field says alpha.93 beats
+  # beta.0, because it sees 93 against 0 and never looks at the channel. That
+  # breaks the one upgrade that matters at a channel change: everyone on the
+  # alpha line would sit there forever while beta shipped.
+  i=1
+  while :; do
+    x=$(printf '%s' "$a_pre" | cut -d. -f"$i")
+    y=$(printf '%s' "$b_pre" | cut -d. -f"$i")
+    # Ran out of identifiers on both: equal, so neither is newer.
+    if [ -z "$x" ] && [ -z "$y" ]; then printf '%s' "$b"; return; fi
+    # Per semver, a larger set of identifiers wins when all before it match.
+    if [ -z "$x" ]; then printf '%s' "$b"; return; fi
+    if [ -z "$y" ]; then printf '%s' "$a"; return; fi
+    if [ "$x" != "$y" ]; then
+      case "$x$y" in
+        # Either side non-numeric: compare as text. This also gives the
+        # semver rule that a numeric identifier ranks below an alphanumeric
+        # one, since digits sort before letters.
+        *[!0-9]*) if [ "$x" \> "$y" ]; then printf '%s' "$a"; else printf '%s' "$b"; fi ;;
+        *) if [ "$x" -gt "$y" ]; then printf '%s' "$a"; else printf '%s' "$b"; fi ;;
+      esac
+      return
+    fi
+    i=$((i + 1))
+  done
 }
 
 tag_from() {

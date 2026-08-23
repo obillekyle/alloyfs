@@ -422,6 +422,19 @@ mod tests {
         assert!(!is_newer("v1.0.0-alpha.9", "v1.0.0-alpha.62"));
         assert!(is_newer("v1.0.0-beta.1", "v1.0.0-alpha.99"));
 
+        // The channel change this project is making. The prerelease counter
+        // RESETS per channel, so alpha.93 is followed by beta.0 — and beta.0
+        // has to outrank it even though 0 is less than 93. Comparing only the
+        // TRAILING identifier gets this exactly backwards, which is what
+        // `docs/install.sh` and `docs/install.ps1` did until they were fixed
+        // to walk the identifiers the way this loop does. The consequence
+        // there was not academic: every machine on the alpha line would have
+        // sat on it forever while beta shipped, because `alloyfs update` runs
+        // those scripts.
+        assert!(is_newer("v1.0.0-beta.0", "v1.0.0-alpha.93"));
+        assert!(!is_newer("v1.0.0-alpha.93", "v1.0.0-beta.0"));
+        assert!(is_newer("v1.0.0-rc.0", "v1.0.0-beta.9"));
+
         // A `v` prefix is optional on either side.
         assert!(is_newer("1.0.1", "v1.0.0"));
     }
