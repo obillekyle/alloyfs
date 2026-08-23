@@ -1348,9 +1348,33 @@ pub fn mount(
         // and the timeout only bounds staleness if the pump dies silently —
         // the same role the user-mode 5 s floor plays. DirInfoTimeout is
         // deliberately not set: per fsctl.h it merely OVERRIDES this value,
-        // so listings ride the same 30 s + revocation. Repeat stats and
-        // re-listings inside the window never reach user mode at all.
-        .file_info_timeout(30_000)
+        // so listings ride the same revocation.
+        //
+        // u32::MAX rather than a number of seconds, because it means something
+        // different in kind: it hands the Windows CACHE MANAGER the volume, so
+        // repeat reads are served without reaching this process at all. It is
+        // all-or-nothing — 300 s behaves exactly like 30 s, measured — and the
+        // difference is large. Five hundred reads of one 64 KiB range:
+        //
+        //     FileInfoTimeout      reads reaching us      p50       p95
+        //       30 s                     500            59.7 us   ~121 us
+        //       300 s                    500            72.1 us    314 us
+        //       u32::MAX                   0             9.2 us     19 us
+        //
+        // Local disk on the same box is 8.3 us / 17 us, so cached reads now run
+        // at local speed and never cross the boundary.
+        //
+        // Safe because the timeout was never what made this correct. Our notify
+        // path is: a server-side change evicts the kernel's metadata AND its
+        // cached data, verified rather than assumed — a file read 21 times
+        // reached this process once, and one remote change put the next read
+        // back through to us. What the old 30 s bought was a bound on how long
+        // a mount stayed wrong if that path stopped working, and `canary.rs`
+        // now provides that bound by checking the thing itself: it re-stats
+        // cached paths against the server on a timer and treats any
+        // disagreement as a change. A clock cannot tell you invalidation is
+        // broken; a comparison can.
+        .file_info_timeout(u32::MAX)
         // Only post Cleanup when something actually changed (or a delete is
         // pending) — saves a callback storm on read-only workloads.
         .post_cleanup_when_modified_only(true)

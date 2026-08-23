@@ -48,7 +48,7 @@ impl RemoteFs {
     }
 
     /// Auto-cache maintenance driven by (already overlay-filtered) events.
-    fn apply_events_to_cache(&self, batch: &[FsEvent]) {
+    pub(crate) fn apply_events_to_cache(&self, batch: &[FsEvent]) {
         let Some(cache) = &self.cache else { return };
         for ev in batch {
             match &ev.kind {
@@ -198,7 +198,7 @@ impl RemoteFs {
     /// the connection closes, as before.
     pub async fn start_event_pump(
         self: &Arc<Self>,
-        on_batch: impl Fn(&[FsEvent]) + Send + 'static,
+        on_batch: impl Fn(&[FsEvent]) + Send + Sync + 'static,
     ) -> Result<u64, FsError> {
         // Resume from where the cache left off, not from nothing. The manifest
         // records the sequence its blobs were current at, so a mount that finds
@@ -223,7 +223,7 @@ impl RemoteFs {
     pub async fn start_event_pump_since(
         self: &Arc<Self>,
         since: Option<u64>,
-        on_batch: impl Fn(&[FsEvent]) + Send + 'static,
+        on_batch: impl Fn(&[FsEvent]) + Send + Sync + 'static,
     ) -> Result<u64, FsError> {
         let conn = self.conn();
         // Receiver BEFORE Subscribe: catchup batches pushed with no receiver
@@ -261,6 +261,13 @@ impl RemoteFs {
             self.last_event_seq
                 .fetch_max(s, std::sync::atomic::Ordering::AcqRel);
         }
+        // Share the mount's callback rather than consuming it: the canary
+        // needs the same route into the kernel's notifier that a real server
+        // event takes, or a path it finds stale would be dropped from our
+        // caches and left in the kernel's.
+        let sink: crate::remote_fs::EventSink = std::sync::Arc::new(on_batch);
+        let _ = self.event_sink.set(sink.clone());
+        crate::canary::spawn(self.clone());
         let fs = self.clone();
         tokio::spawn(async move {
             let mut rx = rx;
@@ -299,7 +306,7 @@ impl RemoteFs {
                                     tracing::error!(error = %e, "cache maintenance for an event batch died");
                                 }
                                 fs.spawn_attr_rewarm(hot);
-                                on_batch(&batch);
+                                sink(&batch);
                             }
                             // A cleanly received batch is proof the stream
                             // flows: after a lag flushed the caches, this is

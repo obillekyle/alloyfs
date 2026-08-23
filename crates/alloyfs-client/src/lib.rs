@@ -8,6 +8,7 @@
 
 mod autocache;
 mod batcher;
+mod canary;
 mod error;
 mod events;
 mod inode;

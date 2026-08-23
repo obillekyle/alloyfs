@@ -155,12 +155,22 @@ pub(crate) struct OpenState {
     pub version: AtomicU64,
 }
 
+/// The mount's callback for a batch of events: what turns an invalidation
+/// into a kernel-cache eviction. Shared rather than owned by the pump, so the
+/// canary can push synthetic events down the same route.
+pub(crate) type EventSink = std::sync::Arc<dyn Fn(&[alloyfs_proto::FsEvent]) + Send + Sync>;
+
 pub struct RemoteFs {
     conn: RwLock<Arc<MuxConnection>>,
     pub(crate) rt: tokio::runtime::Handle,
     pub ino: crate::InodeTable,
     pub root_attr: Attr,
     attr_cache: DashMap<u64, (Attr, Instant)>,
+    /// Where the rotating canary sample resumes each round.
+    canary_cursor: AtomicU64,
+    /// The mount's event callback, kept so paths the canary finds stale can be
+    /// pushed through the same notifier a real server event uses.
+    pub(crate) event_sink: std::sync::OnceLock<EventSink>,
     /// Complete REMOTE listing per directory ino, good for [`DIR_TTL_PUSH`]/[`DIR_TTL_POLL`] (pump-health-dependent) or
     /// until an event touches a child. One structure, three answers:
     ///
@@ -359,6 +369,8 @@ impl RemoteFs {
             ino: crate::InodeTable::new(),
             root_attr,
             attr_cache: DashMap::new(),
+            canary_cursor: AtomicU64::new(0),
+            event_sink: std::sync::OnceLock::new(),
             attr_epoch: AtomicU64::new(0),
             rewarmed: AtomicU64::new(0),
             settle_failures: AtomicU64::new(0),
@@ -429,6 +441,66 @@ impl RemoteFs {
     ///
     /// The numbers existed and were logged exactly once, at shutdown, which
     /// is the one moment nobody is looking. `alloyfs status` asks here.
+    /// A few paths the kernel could currently be answering from cache, for the
+    /// canary to re-check.
+    ///
+    /// ROTATING, not the first n. A fixed window would re-check the same
+    /// handful forever and never notice a change anywhere else — for a
+    /// detector, the difference between working and appearing to.
+    ///
+    /// Sampling rather than sweeping is deliberate: a pump that has stopped is
+    /// wrong about everything, so a handful of paths finds it as surely as all
+    /// of them, at one bulk stat instead of thousands.
+    pub(crate) fn sample_cached_paths(&self, n: usize) -> Vec<RelPath> {
+        let all: Vec<RelPath> = self
+            .attr_cache
+            .iter()
+            .filter_map(|e| self.ino.path_of(*e.key()))
+            .filter(|p| !p.is_root() && !self.is_overlay(p))
+            .collect();
+        if all.is_empty() {
+            return Vec::new();
+        }
+        let start = self.canary_cursor.fetch_add(n as u64, Ordering::Relaxed) as usize % all.len();
+        all.iter()
+            .cycle()
+            .skip(start)
+            .take(n.min(all.len()))
+            .cloned()
+            .collect()
+    }
+
+    /// Does the server's attr disagree with what we hold for `path`?
+    ///
+    /// Only what a client would notice and act on: size, mtime, version. A
+    /// difference means a change nobody told us about.
+    pub(crate) fn cached_attr_differs(&self, path: &RelPath, server: &Attr) -> bool {
+        let Some(ino) = self.ino.ino_of(path) else {
+            return false; // not tracked; nothing of ours to be stale
+        };
+        let Some(hit) = self.attr_cache.get(&ino) else {
+            return false;
+        };
+        let ours = hit.0;
+        ours.size != server.size
+            || ours.mtime != server.mtime
+            // Version 0 on either side is "unknowable" — the same escape hatch
+            // blob freshness uses. Treating it as a difference would make the
+            // canary cry wolf on every export nobody writes through alloyfs.
+            || (ours.version != 0 && server.version != 0 && ours.version != server.version)
+    }
+
+    /// Treat these paths as changed: drop them from our caches and push them
+    /// through the mount's notifier, which is what evicts the kernel's copies.
+    pub(crate) fn force_invalidate(&self, paths: &[RelPath]) {
+        let batch = crate::canary::events_for(paths);
+        self.apply_events(&batch);
+        self.apply_events_to_cache(&batch);
+        if let Some(sink) = self.event_sink.get() {
+            sink(&batch);
+        }
+    }
+
     pub fn cache_stats(&self) -> Option<(usize, u64)> {
         self.cache.as_ref().map(|c| c.stats())
     }
