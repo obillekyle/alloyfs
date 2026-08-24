@@ -37,6 +37,18 @@ impl RemoteFs {
         if self.batch.as_ref().is_some_and(|b| b.involves(&path)) {
             self.barrier_for(&path)?;
         }
+        // The barrier alone is not enough, and this is why: an UNSEALED
+        // pending file's bytes live on its own handle, not in the queue, so
+        // `barrier_for` — which drains the queue and checks damage — leaves it
+        // exactly where it was. The open then went to the wire, and the
+        // agent's `open` has no create, so it answered NotFound for a file
+        // `ls` had just listed.
+        //
+        // `rename` and `copy_range` already call this for the same reason.
+        // Reachable through all three backends, and the same root cause made
+        // `flock()` and `chmod +x` fail on a file you had just written and
+        // still held open.
+        self.materialize_open_pending(&path)?;
         // Read-only, and the cache already holds this file at the version the
         // last listing reported? Then the server has nothing to add. Skipping
         // the round trip here is what makes browsing a remote tree bearable:

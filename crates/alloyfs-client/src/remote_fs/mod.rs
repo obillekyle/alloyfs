@@ -650,6 +650,24 @@ impl RemoteFs {
         if existing != NO_SERVER_FH {
             return Ok(existing);
         }
+        // An unsealed pending-new file has to reach the server before anything
+        // can ask for a handle on it. Its bytes live on this handle, not in the
+        // queue, so a barrier does not move them — and the `Open` below would
+        // ask for a path the server has never heard of and get NotFound.
+        //
+        // That is what made `flock()` and `F_SETLK` fail on a file you had
+        // just created and still held open, though the batcher's own
+        // documentation lists taking a lock as a barrier point.
+        {
+            let pending_path = self.open_files.get(&fh).map(|s| s.path.clone());
+            if let Some(p) = pending_path {
+                self.materialize_open_pending(&p)?;
+            }
+        }
+        let existing = self.server_fh(fh);
+        if existing != NO_SERVER_FH {
+            return Ok(existing);
+        }
         let (path, flags) = {
             let Some(state) = self.open_files.get(&fh) else {
                 return Err(ErrorCode::BadHandle.into());

@@ -136,7 +136,7 @@ impl Export {
     }
 
     /// Every sidecar's view of a removal — whichever platform carries one.
-    fn sidecars_remove(&self, rel: &RelPath) {
+    pub(crate) fn sidecars_remove(&self, rel: &RelPath) {
         self.winattrs.remove(rel);
         #[cfg(windows)]
         self.posix_modes.remove(rel);
@@ -164,7 +164,7 @@ impl Export {
     }
 
     /// Every sidecar's view of a rename.
-    fn sidecars_rename(&self, from: &RelPath, to: &RelPath) {
+    pub(crate) fn sidecars_rename(&self, from: &RelPath, to: &RelPath) {
         self.winattrs.rename(from, to);
         #[cfg(windows)]
         self.posix_modes.rename(from, to);

@@ -133,9 +133,27 @@ impl EventHub {
             None => Vec::new(),
             Some(since) => {
                 let log = self.log.lock().unwrap();
+                // A cursor from the FUTURE means this is not the agent that
+                // issued it. Sequence numbers restart at zero when the agent
+                // does, so a mount resubscribing at its old cursor was told
+                // "you are caught up" by an agent that had never sent it
+                // anything — and `pump_healthy` went true on the strength of
+                // it. `last_event_seq` uses `fetch_max`, so every later
+                // reconnect repeated the same false reassurance.
+                //
+                // `TooOld` is the right answer: it already means "resubscribe
+                // live and drop what you were holding", which is exactly the
+                // recovery a restarted agent needs. The sync engine checks
+                // this; the mount's pump did not.
+                //
+                // Compared against `last_seq()` rather than `since + 1` so
+                // `u64::MAX` cannot overflow the way the check below could.
+                if since > self.last_seq() {
+                    return Err(ErrorCode::TooOld);
+                }
                 match log.front() {
                     // Ring must contain (since+1); its head is the oldest kept.
-                    Some(head) if head.seq > since + 1 => return Err(ErrorCode::TooOld),
+                    Some(head) if head.seq > since.saturating_add(1) => return Err(ErrorCode::TooOld),
                     // Seek rather than scan; see `since`.
                     _ => {
                         let start = log.partition_point(|e| e.seq <= since);
@@ -399,10 +417,36 @@ async fn publish_batch(export: &Arc<Export>, hub: &Arc<EventHub>, batch: Vec<(Re
             match kind {
                 EventKind::RenamedFrom { to } => {
                     export.rename_version(path, to);
+                    // The sidecars move with the file. Only the RENAME HANDLER
+                    // did this, so a rename observed by the watcher — anything
+                    // done over SSH, by another process, or by a second agent
+                    // — left the Hidden/System bits (or the POSIX mode on a
+                    // Windows export) keyed to a path that no longer exists.
+                    export.sidecars_rename(path, to);
                     changes.push((path.clone(), true));
                     changes.push((to.clone(), false));
                 }
-                EventKind::Removed => changes.push((path.clone(), true)),
+                EventKind::Removed => {
+                    // Both of these were missing, and both matter.
+                    //
+                    // `forget_version` closes the leak it was written for:
+                    // out-of-band create/delete churn over unique names grew
+                    // the versions map without bound, which its own doc
+                    // records as ending in an OOM kill on a small agent. The
+                    // mutation path called it; the watcher path did not, so
+                    // the leak stayed fully open for exactly the workload that
+                    // produces the most churn.
+                    //
+                    // `sidecars_remove` stops entries being RESURRECTED. Mark
+                    // `report.pdf` Hidden, delete it over SSH, drop a new file
+                    // of the same name in — `with_winattrs` reads the stale
+                    // entry and every Windows client sees the new file as
+                    // Hidden, with nothing on disk to explain it. The sidecar
+                    // prunes vanished paths only at process start.
+                    export.forget_version(path);
+                    export.sidecars_remove(path);
+                    changes.push((path.clone(), true));
+                }
                 // A gap means the watcher stopped being able to describe what
                 // changed, so the index describes a state that may never have
                 // existed. Dropping it costs one rebuild — cheap enough that

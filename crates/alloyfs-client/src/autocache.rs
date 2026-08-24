@@ -336,15 +336,24 @@ impl AutoCache {
         }
         // Enforce the budget at load too: a remount with a smaller budget
         // must shrink the cache immediately, not on the next refetch.
-        if total > cfg.budget {
-            let mut victims: Vec<(RelPath, u64, u64, bool)> = entries
+        // The COMBINED budget, because `total` sums both pools. Comparing it
+        // against `cfg.budget` — the AUTO budget alone — discarded warm
+        // content above it on every single remount: the defaults are 512 MiB
+        // auto against 4 GiB warm, deliberately 8x, so the large file that
+        // `warm-max` exists to keep could never survive a remount. Runtime
+        // commits charge each pool against its own budget; load now agrees
+        // with them instead of enforcing a limit that was never meant to
+        // cover warm bytes.
+        let combined = cfg.budget.saturating_add(cfg.warm_budget);
+        if total > combined {
+            let mut victims: Vec<(RelPath, u64, u64, bool, bool)> = entries
                 .iter()
-                .map(|(p, e)| (p.clone(), e.last_used, e.on_disk, e.pinned))
+                .map(|(p, e)| (p.clone(), e.last_used, e.on_disk, e.pinned, e.warm))
                 .collect();
-            victims.sort_by_key(|(_, used, _, _)| *used);
+            victims.sort_by_key(|(_, used, _, _, _)| *used);
             let mut evicted = 0usize;
-            for (p, _, size, pinned) in victims {
-                if total <= cfg.budget {
+            for (p, _, size, pinned, warm) in victims {
+                if total <= combined {
                     break;
                 }
                 if pinned {
@@ -352,6 +361,17 @@ impl AutoCache {
                 }
                 entries.remove(&p);
                 total -= size;
+                // `warm_total` tracks the warm pool and has to shrink with it.
+                // Leaving it un-adjusted let `warm_bytes` exceed `total_bytes`,
+                // and `pool_bytes` computes `total_bytes - warm_bytes` — an
+                // underflow. In dev that panics INSIDE the `CacheState` mutex
+                // guard, poisoning it, after which every later cache call
+                // panics: `fresh_for`, `commit`, `invalidate`, `stats`, and the
+                // event pump's apply. In release it wraps, and the budget
+                // silently stops bounding disk use at all.
+                if warm {
+                    warm_total = warm_total.saturating_sub(size);
+                }
                 let _ = std::fs::remove_file(blob_path(&cfg.root, &p));
                 evicted += 1;
             }
@@ -361,10 +381,10 @@ impl AutoCache {
                 loaded_token = 0;
                 tracing::info!(evicted, bytes = total, "auto-cache shrank to fit budget at load");
             }
-            if total > cfg.budget {
+            if total > combined {
                 tracing::warn!(
                     bytes = total,
-                    budget = cfg.budget,
+                    budget = combined,
                     "pinned files alone exceed the cache budget"
                 );
             }

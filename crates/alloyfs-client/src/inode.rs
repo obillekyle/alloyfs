@@ -74,6 +74,27 @@ impl InodeTable {
             if let Some((_, old_path)) = self.by_ino.remove(&ino) {
                 self.by_path.remove(&old_path);
             }
+            // A REPLACING rename leaves the displaced inode behind, and it has
+            // to go. `by_path.insert` overwrote the destination's mapping while
+            // the old inode kept its `by_ino` entry pointing at the same path —
+            // a dangling alias. `forget(displaced)` then removed
+            // `by_path[that path]`, which by then belonged to the LIVE inode,
+            // and the WinFsp backend forgets on every failed resolve.
+            //
+            // What that costs: `st_ino` changes for a file that never moved,
+            // breaking `(dev,ino)` identity for make, rsync and tar; and event
+            // invalidation, which resolves path→ino, silently stops covering
+            // that path. With `dir_ttl` at `Duration::MAX` under a healthy
+            // pump, a stale listing can then answer a hard NotFound for a file
+            // that exists.
+            //
+            // This is the editor-save shape — write `a.tmp`, rename onto `a` —
+            // so it is not an edge case.
+            if let Some(displaced) = self.by_path.get(&new_path).map(|e| *e.value()) {
+                if displaced != ino {
+                    self.by_ino.remove(&displaced);
+                }
+            }
             self.by_path.insert(new_path.clone(), ino);
             self.by_ino.insert(ino, new_path);
         }
