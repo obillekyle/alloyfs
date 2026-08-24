@@ -109,3 +109,49 @@ pub(crate) fn fs_space(path: &Path) -> Option<(u32, u64, u64)> {
     const BS: u64 = 4096; // report in 4K blocks; callers only need ratios×size
     Some((BS as u32, total / BS, avail / BS))
 }
+
+/// Does every EXISTING prefix of a symlink target stay inside the export?
+///
+/// The companion to [`symlink_lands_inside`], which is lexical by design: a
+/// link is allowed to dangle, so its target may not exist and canonicalizing
+/// it would refuse a perfectly legal link. The cost of being lexical is that
+/// `up/..` cancels on paper, while the kernel resolves `up` first — to
+/// wherever it points — and then applies `..` from THERE. Chain those and each
+/// hop is lexically innocent while the walk leaves the export one level at a
+/// time.
+///
+/// This closes that without giving up dangling links: it walks the target's
+/// components from the link's own directory, canonicalizing each prefix that
+/// exists, and refuses the moment one lands outside. A component that does not
+/// exist ends the walk — there is nothing there to redirect through, and
+/// everything after it is subject to the lexical check that already ran.
+pub(crate) fn target_walk_stays_inside(root: &Path, link: &RelPath, target: &str) -> bool {
+    let Some((parent, _)) = link.split() else {
+        return false;
+    };
+    let mut at = root.to_path_buf();
+    for comp in parent.0.split('/').filter(|c| !c.is_empty()) {
+        at.push(comp);
+    }
+    for comp in target.split(['/', '\\']) {
+        if comp.is_empty() || comp == "." {
+            continue;
+        }
+        at.push(comp);
+        match std::fs::canonicalize(&at) {
+            Ok(canon) => {
+                if !canon.starts_with(root) {
+                    return false;
+                }
+                // Continue from where the filesystem actually put us, so the
+                // next component is resolved from the real location rather
+                // than the textual one. This is the whole point.
+                at = canon;
+            }
+            // Does not exist (or cannot be resolved): nothing here can
+            // redirect the walk, and the lexical check governs the rest.
+            Err(_) => return true,
+        }
+    }
+    true
+}

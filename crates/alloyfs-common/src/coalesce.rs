@@ -60,8 +60,21 @@ impl Coalescer {
     }
 
     /// Age of the oldest pending change (overflow-flush input).
+    ///
+    /// `max`, not `min`. An older `first_seen` gives a LARGER `elapsed`, so
+    /// `min` returned the age of the YOUNGEST pending change — and its only
+    /// consumer is the `MAX_LATENCY` backstop in `watch.rs`, which exists
+    /// precisely because the debounce resets on every event.
+    ///
+    /// With `min`, a workload that keeps creating new paths — atomic saves,
+    /// compilers, package managers — reset the answer to ~0 on every event, so
+    /// the backstop could never fire. Create+Remove pairs also cancel to
+    /// nothing, so `BATCH_MAX` never tripped either: for the whole storm the
+    /// export published NO events, and every mount kept serving the old index.
+    /// The documented bound is 250 ms; the delivered one was "until the
+    /// workload stops".
     pub fn oldest_age(&self) -> Option<Duration> {
-        self.pending.values().map(|p| p.first_seen.elapsed()).min()
+        self.pending.values().map(|p| p.first_seen.elapsed()).max()
     }
 
     /// Fold one raw notify event into the pending state.
@@ -331,6 +344,42 @@ mod tests {
         assert!(
             matches!(&batch[1], (p, EventKind::Modified) if p.0 == "b.txt"),
             "late halves must not shadow the Modified: {batch:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod oldest_age_tests {
+    use super::*;
+
+    /// `oldest_age` must report the OLDEST pending change, which is what the
+    /// `MAX_LATENCY` backstop needs to decide whether the debounce has been
+    /// starving the export.
+    ///
+    /// It returned the youngest, so a stream of new paths held it near zero
+    /// forever and the backstop never fired. The test seeds two changes a
+    /// measurable time apart and asserts the answer tracks the first.
+    #[test]
+    fn oldest_age_reports_the_oldest_not_the_youngest() {
+        let root = std::path::PathBuf::from(if cfg!(windows) { "C:\\" } else { "/" });
+        let mut co = Coalescer::new(root.clone(), ExcludeSet::compile(&[], false).unwrap());
+        co.ingest(notify::Event {
+            kind: notify::EventKind::Modify(notify::event::ModifyKind::Data(notify::event::DataChange::Any)),
+            paths: vec![root.join("first.txt")],
+            attrs: Default::default(),
+        });
+        std::thread::sleep(Duration::from_millis(40));
+        co.ingest(notify::Event {
+            kind: notify::EventKind::Modify(notify::event::ModifyKind::Data(notify::event::DataChange::Any)),
+            paths: vec![root.join("second.txt")],
+            attrs: Default::default(),
+        });
+
+        let age = co.oldest_age().expect("two changes are pending");
+        assert!(
+            age >= Duration::from_millis(35),
+            "oldest_age reported {age:?}, which is the age of the SECOND change — \
+             the MAX_LATENCY backstop reads this and would never fire"
         );
     }
 }

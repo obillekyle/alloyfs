@@ -180,6 +180,20 @@ impl LockManager {
                         end,
                     });
                     entry.coalesce(owner);
+                    // A GRANT can unblock waiters too, which is why this is
+                    // here and not only on the release paths.
+                    //
+                    // The case is a downgrade. `conflict` skips the caller's
+                    // own holds, so Exclusive → Shared over the same extent is
+                    // granted here rather than going through a release — and a
+                    // waiter parked for Shared on that range became grantable
+                    // the moment it happened. Without this it stayed parked
+                    // until some later, unrelated release woke it.
+                    //
+                    // That is SQLite's downgrade-and-keep-reading pattern
+                    // exactly: writer finishes, drops to a read lock, and the
+                    // readers it was blocking should proceed.
+                    Self::wake_waiters(entry);
                     return Ok(());
                 }
                 if !wait {

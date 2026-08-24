@@ -77,10 +77,35 @@ impl ExcludeSet {
     pub fn compile(patterns: &[String], case_insensitive: bool) -> anyhow::Result<Self> {
         let mut builder = GlobSetBuilder::new();
         for p in patterns {
-            let p = p.trim_end_matches('/');
+            // A LEADING slash is stripped, not rejected. `/secrets` is the
+            // idiomatic gitignore spelling for "at the root", and the config
+            // docs promise gitignore-flavored globs — but paths on the wire
+            // never start with `/` (`validate_wire` guarantees it), so the
+            // compiled glob `/secrets` matched nothing at all. Silently: no
+            // error at startup, and server-side excludes are a security
+            // boundary, so the failure mode was under-exclusion.
+            //
+            // Stripping is right rather than erroring: every pattern here is
+            // already root-relative, so `/secrets` and `secrets` mean the same
+            // thing. The one difference gitignore draws — that a leading slash
+            // suppresses the `**/` variants below — is preserved, because
+            // `contains('/')` is tested on the ORIGINAL.
+            let anchored = p.starts_with('/');
+            let p = p.trim_matches('/');
             anyhow::ensure!(!p.is_empty(), "empty exclude pattern");
+            // A backslash never separates on the wire either; catching it here
+            // beats compiling a pattern that cannot match.
+            anyhow::ensure!(
+                !p.contains('\\'),
+                "exclude pattern {p:?} contains a backslash; paths are always '/'-separated"
+            );
             let mut variants = vec![p.to_string(), format!("{p}/**")];
-            if !p.contains('/') {
+            // A bare name matches at any depth; an ANCHORED one (`/secrets`)
+            // or one that already contains a separator matches only where it
+            // says. That is gitignore's rule, and it is the whole reason the
+            // leading slash is worth preserving as `anchored` rather than
+            // simply discarded.
+            if !anchored && !p.contains('/') {
                 variants.push(format!("**/{p}"));
                 variants.push(format!("**/{p}/**"));
             }
@@ -266,5 +291,58 @@ mod artifact_tests {
 
         let plain = ExcludeSet::compile(&[], false).unwrap();
         assert!(!plain.is_excluded(&p(".DS_Store")), "opt-out really opts out");
+    }
+}
+
+#[cfg(test)]
+mod leading_slash_tests {
+    use super::*;
+
+    /// A root-anchored gitignore pattern must actually exclude.
+    ///
+    /// `/secrets` compiled to the glob `/secrets`, and no path on the wire
+    /// starts with `/` — so the idiomatic spelling matched NOTHING, with no
+    /// error at startup. Server-side excludes are a security boundary, which
+    /// makes silent under-exclusion the worst possible failure here.
+    #[test]
+    fn a_leading_slash_pattern_still_excludes() {
+        let set = ExcludeSet::compile(&["/secrets".into()], false).unwrap();
+        assert!(
+            set.is_excluded(&RelPath("secrets".into())),
+            "the directory itself"
+        );
+        assert!(
+            set.is_excluded(&RelPath("secrets/key.pem".into())),
+            "and everything under it"
+        );
+    }
+
+    /// The slash still MEANS something: anchored matches only at the root,
+    /// where a bare name matches at any depth. Dropping the distinction would
+    /// have been over-exclusion, which is quieter but still wrong.
+    #[test]
+    fn anchoring_is_preserved_not_just_stripped() {
+        let anchored = ExcludeSet::compile(&["/build".into()], false).unwrap();
+        assert!(anchored.is_excluded(&RelPath("build".into())), "at the root");
+        assert!(
+            !anchored.is_excluded(&RelPath("crates/build".into())),
+            "an anchored pattern must NOT match a nested one"
+        );
+
+        let bare = ExcludeSet::compile(&["build".into()], false).unwrap();
+        assert!(bare.is_excluded(&RelPath("build".into())));
+        assert!(
+            bare.is_excluded(&RelPath("crates/build".into())),
+            "a bare name still matches at any depth"
+        );
+    }
+
+    /// A pattern that cannot ever match is a config error, not a silent no-op.
+    #[test]
+    fn a_backslash_pattern_is_refused_rather_than_ignored() {
+        assert!(
+            ExcludeSet::compile(&[r"secrets\keys".into()], false).is_err(),
+            "paths are always '/'-separated; this could never match"
+        );
     }
 }

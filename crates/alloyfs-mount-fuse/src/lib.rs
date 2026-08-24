@@ -522,6 +522,41 @@ impl Filesystem for DsFuse {
         }
     }
 
+    /// `fsync(2)`. Without this, fuser's default replies `ENOSYS`, which the
+    /// kernel translates to SUCCESS and then stops asking — so every
+    /// `fsync` on this mount returned Ok having sent nothing, and the data
+    /// reached the server on `close(2)` and not before.
+    ///
+    /// That is silent data loss on a call whose entire purpose is durability,
+    /// and it contradicted five separate documented promises. `flush` was
+    /// implemented and correct; nothing routed `fsync` to it.
+    ///
+    /// `datasync` is ignored deliberately: the client has one durability
+    /// primitive, which seals the pending file and drains the batcher. There
+    /// is no cheaper metadata-only path to select, and answering a
+    /// `datasync` request with less than `flush` gives would be the same
+    /// class of lie this fixes.
+    fn fsync(&self, _req: &FuseRequest, _ino: INodeNo, fh: FileHandle, _datasync: bool, reply: ReplyEmpty) {
+        match self.fs.flush(fh.0) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(errno(&e)),
+        }
+    }
+
+    /// `fsyncdir(2)`. Directory operations are not buffered by this client —
+    /// mkdir, rename and unlink go to the server on the call — so there is
+    /// genuinely nothing to flush, and Ok is the truth rather than a default.
+    fn fsyncdir(
+        &self,
+        _req: &FuseRequest,
+        _ino: INodeNo,
+        _fh: FileHandle,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        reply.ok();
+    }
+
     fn release(
         &self,
         _req: &FuseRequest,

@@ -252,6 +252,28 @@ impl Export {
             return Err(ErrorCode::InvalidPath);
         }
         if let Ok(canon) = std::fs::canonicalize(&full) {
+            // **The containment check, and it has to be here.** Everything
+            // above is lexical: `full` is built by joining a plain leaf onto a
+            // parent that `resolve` already vouched for, so `starts_with`
+            // above can only see the TEXT. If the leaf already exists and is a
+            // symlink out of the export, the text lands inside and the
+            // filesystem does not.
+            //
+            // That was the hole. This canonicalization existed, and its result
+            // was handed to `excluded_on_disk` alone — which answers `false`
+            // for anything outside the root, because its `strip_prefix` fails.
+            // So an escaping link was neither refused nor excluded, and
+            // `create` opened it with `open(2)`, which follows links, and
+            // truncated whatever was on the other side.
+            //
+            // PermissionDenied rather than NotFound, matching
+            // `resolve_unchecked`: the path exists and is refused, which is a
+            // different fact from a path that is not there, and the export
+            // boundary is not a secret.
+            if !canon.starts_with(&self.root) {
+                tracing::warn!(path = %rel, "refusing a create that resolves outside the export");
+                return Err(ErrorCode::PermissionDenied);
+            }
             if self.excluded_on_disk(&canon) {
                 return Err(ErrorCode::NotFound);
             }
@@ -1643,6 +1665,21 @@ impl SessionInner {
         // otherwise a trivial way to read a path the config says is invisible.
         if export.exclude.is_excluded(&RelPath(landing.clone())) {
             tracing::warn!(%link, target, "refusing a symlink into an excluded path");
+            return Err(ErrorCode::PermissionDenied);
+        }
+        // And the walk must survive the DISK, not just the text. The check
+        // above is lexical on purpose — a link is allowed to dangle, so the
+        // target may not exist — but that means `up/..` cancels on paper while
+        // the kernel resolves `up` first and `..` from wherever it landed. A
+        // chain of those walks out one level per hop, each hop lexically
+        // innocent.
+        //
+        // So: whatever part of the target's path already exists is
+        // canonicalized, and has to still be inside. A dangling target has
+        // nothing to canonicalize and stays legal, which is the property the
+        // lexical check exists to preserve.
+        if !crate::fsutil::target_walk_stays_inside(&export.root, &link, &target) {
+            tracing::warn!(%link, target, "refusing a symlink whose path walks outside the export");
             return Err(ErrorCode::PermissionDenied);
         }
 

@@ -141,3 +141,107 @@ async fn an_ordinary_colon_is_still_a_legal_name() {
         "a timestamped filename was refused"
     );
 }
+
+/// A symlink chain cannot walk the create path out of the export.
+///
+/// `Export::resolve` canonicalizes and checks containment, so every READ is
+/// safe. `resolve_new` — the create/mkdir/rename-to path — canonicalized only
+/// to test EXCLUDES and returned the un-resolved path, which `create` then
+/// `open(2)`s, following the link.
+///
+/// `symlink_lands_inside` is purely lexical, and that is what makes it
+/// reachable. `up/..` cancels on paper, while the kernel resolves `up` to the
+/// export root and then `..` to its PARENT. Each hop adds one level, so a
+/// chain reaches any depth:
+///
+///     sub/up   -> ".."             lands ""    on paper; really the root
+///     sub/up2  -> "up/.."          lands "sub" on paper; really the parent
+///     sub/esc  -> "up2/secret.txt" lands under sub on paper; really outside
+///
+/// `docs/deployment/security.md` promises this is refused. It was not.
+///
+/// Unix-only: it needs real symlinks, and creating one on Windows requires
+/// Developer Mode or elevation.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_symlink_chain_cannot_escape_the_export_on_create() {
+    let outside = tempfile::TempDir::new().expect("outside");
+    let secret = outside.path().join("secret.txt");
+    std::fs::write(&secret, b"ORIGINAL SECRET").unwrap();
+
+    // The export is a directory INSIDE `outside`, so `..` from it reaches the
+    // secret's directory — the ordinary shape of an export under a home dir.
+    let export_root = outside.path().join("export");
+    std::fs::create_dir(&export_root).unwrap();
+    std::fs::create_dir(export_root.join("sub")).unwrap();
+
+    let mut cfg = AgentConfig::default();
+    cfg.exports.insert(
+        "test".into(),
+        ExportConfig {
+            path: export_root.clone(),
+            read_only: false,
+            exclude: Vec::new(),
+            ..Default::default()
+        },
+    );
+    let registry = Arc::new(ExportRegistry::from_config(&cfg).expect("registry"));
+
+    // Build the chain on disk directly — whether the agent's `symlink` handler
+    // would accept each hop is a separate question; this test is about what
+    // `resolve_new` does once such a link EXISTS. A pre-existing symlink out
+    // of the export, made by any means, is the same situation.
+    std::os::unix::fs::symlink("..", export_root.join("sub").join("up")).unwrap();
+    std::os::unix::fs::symlink("up/..", export_root.join("sub").join("up2")).unwrap();
+    std::os::unix::fs::symlink("up2/secret.txt", export_root.join("sub").join("esc")).unwrap();
+
+    let escaped = create_succeeds(&registry, "sub/esc").await;
+
+    let after = std::fs::read(&secret).unwrap_or_default();
+    assert_eq!(
+        after, b"ORIGINAL SECRET",
+        "create() followed a symlink out of the export and truncated a file the \
+         client can never legitimately name"
+    );
+    assert!(
+        !escaped,
+        "create() on a symlink that resolves outside the export must be refused"
+    );
+}
+
+/// The same guarantee for a link that points straight out, with no chain.
+///
+/// The chain above is what makes it reachable through the agent's own
+/// `symlink` handler; this is what happens when the export simply contains a
+/// symlink somebody made another way — far more common.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_plain_symlink_out_of_the_export_is_refused_on_create() {
+    let outside = tempfile::TempDir::new().expect("outside");
+    let secret = outside.path().join("secret.txt");
+    std::fs::write(&secret, b"ORIGINAL SECRET").unwrap();
+
+    let export_root = outside.path().join("export");
+    std::fs::create_dir(&export_root).unwrap();
+    std::os::unix::fs::symlink(&secret, export_root.join("esc")).unwrap();
+
+    let mut cfg = AgentConfig::default();
+    cfg.exports.insert(
+        "test".into(),
+        ExportConfig {
+            path: export_root.clone(),
+            read_only: false,
+            exclude: Vec::new(),
+            ..Default::default()
+        },
+    );
+    let registry = Arc::new(ExportRegistry::from_config(&cfg).expect("registry"));
+
+    let escaped = create_succeeds(&registry, "esc").await;
+    assert_eq!(
+        std::fs::read(&secret).unwrap_or_default(),
+        b"ORIGINAL SECRET",
+        "create() truncated a file outside the export"
+    );
+    assert!(!escaped, "must be refused");
+}
