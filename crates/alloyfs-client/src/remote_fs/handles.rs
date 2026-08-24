@@ -341,9 +341,20 @@ impl RemoteFs {
                     ..OpenFlags::default()
                 },
                 mode,
-            })?,
+            })
+            .inspect_err(|e| self.note_materialize_damage(&path, e))?,
             Response::Opened { fh, attr } => (fh, attr)
         );
+        // From here the bytes exist ONLY in `buf`: they were moved off the
+        // handle above and the batch claim was forgotten, so a failure part
+        // way through used to drop them on the floor. Nothing was recorded,
+        // the handle was not poisoned, and a later `fsync` saw no pending file
+        // and no queued op — so it took no barrier and returned Ok on a file
+        // that was left empty. The application was told its data was durable.
+        //
+        // Every exit from here on records the failure against the path, so the
+        // next barrier (which `fsync`, `open`, `lock` and `rename` all take)
+        // reports it instead of succeeding.
         let mut off = 0u64;
         for chunk in buf.chunks(DATA_CHUNK as usize) {
             expect_resp!(
@@ -352,7 +363,8 @@ impl RemoteFs {
                     offset: off,
                     data: Bytes::copy_from_slice(chunk),
                     expect_version: None,
-                })?,
+                })
+                .inspect_err(|e| self.note_materialize_damage(&path, e))?,
                 Response::Written { .. } | Response::WrittenAttr { .. } => ()
             );
             off += chunk.len() as u64;
@@ -390,5 +402,25 @@ impl RemoteFs {
             self.flush_batch();
         }
         Some(path)
+    }
+}
+
+impl RemoteFs {
+    /// Record that a pending-new file's bytes never reached the server.
+    ///
+    /// Split out because every failure exit in `materialize_pending` needs it
+    /// and an inline closure there would obscure the request it guards. See
+    /// the comment at the write loop for what goes wrong without it.
+    fn note_materialize_damage(&self, path: &RelPath, err: &FsError) {
+        let code = match err {
+            FsError::Remote(c) => *c,
+            // A transport failure is not the server's refusal, but for the
+            // caller it is the same fact: the data is not there.
+            FsError::Transport(_) => alloyfs_proto::ErrorCode::Io,
+        };
+        if let Some(batch) = &self.batch {
+            batch.note_damage(path, code);
+        }
+        tracing::warn!(%path, ?code, "pending file failed to materialize; its data is gone");
     }
 }

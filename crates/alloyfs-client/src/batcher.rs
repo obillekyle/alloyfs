@@ -253,6 +253,21 @@ impl Batcher {
         self.damage.remove(path).map(|(_, c)| c)
     }
 
+    /// Record that a path's acknowledged data did not reach the server.
+    ///
+    /// The queue records its own failures as it drains, but the pending-new
+    /// materialization happens OUTSIDE it: `materialize_pending` moves the
+    /// buffer off the handle before the first server call, and a failure part
+    /// way through the writes left the bytes nowhere — not on the handle, not
+    /// in the queue, and not here. A later `fsync` then found nothing pending,
+    /// took no barrier, and returned Ok on a file the application had been
+    /// told was written.
+    ///
+    /// First failure wins: it is the one that explains the others.
+    pub fn note_damage(&self, path: &RelPath, code: ErrorCode) {
+        self.damage.entry(path.clone()).or_insert(code);
+    }
+
     /// Note a path that so far exists only locally — a pending-new file not
     /// yet sealed into the queue. Remote paths must barrier on it just like
     /// on a queued op. Cleared by seal (which converts it to a queued claim)
