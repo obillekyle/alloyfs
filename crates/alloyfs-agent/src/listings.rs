@@ -9,39 +9,46 @@
 //! tenth, and the whole listing cost pages × that.
 //!
 //! Now the first page builds the COMPLETE listing once and parks it here;
-//! continuation pages are a lookup and a slice. Bonus: a multi-page listing
-//! is served from one consistent snapshot instead of re-deriving the world
-//! per page, so a mutation mid-pagination can no longer duplicate or drop
-//! entries around a page boundary — the churn cases fall to rebuilds
-//! instead.
+//! continuation pages are a lookup and a slice. That also makes a multi-page
+//! listing consistent — one snapshot rather than the world re-derived per
+//! page — so a mutation mid-pagination cannot duplicate or drop entries
+//! around a page boundary.
 //!
-//! Freshness is not guessed at:
-//! - Index-built snapshots carry the tree token they were built under and
-//!   are dropped the moment the live token differs.
-//! - Every agent-mediated mutation (the version funnel: bump /
-//!   forget_version / rename_version — the watcher feeds the same funnel)
-//!   drops the snapshots it could have changed: the path's parent and the
-//!   path itself.
-//! - Disk-built snapshots (unindexed exports have no token) additionally
-//!   age out after [`DISK_SNAPSHOT_TTL`] — long enough to page a huge
-//!   directory over a WAN, short enough that out-of-band server-side edits
-//!   are seen on the next listing.
+//! A snapshot is NOT a cache of "the current listing", and that distinction
+//! decides every rule below. It is one scan's state, read only by the scan
+//! that parked it: a NEW scan (cursor 0) rebuilds unconditionally and never
+//! looks in this map, so nothing here can answer with a stale directory no
+//! matter how old it gets.
 //!
-//! Snapshots are pure performance: dropping one at any moment is always
-//! correct, so eviction is allowed to be crude.
+//! Which is why there is no freshness check. There were three — the tree
+//! token an index build ran under, a TTL on disk builds, and an eager drop
+//! from every agent-mediated mutation — and all three answered the wrong
+//! question. Pages are addressed by POSITION, so discarding a snapshot
+//! mid-scan did not make that scan fresher: it made the next page rebuild a
+//! SHORTER listing and apply the old position to it, skipping the entries in
+//! between. Those entries had not been touched. POSIX lets a scan miss only
+//! what is added or removed while it runs, not what sits still — and
+//! `find -delete`, or any shell loop over a directory, is exactly a mutation
+//! interleaved with a scan. The token made it worse than it looks: one
+//! global token for the whole export, so a write to ANY file dropped every
+//! in-flight listing.
+//!
+//! So a continuation names its snapshot by generation and pages that one.
+//! A generation that is gone — evicted by the entry budget, or replaced by a
+//! concurrent scan of the same directory — still falls back to a rebuild at
+//! the old position, and that fallback can still skip. What changed is that
+//! reaching it now requires the snapshot to be genuinely lost, instead of
+//! happening on every mutation anywhere in the export.
+//!
+//! Eviction is allowed to be crude: it costs a scan its consistency, which
+//! is the same price the fallback pays, and the budget is sized so that
+//! several simultaneous huge listings are what it takes to trip it.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use alloyfs_proto::{DirEntry, RelPath};
 use dashmap::DashMap;
-
-/// How long a DISK-built snapshot may serve continuation pages. A 100k-entry
-/// directory pages ~100 replies; at WAN round-trip pacing that is tens of
-/// seconds, and expiring mid-listing would re-pay the O(N) stat sweep per
-/// remaining page — the exact cost this exists to kill.
-const DISK_SNAPSHOT_TTL: Duration = Duration::from_secs(30);
 
 /// Total entries parked across all snapshots before the cache clears itself.
 /// Listings under one page are never parked, so this only bounds the rare
@@ -50,46 +57,45 @@ const MAX_TOTAL_ENTRIES: usize = 262_144;
 
 pub struct Snapshot {
     pub entries: Arc<Vec<DirEntry>>,
-    /// Tree token the listing was built under; 0 = built from disk.
-    pub token: u64,
-    born: Instant,
-}
-
-impl Snapshot {
-    /// Valid against the CURRENT tree token (index builds), or young enough
-    /// (disk builds).
-    pub fn still_fresh(&self, live_token: u64) -> bool {
-        if self.token != 0 {
-            self.token == live_token
-        } else {
-            self.born.elapsed() <= DISK_SNAPSHOT_TTL
-        }
-    }
+    /// Which scan parked this. A continuation carries the generation it was
+    /// issued under, so it can tell "my listing" from "someone else's
+    /// listing of the same directory" — the one thing a bare path key
+    /// cannot express.
+    generation: u64,
 }
 
 #[derive(Default)]
 pub struct ListingCache {
     map: DashMap<RelPath, Snapshot>,
     total: AtomicUsize,
+    generations: AtomicU64,
 }
 
 impl ListingCache {
+    /// Whatever is parked for `dir`, for tests and diagnostics. Serving a
+    /// continuation goes through [`Self::get_generation`] instead: it is the
+    /// generation, not the path, that says this listing belongs to the scan
+    /// asking for it.
     pub fn get(&self, dir: &RelPath) -> Option<Arc<Vec<DirEntry>>> {
         self.map.get(dir).map(|s| s.entries.clone())
     }
 
-    /// `get` that also checks freshness, dropping a stale snapshot in place.
-    pub fn get_fresh(&self, dir: &RelPath, live_token: u64) -> Option<Arc<Vec<DirEntry>>> {
+    /// The listing a continuation is paging, or `None` when that scan's
+    /// snapshot is gone and the caller has to rebuild.
+    pub fn get_generation(&self, dir: &RelPath, generation: u64) -> Option<Arc<Vec<DirEntry>>> {
         let hit = self.map.get(dir)?;
-        if hit.still_fresh(live_token) {
-            return Some(hit.entries.clone());
-        }
-        drop(hit);
-        self.remove(dir);
-        None
+        (hit.generation == generation).then(|| hit.entries.clone())
     }
 
-    pub fn put(&self, dir: RelPath, entries: Arc<Vec<DirEntry>>, token: u64) {
+    /// Park a freshly built listing; the returned generation is what names it
+    /// in the cursors handed to the client.
+    pub fn put(&self, dir: RelPath, entries: Arc<Vec<DirEntry>>) -> u64 {
+        // Never 0 — a cursor with generation 0 means "no snapshot", which is
+        // what a pre-generation cursor and a single-page listing both look
+        // like. Wrapping at 32 bits keeps the generation inside the cursor's
+        // high half; a collision would need the same directory to still hold
+        // a snapshot from 4 billion listings ago, and `put` replaces.
+        let generation = (self.generations.fetch_add(1, Ordering::Relaxed) % 0xffff_fffe) + 1;
         let added = entries.len();
         // Crude by design: blowing the budget clears everything rather than
         // tracking recency. Snapshots exist for directories big enough to
@@ -99,34 +105,10 @@ impl ListingCache {
             self.clear();
             self.total.store(added, Ordering::Relaxed);
         }
-        if let Some(old) = self.map.insert(
-            dir,
-            Snapshot {
-                entries,
-                token,
-                born: Instant::now(),
-            },
-        ) {
+        if let Some(old) = self.map.insert(dir, Snapshot { entries, generation }) {
             self.total.fetch_sub(old.entries.len(), Ordering::Relaxed);
         }
-    }
-
-    pub fn remove(&self, dir: &RelPath) {
-        if let Some((_, old)) = self.map.remove(dir) {
-            self.total.fetch_sub(old.entries.len(), Ordering::Relaxed);
-        }
-    }
-
-    /// Invalidation hook for the version funnel: a mutation at `path` can
-    /// change the listing of its parent (membership, the entry's attrs) and
-    /// of the path itself (when it is a directory being listed).
-    pub fn drop_for(&self, path: &RelPath) {
-        self.remove(path);
-        let parent = match path.0.rsplit_once('/') {
-            Some((dir, _)) => RelPath(dir.to_string()),
-            None => RelPath(String::new()),
-        };
-        self.remove(&parent);
+        generation
     }
 
     pub fn clear(&self) {
@@ -155,51 +137,52 @@ mod tests {
     }
 
     #[test]
-    fn mutations_drop_the_parent_and_the_path_itself() {
+    fn a_scan_pages_its_own_snapshot_however_old_it_is() {
         let cache = ListingCache::default();
-        let root_listing = Arc::new(vec![entry("d"), entry("f")]);
-        let d_listing = Arc::new(vec![entry("x")]);
-        cache.put(RelPath(String::new()), root_listing, 7);
-        cache.put(RelPath("d".into()), d_listing, 7);
+        let generation = cache.put(RelPath("d".into()), Arc::new(vec![entry("x"), entry("y")]));
+        assert!(generation != 0, "0 is reserved for 'no snapshot'");
 
-        // A mutation at d/x invalidates d's listing (membership) but not
-        // the root's (d itself did not change name or existence… its attrs
-        // may — which is why drop_for of "d" also removes root).
-        cache.drop_for(&RelPath("d/x".into()));
-        assert!(cache.get(&RelPath("d".into())).is_none());
-        assert!(cache.get(&RelPath(String::new())).is_some());
-
-        cache.drop_for(&RelPath("d".into()));
-        assert!(cache.get(&RelPath(String::new())).is_none());
+        // Nothing invalidates this: age and concurrent mutation elsewhere
+        // were both grounds for dropping it, and both dropped a scan that
+        // was still running. The only reader is the scan that parked it.
+        let paged = cache
+            .get_generation(&RelPath("d".into()), generation)
+            .expect("the scan that parked it must still be able to page it");
+        assert_eq!(paged.len(), 2);
     }
 
     #[test]
-    fn token_mismatch_is_stale_and_disk_builds_age_instead() {
+    fn a_concurrent_scan_of_the_same_directory_does_not_alias() {
         let cache = ListingCache::default();
-        cache.put(RelPath("a".into()), Arc::new(vec![entry("x")]), 5);
-        assert!(cache.get_fresh(&RelPath("a".into()), 5).is_some());
-        assert!(
-            cache.get_fresh(&RelPath("a".into()), 6).is_none(),
-            "index snapshot must die with its token"
-        );
-        assert!(
-            cache.get(&RelPath("a".into())).is_none(),
-            "the stale hit is dropped in place, not left to lie again"
-        );
+        let first = cache.put(RelPath("d".into()), Arc::new(vec![entry("x"), entry("y")]));
+        // Another client starts its own scan of the same directory; one
+        // snapshot per path means this replaces the first.
+        let second = cache.put(RelPath("d".into()), Arc::new(vec![entry("y")]));
+        assert_ne!(first, second);
 
-        // Disk-built (token 0): fresh regardless of the live token while
-        // young — TTL is its only clock.
-        cache.put(RelPath("b".into()), Arc::new(vec![entry("y")]), 0);
-        assert!(cache.get_fresh(&RelPath("b".into()), 999).is_some());
+        assert!(
+            cache.get_generation(&RelPath("d".into()), first).is_none(),
+            "the first scan must rebuild rather than silently page the second scan's listing"
+        );
+        assert!(cache.get_generation(&RelPath("d".into()), second).is_some());
+    }
+
+    #[test]
+    fn an_unknown_generation_is_a_miss_not_a_wrong_answer() {
+        let cache = ListingCache::default();
+        cache.put(RelPath("d".into()), Arc::new(vec![entry("x")]));
+        assert!(cache.get_generation(&RelPath("d".into()), 0).is_none());
+        assert!(cache.get_generation(&RelPath("d".into()), u64::MAX).is_none());
+        assert!(cache.get_generation(&RelPath("other".into()), 1).is_none());
     }
 
     #[test]
     fn the_entry_budget_clears_rather_than_grows() {
         let cache = ListingCache::default();
         let big: Arc<Vec<DirEntry>> = Arc::new((0..200_000).map(|i| entry(&format!("f{i}"))).collect());
-        cache.put(RelPath("one".into()), big.clone(), 1);
+        cache.put(RelPath("one".into()), big.clone());
         assert!(cache.get(&RelPath("one".into())).is_some());
-        cache.put(RelPath("two".into()), big, 1);
+        cache.put(RelPath("two".into()), big);
         assert!(
             cache.get(&RelPath("one".into())).is_none(),
             "second oversized snapshot must clear the first, not stack on it"

@@ -34,6 +34,17 @@ fn registry(dir: &std::path::Path, tree_cap: Option<usize>, exclude: Vec<String>
     Arc::new(ExportRegistry::from_config(&cfg).expect("export registry"))
 }
 
+/// A readdir cursor is `(generation << 32) | position` — the agent writes it
+/// and the agent reads it back, so the encoding is private to ops.rs and
+/// mirrored here rather than exported.
+fn cursor_pos(cursor: u64) -> usize {
+    (cursor & 0xffff_ffff) as usize
+}
+
+fn cursor_generation(cursor: u64) -> u64 {
+    cursor >> 32
+}
+
 struct Peer {
     io: Framed<tokio::io::DuplexStream, FrameCodec>,
     next_id: u64,
@@ -117,7 +128,18 @@ impl Peer {
             all.extend(page);
             match next {
                 Some(n) => {
-                    assert_eq!(n as usize, all.len(), "the cursor advances by entries served");
+                    assert_eq!(cursor_pos(n), all.len(), "the cursor advances by entries served");
+                    assert!(
+                        cursor_generation(n) != 0,
+                        "a listing that pages must name the snapshot it is paging"
+                    );
+                    if cursor != 0 {
+                        assert_eq!(
+                            cursor_generation(n),
+                            cursor_generation(cursor),
+                            "one scan pages one snapshot from end to end"
+                        );
+                    }
                     cursor = n;
                 }
                 None => break,
@@ -251,17 +273,23 @@ async fn excluded_names_never_appear_in_either_path() {
 }
 
 /// A directory big enough to page parks a listing snapshot after its first
-/// page (continuation pages slice it instead of rebuilding the world). An
-/// agent-mediated mutation must drop that snapshot — the version funnel
-/// hooks — so the next listing shows the change, while the in-flight
-/// pagination still completes.
+/// page (continuation pages slice it instead of rebuilding the world). A
+/// mutation racing that pagination must reach the NEXT listing, while the
+/// in-flight one completes on what it started with.
 ///
-/// The DISK path is where this is observable and load-bearing: disk-built
-/// snapshots have no tree token to invalidate them, only a 30 s TTL — so
-/// without the funnel hook, the create would stay invisible to listings for
-/// the whole TTL. (The index path can't show this in a watcherless rig:
-/// agent-mediated creates only reach the index through the event feed, which
-/// is the watcher's — pinned by `a_live_index_is_what_answers_readdir`.)
+/// The next listing is the easy half: a new scan never consults a snapshot.
+/// The other half used to be the reverse — the version funnel dropped the
+/// snapshot, so the continuation rebuilt and spliced the create in. This
+/// test asserted exactly that, and had to pick a name sorting LAST to do it,
+/// because a rebuild is indexed by the OLD position and any shift in the
+/// range ahead of the cursor loses entries. See
+/// `a_delete_mid_listing_does_not_skip_untouched_entries` for the same shape
+/// without the dodge.
+///
+/// The DISK path is where this is observable: the index path can't show it
+/// in a watcherless rig, since agent-mediated creates only reach the index
+/// through the event feed, which is the watcher's — pinned by
+/// `a_live_index_is_what_answers_readdir`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_mutation_mid_listing_reaches_the_next_listing() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -295,8 +323,11 @@ async fn a_mutation_mid_listing_reaches_the_next_listing() {
         .await;
     assert!(matches!(created, Ok(Response::Opened { .. })), "got {created:?}");
 
-    // The in-flight continuation completes (a dropped snapshot rebuilds at
-    // the requested cursor), and the rebuild already serves the new truth.
+    // The in-flight continuation completes on the listing it STARTED. The
+    // create landed after the first page was served, and POSIX leaves an
+    // entry added during a scan unspecified — so completing consistently is
+    // a choice, and it is the one that lets the position in the cursor keep
+    // meaning something.
     let mut rest = Vec::new();
     let mut c = cursor;
     loop {
@@ -308,16 +339,83 @@ async fn a_mutation_mid_listing_reaches_the_next_listing() {
         }
     }
     assert_eq!(
-        rest.last().map(|e| e.name.as_str()),
-        Some("zz-mid-listing.txt"),
-        "the rebuild behind the dropped snapshot serves the mutation"
+        page0.len() + rest.len(),
+        1100,
+        "the scan completes on the snapshot it started"
     );
-    assert_eq!(page0.len() + rest.len(), 1101, "nothing lost across the drop");
+    assert!(
+        !rest.iter().any(|e| e.name == "zz-mid-listing.txt"),
+        "an entry created after the scan began is not spliced into it"
+    );
 
     // And a fresh listing agrees end to end.
     let (all, _) = peer.readdir_all("").await;
     assert_eq!(all.len(), 1101);
     assert!(all.iter().any(|e| e.name == "zz-mid-listing.txt"));
+}
+
+/// Deleting one entry mid-scan must not take an unrelated entry with it.
+///
+/// Pages are addressed by POSITION. Dropping the snapshot behind a running
+/// scan meant the next page rebuilt a listing one entry SHORTER and applied
+/// the old position to it, so whatever had shifted down into that slot was
+/// stepped straight over — never served, never reported missing. Here the
+/// scan has already been handed positions 0..1024 when position 0 is
+/// removed; every later name shifts down one, and the entry that lands on
+/// 1024 is `f1024.txt`, which nothing touched.
+///
+/// POSIX permits a scan to miss what is added or removed while it runs. It
+/// does not permit it to miss what sat still. `find -delete` and a shell
+/// loop over a directory are both this exact interleaving.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_delete_mid_listing_does_not_skip_untouched_entries() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    for i in 0..1100 {
+        std::fs::write(dir.path().join(format!("f{i:04}.txt")), b"x").unwrap();
+    }
+    let registry = registry(dir.path(), Some(0), vec![]);
+    let mut peer = Peer::connect(&registry).await;
+
+    let (page0, next) = peer.readdir_page("", 0).await;
+    assert_eq!(page0.len(), 1024, "a full first page is what sets up the shift");
+    let cursor = next.expect("1100 entries must page");
+
+    // Through the agent, so the version funnel sees it — the funnel is what
+    // used to discard the snapshot this scan is paging.
+    let removed = peer
+        .call(Request::Unlink {
+            path: RelPath("f0000.txt".into()),
+        })
+        .await;
+    assert!(matches!(removed, Ok(Response::Ok)), "got {removed:?}");
+
+    let mut rest = Vec::new();
+    let mut c = cursor;
+    loop {
+        let (page, next) = peer.readdir_page("", c).await;
+        rest.extend(page);
+        match next {
+            Some(n) => c = n,
+            None => break,
+        }
+    }
+
+    assert!(
+        rest.iter().any(|e| e.name == "f1024.txt"),
+        "f1024.txt shifted into the position the cursor names; it was never touched \
+         and must still be served"
+    );
+    assert_eq!(
+        page0.len() + rest.len(),
+        1100,
+        "the scan completes on its own snapshot: every entry once, none dropped"
+    );
+
+    // The delete is not hidden — it is simply not retrofitted into a scan
+    // that started before it.
+    let (all, _) = peer.readdir_all("").await;
+    assert_eq!(all.len(), 1099);
+    assert!(!all.iter().any(|e| e.name == "f0000.txt"));
 }
 
 /// Pin WHICH path answers. No watcher runs in these tests, so a file created

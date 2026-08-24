@@ -15,6 +15,27 @@ use dashmap::DashMap;
 /// Max directory entries per Readdir response; clients page with the cursor.
 const READDIR_PAGE: usize = 1024;
 
+/// A readdir cursor is written by the agent and read back by the agent —
+/// every client treats it as opaque and echoes it verbatim — so it can carry
+/// more than a position without a wire change or a version bump. The high 32
+/// bits name the snapshot the scan is paging (see listings.rs); the low 32
+/// are the offset into it.
+///
+/// 32 bits of offset caps a paged listing at 4 billion entries, which is
+/// three orders of magnitude past what the snapshot itself could hold in
+/// memory. Generation 0 means "no snapshot": a single-page listing, or a
+/// cursor issued before this encoding existed.
+const CURSOR_POS_BITS: u32 = 32;
+const CURSOR_POS_MASK: u64 = (1 << CURSOR_POS_BITS) - 1;
+
+fn pack_cursor(generation: u64, pos: usize) -> u64 {
+    (generation << CURSOR_POS_BITS) | (pos as u64 & CURSOR_POS_MASK)
+}
+
+fn unpack_cursor(cursor: u64) -> (u64, usize) {
+    (cursor >> CURSOR_POS_BITS, (cursor & CURSOR_POS_MASK) as usize)
+}
+
 /// Byte ceiling for one `ReadMany` reply. Well under `MAX_FRAME_LEN` (1 MiB)
 /// so the entries, their paths and their attributes all still fit alongside
 /// the file contents.
@@ -296,7 +317,6 @@ impl Export {
     pub fn bump(&self, path: &RelPath) -> u64 {
         let v = self.vclock.fetch_add(1, Ordering::Relaxed) + 1;
         self.versions.insert(path.clone(), v);
-        self.listings.drop_for(path);
         v
     }
 
@@ -316,7 +336,6 @@ impl Export {
     pub fn forget_version(&self, path: &RelPath) -> u64 {
         let v = self.vclock.fetch_add(1, Ordering::Relaxed) + 1;
         self.versions.remove(path);
-        self.listings.drop_for(path);
         v
     }
 
@@ -325,7 +344,6 @@ impl Export {
     /// hints, not the source of truth.
     pub fn rename_version(&self, from: &RelPath, to: &RelPath) -> u64 {
         self.versions.remove(from);
-        self.listings.drop_for(from);
         self.bump(to)
     }
 
@@ -911,14 +929,10 @@ impl SessionInner {
     /// One page out of a complete listing, with the `next_cursor` chain the
     /// wire shape promises. Pure slicing — every build cost was paid once,
     /// by whoever parked `entries`.
-    fn listing_page(entries: &[DirEntry], cursor: u64) -> Response {
-        let start = cursor as usize;
+    fn listing_page(entries: &[DirEntry], start: usize, generation: u64) -> Response {
         let page: Vec<DirEntry> = entries.iter().skip(start).take(READDIR_PAGE).cloned().collect();
-        let next_cursor = if start + page.len() < entries.len() {
-            Some((start + page.len()) as u64)
-        } else {
-            None
-        };
+        let next_cursor =
+            (start + page.len() < entries.len()).then(|| pack_cursor(generation, start + page.len()));
         Response::Dir {
             entries: page,
             next_cursor,
@@ -927,15 +941,17 @@ impl SessionInner {
 
     fn readdir(&self, path: RelPath, cursor: u64) -> Result<Response, ErrorCode> {
         let export = self.export()?;
-        // Continuation pages come from the snapshot the first page parked —
-        // a lookup and a slice, not a rebuild (see listings.rs for what the
-        // rebuild-per-page used to cost, and for the freshness rules). A
-        // stale or missing snapshot rebuilds at the requested cursor, which
-        // stays correct: a cursor past the new length is simply the empty
-        // final page.
-        if cursor > 0 {
-            if let Some(entries) = export.listings.get_fresh(&path, export.tree.token()) {
-                return Ok(Self::listing_page(&entries, cursor));
+        let (generation, start) = unpack_cursor(cursor);
+        // Continuation pages come from the snapshot their OWN first page
+        // parked — a lookup and a slice, not a rebuild (see listings.rs for
+        // what the rebuild-per-page used to cost, and for why a continuation
+        // is never checked for freshness). Losing that snapshot rebuilds at
+        // the requested position, which does not run off the end but can
+        // skip entries the scan never touched; listings.rs says why that is
+        // now the rare path rather than the routine one.
+        if generation != 0 {
+            if let Some(entries) = export.listings.get_generation(&path, generation) {
+                return Ok(Self::listing_page(&entries, start, generation));
             }
         }
         // Build the COMPLETE listing once. From the v6 index when it can
@@ -955,7 +971,7 @@ impl SessionInner {
         //   indexed, path unknown to it, not a directory, a case-insensitive
         //   spelling only the volume can resolve) and falls through to disk,
         //   keeping every error identical.
-        if let Some((children, token)) = export.tree.readdir_all(&path) {
+        if let Some((children, _token)) = export.tree.readdir_all(&path) {
             let entries: Vec<DirEntry> = children
                 .into_iter()
                 .map(|(name, attr)| {
@@ -971,10 +987,16 @@ impl SessionInner {
                 })
                 .collect();
             let entries = std::sync::Arc::new(entries);
-            if entries.len() > READDIR_PAGE {
-                export.listings.put(path, entries.clone(), token);
-            }
-            return Ok(Self::listing_page(&entries, cursor));
+            // Only a listing that will actually be paged is worth parking,
+            // and only a parked listing can name itself in a cursor — which
+            // is consistent, because a listing that fits in one page never
+            // issues a continuation.
+            let generation = if entries.len() > READDIR_PAGE {
+                export.listings.put(path, entries.clone())
+            } else {
+                0
+            };
+            return Ok(Self::listing_page(&entries, start, generation));
         }
         let full = export.resolve(&path)?;
         let mut entries: Vec<DirEntry> = Vec::new();
@@ -1001,12 +1023,12 @@ impl SessionInner {
         }
         entries.sort_by(|a, b| a.name.cmp(&b.name));
         let entries = std::sync::Arc::new(entries);
-        // Token 0 = disk-built: no index to validate against, so the
-        // snapshot lives on the TTL clock instead (see listings.rs).
-        if entries.len() > READDIR_PAGE {
-            export.listings.put(path, entries.clone(), 0);
-        }
-        Ok(Self::listing_page(&entries, cursor))
+        let generation = if entries.len() > READDIR_PAGE {
+            export.listings.put(path, entries.clone())
+        } else {
+            0
+        };
+        Ok(Self::listing_page(&entries, start, generation))
     }
 
     fn open(&self, path: RelPath, flags: OpenFlags) -> Result<Response, ErrorCode> {
