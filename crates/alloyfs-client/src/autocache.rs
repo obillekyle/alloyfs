@@ -223,7 +223,26 @@ impl CacheState {
     }
 
     /// Insert an entry and charge both counters correctly.
+    ///
+    /// Including for whatever it DISPLACES. `entries.insert` hands back the
+    /// old entry and drops it, so a `put` onto an occupied key used to add
+    /// the newcomer's bytes without ever subtracting the evictee's. Both
+    /// commit paths `take` first, which left one caller landing on an
+    /// occupied key: `rename`. Renaming `a.tmp` onto a cached `a` — the shape
+    /// every editor save has — leaked `a`'s bytes from the counters each
+    /// time, and those counters are what the eviction loop compares against
+    /// the budget, so a long-lived mount ends up evicting live entries to
+    /// make room that already exists. Load recomputes both totals from
+    /// `entries`, which is the only reason this heals at all: the drift is
+    /// bounded by one mount's uptime.
     fn put(&mut self, path: RelPath, e: CacheEntry) {
+        let displaced = self.entries.get(&path).map(|old| (old.on_disk, old.warm));
+        if let Some((bytes, warm)) = displaced {
+            self.total_bytes -= bytes;
+            if warm {
+                self.warm_bytes -= bytes;
+            }
+        }
         self.total_bytes += e.on_disk;
         if e.warm {
             self.warm_bytes += e.on_disk;
@@ -1884,6 +1903,50 @@ mod partial_reload_tests {
         assert!(
             !c2.fresh_for(&p, &attr(size, 100, 0)),
             "still not servable as a whole blob"
+        );
+    }
+
+    #[test]
+    fn a_put_over_an_occupied_key_discharges_what_it_displaces() {
+        fn entry(on_disk: u64, warm: bool) -> CacheEntry {
+            CacheEntry {
+                version: 1,
+                size: on_disk,
+                mtime_ns: 0,
+                pinned: false,
+                warm,
+                last_used: 0,
+                blocks: BlockMap::complete(),
+                on_disk,
+                verified: true,
+            }
+        }
+
+        let mut st = CacheState {
+            entries: Default::default(),
+            total_bytes: 0,
+            warm_bytes: 0,
+            tick: 0,
+            dirty: false,
+            lru_dirty: false,
+        };
+        let p = RelPath("a".into());
+
+        st.put(p.clone(), entry(1000, true));
+        assert_eq!((st.total_bytes, st.warm_bytes), (1000, 1000));
+
+        // `rename` is the one caller that lands on an occupied key — it
+        // `take`s the SOURCE and puts it at the DESTINATION, so nothing
+        // discharges what the destination already held. Write `a.tmp`,
+        // rename it onto a cached `a`: every editor save leaked a blob's
+        // worth of counter, and the counters are what the eviction loop
+        // compares against the budget.
+        st.put(p.clone(), entry(300, false));
+        assert_eq!(st.entries.len(), 1, "one path, one entry");
+        assert_eq!(
+            (st.total_bytes, st.warm_bytes),
+            (300, 0),
+            "the displaced entry's bytes must leave both counters with it"
         );
     }
 }
