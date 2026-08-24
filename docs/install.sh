@@ -5,7 +5,8 @@
 #
 # Environment:
 #   ALLOYFS_VERSION   install this tag instead of the latest (e.g. v0.1.1)
-#   ALLOYFS_INSTALL   install here instead of ~/.local/bin
+#   ALLOYFS_INSTALL   install here instead of the default (~/.local/bin, or
+#                     /usr/local/bin when running as root)
 #   GITHUB_TOKEN      optional; raises the GitHub API rate limit
 #
 # POSIX sh on purpose: this runs before anything is installed, on whatever
@@ -13,7 +14,25 @@
 set -eu
 
 REPO="obillekyle/alloyfs"
-INSTALL_DIR="${ALLOYFS_INSTALL:-$HOME/.local/bin}"
+
+# Where the binary lands, in three cases rather than one.
+#
+# `$HOME/.local/bin` alone got this wrong for the most common first command
+# anyone runs. Under `sudo sh install.sh` — which is what someone types when
+# they want alloyfs available to the whole machine, and what the FUSE note at
+# the end of this script encourages — sudo sets HOME to /root, so the binary
+# went to /root/.local/bin: a directory on nobody's PATH, unreadable by the
+# user who ran the command, and reported as a success.
+#
+# Running as root therefore means /usr/local/bin, the system location that is
+# already on every PATH. An explicit ALLOYFS_INSTALL still wins over both.
+if [ -n "${ALLOYFS_INSTALL:-}" ]; then
+  INSTALL_DIR="$ALLOYFS_INSTALL"
+elif [ "$(id -u)" = 0 ]; then
+  INSTALL_DIR=/usr/local/bin
+else
+  INSTALL_DIR="$HOME/.local/bin"
+fi
 
 red() { printf '\033[31m%s\033[0m\n' "$1" >&2; }
 dim() { printf '\033[2m%s\033[0m\n' "$1"; }
