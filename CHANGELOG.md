@@ -8,6 +8,30 @@ is only ever as good as the commits — which is the point.
 explanation in the commit body, where it is also visible in `git log`, in a
 pull request, and on the release page.
 
+## [0.8.1] — 2026-08-24
+
+<sub>diff: [742e795...1decdf0](https://github.com/obillekyle/alloyfs/compare/742e795...1decdf0)</sub>
+
+### Fixes
+
+- **install:** the documented install command installed into /root ([1decdf0](https://github.com/obillekyle/alloyfs/commit/1decdf0))
+
+    `INSTALL_DIR="${ALLOYFS_INSTALL:-$HOME/.local/bin}"` got the most common first command anyone runs wrong. Under `sudo sh install.sh` — what someone types when they want alloyfs available to the whole machine, and what the FUSE note at the end of this script encourages — sudo sets HOME to /root, so the binary landed in /root/.local/bin: a directory on nobody's PATH, unreadable by the user who ran the command, and reported as a success.
+
+- **install:** the Windows checksum check never ran ([00092ce](https://github.com/obillekyle/alloyfs/commit/00092ce))
+
+    Every install on Windows PowerShell 5.1 printed "publishes no checksum; skipping verification" — including for releases that publish one. The note was wrong and the verification was dead.
+
+### Docs
+
+- alpha.93 would never upgrade to beta.0 ([22c4d10](https://github.com/obillekyle/alloyfs/commit/22c4d10))
+
+    The version comparison in both install scripts looked only at the TRAILING prerelease identifier, so `alpha.93` against `beta.0` compared 93 against 0 and never read the channel at all. Every one of these came out backwards:
+
+        beta.0  vs alpha.93  ->  alpha.93
+        beta.1  vs alpha.99  ->  alpha.99
+        rc.0    vs beta.9    ->  beta.9
+
 ## [0.8.0] — 2026-08-23
 
 <sub>diff: [5969e77...742e795](https://github.com/obillekyle/alloyfs/compare/5969e77...742e795)</sub>
@@ -170,17 +194,5 @@ pull request, and on the release page.
 - a documentation site at alloy.okyle.dev ([801ae35](https://github.com/obillekyle/alloyfs/commit/801ae35))
 
     Twenty-two pages plus an introduction, on the same hand-written shell the bakery docs use: one index.html, no build step, no CDN, rendering the markdown next to it. That choice is worth keeping — the .md files stay the single source of truth rather than being forked into a generator's format, and the whole site is reviewable as a diff.
-
-## [0.1.1] — 2026-08-15
-
-<sub>diff: [fedde5a...81db420](https://github.com/obillekyle/alloyfs/compare/fedde5a...81db420)</sub>
-
-### Fixes
-
-- **publish:** strip the carriage return jq leaves on a Windows runner ([d2f5db6](https://github.com/obillekyle/alloyfs/commit/d2f5db6))
-
-    The Windows leg built fine once WinFsp and LIBCLANG_PATH were in place, then failed copying a binary that exists:
-
-        cp: cannot stat 'target/release/alloyfs'$'\r''.exe': No such file or directory
 
 Older releases are in the git tags and on the releases page.
