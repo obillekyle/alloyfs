@@ -10,7 +10,7 @@ pull request, and on the release page.
 
 ## [0.8.0] — 2026-08-23
 
-<sub>diff: [5969e77...0121631](https://github.com/obillekyle/alloyfs/compare/5969e77...0121631)</sub>
+<sub>diff: [5969e77...742e795](https://github.com/obillekyle/alloyfs/compare/5969e77...742e795)</sub>
 
 ### New Features
 
