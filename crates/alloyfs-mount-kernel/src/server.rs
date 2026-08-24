@@ -17,7 +17,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alloyfs_client::{FsError, RemoteFs, ROOT_INO};
 use alloyfs_proto::{Attr, ErrorCode, EventKind, FileKind, FsEvent, OpenFlags, RelPath};
@@ -28,10 +28,6 @@ use crate::abi::{self, InHeader, KernelAttr, Notification};
 /// Small on purpose: a handle is server-side state (and possibly a lease), so
 /// the cache is a working set, not a registry.
 const HANDLE_CACHE_CAP: usize = 64;
-
-/// A directory listing is fetched whole and paged out across READDIR calls;
-/// this bounds how long one listing may serve continuation calls.
-const DIR_CACHE_TTL: Duration = Duration::from_secs(5);
 
 /// The kernel emits "." and ".." itself before calling us, so its cursor
 /// starts at 2 and child *i* lives at position *i* + 2.
@@ -92,8 +88,9 @@ struct HandleCache {
 /// so the pages can share one.
 type DirEntries = Arc<Vec<(String, u64, bool)>>;
 
+/// One in-progress scan's listing. No timestamp: it is never used to answer a
+/// NEW scan, so there is nothing for an age to decide. See `dir_entries`.
 struct DirListing {
-    at: Instant,
     entries: DirEntries,
 }
 
@@ -236,10 +233,30 @@ impl Server {
     /// duplicate entries because the directory changed underneath it.
     fn dir_entries(&self, nodeid: u64, offset: u64) -> Result<DirEntries, i32> {
         if offset > DOTS {
+            // A CONTINUATION pages the listing it started on, unconditionally.
+            //
+            // The TTL used to apply here, and `forget_dir` could drop the
+            // entry outright from eleven call sites — so a scan that outlived
+            // either got a FRESH, possibly shorter listing with the old index
+            // applied to it. `first = offset - DOTS` then pointed past several
+            // untouched entries, and they were never returned at all.
+            // Interleaved `getdents64` and `unlink` in one directory is what
+            // `find -delete` and shell loops do, and POSIX permits unspecified
+            // behaviour only for entries added or removed DURING the scan —
+            // not for the ones that stayed put.
+            //
+            // A fresh scan (`offset <= DOTS`) always refetches and replaces,
+            // which is what keeps this from serving anything stale: the cache
+            // exists only to finish scans, never to answer new ones. That also
+            // makes the TTL and the invalidation pointless here — both existed
+            // to stop a stale listing being reused by a NEW scan, which cannot
+            // happen.
+            //
+            // The complete fix is FUSE's: pin the snapshot to an open dir
+            // handle, so concurrent scans of one directory cannot share state.
+            // That needs an opendir concept the kernel ABI does not have yet.
             if let Some(hit) = self.dirs.lock().unwrap().get(&nodeid) {
-                if hit.at.elapsed() < DIR_CACHE_TTL {
-                    return Ok(Arc::clone(&hit.entries));
-                }
+                return Ok(Arc::clone(&hit.entries));
             }
         }
         let listing = self.fs.readdir(nodeid).map_err(|e| errno_of(&e))?;
@@ -261,7 +278,6 @@ impl Server {
         self.dirs.lock().unwrap().insert(
             nodeid,
             DirListing {
-                at: Instant::now(),
                 entries: Arc::clone(&entries),
             },
         );
@@ -680,9 +696,19 @@ impl Server {
     }
 
     /// Drop a cached listing whose directory we just changed.
-    fn forget_dir(&self, nodeid: u64) {
-        self.dirs.lock().unwrap().remove(&nodeid);
-    }
+    /// Deliberately NOT dropping the cached listing.
+    ///
+    /// This map holds one thing: the listing an in-progress scan is paging
+    /// through. A fresh scan always refetches, so nothing here can ever be
+    /// served to a new reader — which means invalidating it protects nobody,
+    /// while dropping it mid-scan silently skipped every entry after the
+    /// cursor. See `dir_entries`.
+    ///
+    /// The name is kept because the call sites are still meaningful: each one
+    /// marks a point where the directory changed. If a per-handle snapshot
+    /// arrives (the real fix, once the ABI has an opendir), this is where the
+    /// bookkeeping would hang.
+    fn forget_dir(&self, _nodeid: u64) {}
 
     // ---------------------------------------------------- notifications
 
