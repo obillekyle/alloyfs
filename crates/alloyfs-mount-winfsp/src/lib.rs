@@ -872,6 +872,9 @@ impl FileSystemContext for WinFspFs {
         // server-side (v9+), which removes both the extra getattr this used to
         // cost and the race against a chmod landing between the read and the
         // write. Pre-v9 agents get the old read-modify-write inside that call.
+        // What `set_win_attrs` produced, when it runs. Used as the reply if
+        // nothing else in this call changes the file — see the match below.
+        let mut after_win_attrs = None;
         let mut readonly = None;
         if cur.kind != FileKind::Dir && file_attributes != 0 && file_attributes != INVALID_FILE_ATTRIBUTES {
             let want = file_attributes & FILE_ATTRIBUTE_READONLY != 0;
@@ -901,7 +904,16 @@ impl FileSystemContext for WinFspFs {
                 }
             }
             if set | clear != 0 {
-                let _ = self.fs.set_win_attrs(context.ino, set, clear).map_err(fsp_err)?;
+                // KEEP the result. It used to be discarded, and when nothing
+                // else in this call changed — no readonly, no mtime — the
+                // reply fell through to `cur`, the attributes read BEFORE the
+                // change. The FSD then caches that for `FileInfoTimeout`, so
+                // `attrib +h` followed by `GetFileInformationByHandle` read
+                // back no H for the next 30 seconds.
+                //
+                // Same shape as the two overlay bugs: report what the
+                // operation produced, never what happened to be true first.
+                after_win_attrs = Some(self.fs.set_win_attrs(context.ino, set, clear).map_err(fsp_err)?);
             }
         }
         // Sentinels that all mean "do not set a time": 0 is "no change",
@@ -925,7 +937,11 @@ impl FileSystemContext for WinFspFs {
                 .setattr_readonly(context.ino, None, mtime, ro)
                 .map_err(fsp_err)?,
             None if mtime.is_some() => self.fs.setattr(context.ino, None, mtime, None).map_err(fsp_err)?,
-            None => cur,
+            // Nothing else changed — so if the win-attr call ran, ITS result
+            // is the current truth. Falling back to `cur` unconditionally is
+            // what made `attrib +h` read back as unset, and the FSD then
+            // cached that answer for FileInfoTimeout.
+            None => after_win_attrs.unwrap_or(cur),
         };
         fill_file_info(file_info, context.ino, &attr);
         Ok(())

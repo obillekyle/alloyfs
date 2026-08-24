@@ -118,6 +118,14 @@ impl RemoteFs {
             let ino = self.ino.get_or_alloc(path);
             return Ok((ino, attr));
         }
+        // A queued removal of this same path must land first, or the create
+        // races it: `rm -rf d && mkdir d` inside the batcher's window gets
+        // EEXIST from the server, and then the queued removal deletes the
+        // directory that was just made. `rename` and `copy_range` already
+        // barrier for exactly this; these three did not.
+        if self.batch.as_ref().is_some_and(|b| b.involves(&path)) {
+            self.barrier_for(&path)?;
+        }
         let attr = expect_resp!(self.call(Request::Mkdir { path: path.clone(), mode })?, Response::Attr(attr) => attr);
         let ino = self.ino.get_or_alloc(path.clone());
         self.patch_parent_dir(&path, ListingPatch::Upsert(ino, attr));
@@ -475,6 +483,18 @@ impl RemoteFs {
         let target = self.path_of(target_ino)?;
         let dir = self.path_of(newparent)?;
         let link = dir.join(newname);
+        // Same race as mkdir and symlink: a queued removal of this name has to
+        // land before the link is created. The TARGET matters too — linking to
+        // a file the queue has not written yet would ask the server for a
+        // source that is not there.
+        if let Some(b) = self.batch.as_ref() {
+            if b.involves(&link) {
+                self.barrier_for(&link)?;
+            }
+            if b.involves(&target) {
+                self.barrier_for(&target)?;
+            }
+        }
         match (self.is_overlay(&target), self.is_overlay(&link)) {
             (true, true) => {
                 let attr = self.overlay_ref().link(&target, &link)?;
@@ -535,6 +555,12 @@ impl RemoteFs {
             let attr = self.overlay_ref().symlink(&target, &link)?;
             let ino = self.ino.get_or_alloc(link);
             return Ok((ino, attr));
+        }
+        // Same race as mkdir: a queued removal of this name must land before
+        // the link is created, or the create gets EEXIST and the removal then
+        // deletes what it made.
+        if self.batch.as_ref().is_some_and(|b| b.involves(&link)) {
+            self.barrier_for(&link)?;
         }
         self.require_proto(4, "symlink")?;
         let attr = expect_resp!(

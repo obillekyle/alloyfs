@@ -163,6 +163,20 @@ fn entry_digest(path: &RelPath, attr: &Attr) -> u64 {
     attr.size.hash(&mut h);
     attr.mtime.hash(&mut h);
     (attr.kind as u8).hash(&mut h);
+    // Mode belongs here, and its absence was visible: a client's warm remount
+    // skips the whole walk when the token matches, so a server-side change
+    // that moved nothing else was invisible to every mount that had been
+    // there before.
+    //
+    // It matters most on Windows, where `mode` carries MODE_WIN_HIDDEN and
+    // MODE_WIN_SYSTEM: `attrib +h` on the server changes no size, no mtime
+    // and no kind, so the token did not move and the file stayed visible.
+    // A Unix `chmod` is the same story.
+    //
+    // Unlike `version` — deliberately absent, because it is per-process and
+    // resets on restart — mode is a property of the file itself, so it is
+    // stable across an agent restart and safe to fold in.
+    attr.mode.hash(&mut h);
     h.finish()
 }
 

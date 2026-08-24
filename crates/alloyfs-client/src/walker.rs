@@ -457,6 +457,12 @@ async fn fetch_one(fs: &Arc<RemoteFs>, cache: &Arc<AutoCache>, path: &RelPath) -
             if stage_write(&stage, &data).is_err() {
                 return false;
             }
+            // Staging lives in a sibling tree now, so the blob's own directory
+            // is no longer created as a side effect of staging into it.
+            if crate::autocache::ensure_blob_dir(&final_path).is_err() {
+                let _ = std::fs::remove_file(&stage);
+                return false;
+            }
             if std::fs::rename(&stage, &final_path).is_err() {
                 let _ = std::fs::remove_file(&stage);
                 return false;
@@ -492,6 +498,12 @@ async fn commit_blob(
     let attr = *attr;
     tokio::task::spawn_blocking(move || {
         if stage_write(&stage, &data).is_err() {
+            return false;
+        }
+        // Staging lives in a sibling tree now, so the blob's own directory is
+        // no longer created as a side effect of staging into it.
+        if crate::autocache::ensure_blob_dir(&final_path).is_err() {
+            let _ = std::fs::remove_file(&stage);
             return false;
         }
         if std::fs::rename(&stage, &final_path).is_err() {

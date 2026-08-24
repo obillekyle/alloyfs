@@ -47,6 +47,23 @@ pub trait RequestHandler: Send + Sync + 'static {
     /// `PROTO_VERSION_MIN`: the oldest shape is the one every peer decodes.
     async fn negotiated(&self, _proto: u16) {}
 
+    /// Called on every keepalive PING, before the pong goes back.
+    ///
+    /// The lease reaper needs this. `touch` had exactly one caller — the
+    /// request handler — while the client's 10 s heartbeat is a `Frame::Ping`
+    /// answered inline in the read loop, which never reaches a handler. So
+    /// pings refreshed nothing, and a session that was demonstrably alive got
+    /// reaped after 30 s without a REQUEST.
+    ///
+    /// Self-inflicted in the case it hurts most: a blocking
+    /// `LockRange { wait: true }` sends only pings while it waits, by design.
+    /// A lock wait over 30 s therefore made the agent close that same
+    /// session's handles, and the write after the lock was granted came back
+    /// `BadHandle`.
+    ///
+    /// Default: ignore it, for handlers with no session state.
+    async fn keepalive(&self) {}
+
     /// Called once after the handshake with a handle for server-push frames.
     /// Default: ignore it (handlers that never push need nothing).
     async fn connected(&self, _push: EventPusher) {}
@@ -190,6 +207,9 @@ where
                 });
             }
             Some(Ok(Frame::Ping { nonce })) => {
+                // A ping is proof of life, so it refreshes the lease. See
+                // `RequestHandler::keepalive`.
+                handler.keepalive().await;
                 let _ = out_tx.send(Frame::Pong { nonce }).await;
             }
             Some(Ok(other)) => {

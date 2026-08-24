@@ -310,6 +310,19 @@ impl RemoteFs {
                 state.cache_ok.store(false, Ordering::Relaxed);
                 state.ra.clear();
                 *state.blob.write().unwrap() = None;
+                // The warm fill has to go too. It was left behind, and the
+                // read path consults it unconditionally with no version check
+                // — `WarmFill::version` is only read at commit time — so a
+                // handle open across a change kept answering from bytes
+                // captured before it.
+                //
+                // Two ways that surfaces: a read-after-write on one handle
+                // returns the pre-write content, and a remote APPEND returns
+                // the short pre-append tail, because `block_len` reads the
+                // stale size and FUSE zero-fills the difference into the page.
+                // That second one is verbatim the failure this function's own
+                // comment says it exists to prevent.
+                *state.warm_fill.lock().unwrap() = None;
             }
         }
     }
@@ -320,6 +333,12 @@ impl RemoteFs {
             entry.value().cache_ok.store(false, Ordering::Relaxed);
             entry.value().ra.clear();
             *entry.value().blob.write().unwrap() = None;
+            // Same reason as `invalidate_open_reads`: a fill left behind keeps
+            // answering from bytes captured before the change, and the read
+            // path never version-checks it. Every caller of this is a
+            // "we may have missed events" path, which is the worst possible
+            // moment to keep a pre-change copy alive.
+            *entry.value().warm_fill.lock().unwrap() = None;
         }
     }
 

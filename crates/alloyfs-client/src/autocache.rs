@@ -788,11 +788,38 @@ impl AutoCache {
         self.cfg.warm_budget
     }
 
+    /// Where staging files live: a SIBLING of the blob tree, never inside it.
+    ///
+    /// Both staging helpers used to append a suffix to the blob's own name,
+    /// inside the blob tree — so `blob_stage_path("a/b")` and
+    /// `blob_path("a/b.part")` were the same file. A real cached file named
+    /// `X.part` was therefore truncated and overwritten by a fetch of `X`,
+    /// while the manifest still claimed a complete blob for it; `.part` is not
+    /// an excluded artifact, so a real one is perfectly possible. Truncating a
+    /// file an open handle has mmapped is SIGBUS on Linux, not a graceful
+    /// miss.
+    ///
+    /// A sibling directory closes it by construction: `blob_path` only ever
+    /// joins components UNDER the blob root, so nothing a peer can name
+    /// reaches here. Same parent directory, so the rename into place is still
+    /// atomic.
+    fn stage_root(&self) -> PathBuf {
+        let root = &self.cfg.root;
+        match (root.parent(), root.file_name().and_then(|n| n.to_str())) {
+            (Some(parent), Some(name)) => parent.join(format!("{name}.staging")),
+            // A root with no parent or a non-UTF-8 name: fall back to a
+            // reserved child. Collision needs a peer to name a path starting
+            // with a NUL-ish component, which `RelPath::validate_wire`
+            // rejects long before it reaches here.
+            _ => root.join(".alloyfs-staging"),
+        }
+    }
+
     /// Staging path for a read-fill, keyed by handle as well as path: two
     /// handles reading the same file must not write into one another's
     /// staging file.
     pub fn warm_stage_path(&self, path: &RelPath, fh: u64) -> PathBuf {
-        let mut p = blob_path(&self.cfg.root, path);
+        let mut p = blob_path(&self.stage_root(), path);
         let name = format!(
             "{}.warm{fh}",
             p.file_name().and_then(|n| n.to_str()).unwrap_or("blob")
@@ -801,8 +828,11 @@ impl AutoCache {
         p
     }
 
+    /// Staging path for a whole-file fetch. Under [`stage_root`], for the
+    /// reason given there: inside the blob tree, this collided with a real
+    /// cached file named `X.part`.
     pub fn blob_stage_path(&self, path: &RelPath) -> PathBuf {
-        let mut p = blob_path(&self.cfg.root, path);
+        let mut p = blob_path(&self.stage_root(), path);
         let name = format!(
             "{}.part",
             p.file_name().and_then(|n| n.to_str()).unwrap_or("blob")
@@ -893,6 +923,22 @@ pub(crate) fn stage_write(path: &std::path::Path, data: &[u8]) -> Result<(), all
         std::fs::create_dir_all(parent).or_code()?;
     }
     std::fs::write(path, data).or_code()
+}
+
+/// Make sure a blob's directory exists before a staged file is renamed onto it.
+///
+/// This used to happen by accident: staging files lived beside their final
+/// blob, so `stage_write`'s `create_dir_all` created the one directory both
+/// needed. Moving staging to a sibling tree (see `stage_root`, which closed a
+/// collision between a staging file and a real cached file named `X.part`)
+/// separated them — and every rename then failed silently into `return false`,
+/// so nothing cached and the walker never finished. Caught by the gate, not by
+/// reading.
+pub(crate) fn ensure_blob_dir(final_path: &std::path::Path) -> Result<(), alloyfs_proto::ErrorCode> {
+    match final_path.parent() {
+        Some(parent) => std::fs::create_dir_all(parent).or_code(),
+        None => Ok(()),
+    }
 }
 
 #[cfg(test)]

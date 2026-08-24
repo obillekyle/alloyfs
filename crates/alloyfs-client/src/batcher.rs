@@ -320,7 +320,18 @@ impl Batcher {
             while j < drained.len()
                 && drained[j].kind() == kind
                 && (j - i) < FLUSH_OPS
-                && run_bytes <= FLUSH_BYTES
+                // The size is tested WITH the candidate included, not before
+                // it. Testing `run_bytes <= FLUSH_BYTES` first let a run reach
+                // the limit and then add one more whole entry, so it could
+                // total FLUSH_BYTES + PENDING_FILE_MAX — 1,536,000 bytes
+                // against a 1 MiB MAX_FRAME_LEN. The encoder refuses that, and
+                // `writer::drain` treats an encode error as fatal, so the
+                // writer task exits and the whole mount's connection dies.
+                //
+                // `j == i` keeps a single oversized entry going out alone
+                // rather than looping forever refusing to place it; one entry
+                // can never exceed the limit on its own.
+                && (j == i || run_bytes + drained[j].bytes() <= FLUSH_BYTES)
             {
                 run_bytes += drained[j].bytes();
                 j += 1;

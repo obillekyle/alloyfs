@@ -1007,7 +1007,31 @@ async fn executor(engine: Arc<SyncEngine>, mut rx: mpsc::UnboundedReceiver<Op>) 
             Op::Remote(batch) => {
                 for ev in &batch {
                     if let Err(e) = engine.apply_remote(ev).await {
-                        tracing::warn!(path = %ev.path, error = %e, "remote apply failed");
+                        // The cursor does NOT advance past work that failed.
+                        //
+                        // It used to: `last_seq` was bumped whether or not the
+                        // apply succeeded, so one transient failure left that
+                        // path permanently stale on an otherwise-healthy
+                        // connection — nothing would ever replay it, because
+                        // the client had already told itself it had.
+                        //
+                        // Stopping the batch here rather than skipping the one
+                        // event is deliberate: events are ordered, and applying
+                        // a later change to a path whose earlier change was
+                        // lost is how a directory ends up in a state that never
+                        // existed on the server. The next subscribe resumes
+                        // from the last event that actually landed.
+                        //
+                        // The `Op::Local` arm below already worked this way and
+                        // explains why; this is the same rule for the other
+                        // direction.
+                        tracing::warn!(
+                            path = %ev.path,
+                            seq = ev.seq,
+                            error = %e,
+                            "remote apply failed; holding the cursor so it replays"
+                        );
+                        break;
                     }
                     let mut m = engine.manifest.lock().unwrap();
                     m.last_seq = m.last_seq.max(ev.seq);

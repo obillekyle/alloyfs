@@ -2054,6 +2054,14 @@ impl RequestHandler for AgentSession {
         self.inner.proto.store(proto, Ordering::Relaxed);
     }
 
+    /// A heartbeat refreshes the lease, which is what the client has always
+    /// believed it did. Before this, `touch` ran only from `handle`, so a
+    /// session sending nothing but pings — exactly what a blocking lock wait
+    /// does — was reaped as dead while it was demonstrably alive.
+    async fn keepalive(&self) {
+        self.inner.touch();
+    }
+
     async fn connected(&self, push: EventPusher) {
         *self.inner.push.lock().unwrap() = Some(push);
     }
