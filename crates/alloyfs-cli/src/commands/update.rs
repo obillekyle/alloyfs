@@ -258,14 +258,27 @@ fn around_restart<T>(ids: &[String], f: impl FnOnce() -> anyhow::Result<T>) -> a
 }
 
 pub fn run(channel: Option<String>, dry_run: bool, restart: bool) -> anyhow::Result<()> {
-    let version = match channel.as_deref() {
-        None | Some("stable") | Some("latest") => None,
+    // Two knobs, both handed STRAIGHT to the installer rather than resolved
+    // here. Which release a channel means is the installer's job — it already
+    // owns the release API, the semver comparison and the stability ladder,
+    // and a second copy of that in Rust is precisely the drift this module
+    // exists to avoid (see the note at the top).
+    //
+    // No argument sets NEITHER, which tells the installer to follow whatever
+    // channel this machine is already on. That is the useful default: picking
+    // "the newest thing published" regardless of channel is what would move a
+    // stable machine onto an alpha.
+    let (version, want_channel) = match channel.as_deref() {
+        None => (None, None),
+        Some(c @ ("alpha" | "beta" | "rc" | "pre" | "stable" | "latest")) => (None, Some(c.to_string())),
         // A literal tag: `alloyfs update v0.1.1` pins, which is what you want
         // when rolling back.
-        Some(v) if v.starts_with('v') => Some(v.to_string()),
+        Some(v) if v.starts_with('v') => (Some(v.to_string()), None),
         Some(other) => anyhow::bail!(
-            "unknown channel {other:?}. Use `stable` (the default), or a tag \
-             like `v0.1.1` to install a specific release."
+            "unknown channel {other:?}. Use one of `alpha`, `beta`, `rc`, `stable`, \
+             `latest`, or a tag like `v0.1.1` to install a specific release.\n\n  \
+             With no argument at all, the channel this machine is already on is \
+             the one it stays on."
         ),
     };
 
@@ -288,7 +301,7 @@ pub fn run(channel: Option<String>, dry_run: bool, restart: bool) -> anyhow::Res
         println!("into:    {}", dir.display());
     }
 
-    let (program, args) = installer_command(version.as_deref());
+    let (program, args) = installer_command(version.as_deref(), want_channel.as_deref());
 
     if dry_run {
         let env_note = install_dir
@@ -362,10 +375,14 @@ pub fn run(channel: Option<String>, dry_run: bool, restart: bool) -> anyhow::Res
 /// The platform's own downloader piped into its own shell — the same one-liner
 /// the docs tell people to paste, so there is only one path to keep working.
 #[cfg(windows)]
-fn installer_command(version: Option<&str>) -> (String, Vec<String>) {
-    let set = version
-        .map(|v| format!("$env:ALLOYFS_VERSION='{v}'; "))
-        .unwrap_or_default();
+fn installer_command(version: Option<&str>, channel: Option<&str>) -> (String, Vec<String>) {
+    let mut set = String::new();
+    if let Some(v) = version {
+        set.push_str(&format!("$env:ALLOYFS_VERSION='{v}'; "));
+    }
+    if let Some(c) = channel {
+        set.push_str(&format!("$env:ALLOYFS_CHANNEL='{c}'; "));
+    }
     (
         "powershell".into(),
         vec![
@@ -379,10 +396,14 @@ fn installer_command(version: Option<&str>) -> (String, Vec<String>) {
 }
 
 #[cfg(unix)]
-fn installer_command(version: Option<&str>) -> (String, Vec<String>) {
-    let set = version
-        .map(|v| format!("ALLOYFS_VERSION={v} "))
-        .unwrap_or_default();
+fn installer_command(version: Option<&str>, channel: Option<&str>) -> (String, Vec<String>) {
+    let mut set = String::new();
+    if let Some(v) = version {
+        set.push_str(&format!("ALLOYFS_VERSION={v} "));
+    }
+    if let Some(c) = channel {
+        set.push_str(&format!("ALLOYFS_CHANNEL={c} "));
+    }
     (
         "sh".into(),
         vec![

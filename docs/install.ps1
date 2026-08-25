@@ -3,7 +3,11 @@
 #   irm alloy.okyle.dev/install.ps1 | iex
 #
 # Environment:
-#   $env:ALLOYFS_VERSION      install this tag instead of the latest (e.g. v0.1.1)
+#   $env:ALLOYFS_VERSION      install this tag instead of resolving one (e.g. v0.1.1)
+#   $env:ALLOYFS_CHANNEL      alpha | beta | rc | stable | latest. With none of
+#                             these, the channel the INSTALLED binary is on is
+#                             the one that is followed, and a fresh machine gets
+#                             the newest release there is.
 #   $env:ALLOYFS_INSTALL      install here instead of %LOCALAPPDATA%\Programs\alloyfs
 #   $env:GITHUB_TOKEN         optional; raises the GitHub API rate limit
 #   $env:ALLOYFS_SKIP_WINFSP  do not offer to install the WinFsp driver
@@ -116,19 +120,182 @@ function Get-Tag([string]$path) {
   } catch { return $null }
 }
 
+# Which rung of the stability ladder a tag sits on: 0 alpha, 1 beta, 2 rc/pre,
+# 3 stable. $null for a prerelease naming something else — there is no rung to
+# promote onto, and guessing which one it resembles would be worse than
+# ignoring it.
+#
+# rc and pre are deliberately one rung: cutver's config maps both onto the same
+# channel, so splitting them here would invent a distinction the releases
+# themselves do not make.
+function Rung-Of([string]$tag) {
+  $v = $tag -replace '^v', ''
+  $i = $v.IndexOf('-')
+  if ($i -lt 0) { return 3 }
+  switch (($v.Substring($i + 1) -split '\.')[0]) {
+    'alpha' { return 0 }
+    'beta' { return 1 }
+    'rc' { return 2 }
+    'pre' { return 2 }
+    'prerelease' { return 2 }
+    default { return $null }
+  }
+}
+
+function Rung-Name([int]$rung) {
+  switch ($rung) { 0 { 'alpha' } 1 { 'beta' } 2 { 'rc' } 3 { 'stable' } }
+}
+
+# Is $a >= $b comparing CORES only, ignoring prerelease identifiers?
+#
+# This is what "stable has caught up" means, and it needs its own comparison
+# because semver precedence cannot express it: 1.0.0 outranks every 1.0.0-*,
+# but so does it outrank nothing at all — while 0.8.1 against 1.0.0-alpha.94
+# must NOT count as caught up. Cores answer that; whole-version order does not.
+function Core-AtLeast([string]$a, [string]$b) {
+  function Core([string]$v) {
+    $v = ($v -replace '^v', '')
+    $v = ($v -split '-')[0]
+    $p = $v -split '\.'
+    return @(0, 1, 2 | ForEach-Object { $n = 0; [void][int]::TryParse($p[$_], [ref]$n); $n })
+  }
+  $x = Core $a; $y = Core $b
+  for ($i = 0; $i -lt 3; $i++) {
+    if ($x[$i] -gt $y[$i]) { return $true }
+    if ($x[$i] -lt $y[$i]) { return $false }
+  }
+  return $true # equal cores: stable has arrived at the line you were following
+}
+
+# When one tag was published. Asked per tag rather than paired up from the
+# release list, so nothing depends on field order inside a release object.
+# Only called when version order cannot decide, which is rare.
+function Published-Of([string]$tag) {
+  try {
+    $r = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/tags/$tag" -Headers $headers
+    return [datetime]$r.published_at
+  } catch { return $null }
+}
+
+# The version already on this machine, if any — the thing that decides which
+# channel is being followed. An install with nothing to upgrade has no channel,
+# which is a different case and handled as one.
+function Installed-Version {
+  foreach ($c in @((Join-Path $InstallDir 'alloyfs.exe'), 'alloyfs')) {
+    try {
+      $out = & $c --version 2>$null
+      if ($LASTEXITCODE -eq 0 -and $out) {
+        $v = ($out | Select-Object -First 1).ToString().Split(' ')[1]
+        if ($v) { return 'v' + ($v -replace '^v', '') }
+      }
+    } catch { }
+  }
+  return $null
+}
+
 $version = $env:ALLOYFS_VERSION
 if (-not $version) {
   Write-Host 'Looking up the latest release...'
-  # Both, because they answer different questions: releases/latest is the
-  # newest STABLE, the first page of releases is the newest thing published at
-  # all. Whichever is genuinely newer wins.
-  $stable = Get-Tag 'releases/latest'
-  $newest = Get-Tag 'releases?per_page=1'
-  if ($stable -and $newest) { $version = Newer-Of $newest $stable }
-  elseif ($stable) { $version = $stable }
-  else { $version = $newest }
-  if ($version -and $version.Contains('-')) {
-    Dim "The newest release is a prerelease ($version); installing it."
+
+  # The newest tag on each rung, from one request. The list arrives
+  # newest-first, so the first tag seen for a rung is that rung's latest.
+  $rungTag = @{}
+  try {
+    $all = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases?per_page=100" -Headers $headers
+    foreach ($r in $all) {
+      if ($r.draft) { continue }
+      $rung = Rung-Of $r.tag_name
+      if ($null -eq $rung) { continue }
+      if (-not $rungTag.ContainsKey($rung)) { $rungTag[$rung] = $r.tag_name }
+    }
+  } catch { }
+
+  # Which channel is being followed. An explicit ALLOYFS_CHANNEL wins; failing
+  # that, the installed binary's own version says it. Choosing the channel by
+  # what is already here is the whole point: installing "the newest thing
+  # published" regardless of channel is what put a STABLE machine onto an
+  # alpha, which is a far worse surprise than a missed upgrade.
+  $mineRung = $null
+  $asked = $false
+  switch ($env:ALLOYFS_CHANNEL) {
+    'alpha' { $mineRung = 0; $asked = $true }
+    'beta' { $mineRung = 1; $asked = $true }
+    'rc' { $mineRung = 2; $asked = $true }
+    'pre' { $mineRung = 2; $asked = $true }
+    'stable' { $mineRung = 3; $asked = $true }
+    # Deliberately off the ladder: whatever is newest, whatever rung it is on.
+    # The escape hatch for someone who wants the bleeding edge without first
+    # installing something on that channel.
+    'latest' { $mineRung = 9 }
+    '' { $c = Installed-Version; if ($c) { $mineRung = Rung-Of $c } }
+    $null { $c = Installed-Version; if ($c) { $mineRung = Rung-Of $c } }
+    default { Die "unknown ALLOYFS_CHANNEL '$($env:ALLOYFS_CHANNEL)'. Use alpha, beta, rc, stable or latest." }
+  }
+
+  $mine = $null
+  if ($null -ne $mineRung -and $rungTag.ContainsKey($mineRung)) { $mine = $rungTag[$mineRung] }
+
+  if (-not $mine -and $asked) {
+    # A channel was NAMED and has nothing on it. Falling through to "newest
+    # overall" here would answer an explicit ALLOYFS_CHANNEL=beta with an
+    # alpha — the opposite of what was asked for, reported as success.
+    $have = ($rungTag.Keys | Sort-Object | ForEach-Object { "`n         {0,-7} {1}" -f (Rung-Name $_), $rungTag[$_] }) -join ''
+    Die "nothing is published on the $(Rung-Name $mineRung) channel.
+
+       Published channels right now:$have"
+  }
+
+  if (-not $mine) {
+    # Nothing installed and no channel named: there is no channel to follow,
+    # so take the newest thing there is.
+    foreach ($t in $rungTag.Values) {
+      if (-not $version) { $version = $t } else { $version = Newer-Of $t $version }
+    }
+    if ($version -and $version.Contains('-')) {
+      Dim "The newest release is a prerelease ($version); installing it."
+    }
+  }
+  else {
+    # Climb. Each rung above the installed one is judged against what is
+    # installed, and later rungs overwrite earlier ones — so the result is the
+    # MOST stable rung that has caught up. Nothing here can move down a rung:
+    # a stable machine is never pulled onto a prerelease.
+    $version = $mine
+    $downgrade = $false
+    foreach ($rung in 1, 2, 3) {
+      if ($rung -le $mineRung) { continue }
+      if (-not $rungTag.ContainsKey($rung)) { continue }
+      $cand = $rungTag[$rung]
+      if ($rung -eq 3) {
+        if (Core-AtLeast $cand $mine) { $version = $cand; $downgrade = $false }
+      }
+      elseif ($cand -ne $mine -and (Newer-Of $cand $mine) -eq $cand) {
+        $version = $cand; $downgrade = $false
+      }
+      else {
+        # Version order says this rung is not ahead. The only way it can still
+        # win is by having been published more recently — and since it is not
+        # version-newer, taking it means going BACKWARDS in version. That is
+        # the one case worth naming out loud rather than performing quietly.
+        $candAt = Published-Of $cand
+        $mineAt = Published-Of $mine
+        if ($candAt -and $mineAt -and $candAt -gt $mineAt) {
+          $version = $cand; $downgrade = $true
+        }
+      }
+    }
+
+    if ($version -ne $mine) {
+      $to = Rung-Name (Rung-Of $version)
+      $from = Rung-Name $mineRung
+      if ($downgrade) {
+        Write-Host "$to is the channel to be on, but $version is OLDER than $mine." -ForegroundColor Yellow
+        Dim 'Installing it anyway — this is a downgrade, not an upgrade.'
+      }
+      else {
+        Dim "$to has caught up; moving off $from ($mine -> $version)."
+      }
+    }
   }
 }
 

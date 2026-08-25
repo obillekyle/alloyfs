@@ -4,7 +4,11 @@
 #   curl -fsSL https://alloy.okyle.dev/install.sh | sh
 #
 # Environment:
-#   ALLOYFS_VERSION   install this tag instead of the latest (e.g. v0.1.1)
+#   ALLOYFS_VERSION   install this tag instead of resolving one (e.g. v0.1.1)
+#   ALLOYFS_CHANNEL   alpha | beta | rc | stable | latest. With none of these,
+#                     the channel the INSTALLED binary is on is the one that
+#                     is followed, and a fresh machine gets the newest release
+#                     there is.
 #   ALLOYFS_INSTALL   install here instead of the default (~/.local/bin, or
 #                     /usr/local/bin when running as root)
 #   GITHUB_TOKEN      optional; raises the GitHub API rate limit
@@ -159,22 +163,202 @@ tag_from() {
     | head -1
 }
 
+# Every tag on a release page, newest first.
+#
+# `tr ',' '\n'` first because the API answers one enormous line and `sed`
+# works a line at a time: without the split, the greedy `.*` matches the LAST
+# tag_name in the whole document and every other release is invisible.
+tags_from() {
+  api "https://api.github.com/repos/$REPO/$1" \
+    | tr ',' '\n' \
+    | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'
+}
+
+# When one tag was published. Fetched per tag rather than paired up from the
+# list, because pairing means trusting that no release BODY contains the text
+# `"published_at"` — and bodies are free-form markdown. One tag, one object,
+# no ambiguity. Only called when version order cannot decide, which is rare.
+published_of() {
+  api "https://api.github.com/repos/$REPO/releases/tags/$1" \
+    | tr ',' '\n' \
+    | sed -n 's/.*"published_at"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+    | head -1
+}
+
+# Which rung of the stability ladder a tag sits on: 0 alpha, 1 beta, 2 rc/pre,
+# 3 stable. Empty for a prerelease naming something else — there is no rung to
+# promote onto, and guessing which one it resembles would be worse than
+# ignoring it.
+#
+# rc and pre are deliberately one rung: cutver's config maps both onto the
+# same channel, so splitting them here would invent a distinction the releases
+# themselves do not make.
+rung_of() {
+  case "${1#v}" in
+    *-alpha|*-alpha.*) printf '0' ;;
+    *-beta|*-beta.*) printf '1' ;;
+    *-rc|*-rc.*|*-pre|*-pre.*|*-prerelease|*-prerelease.*) printf '2' ;;
+    *-*) printf '' ;;
+    *) printf '3' ;;
+  esac
+}
+
+rung_name() {
+  case "$1" in
+    0) printf 'alpha' ;;
+    1) printf 'beta' ;;
+    2) printf 'rc' ;;
+    3) printf 'stable' ;;
+  esac
+}
+
+# Is $1 >= $2 comparing CORES only, ignoring prerelease identifiers?
+#
+# This is what "stable has caught up" means, and it needs its own comparison
+# because semver precedence cannot express it: 1.0.0 outranks every 1.0.0-*,
+# but so does it outrank nothing at all — while 0.8.1 against 1.0.0-alpha.94
+# must NOT count as caught up. Cores answer that; whole-version order does not.
+core_at_least() {
+  a=${1#v}; a=${a%%-*}
+  b=${2#v}; b=${b%%-*}
+  i=1
+  while [ "$i" -le 3 ]; do
+    x=$(printf '%s' "$a" | cut -d. -f"$i"); y=$(printf '%s' "$b" | cut -d. -f"$i")
+    x=${x:-0}; y=${y:-0}
+    case "$x$y" in *[!0-9]*) x=0; y=0 ;; esac
+    if [ "$x" -gt "$y" ]; then return 0; fi
+    if [ "$x" -lt "$y" ]; then return 1; fi
+    i=$((i + 1))
+  done
+  return 0 # equal cores: stable has arrived at the line you were following
+}
+
+# The version already on this machine, if any — the thing that decides which
+# channel is being followed. An install with nothing to upgrade has no channel,
+# which is a different case and handled as one.
+installed_version() {
+  for c in "$INSTALL_DIR/alloyfs" alloyfs; do
+    p=$(command -v "$c" 2>/dev/null) || continue
+    v=$("$p" --version 2>/dev/null | awk 'NR==1 {print $2}') || continue
+    if [ -n "$v" ]; then printf 'v%s' "${v#v}"; return; fi
+  done
+}
+
 version="${ALLOYFS_VERSION:-}"
 if [ -z "$version" ]; then
   bold "Looking up the latest release..."
-  # Both, because they answer different questions: releases/latest is the
-  # newest STABLE, the first page of releases is the newest thing published
-  # at all. Whichever is genuinely newer wins.
-  stable=$(tag_from "releases/latest") || true
-  newest=$(tag_from "releases?per_page=1") || true
-  if [ -n "$stable" ] && [ -n "$newest" ]; then
-    version=$(newer_of "$newest" "$stable")
-  else
-    version="${stable:-$newest}"
-  fi
-  case "$version" in
-    *-*) dim "The newest release is a prerelease ($version); installing it." ;;
+
+  # The newest tag on each rung, from one request. The list arrives
+  # newest-first, so the first tag seen for a rung is that rung's latest.
+  alpha_tag=''; beta_tag=''; rc_tag=''; stable_tag=''
+  for t in $(tags_from "releases?per_page=100"); do
+    case "$(rung_of "$t")" in
+      0) [ -z "$alpha_tag" ] && alpha_tag=$t ;;
+      1) [ -z "$beta_tag" ] && beta_tag=$t ;;
+      2) [ -z "$rc_tag" ] && rc_tag=$t ;;
+      3) [ -z "$stable_tag" ] && stable_tag=$t ;;
+    esac
+  done
+
+  # Which channel is being followed. An explicit ALLOYFS_CHANNEL wins; failing
+  # that, the installed binary's own version says it. Choosing the channel by
+  # what is already here is the whole point: installing "the newest thing
+  # published" regardless of channel is what put a STABLE machine onto an
+  # alpha, which is a far worse surprise than a missed upgrade.
+  asked=''
+  mine_rung="${ALLOYFS_CHANNEL:-}"
+  case "$mine_rung" in
+    alpha) mine_rung=0; asked=1 ;;
+    beta) mine_rung=1; asked=1 ;;
+    rc|pre) mine_rung=2; asked=1 ;;
+    stable) mine_rung=3; asked=1 ;;
+    # Deliberately off the ladder: whatever is newest, whatever rung it is
+    # on. The escape hatch for someone who wants the bleeding edge without
+    # first installing something on that channel.
+    latest) mine_rung=9 ;;
+    '') current=$(installed_version); [ -n "$current" ] && mine_rung=$(rung_of "$current") ;;
+    *) die "unknown ALLOYFS_CHANNEL '$mine_rung'. Use alpha, beta, rc, stable or latest." ;;
   esac
+
+  case "$mine_rung" in
+    0) mine=$alpha_tag ;;
+    1) mine=$beta_tag ;;
+    2) mine=$rc_tag ;;
+    3) mine=$stable_tag ;;
+    *) mine='' ;;
+  esac
+
+  if [ -z "$mine" ] && [ -n "$asked" ]; then
+    # A channel was NAMED and has nothing on it. Falling through to "newest
+    # overall" here would answer an explicit `ALLOYFS_CHANNEL=beta` with an
+    # alpha — the opposite of what was asked for, reported as success.
+    die "nothing is published on the $(rung_name "$mine_rung") channel.
+
+       Published channels right now:$(
+      for r in 0 1 2 3; do
+        case "$r" in
+          0) t=$alpha_tag ;; 1) t=$beta_tag ;; 2) t=$rc_tag ;; 3) t=$stable_tag ;;
+        esac
+        [ -n "$t" ] && printf '\n         %-7s %s' "$(rung_name "$r")" "$t"
+      done
+    )"
+  fi
+
+  if [ -z "$mine" ]; then
+    # Nothing installed and no channel named: there is no channel to follow,
+    # so take the newest thing there is.
+    version=''
+    for t in $stable_tag $rc_tag $beta_tag $alpha_tag; do
+      if [ -z "$version" ]; then version=$t; else version=$(newer_of "$t" "$version"); fi
+    done
+    case "$version" in
+      *-*) dim "The newest release is a prerelease ($version); installing it." ;;
+    esac
+  else
+    # Climb. Each rung above the installed one is judged against what is
+    # installed, and later rungs overwrite earlier ones — so the result is the
+    # MOST stable rung that has caught up. Nothing here can move down a rung:
+    # a stable machine is never pulled onto a prerelease.
+    version=$mine
+    downgrade=''
+    for rung in 1 2 3; do
+      [ "$rung" -le "${mine_rung:-0}" ] && continue
+      case "$rung" in
+        1) cand=$beta_tag ;;
+        2) cand=$rc_tag ;;
+        3) cand=$stable_tag ;;
+      esac
+      [ -z "$cand" ] && continue
+      if [ "$rung" -eq 3 ]; then
+        if core_at_least "$cand" "$mine"; then version=$cand; downgrade=''; fi
+      elif [ "$cand" != "$mine" ] && [ "$(newer_of "$cand" "$mine")" = "$cand" ]; then
+        version=$cand
+        downgrade=''
+      else
+        # Version order says this rung is not ahead. The only way it can still
+        # win is by having been published more recently — and since it is not
+        # version-newer, taking it means going BACKWARDS in version. That is
+        # the one case worth naming out loud rather than performing quietly.
+        cand_at=$(published_of "$cand") || true
+        mine_at=$(published_of "$mine") || true
+        if [ -n "$cand_at" ] && [ -n "$mine_at" ] && [ "$cand_at" \> "$mine_at" ]; then
+          version=$cand
+          downgrade=1
+        fi
+      fi
+    done
+
+    if [ "$version" != "$mine" ]; then
+      to=$(rung_name "$(rung_of "$version")")
+      from=$(rung_name "${mine_rung:-0}")
+      if [ -n "$downgrade" ]; then
+        bold "$to is the channel to be on, but $version is OLDER than $mine."
+        dim "Installing it anyway — this is a downgrade, not an upgrade."
+      else
+        dim "$to has caught up; moving off $from ($mine -> $version)."
+      fi
+    fi
+  fi
 fi
 
 if [ -z "$version" ]; then
