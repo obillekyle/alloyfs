@@ -1,10 +1,24 @@
-//! HTTP surface on the agent: status, browse, file GET/POST, and a
-//! Server-Sent-Events stream of file changes. Not a mount transport — an
-//! observability and integration API (dashboards, scripts, CI).
+//! HTTP surface on the agent. Not a mount transport — an observability and
+//! integration API (dashboards, scripts, CI), documented at
+//! `docs/reference/http-api.md`.
+//!
+//! Read: `status`, `exports`, `browse` (paged), `stat`, `statfs`, `readlink`,
+//! `file` (ranged GET), `events` (SSE).
+//! Write: `file` (whole or at an offset, with `If-Match` / `If-None-Match`),
+//! `mkdir`, `delete` (optionally recursive), `rename`, `copy`, `setattr`,
+//! and `bulk` for per-path batches.
+//!
+//! The read half was always a reasonable HTTP citizen; the write half was a
+//! thin RPC, and its gaps compounded. No conditional write meant two clients
+//! silently lost an edit. No rename meant a move was GET + POST + DELETE. No
+//! partial write meant `MAX_BODY` was a ceiling on the size of file this API
+//! could produce at all. Those are closed; each is noted at its handler.
 //!
 //! Authorization: when a token is configured, EVERY /api route requires
 //! `Authorization: Bearer <token>` (constant-time comparison). Serving on a
-//! non-loopback address without a token is refused at startup.
+//! non-loopback address without a token is refused at startup. A new route
+//! is covered automatically by the layer — `auth_covers_every_route` in the
+//! tests is what keeps that honest, and it needs extending with each route.
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -56,9 +70,16 @@ pub fn router(registry: Arc<ExportRegistry>, token: Option<String>) -> Router {
         .route("/api/status", get(status))
         .route("/api/exports", get(exports))
         .route("/api/exports/{name}/browse", get(browse))
+        .route("/api/exports/{name}/stat", get(stat_get))
+        .route("/api/exports/{name}/statfs", get(statfs_get))
+        .route("/api/exports/{name}/readlink", get(readlink_get))
         .route("/api/exports/{name}/file", get(file_get).post(file_post))
         .route("/api/exports/{name}/mkdir", post(mkdir_post))
         .route("/api/exports/{name}/delete", post(delete_post))
+        .route("/api/exports/{name}/rename", post(rename_post))
+        .route("/api/exports/{name}/copy", post(copy_post))
+        .route("/api/exports/{name}/setattr", post(setattr_post))
+        .route("/api/exports/{name}/bulk", post(bulk_post))
         .route("/api/exports/{name}/events", get(events_sse))
         .layer(middleware::from_fn_with_state(state.clone(), auth))
         .layer(DefaultBodyLimit::max(MAX_BODY))
@@ -139,9 +160,7 @@ async fn file_get(
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    // Weak by declaration and by construction (size + mtime, no hashing) —
-    // exactly strong enough for revalidation.
-    let etag = format!("W/\"{len:x}-{mtime_ms:x}\"");
+    let etag = etag_of(len, mtime_ms);
     let base = |b: axum::http::response::Builder| {
         b.header("etag", etag.clone())
             .header("last-modified", httpdate_ms(mtime_ms))
@@ -307,11 +326,37 @@ fn httpdate_ms(ms: u128) -> String {
     )
 }
 
-/// POST /api/exports/{name}/file?path=… — create or overwrite with the body.
+#[derive(Deserialize)]
+struct WriteQuery {
+    path: String,
+    /// Byte offset to write the body at. Present = a PARTIAL write into an
+    /// existing file; absent = create-or-replace the whole thing.
+    offset: Option<u64>,
+}
+
+/// POST /api/exports/{name}/file?path=…[&offset=…] — write the body.
+///
+/// Three things this grew, each closing a hole a caller could not work
+/// around from outside:
+///
+/// * **`offset=`** writes the body at a byte offset instead of replacing the
+///   file. `MAX_BODY` caps one request at 256 MiB, and with no partial write
+///   that was a hard ceiling on the size of file this API could produce at
+///   all — a 300 MiB upload was simply impossible. Chunks make the cap a
+///   per-request limit rather than a per-file one. Note the trade: an
+///   offset write lands IN PLACE, so a concurrent reader can see a partial
+///   result. That is inherent to writing part of a file, and it is why the
+///   whole-file path keeps its atomic rename.
+/// * **`If-Match`** rejects a write whose ETag no longer matches with 412.
+///   `file_get` handed out ETags and nothing accepted them back, so two
+///   clients that each read, edited and wrote silently lost one edit.
+/// * **`If-None-Match: *`** makes a create fail with 412 if the path already
+///   exists, which is the other half of the same problem — claim-if-absent.
 async fn file_post(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
-    Query(q): Query<PathQuery>,
+    Query(q): Query<WriteQuery>,
+    headers: HeaderMap,
     body: bytes::Bytes,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let export = state.registry.get(&name).ok_or(StatusCode::NOT_FOUND)?;
@@ -320,6 +365,37 @@ async fn file_post(
     }
     let rel = RelPath(q.path);
     let full = export.resolve_new(&rel).map_err(code_to_status)?;
+
+    // Preconditions first, against the file as it is right now. Checked here
+    // rather than inside the blocking closure so a failed precondition costs
+    // no thread and writes nothing.
+    let current = std::fs::metadata(&full).ok();
+    if let Some(inm) = header_str(&headers, "if-none-match") {
+        // `*` is the only form that means anything for a write: "only if it
+        // does not exist".
+        if inm.trim() == "*" && current.is_some() {
+            return Err(StatusCode::PRECONDITION_FAILED);
+        }
+    }
+    if let Some(im) = header_str(&headers, "if-match") {
+        let now = current
+            .as_ref()
+            .map(|md| etag_of(md.len(), ms(md.modified().unwrap_or(std::time::UNIX_EPOCH))));
+        let ok = match (&now, im.trim()) {
+            // `If-Match: *` means "only if it exists at all".
+            (Some(_), "*") => true,
+            (Some(tag), want) => want.split(',').any(|t| t.trim() == tag),
+            (None, _) => false, // nothing to match: the file is gone
+        };
+        if !ok {
+            return Err(StatusCode::PRECONDITION_FAILED);
+        }
+    }
+
+    if let Some(offset) = q.offset {
+        return file_post_at(export, rel, full, offset, body).await;
+    }
+
     let written = body.len();
     // HTTP mutations are deliberately origin-LESS: origin tagging exists only
     // so a mounted session doesn't hear its own writes echoed back, and an
@@ -357,6 +433,285 @@ async fn file_post(
     ))
 }
 
+/// The `offset=` half of `file_post`: write the body into an existing file at
+/// a byte offset, extending it if the offset is past the end.
+///
+/// Deliberately NOT atomic, and it cannot be: replacing the file by rename
+/// would discard every other chunk of the same upload. So this is a real
+/// in-place `write_at`, and a reader during a multi-chunk upload can see a
+/// partially written file. That is the price of being able to produce a file
+/// larger than one request body, and the whole-file path is still there for
+/// callers who want the atomic swap.
+async fn file_post_at(
+    export: Arc<alloyfs_agent::Export>,
+    rel: RelPath,
+    full: std::path::PathBuf,
+    offset: u64,
+    body: bytes::Bytes,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let written = body.len();
+    let version = tokio::task::spawn_blocking(move || -> Result<u64, ErrorCode> {
+        use std::fs::OpenOptions;
+        let f = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&full)
+            .map_err(|_| ErrorCode::Io)?;
+        alloyfs_common::write_at(&f, &body, offset).map_err(|_| ErrorCode::Io)?;
+        Ok(export.bump(&rel))
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .map_err(code_to_status)?;
+    Ok(Json(serde_json::json!({
+        "written": written, "offset": offset, "version": version, "partial": true
+    })))
+}
+
+#[derive(Deserialize)]
+struct FromTo {
+    from: String,
+    to: String,
+}
+
+/// POST /api/exports/{name}/rename — `{"from":…,"to":…}`, atomically.
+///
+/// Without it a move was GET + POST + DELETE: not atomic, twice the bytes
+/// over the wire, and a window where the file exists twice or not at all.
+async fn rename_post(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(q): Json<FromTo>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let export = state.registry.get(&name).ok_or(StatusCode::NOT_FOUND)?;
+    if export.read_only {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let (from, to) = (RelPath(q.from), RelPath(q.to));
+    let src = export.resolve(&from).map_err(code_to_status)?;
+    let dst = export.resolve_new(&to).map_err(code_to_status)?;
+    let version = tokio::task::spawn_blocking(move || -> Result<u64, ErrorCode> {
+        std::fs::rename(&src, &dst).map_err(|_| ErrorCode::Io)?;
+        // One funnel call covering both sides: the source loses its version
+        // and the destination gains a fresh one.
+        Ok(export.rename_version(&from, &to))
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .map_err(code_to_status)?;
+    Ok(Json(serde_json::json!({ "renamed": true, "version": version })))
+}
+
+/// POST /api/exports/{name}/copy — `{"from":…,"to":…}`. Files only.
+async fn copy_post(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(q): Json<FromTo>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let export = state.registry.get(&name).ok_or(StatusCode::NOT_FOUND)?;
+    if export.read_only {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let (from, to) = (RelPath(q.from), RelPath(q.to));
+    let src = export.resolve(&from).map_err(code_to_status)?;
+    let dst = export.resolve_new(&to).map_err(code_to_status)?;
+    let (bytes, version) = tokio::task::spawn_blocking(move || -> Result<(u64, u64), ErrorCode> {
+        if std::fs::symlink_metadata(&src)
+            .map_err(|_| ErrorCode::NotFound)?
+            .is_dir()
+        {
+            return Err(ErrorCode::IsADirectory);
+        }
+        let n = std::fs::copy(&src, &dst).map_err(|_| ErrorCode::Io)?;
+        Ok((n, export.bump(&to)))
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .map_err(code_to_status)?;
+    Ok(Json(serde_json::json!({ "copied": bytes, "version": version })))
+}
+
+#[derive(Deserialize)]
+struct SetattrBody {
+    mode: Option<u32>,
+    mtime_ms: Option<u64>,
+}
+
+/// POST /api/exports/{name}/setattr?path=… — `{"mode":…,"mtime_ms":…}`.
+///
+/// Both optional; absent means unchanged. Nothing here could change a mode
+/// or a timestamp before, which also meant the Windows-attribute behaviour
+/// the mounts care about was invisible from HTTP entirely.
+async fn setattr_post(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Query(q): Query<PathQuery>,
+    Json(b): Json<SetattrBody>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let export = state.registry.get(&name).ok_or(StatusCode::NOT_FOUND)?;
+    if export.read_only {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let rel = RelPath(q.path);
+    let full = export.resolve(&rel).map_err(code_to_status)?;
+    let version = tokio::task::spawn_blocking(move || -> Result<u64, ErrorCode> {
+        if let Some(mode) = b.mode {
+            alloyfs_common::set_mode_path(&full, mode).map_err(|_| ErrorCode::Io)?;
+        }
+        if let Some(ms) = b.mtime_ms {
+            let t = std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms);
+            let f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&full)
+                .map_err(|_| ErrorCode::Io)?;
+            f.set_modified(t).map_err(|_| ErrorCode::Io)?;
+        }
+        Ok(export.bump(&rel))
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .map_err(code_to_status)?;
+    Ok(Json(serde_json::json!({ "version": version })))
+}
+
+#[derive(Deserialize)]
+struct BulkBody {
+    op: String,
+    paths: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct BulkResult {
+    path: String,
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    entry: Option<BrowseEntry>,
+}
+
+/// POST /api/exports/{name}/bulk — `{"op":"stat"|"delete"|"mkdir","paths":[…]}`
+///
+/// One request, one result PER PATH, and a failure on any one of them does
+/// not fail the others or the request. That last part is the whole point:
+/// the wire protocol's `ManyEntry` has always reported per-item success, and
+/// a bulk endpoint that gives up on the first bad path just moves the round
+/// trips back to the client.
+///
+/// The response is always 200 when the request itself was well formed —
+/// check the per-item `ok`, not the status code.
+async fn bulk_post(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(b): Json<BulkBody>,
+) -> Result<Json<Vec<BulkResult>>, StatusCode> {
+    let export = state.registry.get(&name).ok_or(StatusCode::NOT_FOUND)?;
+    let mutating = matches!(b.op.as_str(), "delete" | "mkdir");
+    if mutating && export.read_only {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    if !matches!(b.op.as_str(), "stat" | "delete" | "mkdir") {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    if b.paths.len() > BULK_MAX {
+        return Err(StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    let out = tokio::task::spawn_blocking(move || {
+        b.paths
+            .into_iter()
+            .map(|p| {
+                let rel = RelPath(p.clone());
+                let r = match b.op.as_str() {
+                    "stat" => export.stat(&rel).map(|attr| {
+                        Some(BrowseEntry {
+                            name: leaf_of(&rel),
+                            kind: kind_str(attr.kind),
+                            size: attr.size,
+                            mtime_ms: ms(attr.mtime),
+                            version: attr.version,
+                            mode: attr.mode,
+                        })
+                    }),
+                    "delete" => remove_one(&export, &rel, false).map(|()| None),
+                    _ => export
+                        .resolve_new(&rel)
+                        .and_then(|full| {
+                            std::fs::create_dir(&full).map_err(|e| match e.kind() {
+                                std::io::ErrorKind::AlreadyExists => ErrorCode::AlreadyExists,
+                                _ => ErrorCode::Io,
+                            })
+                        })
+                        .map(|()| {
+                            export.bump(&rel);
+                            None
+                        }),
+                };
+                match r {
+                    Ok(entry) => BulkResult {
+                        path: p,
+                        ok: true,
+                        error: None,
+                        entry,
+                    },
+                    Err(e) => BulkResult {
+                        path: p,
+                        ok: false,
+                        error: Some(err_str(e)),
+                        entry: None,
+                    },
+                }
+            })
+            .collect::<Vec<_>>()
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(out))
+}
+
+/// Paths per bulk request. Bounded so one request cannot pin a blocking
+/// thread for an unbounded stretch — the work is synchronous filesystem
+/// calls, and a million-path body would hold a pool thread for all of them.
+const BULK_MAX: usize = 10_000;
+
+fn err_str(e: ErrorCode) -> &'static str {
+    match e {
+        ErrorCode::NotFound => "not_found",
+        ErrorCode::PermissionDenied => "permission_denied",
+        ErrorCode::InvalidPath => "invalid_path",
+        ErrorCode::NotADirectory => "not_a_directory",
+        ErrorCode::IsADirectory => "is_a_directory",
+        ErrorCode::AlreadyExists => "already_exists",
+        ErrorCode::NotEmpty => "not_empty",
+        ErrorCode::ReadOnly => "read_only",
+        _ => "io",
+    }
+}
+
+/// Remove one path. `recursive` allows a non-empty directory; without it a
+/// non-empty directory is `NotEmpty`, which is the old behaviour and stays
+/// the default — a recursive delete is not something to get by accident.
+fn remove_one(export: &alloyfs_agent::Export, rel: &RelPath, recursive: bool) -> Result<(), ErrorCode> {
+    let full = export.resolve(rel)?;
+    let md = std::fs::symlink_metadata(&full).map_err(|_| ErrorCode::NotFound)?;
+    if md.is_dir() {
+        let r = if recursive {
+            std::fs::remove_dir_all(&full)
+        } else {
+            std::fs::remove_dir(&full)
+        };
+        r.map_err(|e| match e.kind() {
+            std::io::ErrorKind::DirectoryNotEmpty => ErrorCode::NotEmpty,
+            _ => ErrorCode::Io,
+        })?;
+    } else {
+        std::fs::remove_file(&full).map_err(|_| ErrorCode::Io)?;
+    }
+    export.bump(rel);
+    Ok(())
+}
+
 /// POST /api/exports/{name}/mkdir?path=…
 async fn mkdir_post(
     State(state): State<Arc<AppState>>,
@@ -383,34 +738,34 @@ async fn mkdir_post(
     Ok(Json(serde_json::json!({ "created": true })))
 }
 
-/// POST /api/exports/{name}/delete?path=… — file or EMPTY directory.
+#[derive(Deserialize)]
+struct DeleteQuery {
+    path: String,
+    /// Allow a non-empty directory. Off by default: deleting a tree is not a
+    /// thing to acquire by forgetting a flag.
+    #[serde(default)]
+    recursive: bool,
+}
+
+/// POST /api/exports/{name}/delete?path=…[&recursive=true]
+///
+/// Without `recursive`, a whole tree meant one request per entry, depth-first,
+/// from the client — and there was no bulk endpoint to soften it either.
 async fn delete_post(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
-    Query(q): Query<PathQuery>,
+    Query(q): Query<DeleteQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let export = state.registry.get(&name).ok_or(StatusCode::NOT_FOUND)?;
     if export.read_only {
         return Err(StatusCode::FORBIDDEN);
     }
     let rel = RelPath(q.path);
-    let full = export.resolve(&rel).map_err(code_to_status)?;
-    tokio::task::spawn_blocking(move || -> Result<(), ErrorCode> {
-        let md = std::fs::symlink_metadata(&full).map_err(|_| ErrorCode::NotFound)?;
-        if md.is_dir() {
-            std::fs::remove_dir(&full).map_err(|e| match e.kind() {
-                std::io::ErrorKind::DirectoryNotEmpty => ErrorCode::NotEmpty,
-                _ => ErrorCode::Io,
-            })?;
-        } else {
-            std::fs::remove_file(&full).map_err(|_| ErrorCode::Io)?;
-        }
-        export.bump(&rel);
-        Ok(())
-    })
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-    .map_err(code_to_status)?;
+    let recursive = q.recursive;
+    tokio::task::spawn_blocking(move || remove_one(&export, &rel, recursive))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map_err(code_to_status)?;
     Ok(Json(serde_json::json!({ "deleted": true })))
 }
 
@@ -454,10 +809,21 @@ async fn exports(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     )
 }
 
+/// Entries per `browse` page when the caller does not say. Matches the wire
+/// protocol's `READDIR_PAGE`, so the two surfaces page a directory the same
+/// way and a client that has seen one is not surprised by the other.
+const BROWSE_PAGE: usize = 1024;
+const BROWSE_PAGE_MAX: usize = 10_000;
+
 #[derive(Deserialize)]
 struct BrowseQuery {
     #[serde(default)]
     path: String,
+    /// Where to resume. Positional, like the wire protocol's readdir cursor,
+    /// and carried back verbatim from `next_cursor`.
+    #[serde(default)]
+    cursor: usize,
+    limit: Option<usize>,
 }
 
 #[derive(Serialize)]
@@ -467,40 +833,178 @@ struct BrowseEntry {
     size: u64,
     mtime_ms: u128,
     version: u64,
+    /// POSIX mode bits. Reported because `setattr` accepts them, and an API
+    /// that lets you set a value it will not show you is one you have to
+    /// guess at.
+    mode: u32,
 }
 
+#[derive(Serialize)]
+struct BrowsePage {
+    entries: Vec<BrowseEntry>,
+    /// Feed back as `?cursor=` for the next page; `null` on the last one.
+    next_cursor: Option<usize>,
+    /// Entries in the whole directory, so a caller can size a progress bar
+    /// without walking to the end first.
+    total: usize,
+}
+
+/// GET /api/exports/{name}/browse?path=…&cursor=…&limit=…
+///
+/// Paged. It previously answered with the WHOLE directory as one JSON array,
+/// built in memory before a byte went out — a hundred-thousand-entry
+/// directory was a hundred-thousand-entry response, and nothing in the API
+/// let a caller ask for less.
+///
+/// Paging bounds the RESPONSE, not the directory read: listing still costs
+/// one `read_dir` plus a stat per entry, exactly as the wire protocol's
+/// readdir does, because a sorted listing cannot be produced any other way.
+/// What it removes is the unbounded body and the unbounded client-side
+/// buffer, which is where this actually hurt.
 async fn browse(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
     Query(q): Query<BrowseQuery>,
-) -> Result<Json<Vec<BrowseEntry>>, StatusCode> {
+) -> Result<Json<BrowsePage>, StatusCode> {
     let export = state.registry.get(&name).ok_or(StatusCode::NOT_FOUND)?;
     let rel = RelPath(q.path);
     let entries = tokio::task::spawn_blocking(move || export.browse(&rel))
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .map_err(code_to_status)?;
-    Ok(Json(
-        entries
-            .into_iter()
-            .map(|e| BrowseEntry {
-                name: e.name,
-                kind: match e.attr.kind {
-                    FileKind::Dir => "dir",
-                    FileKind::Symlink => "symlink",
-                    FileKind::File => "file",
-                },
-                size: e.attr.size,
-                mtime_ms: e
-                    .attr
-                    .mtime
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis(),
-                version: e.attr.version,
-            })
-            .collect(),
-    ))
+
+    let total = entries.len();
+    let limit = q.limit.unwrap_or(BROWSE_PAGE).clamp(1, BROWSE_PAGE_MAX);
+    let start = q.cursor.min(total);
+    let page: Vec<BrowseEntry> = entries
+        .into_iter()
+        .skip(start)
+        .take(limit)
+        .map(|e| BrowseEntry {
+            name: e.name,
+            kind: kind_str(e.attr.kind),
+            size: e.attr.size,
+            mtime_ms: ms(e.attr.mtime),
+            version: e.attr.version,
+            mode: e.attr.mode,
+        })
+        .collect();
+    let next = start + page.len();
+    Ok(Json(BrowsePage {
+        entries: page,
+        next_cursor: (next < total).then_some(next),
+        total,
+    }))
+}
+
+/// The last component of a path, which is what a listing calls an entry's
+/// `name`. A root-relative path with no slash IS its own leaf.
+fn leaf_of(rel: &RelPath) -> String {
+    rel.0
+        .rsplit_once('/')
+        .map(|(_, n)| n.to_string())
+        .unwrap_or_else(|| rel.0.clone())
+}
+
+fn header_str<'a>(h: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    h.get(name).and_then(|v| v.to_str().ok())
+}
+
+/// The one place the ETag format lives. Weak by declaration and by
+/// construction — size and mtime, no hashing — which is exactly strong
+/// enough for revalidation and for detecting that someone else wrote.
+///
+/// Shared by `file_get` (which issues them) and `file_post` (which now
+/// checks them). Two copies of this would be a lost-update bug the moment
+/// they disagreed by a character.
+fn etag_of(len: u64, mtime_ms: u128) -> String {
+    format!("W/\"{len:x}-{mtime_ms:x}\"")
+}
+
+fn kind_str(k: FileKind) -> &'static str {
+    match k {
+        FileKind::Dir => "dir",
+        FileKind::Symlink => "symlink",
+        FileKind::File => "file",
+    }
+}
+
+fn ms(t: std::time::SystemTime) -> u128 {
+    t.duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
+/// GET /api/exports/{name}/stat?path=… — one path's attributes.
+///
+/// The alternative was listing the parent and filtering: O(directory) to
+/// answer a question about one entry, and the only way to ask before this
+/// existed.
+async fn stat_get(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Query(q): Query<PathQuery>,
+) -> Result<Json<BrowseEntry>, StatusCode> {
+    let export = state.registry.get(&name).ok_or(StatusCode::NOT_FOUND)?;
+    let rel = RelPath(q.path);
+    let leaf = rel
+        .0
+        .rsplit_once('/')
+        .map(|(_, n)| n.to_string())
+        .unwrap_or_else(|| rel.0.clone());
+    let attr = tokio::task::spawn_blocking(move || export.stat(&rel))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map_err(code_to_status)?;
+    Ok(Json(BrowseEntry {
+        name: leaf,
+        kind: kind_str(attr.kind),
+        size: attr.size,
+        mtime_ms: ms(attr.mtime),
+        version: attr.version,
+        mode: attr.mode,
+    }))
+}
+
+/// GET /api/exports/{name}/statfs — capacity of the volume behind the export.
+///
+/// Without it a caller has no way to know whether a write will fit, which is
+/// the one question worth asking before uploading anything large.
+async fn statfs_get(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let export = state.registry.get(&name).ok_or(StatusCode::NOT_FOUND)?;
+    let (block_size, blocks, free) = tokio::task::spawn_blocking(move || export.space())
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(serde_json::json!({
+        "block_size": block_size,
+        "blocks": blocks,
+        "blocks_free": free,
+        // Bytes as well as blocks: every caller of this multiplies, and one
+        // of them will do it in a language where the product overflows.
+        "bytes_total": blocks * block_size as u64,
+        "bytes_free": free * block_size as u64,
+    })))
+}
+
+/// GET /api/exports/{name}/readlink?path=… — a symlink's stored target.
+///
+/// `browse` reported `kind: "symlink"` and gave no way to resolve one.
+async fn readlink_get(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Query(q): Query<PathQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let export = state.registry.get(&name).ok_or(StatusCode::NOT_FOUND)?;
+    let rel = RelPath(q.path);
+    let target = tokio::task::spawn_blocking(move || export.readlink(&rel))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map_err(code_to_status)?;
+    Ok(Json(serde_json::json!({ "target": target })))
 }
 
 /// SSE stream of change events. `Last-Event-ID` (standard SSE reconnect

@@ -392,6 +392,55 @@ impl Export {
 
     /// Directory listing with the same path hardening as the wire protocol —
     /// used by the HTTP browse endpoint. Blocking: call via spawn_blocking.
+    /// One path's attributes, with the same rules a listing applies: excludes
+    /// enforced by `resolve`, symlinks followed through it, live version and
+    /// Windows attributes overlaid.
+    ///
+    /// Exists because the only way to ask about ONE file used to be to list
+    /// its parent and filter — O(directory) to answer a question about a
+    /// single entry, which is a poor trade in a directory of any size.
+    pub fn stat(&self, rel: &RelPath) -> Result<Attr, ErrorCode> {
+        let full = self.resolve(rel)?;
+        // Non-traversing on purpose: `entry_attr` does the following, and it
+        // does it through `resolve`, which is what keeps a link inside the
+        // export.
+        let md = std::fs::symlink_metadata(&full).or_code()?;
+        Ok(self.entry_attr(rel, attr_from_metadata(&md, 0)))
+    }
+
+    /// Block size, total blocks and free blocks for the volume this export
+    /// lives on, or `None` when the platform call fails.
+    ///
+    /// The same numbers `Statfs` serves over the wire. Callers that cannot
+    /// see them have no way to know whether a write will fit.
+    pub fn space(&self) -> Option<(u32, u64, u64)> {
+        crate::fsutil::fs_space(&self.root)
+    }
+
+    /// The target of a symlink, as stored — relative targets are NOT resolved,
+    /// because resolving one is what `resolve` already does safely and a
+    /// caller asking for the link wants the link.
+    ///
+    /// Via `resolve_new` rather than `resolve`, which reads oddly for a path
+    /// that exists but is exactly right: it vouches for the PARENT and then
+    /// appends a plain leaf without following it, which is the only way to
+    /// name a symlink instead of its target. Its containment check still
+    /// applies, so a link pointing out of the export is refused rather than
+    /// having its target disclosed, and a dangling link — where canonicalize
+    /// fails and the check is skipped — reads back normally, as it should.
+    pub fn readlink(&self, rel: &RelPath) -> Result<String, ErrorCode> {
+        let full = self.resolve_new(rel)?;
+        let md = std::fs::symlink_metadata(&full).or_code()?;
+        if !md.file_type().is_symlink() {
+            return Err(ErrorCode::InvalidPath);
+        }
+        std::fs::read_link(&full)
+            .or_code()?
+            .to_str()
+            .map(|s| s.replace('\\', "/"))
+            .ok_or(ErrorCode::InvalidPath)
+    }
+
     pub fn browse(&self, rel: &RelPath) -> Result<Vec<DirEntry>, ErrorCode> {
         let full = self.resolve(rel)?;
         let mut entries = Vec::new();
