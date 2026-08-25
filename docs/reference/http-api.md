@@ -13,7 +13,7 @@ the agent refuses to start. Present it as `Authorization: Bearer <token>`.
 
 Not a mount transport. Mounts speak the binary protocol; this exists for
 dashboards, scripts and CI. For JavaScript there is a typed client —
-[cutver-http](https://http.cutver.okyle.dev) — which wraps everything below.
+[alloyfs-http](https://http.alloy.okyle.dev) — which wraps everything below.
 
 ## Endpoints
 
