@@ -10,21 +10,21 @@ pull request, and on the release page.
 
 ## [0.8.1] — 2026-08-24
 
-<sub>diff: [742e795...ddcc5fc](https://github.com/obillekyle/alloyfs/compare/742e795...ddcc5fc)</sub>
+<sub>diff: [742e795...ddcc5fc](https://github.com/alloyfs/alloyfs/compare/742e795...ddcc5fc)</sub>
 
 ### Fixes
 
-- **install:** the documented install command installed into /root ([1decdf0](https://github.com/obillekyle/alloyfs/commit/1decdf0))
+- **install:** the documented install command installed into /root ([1decdf0](https://github.com/alloyfs/alloyfs/commit/1decdf0))
 
     `INSTALL_DIR="${ALLOYFS_INSTALL:-$HOME/.local/bin}"` got the most common first command anyone runs wrong. Under `sudo sh install.sh` — what someone types when they want alloyfs available to the whole machine, and what the FUSE note at the end of this script encourages — sudo sets HOME to /root, so the binary landed in /root/.local/bin: a directory on nobody's PATH, unreadable by the user who ran the command, and reported as a success.
 
-- **install:** the Windows checksum check never ran ([00092ce](https://github.com/obillekyle/alloyfs/commit/00092ce))
+- **install:** the Windows checksum check never ran ([00092ce](https://github.com/alloyfs/alloyfs/commit/00092ce))
 
     Every install on Windows PowerShell 5.1 printed "publishes no checksum; skipping verification" — including for releases that publish one. The note was wrong and the verification was dead.
 
 ### Docs
 
-- alpha.93 would never upgrade to beta.0 ([22c4d10](https://github.com/obillekyle/alloyfs/commit/22c4d10))
+- alpha.93 would never upgrade to beta.0 ([22c4d10](https://github.com/alloyfs/alloyfs/commit/22c4d10))
 
     The version comparison in both install scripts looked only at the TRAILING prerelease identifier, so `alpha.93` against `beta.0` compared 93 against 0 and never read the channel at all. Every one of these came out backwards:
 
@@ -34,127 +34,127 @@ pull request, and on the release page.
 
 ## [0.8.0] — 2026-08-23
 
-<sub>diff: [5969e77...742e795](https://github.com/obillekyle/alloyfs/compare/5969e77...742e795)</sub>
+<sub>diff: [5969e77...742e795](https://github.com/alloyfs/alloyfs/compare/5969e77...742e795)</sub>
 
 ### New Features
 
-- **release:** publish per-asset sha256, and verify it on install ([5961dd6](https://github.com/obillekyle/alloyfs/commit/5961dd6))
+- **release:** publish per-asset sha256, and verify it on install ([5961dd6](https://github.com/alloyfs/alloyfs/commit/5961dd6))
 
     Publish runs from this branch's workflow definition, so the checksum writing has to live here to take effect; the installers are served from alloy.okyle.dev and are fetched fresh by every install, so they are here for the same reason.
 
 ### Docs
 
-- the install scripts resolved a version from before the 1.0 line ([0121631](https://github.com/obillekyle/alloyfs/commit/0121631))
+- the install scripts resolved a version from before the 1.0 line ([0121631](https://github.com/alloyfs/alloyfs/commit/0121631))
 
     The website serves `install.sh` and `install.ps1` from this branch, and `alloyfs update` runs whichever one matches the platform. Both looked the version up with GitHub's `releases/latest`, which is defined as the newest NON-prerelease — and this project's entire current line is published as prereleases. So the answer was v0.7.0, and on a machine already running an alpha that made `update` a DOWNGRADE rather than a missed upgrade. Confirmed by running it: it took an agent from 1.0.0-alpha.90 to 0.7.0.
 
 ## [0.7.0] — 2026-08-18
 
-<sub>diff: [6141878...5969e77](https://github.com/obillekyle/alloyfs/compare/6141878...5969e77)</sub>
+<sub>diff: [6141878...5969e77](https://github.com/alloyfs/alloyfs/compare/6141878...5969e77)</sub>
 
 ### New Features
 
-- **winfsp:** report the security descriptor the mount actually enforces ([89302ce](https://github.com/obillekyle/alloyfs/commit/89302ce))
+- **winfsp:** report the security descriptor the mount actually enforces ([89302ce](https://github.com/alloyfs/alloyfs/commit/89302ce))
 
     `get_security_by_name` returned no descriptor and let WinFsp synthesize one from the mounting user, which was fine while a person at the keyboard did the mounting and wrong the moment anything else did. It now answers with an explicit protected descriptor: SYSTEM, Administrators and Everyone, full access.
 
-- **cli:** `alloyfs service` — drives that mount themselves, with no console ([3049825](https://github.com/obillekyle/alloyfs/commit/3049825))
+- **cli:** `alloyfs service` — drives that mount themselves, with no console ([3049825](https://github.com/alloyfs/alloyfs/commit/3049825))
 
     alloyfs service setup add <id> --url URL --mount P: [mount flags] add <id> --config agent.yml remove | start | stop | restart | list reset --confirm
 
 ### Fixes
 
-- **cli:** build the service module on Linux, and make verify-remote a real gate ([88051b7](https://github.com/obillekyle/alloyfs/commit/88051b7))
+- **cli:** build the service module on Linux, and make verify-remote a real gate ([88051b7](https://github.com/alloyfs/alloyfs/commit/88051b7))
 
     CI failed on Linux for the commit that added `alloyfs service`, on a machine this was reported as verified for. Everything in commands/service/ except instance.rs is #[cfg(windows)], so on Linux its definitions have no callers and `-D warnings` turns each unused item into an error; the same cfg pattern also leaves a `return` that clippy calls needless.
 
 ### Docs
 
-- the site is generated by cutver now, not copied ([bcd2ecd](https://github.com/obillekyle/alloyfs/commit/bcd2ecd))
+- the site is generated by cutver now, not copied ([bcd2ecd](https://github.com/alloyfs/alloyfs/commit/bcd2ecd))
 
     The shell used to be pasted in from whichever project had it last, which is how a copy ends up half-themed and nobody notices. It comes from `cutver docs update` now, so a fix made once reaches this repository by running a command rather than by remembering to paste again.
 
 ## [0.6.0] — 2026-08-18
 
-<sub>diff: [456a69a...6141878](https://github.com/obillekyle/alloyfs/compare/456a69a...6141878)</sub>
+<sub>diff: [456a69a...6141878](https://github.com/alloyfs/alloyfs/compare/456a69a...6141878)</sub>
 
 ### New Features
 
-- **docs:** versioned docs, with the sidebar and version list as data ([1dbcbd6](https://github.com/obillekyle/alloyfs/commit/1dbcbd6))
+- **docs:** versioned docs, with the sidebar and version list as data ([1dbcbd6](https://github.com/alloyfs/alloyfs/commit/1dbcbd6))
 
     The sidebar was a `const NAV` literal in `index.html`, and the version badge was an element nothing ever filled — this project publishes to no registry, so there was nothing for it to ask. Both become files the site reads: `docs/pages.json` and `docs/versions.json`.
 
 ### Docs
 
-- the agent serving, as a picture ([827c012](https://github.com/obillekyle/alloyfs/commit/827c012))
+- the agent serving, as a picture ([827c012](https://github.com/alloyfs/alloyfs/commit/827c012))
 
     The README described an agent that opens an export, watches it with the OS-native watcher and accepts client sessions. That reads better as the agent saying it. `scripts/terminal-shot.ts` builds an export in a temp directory, starts the agent on a spare port, attaches a real client so the session rows are not staged, captures the log and tears both processes down.
 
-- a header, and the logo as vectors rather than bitmaps ([fd18a7b](https://github.com/obillekyle/alloyfs/commit/fd18a7b))
+- a header, and the logo as vectors rather than bitmaps ([fd18a7b](https://github.com/alloyfs/alloyfs/commit/fd18a7b))
 
     The export carried its grain as two 1024x1024 base64 images and weighed 4.2 MB — an SVG wrapping rasters, which is larger than a PNG of the same picture and no longer scales, in a file whose whole job is to be 96px in a README and 800 in a hero. `feTurbulence` generates the same texture procedurally: 3.3 KB, sharp at any size.
 
 ## [0.5.0] — 2026-08-17
 
-<sub>diff: [3171187...456a69a](https://github.com/obillekyle/alloyfs/compare/3171187...456a69a)</sub>
+<sub>diff: [3171187...456a69a](https://github.com/alloyfs/alloyfs/compare/3171187...456a69a)</sub>
 
 ### New Features
 
-- **exclude:** hide OS bookkeeping from every export by default ([6e421bd](https://github.com/obillekyle/alloyfs/commit/6e421bd))
+- **exclude:** hide OS bookkeeping from every export by default ([6e421bd](https://github.com/alloyfs/alloyfs/commit/6e421bd))
 
     Mounting a Linux export as a Windows drive letter made the MOUNTING machine's volume service create `System Volume Information` inside the served folder, and a recycle bin would have followed the first delete. Found in a first-run walkthrough: a `~/webdav` grew one the moment it appeared as S:, and that folder is also served over WebDAV to things that then have to explain it.
 
 ## [0.4.1] — 2026-08-17
 
-<sub>diff: [a828432...3171187](https://github.com/obillekyle/alloyfs/compare/a828432...3171187)</sub>
+<sub>diff: [a828432...3171187](https://github.com/alloyfs/alloyfs/compare/a828432...3171187)</sub>
 
 ### Fixes
 
-- **ci:** check out before downloading the artifacts ([094a918](https://github.com/obillekyle/alloyfs/commit/094a918))
+- **ci:** check out before downloading the artifacts ([094a918](https://github.com/alloyfs/alloyfs/commit/094a918))
 
     `actions/checkout` cleans the workspace by default, so running it after `download-artifact` deleted `staged/` — v0.4.0's release page was created with its notes and the upload then failed with `no matches found for staged/*`, leaving a release with no binaries.
 
 ## [0.4.0] — 2026-08-17
 
-<sub>diff: [17926b6...a828432](https://github.com/obillekyle/alloyfs/compare/17926b6...a828432)</sub>
+<sub>diff: [17926b6...a828432](https://github.com/alloyfs/alloyfs/compare/17926b6...a828432)</sub>
 
 ### New Features
 
-- **changelog:** compile it from the commits, and summarise the release body ([cdd0d2d](https://github.com/obillekyle/alloyfs/commit/cdd0d2d))
+- **changelog:** compile it from the commits, and summarise the release body ([cdd0d2d](https://github.com/alloyfs/alloyfs/commit/cdd0d2d))
 
     The file said notes were written by hand and then five releases in a row went out with nothing under their headings — and every release page was empty, because publish.yml created them with `--notes ""` and had no checkout to read a changelog from. Hand-written notes only beat compiled ones when they get written.
 
 ## [0.3.1] — 2026-08-15
 
-<sub>diff: [7376f6a...17926b6](https://github.com/obillekyle/alloyfs/compare/7376f6a...17926b6)</sub>
+<sub>diff: [7376f6a...17926b6](https://github.com/alloyfs/alloyfs/compare/7376f6a...17926b6)</sub>
 
 ### Fixes
 
-- **sync:** never let a rename leave its target without a baseline ([565a457](https://github.com/obillekyle/alloyfs/commit/565a457))
+- **sync:** never let a rename leave its target without a baseline ([565a457](https://github.com/alloyfs/alloyfs/commit/565a457))
 
     `rename_prefix` only MOVES existing keys, so renaming a source the manifest never held recorded nothing for the target — while the server had already performed the rename. That combination does not merely go stale, it strands the file: `push_local`'s Removed arm reads "no baseline" as "never synced, nothing to delete remotely" and returns without asking the server, so no later local delete can ever remove the renamed file again.
 
 ### Refactor
 
-- **sync:** reuse ExcludeSet::default for the empty set ([8133073](https://github.com/obillekyle/alloyfs/commit/8133073))
+- **sync:** reuse ExcludeSet::default for the empty set ([8133073](https://github.com/alloyfs/alloyfs/commit/8133073))
 
     `ExcludeSet::compile(&[], false).unwrap()` is what `ExcludeSet::default()` already does, with the "empty exclude set always compiles" invariant spelled out where it belongs rather than assumed at the call site.
 
-- **client:** move the errno table's tests to the crate that owns it ([e2de7fe](https://github.com/obillekyle/alloyfs/commit/e2de7fe))
+- **client:** move the errno table's tests to the crate that owns it ([e2de7fe](https://github.com/alloyfs/alloyfs/commit/e2de7fe))
 
     `posix_errno` is the ErrorCode -> errno table both Linux backends share. It lives in alloyfs-client, which compiles on every platform. Its only tests lived in alloyfs-mount-fuse, which is `#![cfg(unix)]` and compiles to an empty library on Windows — so a Windows `cargo test` never checked the table at all, and the first thing to notice a mistake was CI on Linux minutes later. That is not hypothetical: VersionMismatch was left in the EIO fall-through, the local run went green, and CI caught it.
 
-- **client,mounts:** name the parameters that cross a scope boundary ([96dccf8](https://github.com/obillekyle/alloyfs/commit/96dccf8))
+- **client,mounts:** name the parameters that cross a scope boundary ([96dccf8](https://github.com/alloyfs/alloyfs/commit/96dccf8))
 
     `overlay.rs` and `autocache.rs` had each half-adopted `path: &RelPath` and stopped. The split follows the age of the code rather than any intent: autocache took `path` in 8 methods and `p` in 2, overlay took `p` in 8 and `path` in `readlink`, which was written later. Both files now read one way.
 
 ## [0.3.0] — 2026-08-15
 
-<sub>diff: [5dfc1af...7376f6a](https://github.com/obillekyle/alloyfs/compare/5dfc1af...7376f6a)</sub>
+<sub>diff: [5dfc1af...7376f6a](https://github.com/alloyfs/alloyfs/compare/5dfc1af...7376f6a)</sub>
 
 ### New Features
 
-- **cli:** find the config where you are standing, not only in $HOME ([c61f9ae](https://github.com/obillekyle/alloyfs/commit/c61f9ae))
+- **cli:** find the config where you are standing, not only in $HOME ([c61f9ae](https://github.com/alloyfs/alloyfs/commit/c61f9ae))
 
     `alloyfs serve` took its config from ~/.alloyfs/config.yml or nowhere, so `alloyfs init` in a project wrote a file that then had to be named with --config on every start. Now the search is, in order:
 
@@ -164,7 +164,7 @@ pull request, and on the release page.
 
 ### Docs
 
-- lead with `alloyfs init`, and say which command writes a config ([a59ecfb](https://github.com/obillekyle/alloyfs/commit/a59ecfb))
+- lead with `alloyfs init`, and say which command writes a config ([a59ecfb](https://github.com/alloyfs/alloyfs/commit/a59ecfb))
 
     The first-mount page told people to hand-write ~/.alloyfs/config.yml. `alloyfs init` exists to do that, so the page now starts there:
 
@@ -174,11 +174,11 @@ pull request, and on the release page.
 
 ## [0.2.0] — 2026-08-15
 
-<sub>diff: [81db420...5dfc1af](https://github.com/obillekyle/alloyfs/compare/81db420...5dfc1af)</sub>
+<sub>diff: [81db420...5dfc1af](https://github.com/alloyfs/alloyfs/compare/81db420...5dfc1af)</sub>
 
 ### New Features
 
-- install scripts, `alloyfs init`, and `alloyfs update` ([1dbd8b5](https://github.com/obillekyle/alloyfs/commit/1dbd8b5))
+- install scripts, `alloyfs init`, and `alloyfs update` ([1dbd8b5](https://github.com/alloyfs/alloyfs/commit/1dbd8b5))
 
     Getting AlloyFS onto a machine took reading the README and finding a binary. Now it is one line, the way bun and rustup do it:
 
@@ -187,11 +187,11 @@ pull request, and on the release page.
 
 ### Docs
 
-- strip a stray fragment from the top of index.html ([a9a60c6](https://github.com/obillekyle/alloyfs/commit/a9a60c6))
+- strip a stray fragment from the top of index.html ([a9a60c6](https://github.com/alloyfs/alloyfs/commit/a9a60c6))
 
     The rebrand replaced the document.title template with a perl one-liner whose escaping was wrong, and it prepended the replacement text to line 1 instead of substituting in place. The page still rendered — browsers recover from text before <!doctype> — so the local check and the NAV link sweep both passed, and it went live reading
 
-- a documentation site at alloy.okyle.dev ([801ae35](https://github.com/obillekyle/alloyfs/commit/801ae35))
+- a documentation site at alloy.okyle.dev ([801ae35](https://github.com/alloyfs/alloyfs/commit/801ae35))
 
     Twenty-two pages plus an introduction, on the same hand-written shell the bakery docs use: one index.html, no build step, no CDN, rendering the markdown next to it. That choice is worth keeping — the .md files stay the single source of truth rather than being forked into a generator's format, and the whole site is reviewable as a diff.
 
