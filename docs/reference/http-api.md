@@ -173,6 +173,72 @@ curl -N -H "Authorization: Bearer $TOKEN" \
 | 413 | Body over 256 MiB, or over 10 000 bulk paths |
 | 416 | Range not satisfiable |
 
+## Calling it from a browser
+
+Off by default. The API sends no CORS headers unless you name the origins
+allowed to read a response:
+
+```yaml
+agent:
+  http_listen: "127.0.0.1:7441"
+  http_token: "a-secret"
+  http_cors_origins:
+    - "https://dashboard.example.com"
+    - "http://localhost:5173"
+```
+
+**The default of sending nothing is a security property, not an omission.** An
+agent on loopback without a token is reachable by anything on the machine, and
+the only reason a page you happen to visit cannot read every export is that
+the browser discards a response carrying no `Access-Control-Allow-Origin`.
+
+Entries need a scheme and no trailing slash (`https://app.example.com`),
+because a browser sends `Origin: scheme://host[:port]` and it is compared
+verbatim.
+
+### Turning the check off
+
+```yaml
+agent:
+  http_cors_origins: ["*"]
+```
+
+Every origin allowed. This exists because the local-development case is real:
+a dev server on a port that changes per run cannot be listed usefully. It must
+be the only entry — mixing `*` with named origins is refused, since the names
+would have no effect.
+
+It is logged at startup, and **loudly when there is no `http_token`**, because
+that pair is the one that matters: an agent with no token is open to anything
+that can reach it, and `*` is what tells a browser it may read the reply.
+Together they mean any page open in a browser on that machine can read and
+write every export with no credential at all. Fine on a laptop you are
+developing on; not something to leave running.
+
+Note that `*` still echoes the *requesting* origin rather than answering a
+literal `*` — a literal is rejected by browsers the moment a request carries
+credentials, so echoing keeps the setting working if one ever does.
+
+CORS decides only whether the browser lets JavaScript **read** a reply. It
+grants nothing: a listed origin still needs the bearer token, and without one
+it gets a 401 like anybody else.
+
+**Private Network Access.** Chrome refuses a request from a public page to
+`127.0.0.1` unless the preflight allows it. When a browser asks — by sending
+`Access-Control-Request-Private-Network: true` — the agent answers
+`Access-Control-Allow-Private-Network: true`. It is never volunteered
+otherwise. This is what makes a hosted dashboard talking to a local agent
+work at all; without it the failure reads as a network error rather than a
+CORS one.
+
+**The token is the thing to think about.** Putting it in client-side
+JavaScript exposes it to anyone who can read the page, and it grants full
+read/write to every export. Shipping a browser app to other people means
+keeping the token server-side and proxying `/api/*` from your own backend —
+which also removes the need for CORS entirely, since the browser then sees a
+single origin. The allow-list is for the cases where the page and the agent
+are both yours.
+
 ## Behaviour worth relying on
 
 The API goes through the same hardening as the wire protocol, not a second

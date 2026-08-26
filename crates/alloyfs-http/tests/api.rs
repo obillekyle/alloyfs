@@ -790,3 +790,333 @@ async fn readlink_returns_the_stored_target() {
         "a plain file is not a link, got {status}"
     );
 }
+
+// ------------------------------------------------------------------- CORS
+
+/// Sending nothing is the default, and it is a security property rather than
+/// an omission: an agent on loopback with no token is reachable by anything
+/// on the machine, and the only reason a page you happen to visit cannot read
+/// every export is that the browser discards a reply with no
+/// `Access-Control-Allow-Origin`.
+#[tokio::test]
+async fn no_cors_headers_unless_origins_are_configured() {
+    let api = api(None);
+    let app = alloyfs_http::router(api.registry.clone(), None);
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/status")
+                .header("origin", "https://dashboard.example.com")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert!(
+        res.headers().get("access-control-allow-origin").is_none(),
+        "a default agent must not tell a browser it may read this"
+    );
+}
+
+async fn cors_app(api: &Api, origins: &[&str]) -> axum::Router {
+    alloyfs_http::router_with_cors(
+        api.registry.clone(),
+        api.token.clone(),
+        origins.iter().map(|s| s.to_string()).collect(),
+    )
+}
+
+#[tokio::test]
+async fn a_listed_origin_is_echoed_and_an_unlisted_one_is_not() {
+    let api = api(None);
+    let allowed = "https://dashboard.example.com";
+
+    let res = cors_app(&api, &[allowed])
+        .await
+        .oneshot(
+            Request::builder()
+                .uri("/api/status")
+                .header("origin", allowed)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        res.headers()
+            .get("access-control-allow-origin")
+            .and_then(|v| v.to_str().ok()),
+        Some(allowed),
+        "the listed origin must be echoed back verbatim"
+    );
+    // Without this the browser hands JS a response with almost no headers,
+    // and `read()` would come back with no ETag — which looks exactly like
+    // the server forgetting to send one, and silently breaks safe writes.
+    let expose = res
+        .headers()
+        .get("access-control-expose-headers")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    assert!(expose.contains("etag"), "expose was {expose:?}");
+    assert!(res.headers().get("vary").is_some(), "must vary on origin");
+
+    // A different origin gets a normal response with no CORS headers, so the
+    // browser discards it.
+    let res = cors_app(&api, &[allowed])
+        .await
+        .oneshot(
+            Request::builder()
+                .uri("/api/status")
+                .header("origin", "https://evil.example.com")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        res.headers().get("access-control-allow-origin").is_none(),
+        "an unlisted origin must never be echoed"
+    );
+}
+
+/// The subtle one. A preflight is an `OPTIONS` carrying no credentials — the
+/// browser will not attach them — so if the CORS layer sat behind auth every
+/// preflight would 401 and the real request would never be sent. The symptom
+/// is a CORS error naming a header that was configured perfectly.
+#[tokio::test]
+async fn a_preflight_succeeds_without_a_token_even_on_a_protected_api() {
+    let api = api(Some("s3cret"));
+    let allowed = "https://dashboard.example.com";
+    let res = cors_app(&api, &[allowed])
+        .await
+        .oneshot(
+            Request::builder()
+                .method("OPTIONS")
+                .uri("/api/exports/test/rename")
+                .header("origin", allowed)
+                .header("access-control-request-method", "POST")
+                .header("access-control-request-headers", "authorization,content-type")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::NO_CONTENT,
+        "a preflight carries no token and must still be answered"
+    );
+    let h = res.headers();
+    assert_eq!(
+        h.get("access-control-allow-origin").and_then(|v| v.to_str().ok()),
+        Some(allowed)
+    );
+    let allow_headers = h
+        .get("access-control-allow-headers")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    for needed in ["authorization", "range", "if-match", "if-none-match"] {
+        assert!(
+            allow_headers.contains(needed),
+            "{needed} must be allowed or the browser drops it: {allow_headers:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_preflight_from_an_unlisted_origin_is_refused() {
+    let api = api(None);
+    let res = cors_app(&api, &["https://dashboard.example.com"])
+        .await
+        .oneshot(
+            Request::builder()
+                .method("OPTIONS")
+                .uri("/api/status")
+                .header("origin", "https://evil.example.com")
+                .header("access-control-request-method", "GET")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    assert!(res.headers().get("access-control-allow-origin").is_none());
+}
+
+/// Chrome refuses a public page's request to 127.0.0.1 unless the preflight
+/// says this. Without it the headline case — a hosted dashboard talking to
+/// the agent on your own machine — cannot work, and fails with a message
+/// about the network rather than about CORS.
+#[tokio::test]
+async fn private_network_access_is_granted_only_when_asked_for() {
+    let api = api(None);
+    let allowed = "https://dashboard.example.com";
+
+    let res = cors_app(&api, &[allowed])
+        .await
+        .oneshot(
+            Request::builder()
+                .method("OPTIONS")
+                .uri("/api/status")
+                .header("origin", allowed)
+                .header("access-control-request-method", "GET")
+                .header("access-control-request-private-network", "true")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        res.headers()
+            .get("access-control-allow-private-network")
+            .and_then(|v| v.to_str().ok()),
+        Some("true")
+    );
+
+    // Not volunteered when the browser did not ask.
+    let res = cors_app(&api, &[allowed])
+        .await
+        .oneshot(
+            Request::builder()
+                .method("OPTIONS")
+                .uri("/api/status")
+                .header("origin", allowed)
+                .header("access-control-request-method", "GET")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(res
+        .headers()
+        .get("access-control-allow-private-network")
+        .is_none());
+}
+
+/// CORS decides whether a browser lets JS READ a reply; it never grants
+/// access. A listed origin with no token is still a 401.
+#[tokio::test]
+async fn an_allowed_origin_still_needs_the_token() {
+    let api = api(Some("s3cret"));
+    let allowed = "https://dashboard.example.com";
+    let res = cors_app(&api, &[allowed])
+        .await
+        .oneshot(
+            Request::builder()
+                .uri("/api/status")
+                .header("origin", allowed)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::UNAUTHORIZED,
+        "being on the origin list is not authorisation"
+    );
+}
+
+/// `*` turns the check off. Supported for local development, where a dev
+/// server's port changes per run and cannot be listed usefully.
+#[tokio::test]
+async fn a_wildcard_allows_any_origin() {
+    let api = api(None);
+    for origin in [
+        "http://localhost:5173",
+        "http://localhost:61234",
+        "https://anything.example.com",
+    ] {
+        let res = cors_app(&api, &["*"])
+            .await
+            .oneshot(
+                Request::builder()
+                    .uri("/api/status")
+                    .header("origin", origin)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            res.headers()
+                .get("access-control-allow-origin")
+                .and_then(|v| v.to_str().ok()),
+            Some(origin),
+            "the REQUESTING origin is echoed, not a literal `*` — a literal is \
+             rejected by the browser the moment a request is credentialed"
+        );
+        assert_eq!(
+            res.headers().get("vary").and_then(|v| v.to_str().ok()),
+            Some("origin"),
+            "still varies on origin, so a shared cache cannot cross-serve"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_wildcard_answers_any_preflight() {
+    let api = api(Some("s3cret"));
+    let res = cors_app(&api, &["*"])
+        .await
+        .oneshot(
+            Request::builder()
+                .method("OPTIONS")
+                .uri("/api/exports/test/bulk")
+                .header("origin", "http://localhost:5173")
+                .header("access-control-request-method", "POST")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        res.headers()
+            .get("access-control-allow-origin")
+            .and_then(|v| v.to_str().ok()),
+        Some("http://localhost:5173")
+    );
+}
+
+/// The property that survives turning CORS off: it was never authorisation.
+/// `*` says a browser may READ the reply; the token still decides whether
+/// there is a reply worth reading.
+#[tokio::test]
+async fn a_wildcard_does_not_bypass_the_token() {
+    let api = api(Some("s3cret"));
+    let res = cors_app(&api, &["*"])
+        .await
+        .oneshot(
+            Request::builder()
+                .uri("/api/status")
+                .header("origin", "https://evil.example.com")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::UNAUTHORIZED,
+        "turning CORS off must not turn auth off"
+    );
+}
+
+/// No origin header at all — every non-browser caller, curl included — is
+/// unaffected either way.
+#[tokio::test]
+async fn a_request_without_an_origin_is_untouched() {
+    let api = api(None);
+    for origins in [vec![], vec!["*"]] {
+        let res = cors_app(&api, &origins)
+            .await
+            .oneshot(Request::builder().uri("/api/status").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(res.headers().get("access-control-allow-origin").is_none());
+    }
+}

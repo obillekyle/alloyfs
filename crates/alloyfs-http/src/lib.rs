@@ -42,15 +42,83 @@ const MAX_BODY: usize = 256 * 1024 * 1024;
 struct AppState {
     registry: Arc<ExportRegistry>,
     token: Option<String>,
+    /// Browser origins allowed to read a response. Empty means no CORS
+    /// headers, which is what makes a browser discard one.
+    cors: Vec<String>,
 }
 
-pub async fn serve(listen: &str, registry: Arc<ExportRegistry>, token: Option<String>) -> anyhow::Result<()> {
+/// Headers a browser is allowed to SEND. Everything this API reads from a
+/// request, and nothing else — `range` and the two conditionals are as
+/// load-bearing here as `authorization`, because without them a browser
+/// client silently loses ranged reads and every safe-write precondition.
+const CORS_REQUEST_HEADERS: &str =
+    "authorization, content-type, range, if-match, if-none-match, last-event-id";
+
+/// Headers a browser is allowed to READ. Cross-origin JS sees only a handful
+/// of response headers unless they are named here, and `etag` missing from
+/// this list would break read-modify-write in exactly the way that looks
+/// like the server forgot to send one.
+const CORS_EXPOSE_HEADERS: &str = "etag, last-modified, content-range, accept-ranges, content-length";
+
+pub async fn serve(
+    listen: &str,
+    registry: Arc<ExportRegistry>,
+    token: Option<String>,
+    cors_origins: Vec<String>,
+) -> anyhow::Result<()> {
     anyhow::ensure!(
         token.is_some() || alloyfs_common::is_loopback_listen(listen),
         "http_listen {listen} is not loopback: set agent.http_token (refusing to serve an \
          unauthenticated API on the network)"
     );
-    let app = router(registry, token);
+    // `*` turns the check off: every origin is allowed. Supported because the
+    // local-development case is real — a dev server on a port that changes
+    // per run cannot be listed usefully — but it is the one setting here that
+    // can matter, so it is announced rather than absorbed.
+    let wildcard = cors_origins.iter().any(|o| o.trim() == "*");
+    if wildcard {
+        anyhow::ensure!(
+            cors_origins.len() == 1,
+            "http_cors_origins mixes \"*\" with named origins. \"*\" already \
+             allows every origin, so the rest have no effect — list one or the \
+             other, not both."
+        );
+        if token.is_none() {
+            // The combination worth being loud about, and it is legal on
+            // purpose: an agent with no token is open to anything that can
+            // reach it, and `*` is what tells a browser it may read the
+            // reply. Together they mean any page loaded in this browser can
+            // read and write every export, with no credential at all.
+            tracing::warn!(
+                "http_cors_origins is \"*\" and no http_token is set: ANY website \
+                 open in a browser on this machine can read and write every \
+                 export. Fine for local development; set agent.http_token before \
+                 this is reachable by anything you did not open yourself."
+            );
+        } else {
+            tracing::warn!(
+                "http_cors_origins is \"*\": every origin may call this API. The \
+                 bearer token is the only thing still gating access."
+            );
+        }
+    }
+    for o in cors_origins.iter().filter(|o| o.trim() != "*") {
+        anyhow::ensure!(
+            o.starts_with("http://") || o.starts_with("https://"),
+            "http_cors_origins entry {o:?} is not an origin: it needs a scheme, \
+             e.g. \"https://{o}\". A browser sends `Origin: scheme://host[:port]` \
+             and compares it verbatim, so anything else can never match."
+        );
+        anyhow::ensure!(
+            !o.ends_with('/'),
+            "http_cors_origins entry {o:?} has a trailing slash. A browser's \
+             `Origin` header never has one, so this could never match."
+        );
+    }
+    if !cors_origins.is_empty() {
+        tracing::info!(origins = ?cors_origins, "http CORS enabled for these origins");
+    }
+    let app = router_with_cors(registry, token, cors_origins);
     let listener = tokio::net::TcpListener::bind(listen).await?;
     tracing::info!(%listen, "listening (http)");
     axum::serve(listener, app).await?;
@@ -65,7 +133,20 @@ pub async fn serve(listen: &str, registry: Arc<ExportRegistry>, token: Option<St
 /// `serve` keeps the loopback/token safety check; this does not, because a
 /// caller holding a `Router` has not yet decided where to expose it.
 pub fn router(registry: Arc<ExportRegistry>, token: Option<String>) -> Router {
-    let state = Arc::new(AppState { registry, token });
+    router_with_cors(registry, token, Vec::new())
+}
+
+/// `router`, plus the browser origins allowed to read a response.
+///
+/// Separate constructor rather than a parameter on `router` so the common
+/// case stays a two-argument call and no existing caller has to say "no CORS"
+/// out loud — the empty list already means that.
+pub fn router_with_cors(registry: Arc<ExportRegistry>, token: Option<String>, cors: Vec<String>) -> Router {
+    let state = Arc::new(AppState {
+        registry,
+        token,
+        cors,
+    });
     Router::new()
         .route("/api/status", get(status))
         .route("/api/exports", get(exports))
@@ -82,8 +163,101 @@ pub fn router(registry: Arc<ExportRegistry>, token: Option<String>) -> Router {
         .route("/api/exports/{name}/bulk", post(bulk_post))
         .route("/api/exports/{name}/events", get(events_sse))
         .layer(middleware::from_fn_with_state(state.clone(), auth))
+        // OUTSIDE auth, and it has to be. A CORS preflight is an `OPTIONS`
+        // that carries no `Authorization` header — the browser sends it
+        // before it will let the real request go, and it cannot attach
+        // credentials to it. Behind the auth layer every preflight would be
+        // a 401, the browser would refuse the real request, and the symptom
+        // would be a CORS error naming a header that was configured
+        // correctly.
+        .layer(middleware::from_fn_with_state(state.clone(), cors_layer))
         .layer(DefaultBodyLimit::max(MAX_BODY))
         .with_state(state)
+}
+
+/// Answer a preflight, and tag an allowed origin's response so the browser
+/// will hand it to the page.
+///
+/// Nothing here grants access: the token still decides that, and an origin on
+/// the list with no token still gets a 401. CORS only decides whether the
+/// browser lets JS *read* a reply it already received — which is why the
+/// default of sending no headers at all is the safe one, and why an
+/// allow-list, not a wildcard, is the shape.
+async fn cors_layer(State(state): State<Arc<AppState>>, req: Request, next: Next) -> Response {
+    let origin = req
+        .headers()
+        .get("origin")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+
+    // Exact string match, per the spec: a browser sends `scheme://host[:port]`
+    // and never normalises it, so comparing anything looser would accept
+    // origins the operator did not list.
+    //
+    // `*` matches everything, and still ECHOES the requesting origin rather
+    // than answering the literal `*`. Two reasons: a literal `*` is rejected
+    // by the browser the moment a request is credentialed, so echoing keeps
+    // the setting working if a caller ever adds cookies; and `Vary: origin`
+    // below stays truthful either way.
+    let any = state.cors.iter().any(|a| a.trim() == "*");
+    let allowed = origin
+        .as_deref()
+        .filter(|o| any || state.cors.iter().any(|a| a == o))
+        .map(str::to_string);
+
+    let preflight = req.method() == axum::http::Method::OPTIONS
+        && req.headers().contains_key("access-control-request-method");
+
+    if preflight {
+        let Some(origin) = allowed else {
+            // An unlisted origin gets a bare 403 with no CORS headers, which
+            // is what a browser reads as "not allowed" — rather than a 404
+            // implying the route is missing.
+            return (StatusCode::FORBIDDEN, "origin not allowed\n").into_response();
+        };
+        let wants_private = req
+            .headers()
+            .get("access-control-request-private-network")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+
+        let mut b = Response::builder()
+            .status(StatusCode::NO_CONTENT)
+            .header("access-control-allow-origin", origin)
+            .header("access-control-allow-methods", "GET, HEAD, POST, OPTIONS")
+            .header("access-control-allow-headers", CORS_REQUEST_HEADERS)
+            .header("access-control-max-age", "600")
+            .header("vary", "origin, access-control-request-headers");
+        if wants_private {
+            // Chrome's Private Network Access: a page on a public site
+            // reaching 127.0.0.1 is a private-network request, and it is
+            // refused unless the target says this on the preflight. Without
+            // it the headline use case — a hosted dashboard talking to the
+            // agent on your own machine — cannot work at all, and fails with
+            // a message about the network rather than about CORS.
+            b = b.header("access-control-allow-private-network", "true");
+        }
+        return b
+            .body(axum::body::Body::empty())
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+    }
+
+    let mut res = next.run(req).await;
+    if let Some(origin) = allowed {
+        let h = res.headers_mut();
+        if let Ok(v) = origin.parse() {
+            h.insert("access-control-allow-origin", v);
+        }
+        if let Ok(v) = CORS_EXPOSE_HEADERS.parse() {
+            h.insert("access-control-expose-headers", v);
+        }
+        // The response differs by origin, so a shared cache must not serve
+        // one origin's copy to another.
+        if let Ok(v) = "origin".parse() {
+            h.insert("vary", v);
+        }
+    }
+    res
 }
 
 use alloyfs_common::token_eq;

@@ -70,8 +70,9 @@ pub async fn run(
         if let Some(http) = cfg.agent.http_listen.clone() {
             let registry = registry.clone();
             let token = cfg.agent.http_token.clone();
+            let cors = cfg.agent.http_cors_origins.clone();
             tokio::spawn(async move {
-                if let Err(e) = alloyfs_http::serve(&http, registry, token).await {
+                if let Err(e) = alloyfs_http::serve(&http, registry, token, cors).await {
                     tracing::error!(error = %e, "http api failed");
                 }
             });

@@ -36,6 +36,23 @@ pub struct AgentSection {
     /// Bearer token required on every /api request (`Authorization: Bearer …`).
     /// Mandatory when http_listen is not loopback; optional on localhost.
     pub http_token: Option<String>,
+    /// Browser origins allowed to call the HTTP API, e.g.
+    /// `https://dashboard.example.com`. Empty — the default — sends no CORS
+    /// headers at all, which is what stops a browser reading the response.
+    ///
+    /// Absent CORS is a security property here, not an oversight: an agent on
+    /// loopback with no token is open to anything that can reach it, and the
+    /// only reason a web page you happen to visit cannot read every export is
+    /// that the browser discards a response with no
+    /// `Access-Control-Allow-Origin`.
+    ///
+    /// `"*"` turns the check off entirely — every origin allowed — and is
+    /// supported for local development, where a dev server's port changes per
+    /// run and cannot be listed usefully. It must be the only entry, and it
+    /// is logged at startup: with no `http_token` alongside it, any page open
+    /// in a browser on this machine can read and write every export.
+    #[serde(default)]
+    pub http_cors_origins: Vec<String>,
     /// Opt this server's OUTGOING large frames into zstd on v13+ sessions
     /// — better ratio than the always-on lz4 where it matters, the
     /// bandwidth-bound link serving compressible trees. Off by default;
