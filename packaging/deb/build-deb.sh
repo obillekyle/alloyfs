@@ -51,7 +51,7 @@ Architecture: $ARCH
 Maintainer: Kyle <obillekyle@gmail.com>
 Section: utils
 Priority: optional
-Homepage: https://github.com/obillekyle/alloyfs
+Homepage: https://github.com/AlloyFS/alloyfs
 Recommends: fuse3
 Description: virtual drive service - mount remote folders as real drives
  AlloyFS exports folders from one machine and mounts them as ordinary

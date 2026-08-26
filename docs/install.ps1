@@ -28,7 +28,7 @@
 
 $ErrorActionPreference = 'Stop'
 
-$Repo = 'obillekyle/alloyfs'
+$Repo = 'AlloyFS/alloyfs'
 $InstallDir = if ($env:ALLOYFS_INSTALL) { $env:ALLOYFS_INSTALL }
               else { Join-Path $env:LOCALAPPDATA 'Programs\alloyfs' }
 

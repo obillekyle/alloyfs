@@ -17,7 +17,7 @@
 # shell the machine happens to have.
 set -eu
 
-REPO="obillekyle/alloyfs"
+REPO="AlloyFS/alloyfs"
 
 # Where the binary lands, in three cases rather than one.
 #

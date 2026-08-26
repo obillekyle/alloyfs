@@ -2,7 +2,7 @@
   "name": "AlloyFS",
   "description": "A virtual drive service for Windows and Linux: export a folder, mount it as a real drive over TCP or SSH, with live change events, offline caching and a custom Linux kernel filesystem.",
   "icon": "logo.svg",
-  "repo": "https://github.com/obillekyle/alloyfs",
+  "repo": "https://github.com/AlloyFS/alloyfs",
   "url": "https://alloy.okyle.dev",
   "theme": {
     "light": {

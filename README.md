@@ -1,6 +1,6 @@
 <div align="center">
 
-<a href="https://alloy.okyle.dev"><img src="https://raw.githubusercontent.com/obillekyle/alloyfs/main/assets/logo.svg" alt="AlloyFS" title="Read the docs" width="96"></a>
+<a href="https://alloy.okyle.dev"><img src="https://raw.githubusercontent.com/AlloyFS/alloyfs/main/assets/logo.svg" alt="AlloyFS" title="Read the docs" width="96"></a>
 
 # AlloyFS
 
@@ -14,7 +14,7 @@
 
 Not SMB, not WebDAV, not a sync folder — a mount, with the events and the locking that implies.
 
-[![release](https://img.shields.io/github/v/release/obillekyle/alloyfs?color=2c6e8f&label=release)](https://github.com/obillekyle/alloyfs/releases/latest) [![license](https://img.shields.io/badge/license-MIT-2c6e8f)](LICENSE) ![stars](https://img.shields.io/github/stars/obillekyle/alloyfs?color=2c6e8f)
+[![release](https://img.shields.io/github/v/release/AlloyFS/alloyfs?color=2c6e8f&label=release)](https://github.com/AlloyFS/alloyfs/releases/latest) [![license](https://img.shields.io/badge/license-MIT-2c6e8f)](LICENSE) ![stars](https://img.shields.io/github/stars/AlloyFS/alloyfs?color=2c6e8f)
 
 </div>
 
@@ -28,9 +28,9 @@ Not SMB, not WebDAV, not a sync folder — a mount, with the events and the lock
 
 <div align="center">
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/obillekyle/alloyfs/main/assets/terminal-dark.svg">
-  <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/obillekyle/alloyfs/main/assets/terminal-light.svg">
-  <img alt="the alloyfs agent starting: an export opened and watched, a TCP socket listening, then a client session attaching to it" src="https://raw.githubusercontent.com/obillekyle/alloyfs/main/assets/terminal-light.svg" width="880">
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/AlloyFS/alloyfs/main/assets/terminal-dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/AlloyFS/alloyfs/main/assets/terminal-light.svg">
+  <img alt="the alloyfs agent starting: an export opened and watched, a TCP socket listening, then a client session attaching to it" src="https://raw.githubusercontent.com/AlloyFS/alloyfs/main/assets/terminal-light.svg" width="880">
 </picture>
 </div>
 

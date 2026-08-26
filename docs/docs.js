@@ -25,7 +25,7 @@ function setNav(groups) {
   ]
 }
 
-const REPO = 'https://github.com/obillekyle/alloyfs'
+const REPO = 'https://github.com/AlloyFS/alloyfs'
 document.getElementById('gh-link').href = REPO
 
 /* ------------------------------------------------------------------ markdown

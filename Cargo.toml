@@ -17,7 +17,7 @@ members = [
 version = "1.0.0-alpha.94"
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/obillekyle/alloyfs"
+repository = "https://github.com/AlloyFS/alloyfs"
 
 
 # The lints the gate enforces, declared where the editor can see them.

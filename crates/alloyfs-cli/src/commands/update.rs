@@ -14,7 +14,7 @@
 use std::process::Command;
 
 const BASE: &str = "https://alloy.okyle.dev";
-const REPO: &str = "obillekyle/alloyfs";
+const REPO: &str = "AlloyFS/alloyfs";
 
 /// The previous binary, kept beside the current one so a rollback needs no
 /// network. The Windows installer keeps its own `.old` — which is the
